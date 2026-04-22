@@ -1,0 +1,37 @@
+<svg width="960" height="240" viewBox="0 0 960 240" xmlns="http://www.w3.org/2000/svg" role="img"
+    aria-labelledby="title desc">
+    <title id="title">GrapheneDB Logo</title>
+    <desc id="desc">GrapheneDB brand mark and wordmark</desc>
+    <defs>
+        <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#0B1220" />
+            <stop offset="100%" stop-color="#111B33" />
+        </linearGradient>
+        <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#30E3CA" />
+            <stop offset="100%" stop-color="#19A7CE" />
+        </linearGradient>
+    </defs>
+
+    <rect x="0" y="0" width="960" height="240" rx="20" fill="url(#bg)" />
+
+    <g transform="translate(58,40)">
+        <polygon points="60,8 112,38 112,98 60,128 8,98 8,38" fill="none" stroke="url(#accent)"
+            stroke-width="7" />
+        <line x1="60" y1="8" x2="60" y2="128" stroke="url(#accent)" stroke-width="5" />
+        <line x1="8" y1="38" x2="112" y2="98" stroke="url(#accent)" stroke-width="5" />
+        <line x1="112" y1="38" x2="8" y2="98" stroke="url(#accent)" stroke-width="5" />
+        <circle cx="60" cy="8" r="7" fill="#EAFDFC" />
+        <circle cx="112" cy="38" r="7" fill="#EAFDFC" />
+        <circle cx="112" cy="98" r="7" fill="#EAFDFC" />
+        <circle cx="60" cy="128" r="7" fill="#EAFDFC" />
+        <circle cx="8" cy="98" r="7" fill="#EAFDFC" />
+        <circle cx="8" cy="38" r="7" fill="#EAFDFC" />
+    </g>
+
+    <g font-family="Segoe UI, Tahoma, sans-serif" fill="#F3F9FF">
+        <text x="220" y="112" font-size="72" font-weight="700" letter-spacing="1">GrapheneDB</text>
+        <text x="220" y="156" font-size="26" fill="#8EE3F5">Embeddable graph engine for high-ingest,
+            read-heavy workloads</text>
+    </g>
+</svg>
