@@ -4,6 +4,12 @@ This document is the deep technical companion to the landing README. It is
 intentionally implementation-heavy, but organized so you can skim architecture
 first and dive into low-level details only when needed.
 
+## Status Note
+
+GrapheneDB is currently pre-production. The material in this document describes
+the current implementation direction and behavior, not a finalized production
+contract.
+
 ## 1. System Intent
 
 GrapheneDB is designed for a specific workload shape:

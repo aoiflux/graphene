@@ -6,6 +6,15 @@ GrapheneDB is an embeddable Go graph engine for teams that need to ingest big
 connected datasets fast, keep them durable on disk, and run graph queries
 without external infrastructure.
 
+## Project Status
+
+GrapheneDB is currently in an experimental, pre-production stage.
+
+- The core architecture and APIs are implemented.
+- Benchmarks and stress tests are available, but coverage is still growing.
+- It is not startup-ready or production-ready yet.
+- Treat current performance numbers as early signals, not final guarantees.
+
 ## Why It Exists
 
 - Build once, query many times: optimized for heavy ingest followed by
@@ -14,10 +23,10 @@ without external infrastructure.
 - Typed graph model: predictable APIs with domain-friendly node and edge labels.
 - Durable by design: WAL-backed persistence with replay and explicit compaction.
 
-## Benchmarked Snapshot
+## Benchmarked Snapshot (Early Signal)
 
 The project includes repeatable benchmark and stress suites. Latest benchmark
-run (Windows, AMD Ryzen 9 5980HS, `./test.ps1 -Bench -BenchTime 1s`):
+run (Windows, AMD Ryzen 9 5980HS, ./test.ps1 -Bench -BenchTime 1s):
 
 | Benchmark             |       Result |                      Memory |
 | --------------------- | -----------: | --------------------------: |
@@ -89,8 +98,8 @@ go run ./examples
 - `traversal/`: graph traversal and pattern matching.
 - `viz/`: interactive HTML export.
 
-## Best Fit
+## Current Fit
 
-GrapheneDB is a strong fit for embedded analytics and forensic-style workflows
-where you need deterministic behavior, high ingest throughput, and practical
-graph operations in a single Go codebase.
+GrapheneDB is best used today for exploration, prototyping, and controlled
+internal workloads where you want an embeddable graph engine and can tolerate
+ongoing validation work.

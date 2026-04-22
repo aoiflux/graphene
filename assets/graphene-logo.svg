@@ -1,7 +1,7 @@
 <svg width="960" height="240" viewBox="0 0 960 240" xmlns="http://www.w3.org/2000/svg" role="img"
     aria-labelledby="title desc">
     <title id="title">GrapheneDB Logo</title>
-    <desc id="desc">GrapheneDB brand mark and wordmark</desc>
+    <desc id="desc">GrapheneDB preview brand mark and wordmark</desc>
     <defs>
         <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
             <stop offset="0%" stop-color="#0B1220" />
@@ -31,7 +31,7 @@
 
     <g font-family="Segoe UI, Tahoma, sans-serif" fill="#F3F9FF">
         <text x="220" y="112" font-size="72" font-weight="700" letter-spacing="1">GrapheneDB</text>
-        <text x="220" y="156" font-size="26" fill="#8EE3F5">Embeddable graph engine for high-ingest,
-            read-heavy workloads</text>
+        <text x="220" y="156" font-size="26" fill="#8EE3F5">Preview build: embeddable graph engine
+            under active validation</text>
     </g>
 </svg>
