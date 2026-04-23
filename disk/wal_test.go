@@ -3,6 +3,8 @@ package disk
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -183,5 +185,61 @@ func TestWAL_MultipleCheckpoints(t *testing.T) {
 	})
 	if len(nodes) != 1 || string(nodes[0]) != "a" {
 		t.Errorf("expected only 'a', got %v", nodes)
+	}
+}
+
+func TestWAL_RingOverflow_ConcurrentAppendReplay(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "overflow.wal")
+
+	// Tiny capacity forces overflow path frequently.
+	wal, err := openWALWithCapacity(path, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 8
+	const perWriter = 200
+
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		writerID := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWriter; j++ {
+				payload := []byte("w" + strconv.Itoa(writerID) + "-" + strconv.Itoa(j))
+				if err := wal.AppendNode(payload); err != nil {
+					t.Errorf("append failed: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wal2, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal2.Close()
+
+	count := 0
+	if err := wal2.Replay(ReplayCallbacks{
+		NodeFunc: func(p []byte) error {
+			count++
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := writers * perWriter
+	if count != want {
+		t.Fatalf("replay count mismatch: got %d want %d", count, want)
 	}
 }

@@ -26,15 +26,26 @@ GrapheneDB is currently in an experimental, pre-production stage.
 ## Benchmarked Snapshot (Early Signal)
 
 The project includes repeatable benchmark and stress suites. Latest benchmark
-run (Windows, AMD Ryzen 9 5980HS, ./test.ps1 -Bench -BenchTime 1s):
+results:
+
+**Benchmarking Conditions:**
+
+- **Date**: 2026-04-23
+- **OS**: Windows 10/11 (amd64)
+- **Go Version**: go1.25.5
+- **Hardware**: AMD Ryzen 9 5980HS with Radeon Graphics (16 cores)
+- **Architecture**: amd64
+- **Command**: `./test.ps1 -Bench -BenchTime 1s`
+
+**Results:**
 
 | Benchmark             |       Result |                      Memory |
 | --------------------- | -----------: | --------------------------: |
-| Add node              |  728.9 ns/op |       268 B/op, 3 allocs/op |
-| Get node              |  7.945 ns/op |         0 B/op, 0 allocs/op |
-| BFS traversal         | 447459 ns/op | 223560 B/op, 3058 allocs/op |
-| Shortest path         | 260022 ns/op | 124864 B/op, 2061 allocs/op |
-| Property index lookup |  51.42 ns/op |          8 B/op, 1 alloc/op |
+| Add node              |  587.2 ns/op |       303 B/op, 3 allocs/op |
+| Get node              |  4.758 ns/op |         0 B/op, 0 allocs/op |
+| BFS traversal         | 303155 ns/op | 223561 B/op, 3058 allocs/op |
+| Shortest path         | 179960 ns/op | 124865 B/op, 2061 allocs/op |
+| Property index lookup |  36.13 ns/op |          8 B/op, 1 alloc/op |
 
 Scale validation covered by stress tests:
 

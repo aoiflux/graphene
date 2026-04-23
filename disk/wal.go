@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 // WAL is a simple append-only write-ahead log for crash-safe node and edge writes.
@@ -32,17 +34,54 @@ const (
 
 // WAL manages the write-ahead log file.
 type WAL struct {
-	mu   sync.Mutex
-	file *os.File
+	mu      sync.Mutex
+	writeMu sync.Mutex
+	file    *os.File
+
+	ringMask uint64
+	ring     []walSlot
+	head     atomic.Uint64 // next sequence to reserve
+	tail     atomic.Uint64 // next sequence to consume/write
+
+	barrier  atomic.Uint32 // 1 while maintenance op is active
+	inFlight atomic.Int64  // append calls currently in progress
+	closed   atomic.Uint32 // 1 once Close() starts
 }
+
+type walSlot struct {
+	seq     atomic.Uint64
+	ready   atomic.Uint32
+	recType byte
+	payload []byte
+}
+
+const defaultWALRingCapacity = 1024
 
 // OpenWAL opens (or creates) the WAL at path.
 func OpenWAL(path string) (*WAL, error) {
+	return openWALWithCapacity(path, defaultWALRingCapacity)
+}
+
+func openWALWithCapacity(path string, capacity int) (*WAL, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("wal open: %w", err)
 	}
-	return &WAL{file: f}, nil
+
+	capPow2 := nextPowerOfTwo(capacity)
+	if capPow2 < 2 {
+		capPow2 = 2
+	}
+
+	w := &WAL{
+		file:     f,
+		ring:     make([]walSlot, capPow2),
+		ringMask: uint64(capPow2 - 1),
+	}
+	for i := range w.ring {
+		w.ring[i].seq.Store(uint64(i))
+	}
+	return w, nil
 }
 
 // AppendNode writes a node payload to the WAL.
@@ -69,8 +108,14 @@ func (w *WAL) AppendEdgeProp(payload []byte) error {
 // checkpoint signals that all records before it are durable in the CSR and
 // the WAL can be safely truncated.
 func (w *WAL) Checkpoint() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	if err := w.beginMaintenance(); err != nil {
+		return err
+	}
+	defer w.endMaintenance()
+
+	if err := w.drainQueuedLocked(); err != nil {
+		return err
+	}
 	if err := w.writeRecord(walRecordCheckpoint, nil); err != nil {
 		return err
 	}
@@ -79,8 +124,15 @@ func (w *WAL) Checkpoint() error {
 
 // Truncate removes all records from the WAL (called after successful compaction).
 func (w *WAL) Truncate() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	if err := w.beginMaintenance(); err != nil {
+		return err
+	}
+	defer w.endMaintenance()
+
+	if err := w.drainQueuedLocked(); err != nil {
+		return err
+	}
+
 	// Close the file before truncating: on Windows a file opened with O_APPEND
 	// cannot be truncated via the file-handle Truncate call (Access is denied).
 	// Closing first and using os.Truncate on the path works on all platforms.
@@ -112,8 +164,14 @@ type ReplayCallbacks struct {
 // to the matching callback in cb. It stops at EOF or a checkpoint record.
 // Partial/corrupted records at the tail are silently ignored (crash-safe).
 func (w *WAL) Replay(cb ReplayCallbacks) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	if err := w.beginMaintenance(); err != nil {
+		return err
+	}
+	defer w.endMaintenance()
+
+	if err := w.drainQueuedLocked(); err != nil {
+		return err
+	}
 
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -184,16 +242,48 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 
 // Close closes the underlying file.
 func (w *WAL) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	if err := w.beginMaintenance(); err != nil {
+		return err
+	}
+	defer w.endMaintenance()
+
+	if err := w.drainQueuedLocked(); err != nil {
+		return err
+	}
+	w.closed.Store(1)
 	return w.file.Close()
 }
 
 // append is the internal write path.
 func (w *WAL) append(recType byte, payload []byte) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.writeRecord(recType, payload)
+	if w.closed.Load() != 0 {
+		return fmt.Errorf("wal append: closed")
+	}
+
+	if !w.enterAppend() {
+		return fmt.Errorf("wal append: closed")
+	}
+	defer w.inFlight.Add(-1)
+
+	var copied []byte
+	if len(payload) > 0 {
+		copied = make([]byte, len(payload))
+		copy(copied, payload)
+	}
+
+	if err := w.enqueue(recType, copied); err != nil {
+		return err
+	}
+
+	if w.writeMu.TryLock() {
+		err := w.drainQueuedLocked()
+		w.writeMu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // writeRecord serialises and writes one WAL record. Must hold w.mu.
@@ -213,6 +303,132 @@ func (w *WAL) writeRecord(recType byte, payload []byte) error {
 		return fmt.Errorf("wal write: %w", err)
 	}
 	return nil
+}
+
+func (w *WAL) beginMaintenance() error {
+	w.mu.Lock()
+	if w.closed.Load() != 0 {
+		w.mu.Unlock()
+		return fmt.Errorf("wal closed")
+	}
+	w.barrier.Store(1)
+	for w.inFlight.Load() != 0 {
+		runtime.Gosched()
+	}
+	w.writeMu.Lock()
+	return nil
+}
+
+func (w *WAL) endMaintenance() {
+	w.writeMu.Unlock()
+	w.barrier.Store(0)
+	w.mu.Unlock()
+}
+
+func (w *WAL) enterAppend() bool {
+	for {
+		if w.closed.Load() != 0 {
+			return false
+		}
+		if w.barrier.Load() != 0 {
+			runtime.Gosched()
+			continue
+		}
+		w.inFlight.Add(1)
+		if w.barrier.Load() == 0 {
+			return true
+		}
+		w.inFlight.Add(-1)
+	}
+}
+
+func (w *WAL) enqueue(recType byte, payload []byte) error {
+	for {
+		if seq, ok := w.tryReserve(); ok {
+			slot := &w.ring[seq&w.ringMask]
+			slot.recType = recType
+			slot.payload = payload
+			slot.seq.Store(seq)
+			slot.ready.Store(1)
+			return nil
+		}
+
+		// Overflow path: lock and drain until there is room.
+		w.writeMu.Lock()
+		if err := w.drainQueuedLocked(); err != nil {
+			w.writeMu.Unlock()
+			return err
+		}
+		for {
+			if seq, ok := w.tryReserve(); ok {
+				slot := &w.ring[seq&w.ringMask]
+				slot.recType = recType
+				slot.payload = payload
+				slot.seq.Store(seq)
+				slot.ready.Store(1)
+				if err := w.drainQueuedLocked(); err != nil {
+					w.writeMu.Unlock()
+					return err
+				}
+				w.writeMu.Unlock()
+				return nil
+			}
+			if err := w.drainQueuedLocked(); err != nil {
+				w.writeMu.Unlock()
+				return err
+			}
+			runtime.Gosched()
+		}
+	}
+}
+
+func (w *WAL) tryReserve() (uint64, bool) {
+	capacity := uint64(len(w.ring))
+	for {
+		head := w.head.Load()
+		tail := w.tail.Load()
+		if head-tail >= capacity {
+			return 0, false
+		}
+		if w.head.CompareAndSwap(head, head+1) {
+			return head, true
+		}
+	}
+}
+
+// drainQueuedLocked writes all ready records in sequence order. Caller must hold writeMu.
+func (w *WAL) drainQueuedLocked() error {
+	for {
+		tail := w.tail.Load()
+		head := w.head.Load()
+		if tail >= head {
+			return nil
+		}
+
+		slot := &w.ring[tail&w.ringMask]
+		if slot.seq.Load() != tail || slot.ready.Load() == 0 {
+			return nil
+		}
+
+		if err := w.writeRecord(slot.recType, slot.payload); err != nil {
+			return err
+		}
+
+		slot.payload = nil
+		slot.ready.Store(0)
+		w.tail.Store(tail + 1)
+	}
+}
+
+func nextPowerOfTwo(n int) int {
+	if n <= 1 {
+		return 1
+	}
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return p
 }
 
 // computeCRC32 is a simple CRC32 (IEEE) implementation with no external deps.
