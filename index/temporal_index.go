@@ -4,7 +4,7 @@ import (
 	"sort"
 	"sync"
 
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // TemporalEntry associates a Unix nanosecond timestamp with a NodeID.

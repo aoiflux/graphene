@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"graphene/memory"
-	"graphene/store"
+	"github.com/aoiflux/graphene/memory"
+	"github.com/aoiflux/graphene/store"
 )
 
 // buildGraph builds a simple linear chain: n0 → n1 → n2 → ... → nN

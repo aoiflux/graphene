@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strconv"
 
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 type nodeVM struct {

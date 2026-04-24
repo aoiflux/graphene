@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // openFresh opens a new Store in a temp dir, fails the test on error.

@@ -1,7 +1,7 @@
 package traversal
 
 import (
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // BFSResult holds the subgraph discovered by a BFS walk.

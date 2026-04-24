@@ -2,8 +2,9 @@ package graphene
 
 import (
 	"errors"
-	"graphene/store"
-	"graphene/traversal"
+
+	"github.com/aoiflux/graphene/store"
+	"github.com/aoiflux/graphene/traversal"
 )
 
 // GraphStats holds high-level statistics about the graph.

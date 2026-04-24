@@ -11,10 +11,10 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"graphene"
-	"graphene/store"
-	"graphene/traversal"
-	"graphene/viz"
+	"github.com/aoiflux/graphene"
+	"github.com/aoiflux/graphene/store"
+	"github.com/aoiflux/graphene/traversal"
+	"github.com/aoiflux/graphene/viz"
 )
 
 func main() {
@@ -56,7 +56,7 @@ func main() {
 		fmt.Println()
 	}
 
-	fmt.Println("--- Visualization Examples (Opt-In) ---")
+	fmt.Println("--- Visualization Examples ---")
 	fmt.Println()
 	example19_VisualizationCaseMap()
 	example20_VisualizationSimilarityMesh()

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // helpers

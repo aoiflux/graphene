@@ -3,7 +3,7 @@ package index
 import (
 	"sync"
 
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // PropertyIndex is a secondary index from (property key, encoded value) to the

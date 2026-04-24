@@ -1,7 +1,7 @@
 package traversal
 
 import (
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // PatternNode describes a node constraint in a query pattern.

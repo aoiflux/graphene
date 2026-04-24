@@ -3,7 +3,7 @@ package index
 import (
 	"sync"
 
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // TypeIndex maintains in-memory secondary indexes from NodeType → []NodeID

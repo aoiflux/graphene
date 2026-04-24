@@ -4,8 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"graphene/index"
-	"graphene/store"
+	"github.com/aoiflux/graphene/index"
+	"github.com/aoiflux/graphene/store"
 )
 
 // adjacency holds the outbound and inbound edge ID lists for a single node.

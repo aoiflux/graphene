@@ -14,9 +14,9 @@ import (
 	"sync"
 	"testing"
 
-	"graphene"
-	"graphene/store"
-	"graphene/traversal"
+	"github.com/aoiflux/graphene"
+	"github.com/aoiflux/graphene/store"
+	"github.com/aoiflux/graphene/traversal"
 )
 
 const (

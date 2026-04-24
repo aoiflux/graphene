@@ -7,7 +7,7 @@ import (
 	"math"
 	"sort"
 
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // CSR (Compressed Sparse Row) is an adjacency representation optimised for

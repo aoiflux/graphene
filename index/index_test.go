@@ -3,7 +3,7 @@ package index
 import (
 	"testing"
 
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // --- TypeIndex ---

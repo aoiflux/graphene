@@ -9,8 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"graphene/index"
-	"graphene/store"
+	"github.com/aoiflux/graphene/index"
+	"github.com/aoiflux/graphene/store"
 )
 
 // Store is the on-disk implementation of store.GraphStore.

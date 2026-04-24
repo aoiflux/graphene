@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"graphene"
-	"graphene/store"
+	"github.com/aoiflux/graphene"
+	"github.com/aoiflux/graphene/store"
 )
 
 // newTestGraph builds an in-memory graph with a standard case/file/artefact

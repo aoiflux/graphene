@@ -38,10 +38,10 @@
 package graphene
 
 import (
-	"graphene/disk"
-	"graphene/memory"
-	"graphene/store"
-	"graphene/traversal"
+	"github.com/aoiflux/graphene/disk"
+	"github.com/aoiflux/graphene/memory"
+	"github.com/aoiflux/graphene/store"
+	"github.com/aoiflux/graphene/traversal"
 )
 
 // Graph wraps a GraphStore and exposes the traversal API in one place.

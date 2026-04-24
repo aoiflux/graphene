@@ -3,7 +3,7 @@ package traversal
 import (
 	"errors"
 
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // ErrNoPath is returned when no path exists between the source and destination.

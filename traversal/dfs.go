@@ -1,7 +1,7 @@
 package traversal
 
 import (
-	"graphene/store"
+	"github.com/aoiflux/graphene/store"
 )
 
 // DFSResult holds the provenance chain discovered by a DFS walk.
