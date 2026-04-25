@@ -129,6 +129,49 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 	return id, nil
 }
 
+// AddNodesBatch adds nodes in order and returns assigned IDs.
+// On error, successfully written prefixes are committed and returned.
+func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
+	ids := make([]store.NodeID, len(nodes))
+	stored := make([]*store.Node, len(nodes))
+	payloads := make([][]byte, len(nodes))
+
+	for i, n := range nodes {
+		id := store.NodeID(s.nodeSeq.Add(1))
+		ids[i] = id
+
+		node := &store.Node{ID: id}
+		if len(n.Labels) > 0 {
+			node.Labels = make([]store.NodeType, len(n.Labels))
+			copy(node.Labels, n.Labels)
+		}
+		if len(n.Properties) > 0 {
+			node.Properties = make([]byte, len(n.Properties))
+			copy(node.Properties, n.Properties)
+		}
+
+		stored[i] = node
+		payloads[i] = marshalNode(node)
+	}
+
+	committed := 0
+	for i := range payloads {
+		if err := s.wal.AppendNode(payloads[i]); err != nil {
+			s.mu.Lock()
+			s.commitNodesBatch(stored[:committed])
+			s.mu.Unlock()
+			return ids[:committed], fmt.Errorf("AddNodesBatch: wal: %w", err)
+		}
+		committed++
+	}
+
+	s.mu.Lock()
+	s.commitNodesBatch(stored)
+	s.mu.Unlock()
+
+	return ids, nil
+}
+
 func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 	// Validate src/dst exist (check delta + CSR).
 	if err := s.nodeExists(e.Src); err != nil {
@@ -170,6 +213,61 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 	s.mu.Unlock()
 
 	return id, nil
+}
+
+// AddEdgesBatch adds edges in order and returns assigned IDs.
+// On error, successfully written prefixes are committed and returned.
+func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
+	ids := make([]store.EdgeID, len(edges))
+	stored := make([]*store.Edge, len(edges))
+	payloads := make([][]byte, len(edges))
+
+	for i, e := range edges {
+		if err := s.nodeExists(e.Src); err != nil {
+			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Src}
+		}
+		if err := s.nodeExists(e.Dst); err != nil {
+			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Dst}
+		}
+
+		id := store.EdgeID(s.edgeSeq.Add(1))
+		ids[i] = id
+
+		edge := &store.Edge{
+			ID:     id,
+			Src:    e.Src,
+			Dst:    e.Dst,
+			Weight: e.Weight,
+		}
+		if len(e.Labels) > 0 {
+			edge.Labels = make([]store.EdgeType, len(e.Labels))
+			copy(edge.Labels, e.Labels)
+		}
+		if len(e.Properties) > 0 {
+			edge.Properties = make([]byte, len(e.Properties))
+			copy(edge.Properties, e.Properties)
+		}
+
+		stored[i] = edge
+		payloads[i] = marshalEdge(edge)
+	}
+
+	committed := 0
+	for i := range payloads {
+		if err := s.wal.AppendEdge(payloads[i]); err != nil {
+			s.mu.Lock()
+			s.commitEdgesBatch(stored[:committed])
+			s.mu.Unlock()
+			return ids[:committed], fmt.Errorf("AddEdgesBatch: wal: %w", err)
+		}
+		committed++
+	}
+
+	s.mu.Lock()
+	s.commitEdgesBatch(stored)
+	s.mu.Unlock()
+
+	return ids, nil
 }
 
 func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
@@ -488,6 +586,31 @@ func (s *Store) ensureDeltaAdj(id store.NodeID) *deltaAdj {
 		s.deltaAdj[id] = a
 	}
 	return a
+}
+
+// commitNodesBatch applies node records to in-memory delta/index state.
+// Caller must hold s.mu.
+func (s *Store) commitNodesBatch(nodes []*store.Node) {
+	for _, n := range nodes {
+		s.deltaNodes[n.ID] = n
+		for _, lbl := range n.Labels {
+			s.deltaNodesByType[lbl] = append(s.deltaNodesByType[lbl], n.ID)
+		}
+		s.ensureDeltaAdj(n.ID)
+	}
+}
+
+// commitEdgesBatch applies edge records to in-memory delta/index state.
+// Caller must hold s.mu.
+func (s *Store) commitEdgesBatch(edges []*store.Edge) {
+	for _, e := range edges {
+		s.deltaEdges[e.ID] = e
+		for _, lbl := range e.Labels {
+			s.deltaEdgesByType[lbl] = append(s.deltaEdgesByType[lbl], e.ID)
+		}
+		s.ensureDeltaAdj(e.Src).out = append(s.ensureDeltaAdj(e.Src).out, e.ID)
+		s.ensureDeltaAdj(e.Dst).in = append(s.ensureDeltaAdj(e.Dst).in, e.ID)
+	}
 }
 
 func (s *Store) replayWAL() error {

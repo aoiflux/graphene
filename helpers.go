@@ -7,6 +7,14 @@ import (
 	"github.com/aoiflux/graphene/traversal"
 )
 
+type nodeBatchAdder interface {
+	AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error)
+}
+
+type edgeBatchAdder interface {
+	AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error)
+}
+
 // GraphStats holds high-level statistics about the graph.
 type GraphStats struct {
 	NodeCount uint64
@@ -61,6 +69,10 @@ func (g *Graph) GetEdges(ids []store.EdgeID) ([]*store.Edge, error) {
 // AddNodes adds multiple nodes in order, returning their assigned IDs.
 // If any node fails to be added, the already-added nodes are not rolled back.
 func (g *Graph) AddNodes(nodes []*store.Node) ([]store.NodeID, error) {
+	if b, ok := g.GraphStore.(nodeBatchAdder); ok {
+		return b.AddNodesBatch(nodes)
+	}
+
 	ids := make([]store.NodeID, len(nodes))
 	for i, n := range nodes {
 		id, err := g.AddNode(n)
@@ -75,6 +87,10 @@ func (g *Graph) AddNodes(nodes []*store.Node) ([]store.NodeID, error) {
 // AddEdges adds multiple edges in order, returning their assigned IDs.
 // If any edge fails to be added, the already-added edges are not rolled back.
 func (g *Graph) AddEdges(edges []*store.Edge) ([]store.EdgeID, error) {
+	if b, ok := g.GraphStore.(edgeBatchAdder); ok {
+		return b.AddEdgesBatch(edges)
+	}
+
 	ids := make([]store.EdgeID, len(edges))
 	for i, e := range edges {
 		id, err := g.AddEdge(e)

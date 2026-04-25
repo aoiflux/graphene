@@ -250,8 +250,21 @@ func (w *WAL) Close() error {
 	if err := w.drainQueuedLocked(); err != nil {
 		return err
 	}
+
+	syncErr := w.file.Sync()
 	w.closed.Store(1)
-	return w.file.Close()
+	closeErr := w.file.Close()
+
+	if syncErr != nil && closeErr != nil {
+		return fmt.Errorf("wal close: sync: %v; close: %w", syncErr, closeErr)
+	}
+	if syncErr != nil {
+		return fmt.Errorf("wal close: sync: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("wal close: %w", closeErr)
+	}
+	return nil
 }
 
 // append is the internal write path.

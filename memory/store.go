@@ -97,6 +97,38 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 	return id, nil
 }
 
+// AddNodesBatch adds nodes in order and returns assigned IDs.
+// On error, returns successfully added IDs up to the failing index.
+func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
+	ids := make([]store.NodeID, len(nodes))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i, n := range nodes {
+		id := s.nextNodeID()
+
+		stored := &store.Node{ID: id}
+		if len(n.Labels) > 0 {
+			stored.Labels = make([]store.NodeType, len(n.Labels))
+			copy(stored.Labels, n.Labels)
+		}
+		if len(n.Properties) > 0 {
+			stored.Properties = make([]byte, len(n.Properties))
+			copy(stored.Properties, n.Properties)
+		}
+
+		s.nodes[id] = stored
+		for _, lbl := range n.Labels {
+			s.nodesByType[lbl] = append(s.nodesByType[lbl], id)
+		}
+		s.ensureAdj(id)
+		ids[i] = id
+	}
+
+	return ids, nil
+}
+
 func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 	// validate src and dst exist
 	s.mu.RLock()
@@ -138,6 +170,51 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 	s.mu.Unlock()
 
 	return id, nil
+}
+
+// AddEdgesBatch adds edges in order and returns assigned IDs.
+// On error, returns successfully added IDs up to the failing index.
+func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
+	ids := make([]store.EdgeID, len(edges))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i, e := range edges {
+		if _, ok := s.nodes[e.Src]; !ok {
+			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Src}
+		}
+		if _, ok := s.nodes[e.Dst]; !ok {
+			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Dst}
+		}
+
+		id := s.nextEdgeID()
+
+		stored := &store.Edge{
+			ID:     id,
+			Src:    e.Src,
+			Dst:    e.Dst,
+			Weight: e.Weight,
+		}
+		if len(e.Labels) > 0 {
+			stored.Labels = make([]store.EdgeType, len(e.Labels))
+			copy(stored.Labels, e.Labels)
+		}
+		if len(e.Properties) > 0 {
+			stored.Properties = make([]byte, len(e.Properties))
+			copy(stored.Properties, e.Properties)
+		}
+
+		s.edges[id] = stored
+		for _, lbl := range e.Labels {
+			s.edgesByType[lbl] = append(s.edgesByType[lbl], id)
+		}
+		s.ensureAdj(e.Src).out = append(s.ensureAdj(e.Src).out, id)
+		s.ensureAdj(e.Dst).in = append(s.ensureAdj(e.Dst).in, id)
+		ids[i] = id
+	}
+
+	return ids, nil
 }
 
 func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
