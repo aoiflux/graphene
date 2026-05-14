@@ -281,7 +281,7 @@ func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
 	if s.csr != nil {
 		rec, found := s.csr.GetNode(id)
 		if found {
-			return &store.Node{ID: rec.ID, Labels: rec.Labels}, nil
+			return &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: cloneBytes(rec.Properties)}, nil
 		}
 	}
 	return nil, &store.ErrNotFound{Kind: "node", ID: uint64(id)}
@@ -501,15 +501,16 @@ func (s *Store) Compact() error {
 
 	// From delta.
 	for _, n := range s.deltaNodes {
-		nodes = append(nodes, nodeRecord{ID: n.ID, Labels: n.Labels})
+		nodes = append(nodes, nodeRecord{ID: n.ID, Labels: n.Labels, Properties: cloneBytes(n.Properties)})
 	}
 	for _, e := range s.deltaEdges {
 		edges = append(edges, rawEdge{
-			ID:     e.ID,
-			Src:    e.Src,
-			Dst:    e.Dst,
-			Labels: e.Labels,
-			Weight: e.Weight,
+			ID:         e.ID,
+			Src:        e.Src,
+			Dst:        e.Dst,
+			Labels:     e.Labels,
+			Weight:     e.Weight,
+			Properties: cloneBytes(e.Properties),
 		})
 	}
 
@@ -797,16 +798,18 @@ func unmarshalEdge(b []byte) (*store.Edge, error) {
 
 func rawEdgeToStore(re rawEdge) *store.Edge {
 	return &store.Edge{
-		ID:     re.ID,
-		Src:    re.Src,
-		Dst:    re.Dst,
-		Labels: re.Labels,
-		Weight: re.Weight,
+		ID:         re.ID,
+		Src:        re.Src,
+		Dst:        re.Dst,
+		Labels:     re.Labels,
+		Weight:     re.Weight,
+		Properties: cloneBytes(re.Properties),
 	}
 }
 
-// deserialiseCSR reconstructs a CSRGraph from a Serialise() v2 byte slice.
-// Format v2: variable-length label arrays per node and edge record.
+// deserialiseCSR reconstructs a CSRGraph from Serialise() byte slices.
+// Format v2 stores labels plus a reserved property offset; format v3 stores
+// labels plus inline property blobs.
 func deserialiseCSR(data []byte) (*CSRGraph, error) {
 	if len(data) < 22 {
 		return nil, fmt.Errorf("deserialiseCSR: data too short")
@@ -815,8 +818,8 @@ func deserialiseCSR(data []byte) (*CSRGraph, error) {
 		return nil, fmt.Errorf("deserialiseCSR: invalid magic")
 	}
 	version := binary.LittleEndian.Uint16(data[4:6])
-	if version != 2 {
-		return nil, fmt.Errorf("deserialiseCSR: unsupported version %d (expected 2)", version)
+	if version != 2 && version != 3 {
+		return nil, fmt.Errorf("deserialiseCSR: unsupported version %d (expected 2 or 3)", version)
 	}
 	nodeCount := int(binary.LittleEndian.Uint64(data[6:14]))
 	edgeCount := int(binary.LittleEndian.Uint64(data[14:22]))
@@ -839,9 +842,12 @@ func deserialiseCSR(data []byte) (*CSRGraph, error) {
 			labels[j] = store.NodeType(data[pos])
 			pos++
 		}
-		propOffset := binary.LittleEndian.Uint64(data[pos:])
-		pos += 8
-		nodes[i] = nodeRecord{ID: nid, Labels: labels, PropOffset: propOffset}
+		props, nextPos, err := readCSRProperties(data, pos, version, "node", i)
+		if err != nil {
+			return nil, err
+		}
+		pos = nextPos
+		nodes[i] = nodeRecord{ID: nid, Labels: labels, Properties: props}
 	}
 
 	edges := make([]rawEdge, edgeCount)
@@ -867,9 +873,12 @@ func deserialiseCSR(data []byte) (*CSRGraph, error) {
 		}
 		weight := math.Float32frombits(binary.LittleEndian.Uint32(data[pos:]))
 		pos += 4
-		propOffset := binary.LittleEndian.Uint64(data[pos:])
-		pos += 8
-		edges[i] = rawEdge{ID: eid, Src: src, Dst: dst, Labels: labels, Weight: weight, PropOffset: propOffset}
+		props, nextPos, err := readCSRProperties(data, pos, version, "edge", i)
+		if err != nil {
+			return nil, err
+		}
+		pos = nextPos
+		edges[i] = rawEdge{ID: eid, Src: src, Dst: dst, Labels: labels, Weight: weight, Properties: props}
 	}
 
 	csr := Build(nodes, edges)
@@ -894,6 +903,38 @@ func rawEdgeMatchesFilter(filter []store.EdgeType, labels []store.EdgeType) bool
 		}
 	}
 	return false
+}
+
+func readCSRProperties(data []byte, pos int, version uint16, kind string, index int) ([]byte, int, error) {
+	if version == 2 {
+		if pos+8 > len(data) {
+			return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
+		}
+		return nil, pos + 8, nil
+	}
+	if pos+4 > len(data) {
+		return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
+	}
+	propLen := int(binary.LittleEndian.Uint32(data[pos:]))
+	pos += 4
+	if pos+propLen > len(data) {
+		return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s property blob %d", kind, index)
+	}
+	if propLen == 0 {
+		return nil, pos, nil
+	}
+	props := make([]byte, propLen)
+	copy(props, data[pos:pos+propLen])
+	return props, pos + propLen, nil
+}
+
+func cloneBytes(src []byte) []byte {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]byte, len(src))
+	copy(dst, src)
+	return dst
 }
 
 // marshalNodeProp encodes a node property index entry:

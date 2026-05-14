@@ -10,6 +10,11 @@ GrapheneDB is currently pre-production. The material in this document describes
 the current implementation direction and behavior, not a finalized production
 contract.
 
+GrapheneDB is best understood today as an experimental embedded native graph
+engine. It owns its graph-shaped storage layout directly, but it is not yet
+positioned as a production-complete peer to server-oriented graph database
+products.
+
 ## 1. System Intent
 
 GrapheneDB is designed for a specific workload shape:
@@ -66,7 +71,8 @@ Disk mode combines three layers:
 
 1. WAL (append-only) for durability.
 2. Delta overlay for recent writes.
-3. CSR base for compact, read-friendly adjacency.
+3. CSR base for compact, read-friendly adjacency and durable node/edge property
+   blobs after compaction.
 
 ```mermaid
 flowchart TD
@@ -84,7 +90,9 @@ flowchart TD
 
 CSR gives contiguous adjacency reads for neighborhood operations. After
 compaction, traversal-heavy read phases benefit from cache-friendly sequential
-access.
+access. The compacted CSR also stores raw node and edge property blobs inline so
+`GetNode` and `GetEdge` preserve the same property-bearing entity contract
+across restart and compaction.
 
 ## 4. Read and Write Paths
 
@@ -121,6 +129,10 @@ flowchart LR
 ```
 
 Reads observe merged logical state (base + delta).
+
+The current query surface is intentionally API-first rather than language-first:
+the engine exposes graph operations through Go interfaces and traversal helpers,
+not through a built-in declarative query runtime.
 
 ## 5. Indexing Internals
 
@@ -202,6 +214,10 @@ stateDiagram-v2
 
 Recovery objective: never lose acknowledged WAL-backed writes.
 
+Recovery also preserves compacted node and edge property blobs because CSR
+serialization now carries them inline rather than treating them as transient
+delta-only state.
+
 ## 10. Package-Level LLD Map
 
 | Package      | Role                 | Notes                                         |
@@ -221,6 +237,10 @@ Recovery objective: never lose acknowledged WAL-backed writes.
 | Explicit property indexing | Stable query costs                       | Requires up-front key planning     |
 | Typed labels               | Clear domain APIs                        | Less dynamic than free-form labels |
 | Embedded architecture      | No external infra dependency             | No built-in query language server  |
+
+Positioning note: these trade-offs make Graphene a strong fit for embedded,
+controlled graph workloads, while leaving some of the product surface expected
+from full graph database platforms intentionally out of scope for now.
 
 ## 12. Practical Ops Guidance
 

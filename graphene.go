@@ -1,5 +1,5 @@
 // Package graphene is an application-specific graph storage engine designed for
-// SYNTHRA's forensic micro-artefact platform. It provides:
+// Indicer's forensic micro-artefact platform. It provides:
 //
 //   - A pluggable GraphStore interface (store.GraphStore)
 //   - An in-memory reference implementation (memory.Store)
@@ -45,7 +45,7 @@ import (
 )
 
 // Graph wraps a GraphStore and exposes the traversal API in one place.
-// This is the primary entry point for SYNTHRA consumers.
+// This is the primary entry point for Indicer consumers.
 type Graph struct {
 	store.GraphStore
 }

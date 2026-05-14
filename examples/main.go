@@ -1,5 +1,5 @@
 // Package examples demonstrates common Graphene usage patterns for the
-// SYNTHRA forensic platform.
+// Indicer forensic platform.
 //
 // Run with: go run ./examples
 package main

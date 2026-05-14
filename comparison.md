@@ -23,7 +23,7 @@
 
 **Key difference:** Cayley's model is fundamentally RDF
 (subject-predicate-object-label quads). Properties are not first-class; they
-must be expressed as extra triples, which is verbose for SYNTHRA's artefact
+must be expressed as extra triples, which is verbose for Indicer's artefact
 records. Neo4j and Graphene both use property graph models, but Neo4j's
 properties are richly typed while Graphene intentionally keeps properties as
 opaque blobs to stay schema-agnostic — the CRL schema lives above the storage
@@ -36,16 +36,16 @@ roles at once.
 
 ## 2. Storage Model
 
-| Feature                  | Graphene                                                                         | Cayley                                                                   | Neo4j                                                                                      |
-| ------------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| Storage format           | Custom CSR (Compressed Sparse Row) flat arrays                                   | Pluggable backend: in-memory, BoltDB, LevelDB, PostgreSQL, MongoDB, etc. | Native graph store files (node store, relationship store, property store)                  |
-| Adjacency representation | Outbound + inbound CSR arrays; O(degree) sequential read per neighbourhood query | Depends on backend; no native adjacency structure                        | **Index-free adjacency** — each record holds a pointer to its relationship chain; O(1) hop |
-| Write path               | Append to WAL → delta layer (in-memory map)                                      | Write directly to chosen backend                                         | Transactional write to WAL, then store files                                               |
-| Read path                | Merge CSR + delta layer                                                          | Backend read                                                             | Store file read via adjacency pointer chain                                                |
-| Compaction               | Explicit `Compact()` — rebuilds CSR from CSR + delta, atomic rename              | No concept; backend handles it                                           | Page cache, periodic checkpoint                                                            |
-| In-memory mode           | Yes (reference impl)                                                             | Yes (mem backend)                                                        | Yes (embedded / test mode)                                                                 |
-| Property storage         | Co-serialised with node/edge records in WAL and CSR                              | Encoded as additional quads in backend                                   | Separate property store file; linked from node/rel records                                 |
-| mmap                     | Designed for (CSR serialised to flat byte slice)                                 | Depends on backend (LevelDB/BoltDB do mmap internally)                   | Yes — page cache backed by mmap                                                            |
+| Feature                  | Graphene                                                                                            | Cayley                                                                   | Neo4j                                                                                      |
+| ------------------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| Storage format           | Custom CSR (Compressed Sparse Row) flat arrays                                                      | Pluggable backend: in-memory, BoltDB, LevelDB, PostgreSQL, MongoDB, etc. | Native graph store files (node store, relationship store, property store)                  |
+| Adjacency representation | Outbound + inbound CSR arrays; O(degree) sequential read per neighbourhood query                    | Depends on backend; no native adjacency structure                        | **Index-free adjacency** — each record holds a pointer to its relationship chain; O(1) hop |
+| Write path               | Append to WAL → delta layer (in-memory map)                                                         | Write directly to chosen backend                                         | Transactional write to WAL, then store files                                               |
+| Read path                | Merge CSR + delta layer                                                                             | Backend read                                                             | Store file read via adjacency pointer chain                                                |
+| Compaction               | Explicit `Compact()` — rebuilds CSR from CSR + delta, atomic rename                                 | No concept; backend handles it                                           | Page cache, periodic checkpoint                                                            |
+| In-memory mode           | Yes (reference impl)                                                                                | Yes (mem backend)                                                        | Yes (embedded / test mode)                                                                 |
+| Property storage         | Co-serialised with node/edge records in the WAL; compacted CSR now stores raw property blobs inline | Encoded as additional quads in backend                                   | Separate property store file; linked from node/rel records                                 |
+| mmap                     | Designed for (CSR serialised to flat byte slice)                                                    | Depends on backend (LevelDB/BoltDB do mmap internally)                   | Yes — page cache backed by mmap                                                            |
 
 **Key difference:** Neo4j's index-free adjacency means a single relationship hop
 touches only the records on that chain, making per-hop cost independent of graph
@@ -93,7 +93,7 @@ that backend's data layout.
 | Temporal / range index             | Yes — `TemporalIndex`: sorted slice, binary-search range queries                                    | No                                      | Yes — B-tree range index on numeric/date properties |
 | Full-text search                   | No                                                                                                  | No                                      | Yes — Lucene-backed full-text index                 |
 | Vector / similarity index          | No                                                                                                  | No                                      | Yes — vector index (ANN search)                     |
-| Property index                     | No — properties are opaque blobs                                                                    | Depends on backend                      | Yes — index on any property key                     |
+| Property index                     | Yes — explicit secondary index over selected decoded key/value pairs                                | Depends on backend                      | Yes — index on any property key                     |
 | Secondary indexes on custom fields | No                                                                                                  | No                                      | Yes — composite and token indexes                   |
 
 ---
@@ -141,7 +141,9 @@ that backend's data layout.
 
 - The workload is bulk-ingest (parsing a case file) followed by many read
   queries — CSR is purpose-built for this.
-- The graph schema is fixed and known at compile time (SYNTHRA's
+- You want a native embedded graph engine rather than a server-oriented graph
+  database product.
+- The graph schema is fixed and known at compile time (Indicer's
   `NodeType`/`EdgeType` enums), and elements can carry multiple labels to
   express composite forensic roles (e.g. a node that is both a `MicroArtefact`
   and an `AntiForensicIndicator`).
@@ -159,13 +161,17 @@ that backend's data layout.
 - ACID multi-step write transactions (e.g. atomic case ingestion rollback).
 - Full-text and vector similarity search over properties.
 
-**Cayley is not recommended** for SYNTHRA given its unmaintained state, the RDF
+**Cayley is not recommended** for Indicer given its unmaintained state, the RDF
 quad model mismatch with the typed artefact domain, and the lack of native
 property support.
 
 ---
 
 > Graphene's design choices (CSR, typed enum label slices, msgpack blobs,
-> explicit compaction) are deliberate trade-offs for the SYNTHRA access pattern:
+> explicit compaction) are deliberate trade-offs for the Indicer access pattern:
 > parse once, query many times, stay embeddable, and stay schema-agnostic at the
 > storage layer while the CRL schema evolves above it.
+
+Graphene is graph-native at the storage layer, but it is still best described
+today as an experimental embedded graph engine rather than a production-complete
+peer to Neo4j-class graph database products.

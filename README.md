@@ -2,9 +2,9 @@
 
 ![GrapheneDB Logo](assets/graphene-logo.svg)
 
-GrapheneDB is an embeddable Go graph engine for teams that need to ingest big
-connected datasets fast, keep them durable on disk, and run graph queries
-without external infrastructure.
+GrapheneDB is an experimental embeddable Go graph engine for teams that need to
+ingest big connected datasets fast, keep them durable on disk, and run graph
+queries without external infrastructure.
 
 ## Project Status
 
@@ -13,6 +13,8 @@ GrapheneDB is currently in an experimental, pre-production stage.
 - The core architecture and APIs are implemented.
 - Benchmarks and stress tests are available, but coverage is still growing.
 - It is not startup-ready or production-ready yet.
+- The on-disk backend is still maturing toward a fuller property-graph feature
+  set.
 - Treat current performance numbers as early signals, not final guarantees.
 
 ## Why It Exists
@@ -112,5 +114,5 @@ go run ./examples
 ## Current Fit
 
 GrapheneDB is best used today for exploration, prototyping, and controlled
-internal workloads where you want an embeddable graph engine and can tolerate
-ongoing validation work.
+internal workloads where you want a native embeddable graph engine and can
+tolerate ongoing validation work.

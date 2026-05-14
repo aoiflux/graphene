@@ -25,14 +25,12 @@ import (
 // rawEdge is the compact on-disk/in-memory edge representation used during
 // CSR construction.
 type rawEdge struct {
-	ID     store.EdgeID
-	Src    store.NodeID
-	Dst    store.NodeID
-	Labels []store.EdgeType // one or more labels; nil/empty = unknown
-	Weight float32
-	// Properties are stored separately in the property store; only the
-	// blob offset is kept here (0 = no properties).
-	PropOffset uint64
+	ID         store.EdgeID
+	Src        store.NodeID
+	Dst        store.NodeID
+	Labels     []store.EdgeType // one or more labels; nil/empty = unknown
+	Weight     float32
+	Properties []byte
 }
 
 // CSRGraph holds the built adjacency arrays plus the node/edge metadata slices.
@@ -56,7 +54,7 @@ type CSRGraph struct {
 type nodeRecord struct {
 	ID         store.NodeID
 	Labels     []store.NodeType // one or more labels; nil/empty = unknown
-	PropOffset uint64           // offset into property blob store (0 = no props)
+	Properties []byte
 }
 
 // Build constructs a CSRGraph from a slice of nodes and edges.
@@ -194,13 +192,14 @@ func (g *CSRGraph) EdgeCount() int {
 	return len(g.outEdges)
 }
 
-// Serialise writes the CSR arrays to binary format v2 (variable-length labels).
+// Serialise writes the CSR arrays to binary format v3 (variable-length labels
+// and inline property blobs).
 //
 // Format:
 //
-//	[magic:4][version:2=0x0002][nodeCount:8][edgeCount:8]
-//	[nodeRecord * nodeCount] (each: id:8 + labelCount:1 + labels:N + propOffset:8)
-//	[rawEdge * edgeCount]    (each: id:8 + src:8 + dst:8 + labelCount:1 + labels:N + weight:4 + propOffset:8)
+//	[magic:4][version:2=0x0003][nodeCount:8][edgeCount:8]
+//	[nodeRecord * nodeCount] (each: id:8 + labelCount:1 + labels:N + propLen:4 + props:N)
+//	[rawEdge * edgeCount]    (each: id:8 + src:8 + dst:8 + labelCount:1 + labels:N + weight:4 + propLen:4 + props:N)
 //	[outOffset * (maxNodeID+2):8 each]
 //	[outEdges * edgeCount:8 each]
 //	[inOffset * (maxNodeID+2):8 each]
@@ -224,7 +223,7 @@ func (g *CSRGraph) Serialise() []byte {
 
 	// Header
 	buf.Write([]byte("GCSR"))
-	writeUint16(&buf, 2) // version 2
+	writeUint16(&buf, 3) // version 3
 	writeUint64(&buf, uint64(nodeCount))
 	writeUint64(&buf, uint64(edgeCount))
 
@@ -239,7 +238,8 @@ func (g *CSRGraph) Serialise() []byte {
 		for _, lbl := range n.Labels {
 			buf.WriteByte(byte(lbl))
 		}
-		writeUint64(&buf, n.PropOffset)
+		writeUint32(&buf, uint32(len(n.Properties)))
+		buf.Write(n.Properties)
 	}
 
 	// Edges (variable-length labels)
@@ -258,7 +258,8 @@ func (g *CSRGraph) Serialise() []byte {
 		var wbuf [4]byte
 		binary.LittleEndian.PutUint32(wbuf[:], math.Float32bits(e.Weight))
 		buf.Write(wbuf[:])
-		writeUint64(&buf, e.PropOffset)
+		writeUint32(&buf, uint32(len(e.Properties)))
+		buf.Write(e.Properties)
 	}
 
 	// Adjacency arrays
@@ -289,6 +290,13 @@ func writeUint16(buf *bytes.Buffer, v uint16) {
 func writeUint64(buf *bytes.Buffer, v uint64) {
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], v)
+	buf.Write(b[:])
+}
+
+// writeUint32 appends a little-endian uint32 to buf.
+func writeUint32(buf *bytes.Buffer, v uint32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
 	buf.Write(b[:])
 }
 

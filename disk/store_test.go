@@ -272,6 +272,74 @@ func TestDiskStore_PropertyIndex_AfterCompact(t *testing.T) {
 	}
 }
 
+func TestDiskStore_NodeProperties_AfterCompact(t *testing.T) {
+	dir := t.TempDir()
+	var id store.NodeID
+	wantProps := []byte{1, 2, 3, 4}
+	{
+		s, _ := Open(dir)
+		id, _ = s.AddNode(&store.Node{
+			Labels:     []store.NodeType{store.NodeTypeMicroArtefact},
+			Properties: wantProps,
+		})
+		if err := s.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
+	}
+	{
+		s, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		n, err := s.GetNode(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(n.Properties) != string(wantProps) {
+			t.Fatalf("GetNode after compact+restart properties = %v, want %v", n.Properties, wantProps)
+		}
+	}
+}
+
+func TestDiskStore_EdgeProperties_AfterCompact(t *testing.T) {
+	dir := t.TempDir()
+	var eid store.EdgeID
+	wantProps := []byte("edge-meta")
+	{
+		s, _ := Open(dir)
+		src := addNodeD(t, s, store.NodeTypeMicroArtefact)
+		dst := addNodeD(t, s, store.NodeTypeCase)
+		eid, _ = s.AddEdge(&store.Edge{
+			Src:        src,
+			Dst:        dst,
+			Labels:     []store.EdgeType{store.EdgeTypeBelongsTo},
+			Properties: wantProps,
+		})
+		if err := s.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
+	}
+	{
+		s, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		e, err := s.GetEdge(eid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(e.Properties) != string(wantProps) {
+			t.Fatalf("GetEdge after compact+restart properties = %v, want %v", e.Properties, wantProps)
+		}
+	}
+}
+
 // --- CSR serialise/deserialise round-trip ---
 
 func TestDiskStore_CSR_RoundTrip(t *testing.T) {
