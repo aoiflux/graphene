@@ -61,6 +61,7 @@ func main() {
 	example19_VisualizationCaseMap()
 	example20_VisualizationSimilarityMesh()
 	example21_VisualizationPatternScope()
+	example22_VisualizationExplorationDemo()
 }
 
 // ----------------------------------------------------------------------------
@@ -1262,6 +1263,72 @@ func example21_VisualizationPatternScope() {
 	}
 
 	fmt.Printf("  Visualization: %s\n", out)
+	fmt.Println()
+}
+
+// ----------------------------------------------------------------------------
+// Example 22 — Visualization: exploration controls demo
+// ----------------------------------------------------------------------------
+func example22_VisualizationExplorationDemo() {
+	fmt.Println("--- Example 22: Visualization exploration demo ---")
+
+	g := graphene.NewInMemory()
+	caseID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}, Properties: []byte("case=exploration-demo")})
+	scope := []store.NodeID{caseID}
+
+	anchorIDs := make([]store.NodeID, 0, 6)
+	for i := 0; i < 6; i++ {
+		fileID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}, Properties: []byte(fmt.Sprintf("file=%02d", i))})
+		scope = append(scope, fileID)
+		anchorIDs = append(anchorIDs, fileID)
+		_, _ = g.AddEdge(&store.Edge{Src: fileID, Dst: caseID, Labels: []store.EdgeType{store.EdgeTypeBelongsTo}})
+
+		var previous store.NodeID
+		for hop := 0; hop < 4; hop++ {
+			artID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}, Properties: []byte(fmt.Sprintf("file=%02d hop=%d", i, hop+1))})
+			scope = append(scope, artID)
+			if hop == 0 {
+				_, _ = g.AddEdge(&store.Edge{Src: fileID, Dst: artID, Labels: []store.EdgeType{store.EdgeTypeContains}})
+			} else {
+				_, _ = g.AddEdge(&store.Edge{Src: previous, Dst: artID, Labels: []store.EdgeType{store.EdgeTypeContains}})
+			}
+
+			if hop > 0 {
+				_, _ = g.AddEdge(&store.Edge{Src: artID, Dst: previous, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}, Weight: 0.58 + float32((i+hop)%4)/10})
+			}
+			previous = artID
+		}
+	}
+
+	for i := 0; i < len(anchorIDs)-1; i++ {
+		_, _ = g.AddEdge(&store.Edge{Src: anchorIDs[i], Dst: anchorIDs[i+1], Labels: []store.EdgeType{store.EdgeTypeTemporal}, Weight: 0.35})
+	}
+	_, _ = g.AddEdge(&store.Edge{Src: anchorIDs[len(anchorIDs)-1], Dst: anchorIDs[0], Labels: []store.EdgeType{store.EdgeTypeTemporal}, Weight: 0.35})
+
+	for i := 0; i < len(anchorIDs); i++ {
+		tagID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeTag}, Properties: []byte(fmt.Sprintf("tag=cluster-%d", i%3))})
+		scope = append(scope, tagID)
+		_, _ = g.AddEdge(&store.Edge{Src: anchorIDs[i], Dst: tagID, Labels: []store.EdgeType{store.EdgeTypeTaggedWith}})
+	}
+
+	nodes, edges, err := collectScopeForViz(g, scope)
+	if err != nil {
+		log.Fatalf("  collectScopeForViz: %v", err)
+	}
+
+	cwd, _ := os.Getwd()
+	out := filepath.Join(cwd, "viz_exploration_demo.html")
+	err = viz.ExportInteractiveHTMLWithOptions(nodes, edges, out, viz.ExportOptions{
+		Title:    "GrapheneDB Exploration Controls Demo",
+		Subtitle: "A larger mixed graph for testing hop-based reveal, edge labels, and the overview mini-map. Select a node, expand by hops, and use the mini-map to navigate.",
+	})
+	if err != nil {
+		log.Fatalf("  viz export: %v", err)
+	}
+
+	fmt.Printf("  Visualization: %s\n", out)
+	fmt.Printf("  Demo anchor: file node %d\n", anchorIDs[2])
+	fmt.Println("  Manual check: open the HTML, select the demo anchor, use Expand +1 Hop / +2 Hops, and confirm the mini-map tracks the viewport while edge labels appear when zoomed in.")
 	fmt.Println()
 }
 

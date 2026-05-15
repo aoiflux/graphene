@@ -1,291 +1,9 @@
-package viz
-
-import (
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"html/template"
-	"math"
-	"os"
-	"sort"
-	"strconv"
-	"strings"
-	"unicode/utf8"
-
-	"github.com/aoiflux/graphene/store"
-)
-
-type nodeVM struct {
-	ID             string   `json:"id"`
-	Label          string   `json:"label"`
-	Type           string   `json:"type"`
-	Labels         []string `json:"labels"`
-	Color          string   `json:"color"`
-	X              float64  `json:"x"`
-	Y              float64  `json:"y"`
-	PropertiesSize int      `json:"propertiesSize"`
-	PropertiesText string   `json:"propertiesText"`
-	PropertiesB64  string   `json:"propertiesB64"`
-	PropertiesHex  string   `json:"propertiesHex"`
-	SearchText     string   `json:"searchText"`
-}
-
-type edgeVM struct {
-	ID             string   `json:"id"`
-	Source         string   `json:"source"`
-	Target         string   `json:"target"`
-	Type           string   `json:"type"`
-	Label          string   `json:"label"`
-	Labels         []string `json:"labels"`
-	Weight         float32  `json:"weight"`
-	PropertiesSize int      `json:"propertiesSize"`
-	PropertiesText string   `json:"propertiesText"`
-	PropertiesB64  string   `json:"propertiesB64"`
-	PropertiesHex  string   `json:"propertiesHex"`
-}
-
-type pageData struct {
-	Title      string
-	Subtitle   string
-	NodeCount  int
-	EdgeCount  int
-	NodesJSON  template.JS
-	EdgesJSON  template.JS
-	EdgeTypes  []string
-	ColorItems []legendItem
-}
-
-// ExportOptions customizes metadata shown in the generated visualization.
-type ExportOptions struct {
-	Title    string
-	Subtitle string
-}
-
-type legendItem struct {
-	Name  string
-	Color string
-}
-
-// ExportInteractiveHTML writes an interactive graph visualization to outPath.
-// The output is a self-contained HTML file with embedded CSS/JS.
-func ExportInteractiveHTML(nodes []*store.Node, edges []*store.Edge, outPath string) error {
-	return ExportInteractiveHTMLWithOptions(nodes, edges, outPath, ExportOptions{})
-}
-
-// ExportInteractiveHTMLWithOptions writes an interactive graph visualization to outPath.
-// The output is a self-contained HTML file with embedded CSS/JS.
-func ExportInteractiveHTMLWithOptions(nodes []*store.Node, edges []*store.Edge, outPath string, opts ExportOptions) error {
-	if len(nodes) == 0 {
-		return fmt.Errorf("viz export requires at least one node")
-	}
-
-	nodesVM := make([]nodeVM, 0, len(nodes))
-	nodeSet := make(map[store.NodeID]struct{}, len(nodes))
-	for _, n := range nodes {
-		nodeSet[n.ID] = struct{}{}
-	}
-
-	const (
-		width  = 1500.0
-		height = 980.0
-		cx     = width / 2
-		cy     = height / 2
-		radius = 360.0
-	)
-
-	for i, n := range nodes {
-		typeName := nodeTypeName(n)
-		labels := nodeLabelNames(n)
-		propsText := bytesTextPreview(n.Properties)
-		propsB64 := base64.StdEncoding.EncodeToString(n.Properties)
-		propsHex := strings.ToUpper(hex.EncodeToString(n.Properties))
-		angle := 2 * math.Pi * float64(i) / float64(len(nodes))
-		nodesVM = append(nodesVM, nodeVM{
-			ID:             strconv.FormatUint(uint64(n.ID), 10),
-			Label:          typeName,
-			Type:           typeName,
-			Labels:         labels,
-			Color:          nodeColor(n),
-			X:              cx + radius*math.Cos(angle),
-			Y:              cy + radius*math.Sin(angle),
-			PropertiesSize: len(n.Properties),
-			PropertiesText: propsText,
-			PropertiesB64:  propsB64,
-			PropertiesHex:  propsHex,
-			SearchText:     buildNodeSearchText(strconv.FormatUint(uint64(n.ID), 10), labels, propsText),
-		})
-	}
-
-	edgesVM := make([]edgeVM, 0, len(edges))
-	edgeTypesSet := make(map[string]struct{})
-	for _, e := range edges {
-		if _, ok := nodeSet[e.Src]; !ok {
-			continue
-		}
-		if _, ok := nodeSet[e.Dst]; !ok {
-			continue
-		}
-
-		t := edgeTypeName(e)
-		labels := edgeLabelNames(e)
-		propsText := bytesTextPreview(e.Properties)
-		propsB64 := base64.StdEncoding.EncodeToString(e.Properties)
-		propsHex := strings.ToUpper(hex.EncodeToString(e.Properties))
-		edgeTypesSet[t] = struct{}{}
-		edgesVM = append(edgesVM, edgeVM{
-			ID:             strconv.FormatUint(uint64(e.ID), 10),
-			Source:         strconv.FormatUint(uint64(e.Src), 10),
-			Target:         strconv.FormatUint(uint64(e.Dst), 10),
-			Type:           t,
-			Label:          t,
-			Labels:         labels,
-			Weight:         e.Weight,
-			PropertiesSize: len(e.Properties),
-			PropertiesText: propsText,
-			PropertiesB64:  propsB64,
-			PropertiesHex:  propsHex,
-		})
-	}
-
-	edgeTypes := make([]string, 0, len(edgeTypesSet))
-	for t := range edgeTypesSet {
-		edgeTypes = append(edgeTypes, t)
-	}
-	sort.Strings(edgeTypes)
-
-	nodesJSON, err := json.Marshal(nodesVM)
-	if err != nil {
-		return err
-	}
-	edgesJSON, err := json.Marshal(edgesVM)
-	if err != nil {
-		return err
-	}
-
-	title := opts.Title
-	if title == "" {
-		title = "GrapheneDB Interactive Graph View"
-	}
-	subtitle := opts.Subtitle
-	if subtitle == "" {
-		subtitle = "Interactive connected-data view generated from GrapheneDB with lazy rendering. Hover for quick previews, click for full node and edge cards, filter edge types, and zoom/pan the graph."
-	}
-
-	data := pageData{
-		Title:     title,
-		Subtitle:  subtitle,
-		NodeCount: len(nodesVM),
-		EdgeCount: len(edgesVM),
-		NodesJSON: template.JS(nodesJSON),
-		EdgesJSON: template.JS(edgesJSON),
-		EdgeTypes: edgeTypes,
-		ColorItems: []legendItem{
-			{Name: "MicroArtefact", Color: "#0b5fff"},
-			{Name: "EvidenceFile", Color: "#089981"},
-			{Name: "Case", Color: "#d97706"},
-			{Name: "Tag", Color: "#7c3aed"},
-			{Name: "Other", Color: "#334155"},
-		},
-	}
-
-	f, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	t, err := template.New("graphviz").Parse(pageTemplate)
-	if err != nil {
-		return err
-	}
-	if err := t.Execute(f, data); err != nil {
-		return err
-	}
-	return nil
-}
-
-func nodeTypeName(n *store.Node) string {
-	if len(n.Labels) == 0 {
-		return "Unknown"
-	}
-	return n.Labels[0].String()
-}
-
-func edgeTypeName(e *store.Edge) string {
-	if len(e.Labels) == 0 {
-		return "Unknown"
-	}
-	return e.Labels[0].String()
-}
-
-func nodeLabelNames(n *store.Node) []string {
-	if len(n.Labels) == 0 {
-		return []string{"Unknown"}
-	}
-	out := make([]string, 0, len(n.Labels))
-	for _, l := range n.Labels {
-		out = append(out, l.String())
-	}
-	return out
-}
-
-func edgeLabelNames(e *store.Edge) []string {
-	if len(e.Labels) == 0 {
-		return []string{"Unknown"}
-	}
-	out := make([]string, 0, len(e.Labels))
-	for _, l := range e.Labels {
-		out = append(out, l.String())
-	}
-	return out
-}
-
-func bytesTextPreview(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
-	if utf8.Valid(b) {
-		return string(b)
-	}
-	var sb strings.Builder
-	sb.Grow(len(b))
-	for _, c := range b {
-		if c >= 32 && c <= 126 {
-			sb.WriteByte(c)
-			continue
-		}
-		sb.WriteByte('.')
-	}
-	return sb.String()
-}
-
-func buildNodeSearchText(id string, labels []string, propsText string) string {
-	return strings.Join([]string{id, strings.Join(labels, " "), propsText}, " ")
-}
-
-func nodeColor(n *store.Node) string {
-	if n.HasLabel(store.NodeTypeMicroArtefact) {
-		return "#0b5fff"
-	}
-	if n.HasLabel(store.NodeTypeEvidenceFile) {
-		return "#089981"
-	}
-	if n.HasLabel(store.NodeTypeCase) {
-		return "#d97706"
-	}
-	if n.HasLabel(store.NodeTypeTag) {
-		return "#7c3aed"
-	}
-	return "#334155"
-}
-
-const pageTemplate = `<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{.Title}}</title>
+  <title>GrapheneDB Exploration Controls Demo</title>
   <style>
     :root {
       --bg: #f3f6fb;
@@ -615,12 +333,12 @@ const pageTemplate = `<!doctype html>
 <body>
   <div class="container">
     <aside class="panel controls">
-      <h1>{{.Title}}</h1>
-      <div class="sub">{{.Subtitle}}</div>
+      <h1>GrapheneDB Exploration Controls Demo</h1>
+      <div class="sub">A larger mixed graph for testing hop-based reveal, edge labels, and the overview mini-map. Select a node, expand by hops, and use the mini-map to navigate.</div>
 
       <div class="statRow">
-        <div class="stat"><span class="label">Nodes</span><b>{{.NodeCount}}</b></div>
-        <div class="stat"><span class="label">Edges</span><b>{{.EdgeCount}}</b></div>
+        <div class="stat"><span class="label">Nodes</span><b>37</b></div>
+        <div class="stat"><span class="label">Edges</span><b>60</b></div>
       </div>
 
       <label class="label" for="search">Search by node ID, label, or payload text</label>
@@ -628,9 +346,17 @@ const pageTemplate = `<!doctype html>
 
       <label class="label">Edge type filters</label>
       <div class="edgeFilters" id="edgeFilters">
-        {{range .EdgeTypes}}
-        <label class="chk"><input type="checkbox" value="{{.}}" checked /> {{.}}</label>
-        {{end}}
+        
+        <label class="chk"><input type="checkbox" value="BelongsTo" checked /> BelongsTo</label>
+        
+        <label class="chk"><input type="checkbox" value="Contains" checked /> Contains</label>
+        
+        <label class="chk"><input type="checkbox" value="SimilarTo" checked /> SimilarTo</label>
+        
+        <label class="chk"><input type="checkbox" value="TaggedWith" checked /> TaggedWith</label>
+        
+        <label class="chk"><input type="checkbox" value="Temporal" checked /> Temporal</label>
+        
       </div>
 
       <div class="row">
@@ -661,9 +387,17 @@ const pageTemplate = `<!doctype html>
 
       <div class="legend">
         <span class="label">Node legend</span>
-        {{range .ColorItems}}
-        <div class="legendItem"><span class="dot" style="background: {{.Color}}"></span>{{.Name}}</div>
-        {{end}}
+        
+        <div class="legendItem"><span class="dot" style="background: #0b5fff"></span>MicroArtefact</div>
+        
+        <div class="legendItem"><span class="dot" style="background: #089981"></span>EvidenceFile</div>
+        
+        <div class="legendItem"><span class="dot" style="background: #d97706"></span>Case</div>
+        
+        <div class="legendItem"><span class="dot" style="background: #7c3aed"></span>Tag</div>
+        
+        <div class="legendItem"><span class="dot" style="background: #334155"></span>Other</div>
+        
       </div>
 
       <div class="lazyStats" id="lazyStats">Preparing lazy renderer...</div>
@@ -690,8 +424,8 @@ const pageTemplate = `<!doctype html>
   </div>
 
   <script>
-    const nodes = {{.NodesJSON}};
-    const edges = {{.EdgesJSON}};
+    const nodes = [{"id":"1","label":"Case","type":"Case","labels":["Case"],"color":"#d97706","x":1110,"y":490,"propertiesSize":21,"propertiesText":"case=exploration-demo","propertiesB64":"Y2FzZT1leHBsb3JhdGlvbi1kZW1v","propertiesHex":"636173653D6578706C6F726174696F6E2D64656D6F","searchText":"1 Case case=exploration-demo"},{"id":"2","label":"EvidenceFile","type":"EvidenceFile","labels":["EvidenceFile"],"color":"#089981","x":1104.8217277251752,"y":550.8402953158657,"propertiesSize":7,"propertiesText":"file=00","propertiesB64":"ZmlsZT0wMA==","propertiesHex":"66696C653D3030","searchText":"2 EvidenceFile file=00"},{"id":"3","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":1089.4358803659902,"y":609.9303261071407,"propertiesSize":13,"propertiesText":"file=00 hop=1","propertiesB64":"ZmlsZT0wMCBob3A9MQ==","propertiesHex":"66696C653D303020686F703D31","searchText":"3 MicroArtefact file=00 hop=1"},{"id":"4","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":1064.2850807380278,"y":665.5701797729084,"propertiesSize":13,"propertiesText":"file=00 hop=2","propertiesB64":"ZmlsZT0wMCBob3A9Mg==","propertiesHex":"66696C653D303020686F703D32","searchText":"4 MicroArtefact file=00 hop=2"},{"id":"5","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":1030.0928715546384,"y":716.1591990264312,"propertiesSize":13,"propertiesText":"file=00 hop=3","propertiesB64":"ZmlsZT0wMCBob3A9Mw==","propertiesHex":"66696C653D303020686F703D33","searchText":"5 MicroArtefact file=00 hop=3"},{"id":"6","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":987.8429004204294,"y":760.2420298909808,"propertiesSize":13,"propertiesText":"file=00 hop=4","propertiesB64":"ZmlsZT0wMCBob3A9NA==","propertiesHex":"66696C653D303020686F703D34","searchText":"6 MicroArtefact file=00 hop=4"},{"id":"7","label":"EvidenceFile","type":"EvidenceFile","labels":["EvidenceFile"],"color":"#089981","x":938.7506220806034,"y":796.5504895839921,"propertiesSize":7,"propertiesText":"file=01","propertiesB64":"ZmlsZT0wMQ==","propertiesHex":"66696C653D3031","searchText":"7 EvidenceFile file=01"},{"id":"8","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":884.2283320009111,"y":824.0400498267434,"propertiesSize":13,"propertiesText":"file=01 hop=1","propertiesB64":"ZmlsZT0wMSBob3A9MQ==","propertiesHex":"66696C653D303120686F703D31","searchText":"8 MicroArtefact file=01 hop=1"},{"id":"9","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":825.8445371984615,"y":841.919886021167,"propertiesSize":13,"propertiesText":"file=01 hop=2","propertiesB64":"ZmlsZT0wMSBob3A9Mg==","propertiesHex":"66696C653D303120686F703D32","searchText":"9 MicroArtefact file=01 hop=2"},{"id":"10","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":765.2788331506134,"y":849.6756278336853,"propertiesSize":13,"propertiesText":"file=01 hop=3","propertiesB64":"ZmlsZT0wMSBob3A9Mw==","propertiesHex":"66696C653D303120686F703D33","searchText":"10 MicroArtefact file=01 hop=3"},{"id":"11","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":704.2735848911236,"y":847.0841566931956,"propertiesSize":13,"propertiesText":"file=01 hop=4","propertiesB64":"ZmlsZT0wMSBob3A9NA==","propertiesHex":"66696C653D303120686F703D34","searchText":"11 MicroArtefact file=01 hop=4"},{"id":"12","label":"EvidenceFile","type":"EvidenceFile","labels":["EvidenceFile"],"color":"#089981","x":644.5838023404419,"y":834.2200245061304,"propertiesSize":7,"propertiesText":"file=02","propertiesB64":"ZmlsZT0wMg==","propertiesHex":"66696C653D3032","searchText":"12 EvidenceFile file=02"},{"id":"13","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":587.9266518656376,"y":811.4533089338446,"propertiesSize":13,"propertiesText":"file=02 hop=1","propertiesB64":"ZmlsZT0wMiBob3A9MQ==","propertiesHex":"66696C653D303220686F703D31","searchText":"13 MicroArtefact file=02 hop=1"},{"id":"14","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":535.9320565304569,"y":779.4389669320987,"propertiesSize":13,"propertiesText":"file=02 hop=2","propertiesB64":"ZmlsZT0wMiBob3A9Mg==","propertiesHex":"66696C653D303220686F703D32","searchText":"14 MicroArtefact file=02 hop=2"},{"id":"15","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":490.0958061763712,"y":739.0979928319166,"propertiesSize":13,"propertiesText":"file=02 hop=3","propertiesB64":"ZmlsZT0wMiBob3A9Mw==","propertiesHex":"66696C653D303220686F703D33","searchText":"15 MicroArtefact file=02 hop=3"},{"id":"16","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":451.73652627221685,"y":691.5909230095343,"propertiesSize":13,"propertiesText":"file=02 hop=4","propertiesB64":"ZmlsZT0wMiBob3A9NA==","propertiesHex":"66696C653D303220686F703D34","searchText":"16 MicroArtefact file=02 hop=4"},{"id":"17","label":"EvidenceFile","type":"EvidenceFile","labels":["EvidenceFile"],"color":"#089981","x":421.9577434602712,"y":638.2844493678374,"propertiesSize":7,"propertiesText":"file=03","propertiesB64":"ZmlsZT0wMw==","propertiesHex":"66696C653D3033","searchText":"17 EvidenceFile file=03"},{"id":"18","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":401.6161391039404,"y":580.712102098645,"propertiesSize":13,"propertiesText":"file=03 hop=1","propertiesB64":"ZmlsZT0wMyBob3A9MQ==","propertiesHex":"66696C653D303320686F703D31","searchText":"18 MicroArtefact file=03 hop=1"},{"id":"19","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":391.29690412469046,"y":520.5301328111834,"propertiesSize":13,"propertiesText":"file=03 hop=2","propertiesB64":"ZmlsZT0wMyBob3A9Mg==","propertiesHex":"66696C653D303320686F703D32","searchText":"19 MicroArtefact file=03 hop=2"},{"id":"20","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":391.29690412469046,"y":459.4698671888168,"propertiesSize":13,"propertiesText":"file=03 hop=3","propertiesB64":"ZmlsZT0wMyBob3A9Mw==","propertiesHex":"66696C653D303320686F703D33","searchText":"20 MicroArtefact file=03 hop=3"},{"id":"21","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":401.6161391039404,"y":399.28789790135494,"propertiesSize":13,"propertiesText":"file=03 hop=4","propertiesB64":"ZmlsZT0wMyBob3A9NA==","propertiesHex":"66696C653D303320686F703D34","searchText":"21 MicroArtefact file=03 hop=4"},{"id":"22","label":"EvidenceFile","type":"EvidenceFile","labels":["EvidenceFile"],"color":"#089981","x":421.95774346027116,"y":341.71555063216266,"propertiesSize":7,"propertiesText":"file=04","propertiesB64":"ZmlsZT0wNA==","propertiesHex":"66696C653D3034","searchText":"22 EvidenceFile file=04"},{"id":"23","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":451.73652627221674,"y":288.40907699046585,"propertiesSize":13,"propertiesText":"file=04 hop=1","propertiesB64":"ZmlsZT0wNCBob3A9MQ==","propertiesHex":"66696C653D303420686F703D31","searchText":"23 MicroArtefact file=04 hop=1"},{"id":"24","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":490.0958061763711,"y":240.9020071680834,"propertiesSize":13,"propertiesText":"file=04 hop=2","propertiesB64":"ZmlsZT0wNCBob3A9Mg==","propertiesHex":"66696C653D303420686F703D32","searchText":"24 MicroArtefact file=04 hop=2"},{"id":"25","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":535.9320565304569,"y":200.56103306790135,"propertiesSize":13,"propertiesText":"file=04 hop=3","propertiesB64":"ZmlsZT0wNCBob3A9Mw==","propertiesHex":"66696C653D303420686F703D33","searchText":"25 MicroArtefact file=04 hop=3"},{"id":"26","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":587.9266518656375,"y":168.5466910661554,"propertiesSize":13,"propertiesText":"file=04 hop=4","propertiesB64":"ZmlsZT0wNCBob3A9NA==","propertiesHex":"66696C653D303420686F703D34","searchText":"26 MicroArtefact file=04 hop=4"},{"id":"27","label":"EvidenceFile","type":"EvidenceFile","labels":["EvidenceFile"],"color":"#089981","x":644.5838023404419,"y":145.77997549386964,"propertiesSize":7,"propertiesText":"file=05","propertiesB64":"ZmlsZT0wNQ==","propertiesHex":"66696C653D3035","searchText":"27 EvidenceFile file=05"},{"id":"28","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":704.2735848911235,"y":132.91584330680433,"propertiesSize":13,"propertiesText":"file=05 hop=1","propertiesB64":"ZmlsZT0wNSBob3A9MQ==","propertiesHex":"66696C653D303520686F703D31","searchText":"28 MicroArtefact file=05 hop=1"},{"id":"29","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":765.2788331506133,"y":130.32437216631467,"propertiesSize":13,"propertiesText":"file=05 hop=2","propertiesB64":"ZmlsZT0wNSBob3A9Mg==","propertiesHex":"66696C653D303520686F703D32","searchText":"29 MicroArtefact file=05 hop=2"},{"id":"30","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":825.8445371984616,"y":138.08011397883297,"propertiesSize":13,"propertiesText":"file=05 hop=3","propertiesB64":"ZmlsZT0wNSBob3A9Mw==","propertiesHex":"66696C653D303520686F703D33","searchText":"30 MicroArtefact file=05 hop=3"},{"id":"31","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":884.228332000911,"y":155.95995017325663,"propertiesSize":13,"propertiesText":"file=05 hop=4","propertiesB64":"ZmlsZT0wNSBob3A9NA==","propertiesHex":"66696C653D303520686F703D34","searchText":"31 MicroArtefact file=05 hop=4"},{"id":"32","label":"Tag","type":"Tag","labels":["Tag"],"color":"#7c3aed","x":938.7506220806032,"y":183.4495104160078,"propertiesSize":13,"propertiesText":"tag=cluster-0","propertiesB64":"dGFnPWNsdXN0ZXItMA==","propertiesHex":"7461673D636C75737465722D30","searchText":"32 Tag tag=cluster-0"},{"id":"33","label":"Tag","type":"Tag","labels":["Tag"],"color":"#7c3aed","x":987.8429004204293,"y":219.75797010901914,"propertiesSize":13,"propertiesText":"tag=cluster-1","propertiesB64":"dGFnPWNsdXN0ZXItMQ==","propertiesHex":"7461673D636C75737465722D31","searchText":"33 Tag tag=cluster-1"},{"id":"34","label":"Tag","type":"Tag","labels":["Tag"],"color":"#7c3aed","x":1030.0928715546384,"y":263.8408009735688,"propertiesSize":13,"propertiesText":"tag=cluster-2","propertiesB64":"dGFnPWNsdXN0ZXItMg==","propertiesHex":"7461673D636C75737465722D32","searchText":"34 Tag tag=cluster-2"},{"id":"35","label":"Tag","type":"Tag","labels":["Tag"],"color":"#7c3aed","x":1064.2850807380278,"y":314.4298202270917,"propertiesSize":13,"propertiesText":"tag=cluster-0","propertiesB64":"dGFnPWNsdXN0ZXItMA==","propertiesHex":"7461673D636C75737465722D30","searchText":"35 Tag tag=cluster-0"},{"id":"36","label":"Tag","type":"Tag","labels":["Tag"],"color":"#7c3aed","x":1089.4358803659902,"y":370.06967389285927,"propertiesSize":13,"propertiesText":"tag=cluster-1","propertiesB64":"dGFnPWNsdXN0ZXItMQ==","propertiesHex":"7461673D636C75737465722D31","searchText":"36 Tag tag=cluster-1"},{"id":"37","label":"Tag","type":"Tag","labels":["Tag"],"color":"#7c3aed","x":1104.821727725175,"y":429.1597046841341,"propertiesSize":13,"propertiesText":"tag=cluster-2","propertiesB64":"dGFnPWNsdXN0ZXItMg==","propertiesHex":"7461673D636C75737465722D32","searchText":"37 Tag tag=cluster-2"}];
+    const edges = [{"id":"1","source":"2","target":"1","type":"BelongsTo","label":"BelongsTo","labels":["BelongsTo"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"2","source":"2","target":"3","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"49","source":"2","target":"7","type":"Temporal","label":"Temporal","labels":["Temporal"],"weight":0.35,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"55","source":"2","target":"32","type":"TaggedWith","label":"TaggedWith","labels":["TaggedWith"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"3","source":"3","target":"4","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"4","source":"4","target":"3","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.68,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"5","source":"4","target":"5","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"6","source":"5","target":"4","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.78,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"7","source":"5","target":"6","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"8","source":"6","target":"5","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.88,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"9","source":"7","target":"1","type":"BelongsTo","label":"BelongsTo","labels":["BelongsTo"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"10","source":"7","target":"8","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"50","source":"7","target":"12","type":"Temporal","label":"Temporal","labels":["Temporal"],"weight":0.35,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"56","source":"7","target":"33","type":"TaggedWith","label":"TaggedWith","labels":["TaggedWith"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"11","source":"8","target":"9","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"12","source":"9","target":"8","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.78,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"13","source":"9","target":"10","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"14","source":"10","target":"9","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.88,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"15","source":"10","target":"11","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"16","source":"11","target":"10","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.58,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"17","source":"12","target":"1","type":"BelongsTo","label":"BelongsTo","labels":["BelongsTo"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"18","source":"12","target":"13","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"51","source":"12","target":"17","type":"Temporal","label":"Temporal","labels":["Temporal"],"weight":0.35,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"57","source":"12","target":"34","type":"TaggedWith","label":"TaggedWith","labels":["TaggedWith"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"19","source":"13","target":"14","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"20","source":"14","target":"13","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.88,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"21","source":"14","target":"15","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"22","source":"15","target":"14","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.58,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"23","source":"15","target":"16","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"24","source":"16","target":"15","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.68,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"25","source":"17","target":"1","type":"BelongsTo","label":"BelongsTo","labels":["BelongsTo"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"26","source":"17","target":"18","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"52","source":"17","target":"22","type":"Temporal","label":"Temporal","labels":["Temporal"],"weight":0.35,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"58","source":"17","target":"35","type":"TaggedWith","label":"TaggedWith","labels":["TaggedWith"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"27","source":"18","target":"19","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"28","source":"19","target":"18","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.58,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"29","source":"19","target":"20","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"30","source":"20","target":"19","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.68,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"31","source":"20","target":"21","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"32","source":"21","target":"20","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.78,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"33","source":"22","target":"1","type":"BelongsTo","label":"BelongsTo","labels":["BelongsTo"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"34","source":"22","target":"23","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"53","source":"22","target":"27","type":"Temporal","label":"Temporal","labels":["Temporal"],"weight":0.35,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"59","source":"22","target":"36","type":"TaggedWith","label":"TaggedWith","labels":["TaggedWith"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"35","source":"23","target":"24","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"36","source":"24","target":"23","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.68,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"37","source":"24","target":"25","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"38","source":"25","target":"24","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.78,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"39","source":"25","target":"26","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"40","source":"26","target":"25","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.88,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"41","source":"27","target":"1","type":"BelongsTo","label":"BelongsTo","labels":["BelongsTo"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"42","source":"27","target":"28","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"54","source":"27","target":"2","type":"Temporal","label":"Temporal","labels":["Temporal"],"weight":0.35,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"60","source":"27","target":"37","type":"TaggedWith","label":"TaggedWith","labels":["TaggedWith"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"43","source":"28","target":"29","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"44","source":"29","target":"28","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.78,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"45","source":"29","target":"30","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"46","source":"30","target":"29","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.88,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"47","source":"30","target":"31","type":"Contains","label":"Contains","labels":["Contains"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"48","source":"31","target":"30","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.58,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""}];
 
     const VIEW_W = 1500;
     const VIEW_H = 980;
@@ -1705,4 +1439,4 @@ const pageTemplate = `<!doctype html>
     refreshVisibleGraph();
   </script>
 </body>
-</html>`
+</html>

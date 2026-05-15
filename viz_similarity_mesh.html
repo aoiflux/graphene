@@ -1,291 +1,9 @@
-package viz
-
-import (
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"html/template"
-	"math"
-	"os"
-	"sort"
-	"strconv"
-	"strings"
-	"unicode/utf8"
-
-	"github.com/aoiflux/graphene/store"
-)
-
-type nodeVM struct {
-	ID             string   `json:"id"`
-	Label          string   `json:"label"`
-	Type           string   `json:"type"`
-	Labels         []string `json:"labels"`
-	Color          string   `json:"color"`
-	X              float64  `json:"x"`
-	Y              float64  `json:"y"`
-	PropertiesSize int      `json:"propertiesSize"`
-	PropertiesText string   `json:"propertiesText"`
-	PropertiesB64  string   `json:"propertiesB64"`
-	PropertiesHex  string   `json:"propertiesHex"`
-	SearchText     string   `json:"searchText"`
-}
-
-type edgeVM struct {
-	ID             string   `json:"id"`
-	Source         string   `json:"source"`
-	Target         string   `json:"target"`
-	Type           string   `json:"type"`
-	Label          string   `json:"label"`
-	Labels         []string `json:"labels"`
-	Weight         float32  `json:"weight"`
-	PropertiesSize int      `json:"propertiesSize"`
-	PropertiesText string   `json:"propertiesText"`
-	PropertiesB64  string   `json:"propertiesB64"`
-	PropertiesHex  string   `json:"propertiesHex"`
-}
-
-type pageData struct {
-	Title      string
-	Subtitle   string
-	NodeCount  int
-	EdgeCount  int
-	NodesJSON  template.JS
-	EdgesJSON  template.JS
-	EdgeTypes  []string
-	ColorItems []legendItem
-}
-
-// ExportOptions customizes metadata shown in the generated visualization.
-type ExportOptions struct {
-	Title    string
-	Subtitle string
-}
-
-type legendItem struct {
-	Name  string
-	Color string
-}
-
-// ExportInteractiveHTML writes an interactive graph visualization to outPath.
-// The output is a self-contained HTML file with embedded CSS/JS.
-func ExportInteractiveHTML(nodes []*store.Node, edges []*store.Edge, outPath string) error {
-	return ExportInteractiveHTMLWithOptions(nodes, edges, outPath, ExportOptions{})
-}
-
-// ExportInteractiveHTMLWithOptions writes an interactive graph visualization to outPath.
-// The output is a self-contained HTML file with embedded CSS/JS.
-func ExportInteractiveHTMLWithOptions(nodes []*store.Node, edges []*store.Edge, outPath string, opts ExportOptions) error {
-	if len(nodes) == 0 {
-		return fmt.Errorf("viz export requires at least one node")
-	}
-
-	nodesVM := make([]nodeVM, 0, len(nodes))
-	nodeSet := make(map[store.NodeID]struct{}, len(nodes))
-	for _, n := range nodes {
-		nodeSet[n.ID] = struct{}{}
-	}
-
-	const (
-		width  = 1500.0
-		height = 980.0
-		cx     = width / 2
-		cy     = height / 2
-		radius = 360.0
-	)
-
-	for i, n := range nodes {
-		typeName := nodeTypeName(n)
-		labels := nodeLabelNames(n)
-		propsText := bytesTextPreview(n.Properties)
-		propsB64 := base64.StdEncoding.EncodeToString(n.Properties)
-		propsHex := strings.ToUpper(hex.EncodeToString(n.Properties))
-		angle := 2 * math.Pi * float64(i) / float64(len(nodes))
-		nodesVM = append(nodesVM, nodeVM{
-			ID:             strconv.FormatUint(uint64(n.ID), 10),
-			Label:          typeName,
-			Type:           typeName,
-			Labels:         labels,
-			Color:          nodeColor(n),
-			X:              cx + radius*math.Cos(angle),
-			Y:              cy + radius*math.Sin(angle),
-			PropertiesSize: len(n.Properties),
-			PropertiesText: propsText,
-			PropertiesB64:  propsB64,
-			PropertiesHex:  propsHex,
-			SearchText:     buildNodeSearchText(strconv.FormatUint(uint64(n.ID), 10), labels, propsText),
-		})
-	}
-
-	edgesVM := make([]edgeVM, 0, len(edges))
-	edgeTypesSet := make(map[string]struct{})
-	for _, e := range edges {
-		if _, ok := nodeSet[e.Src]; !ok {
-			continue
-		}
-		if _, ok := nodeSet[e.Dst]; !ok {
-			continue
-		}
-
-		t := edgeTypeName(e)
-		labels := edgeLabelNames(e)
-		propsText := bytesTextPreview(e.Properties)
-		propsB64 := base64.StdEncoding.EncodeToString(e.Properties)
-		propsHex := strings.ToUpper(hex.EncodeToString(e.Properties))
-		edgeTypesSet[t] = struct{}{}
-		edgesVM = append(edgesVM, edgeVM{
-			ID:             strconv.FormatUint(uint64(e.ID), 10),
-			Source:         strconv.FormatUint(uint64(e.Src), 10),
-			Target:         strconv.FormatUint(uint64(e.Dst), 10),
-			Type:           t,
-			Label:          t,
-			Labels:         labels,
-			Weight:         e.Weight,
-			PropertiesSize: len(e.Properties),
-			PropertiesText: propsText,
-			PropertiesB64:  propsB64,
-			PropertiesHex:  propsHex,
-		})
-	}
-
-	edgeTypes := make([]string, 0, len(edgeTypesSet))
-	for t := range edgeTypesSet {
-		edgeTypes = append(edgeTypes, t)
-	}
-	sort.Strings(edgeTypes)
-
-	nodesJSON, err := json.Marshal(nodesVM)
-	if err != nil {
-		return err
-	}
-	edgesJSON, err := json.Marshal(edgesVM)
-	if err != nil {
-		return err
-	}
-
-	title := opts.Title
-	if title == "" {
-		title = "GrapheneDB Interactive Graph View"
-	}
-	subtitle := opts.Subtitle
-	if subtitle == "" {
-		subtitle = "Interactive connected-data view generated from GrapheneDB with lazy rendering. Hover for quick previews, click for full node and edge cards, filter edge types, and zoom/pan the graph."
-	}
-
-	data := pageData{
-		Title:     title,
-		Subtitle:  subtitle,
-		NodeCount: len(nodesVM),
-		EdgeCount: len(edgesVM),
-		NodesJSON: template.JS(nodesJSON),
-		EdgesJSON: template.JS(edgesJSON),
-		EdgeTypes: edgeTypes,
-		ColorItems: []legendItem{
-			{Name: "MicroArtefact", Color: "#0b5fff"},
-			{Name: "EvidenceFile", Color: "#089981"},
-			{Name: "Case", Color: "#d97706"},
-			{Name: "Tag", Color: "#7c3aed"},
-			{Name: "Other", Color: "#334155"},
-		},
-	}
-
-	f, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	t, err := template.New("graphviz").Parse(pageTemplate)
-	if err != nil {
-		return err
-	}
-	if err := t.Execute(f, data); err != nil {
-		return err
-	}
-	return nil
-}
-
-func nodeTypeName(n *store.Node) string {
-	if len(n.Labels) == 0 {
-		return "Unknown"
-	}
-	return n.Labels[0].String()
-}
-
-func edgeTypeName(e *store.Edge) string {
-	if len(e.Labels) == 0 {
-		return "Unknown"
-	}
-	return e.Labels[0].String()
-}
-
-func nodeLabelNames(n *store.Node) []string {
-	if len(n.Labels) == 0 {
-		return []string{"Unknown"}
-	}
-	out := make([]string, 0, len(n.Labels))
-	for _, l := range n.Labels {
-		out = append(out, l.String())
-	}
-	return out
-}
-
-func edgeLabelNames(e *store.Edge) []string {
-	if len(e.Labels) == 0 {
-		return []string{"Unknown"}
-	}
-	out := make([]string, 0, len(e.Labels))
-	for _, l := range e.Labels {
-		out = append(out, l.String())
-	}
-	return out
-}
-
-func bytesTextPreview(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
-	if utf8.Valid(b) {
-		return string(b)
-	}
-	var sb strings.Builder
-	sb.Grow(len(b))
-	for _, c := range b {
-		if c >= 32 && c <= 126 {
-			sb.WriteByte(c)
-			continue
-		}
-		sb.WriteByte('.')
-	}
-	return sb.String()
-}
-
-func buildNodeSearchText(id string, labels []string, propsText string) string {
-	return strings.Join([]string{id, strings.Join(labels, " "), propsText}, " ")
-}
-
-func nodeColor(n *store.Node) string {
-	if n.HasLabel(store.NodeTypeMicroArtefact) {
-		return "#0b5fff"
-	}
-	if n.HasLabel(store.NodeTypeEvidenceFile) {
-		return "#089981"
-	}
-	if n.HasLabel(store.NodeTypeCase) {
-		return "#d97706"
-	}
-	if n.HasLabel(store.NodeTypeTag) {
-		return "#7c3aed"
-	}
-	return "#334155"
-}
-
-const pageTemplate = `<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{.Title}}</title>
+  <title>GrapheneDB Similarity Mesh</title>
   <style>
     :root {
       --bg: #f3f6fb;
@@ -615,12 +333,12 @@ const pageTemplate = `<!doctype html>
 <body>
   <div class="container">
     <aside class="panel controls">
-      <h1>{{.Title}}</h1>
-      <div class="sub">{{.Subtitle}}</div>
+      <h1>GrapheneDB Similarity Mesh</h1>
+      <div class="sub">Weighted SimilarTo and Reuse relationships with filterable edge types.</div>
 
       <div class="statRow">
-        <div class="stat"><span class="label">Nodes</span><b>{{.NodeCount}}</b></div>
-        <div class="stat"><span class="label">Edges</span><b>{{.EdgeCount}}</b></div>
+        <div class="stat"><span class="label">Nodes</span><b>14</b></div>
+        <div class="stat"><span class="label">Edges</span><b>22</b></div>
       </div>
 
       <label class="label" for="search">Search by node ID, label, or payload text</label>
@@ -628,9 +346,11 @@ const pageTemplate = `<!doctype html>
 
       <label class="label">Edge type filters</label>
       <div class="edgeFilters" id="edgeFilters">
-        {{range .EdgeTypes}}
-        <label class="chk"><input type="checkbox" value="{{.}}" checked /> {{.}}</label>
-        {{end}}
+        
+        <label class="chk"><input type="checkbox" value="Reuse" checked /> Reuse</label>
+        
+        <label class="chk"><input type="checkbox" value="SimilarTo" checked /> SimilarTo</label>
+        
       </div>
 
       <div class="row">
@@ -661,9 +381,17 @@ const pageTemplate = `<!doctype html>
 
       <div class="legend">
         <span class="label">Node legend</span>
-        {{range .ColorItems}}
-        <div class="legendItem"><span class="dot" style="background: {{.Color}}"></span>{{.Name}}</div>
-        {{end}}
+        
+        <div class="legendItem"><span class="dot" style="background: #0b5fff"></span>MicroArtefact</div>
+        
+        <div class="legendItem"><span class="dot" style="background: #089981"></span>EvidenceFile</div>
+        
+        <div class="legendItem"><span class="dot" style="background: #d97706"></span>Case</div>
+        
+        <div class="legendItem"><span class="dot" style="background: #7c3aed"></span>Tag</div>
+        
+        <div class="legendItem"><span class="dot" style="background: #334155"></span>Other</div>
+        
       </div>
 
       <div class="lazyStats" id="lazyStats">Preparing lazy renderer...</div>
@@ -690,8 +418,8 @@ const pageTemplate = `<!doctype html>
   </div>
 
   <script>
-    const nodes = {{.NodesJSON}};
-    const edges = {{.EdgesJSON}};
+    const nodes = [{"id":"1","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":1110,"y":490,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"1 MicroArtefact "},{"id":"2","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":1074.348792444871,"y":646.1981460823209,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"2 MicroArtefact "},{"id":"3","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":974.4563286691441,"y":771.4593336884907,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"3 MicroArtefact "},{"id":"4","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":830.1075362242732,"y":840.9740483854565,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"4 MicroArtefact "},{"id":"5","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":669.8924637757268,"y":840.9740483854566,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"5 MicroArtefact "},{"id":"6","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":525.543671330856,"y":771.4593336884907,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"6 MicroArtefact "},{"id":"7","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":425.65120755512913,"y":646.1981460823209,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"7 MicroArtefact "},{"id":"8","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":390,"y":490.00000000000006,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"8 MicroArtefact "},{"id":"9","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":425.65120755512913,"y":333.8018539176791,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"9 MicroArtefact "},{"id":"10","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":525.5436713308559,"y":208.5406663115093,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"10 MicroArtefact "},{"id":"11","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":669.8924637757268,"y":139.0259516145435,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"11 MicroArtefact "},{"id":"12","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":830.1075362242728,"y":139.02595161454343,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"12 MicroArtefact "},{"id":"13","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":974.456328669144,"y":208.5406663115092,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"13 MicroArtefact "},{"id":"14","label":"MicroArtefact","type":"MicroArtefact","labels":["MicroArtefact"],"color":"#0b5fff","x":1074.348792444871,"y":333.8018539176793,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":"","searchText":"14 MicroArtefact "}];
+    const edges = [{"id":"1","source":"1","target":"2","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.55,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"14","source":"1","target":"4","type":"Reuse","label":"Reuse","labels":["Reuse"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"2","source":"2","target":"3","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.65000004,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"3","source":"3","target":"4","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.75,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"15","source":"3","target":"6","type":"Reuse","label":"Reuse","labels":["Reuse"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"4","source":"4","target":"5","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.85,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"5","source":"5","target":"6","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.95000005,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"16","source":"5","target":"8","type":"Reuse","label":"Reuse","labels":["Reuse"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"6","source":"6","target":"7","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.55,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"20","source":"6","target":"1","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.93,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"7","source":"7","target":"8","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.65000004,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"17","source":"7","target":"10","type":"Reuse","label":"Reuse","labels":["Reuse"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"8","source":"8","target":"9","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.75,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"9","source":"9","target":"10","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.85,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"18","source":"9","target":"12","type":"Reuse","label":"Reuse","labels":["Reuse"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"10","source":"10","target":"11","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.95000005,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"21","source":"10","target":"5","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.93,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"11","source":"11","target":"12","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.55,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"19","source":"11","target":"14","type":"Reuse","label":"Reuse","labels":["Reuse"],"weight":0,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"12","source":"12","target":"13","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.65000004,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"13","source":"13","target":"14","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.75,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""},{"id":"22","source":"14","target":"9","type":"SimilarTo","label":"SimilarTo","labels":["SimilarTo"],"weight":0.93,"propertiesSize":0,"propertiesText":"","propertiesB64":"","propertiesHex":""}];
 
     const VIEW_W = 1500;
     const VIEW_H = 980;
@@ -1705,4 +1433,4 @@ const pageTemplate = `<!doctype html>
     refreshVisibleGraph();
   </script>
 </body>
-</html>`
+</html>
