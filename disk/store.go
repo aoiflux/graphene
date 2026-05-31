@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -472,6 +473,92 @@ func (s *Store) EdgesByProperty(key string, value []byte) ([]store.EdgeID, error
 	return s.propIdx.EdgesByProperty(key, value), nil
 }
 
+func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
+	candidates := s.collectCandidateNodeIDs(query.IDs)
+
+	if len(query.Types) > 0 {
+		typeSet := make(map[store.NodeType]struct{}, len(query.Types))
+		for _, t := range query.Types {
+			typeSet[t] = struct{}{}
+		}
+		filtered := make([]store.NodeID, 0, len(candidates))
+		for _, id := range candidates {
+			n, err := s.GetNode(id)
+			if err != nil {
+				continue
+			}
+			if nodeHasAnyType(n, typeSet) {
+				filtered = append(filtered, id)
+			}
+		}
+		candidates = filtered
+	}
+
+	if len(query.Filters) > 0 {
+		matched := s.matchNodeIDsByFilters(query.Filters, store.NormalizedFilterMode(query.FilterMode))
+		candidates = intersectNodeIDSet(candidates, matched)
+	}
+
+	order := store.NormalizedQueryOrder(query.Order)
+	sort.Slice(candidates, func(i, j int) bool {
+		if order == store.QueryOrderDesc {
+			return candidates[i] > candidates[j]
+		}
+		return candidates[i] < candidates[j]
+	})
+	return store.ApplyNodeQueryWindow(candidates, query.Offset, query.Limit), nil
+}
+
+func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
+	candidates := s.collectCandidateEdgeIDs(query.IDs)
+
+	if len(query.Types) > 0 || len(query.SrcIDs) > 0 || len(query.DstIDs) > 0 {
+		typeSet := make(map[store.EdgeType]struct{}, len(query.Types))
+		for _, t := range query.Types {
+			typeSet[t] = struct{}{}
+		}
+		srcSet := makeNodeIDSet(query.SrcIDs)
+		dstSet := makeNodeIDSet(query.DstIDs)
+
+		filtered := make([]store.EdgeID, 0, len(candidates))
+		for _, id := range candidates {
+			e, err := s.GetEdge(id)
+			if err != nil {
+				continue
+			}
+			if len(typeSet) > 0 && !edgeHasAnyType(e, typeSet) {
+				continue
+			}
+			if len(srcSet) > 0 {
+				if _, ok := srcSet[e.Src]; !ok {
+					continue
+				}
+			}
+			if len(dstSet) > 0 {
+				if _, ok := dstSet[e.Dst]; !ok {
+					continue
+				}
+			}
+			filtered = append(filtered, id)
+		}
+		candidates = filtered
+	}
+
+	if len(query.Filters) > 0 {
+		matched := s.matchEdgeIDsByFilters(query.Filters, store.NormalizedFilterMode(query.FilterMode))
+		candidates = intersectEdgeIDSet(candidates, matched)
+	}
+
+	order := store.NormalizedQueryOrder(query.Order)
+	sort.Slice(candidates, func(i, j int) bool {
+		if order == store.QueryOrderDesc {
+			return candidates[i] > candidates[j]
+		}
+		return candidates[i] < candidates[j]
+	})
+	return store.ApplyEdgeQueryWindow(candidates, query.Offset, query.Limit), nil
+}
+
 // Compact merges the delta layer into the CSR and truncates the WAL.
 // This should be called after a bulk ingest is complete.
 // Compact is crash-safe: it writes a temp CSR file then atomically renames it.
@@ -935,6 +1022,237 @@ func cloneBytes(src []byte) []byte {
 	dst := make([]byte, len(src))
 	copy(dst, src)
 	return dst
+}
+
+func (s *Store) collectCandidateNodeIDs(ids []store.NodeID) []store.NodeID {
+	if len(ids) > 0 {
+		out := make([]store.NodeID, 0, len(ids))
+		seen := make(map[store.NodeID]struct{}, len(ids))
+		for _, id := range ids {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			if _, err := s.GetNode(id); err == nil {
+				seen[id] = struct{}{}
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+
+	out := make([]store.NodeID, 0)
+	seen := make(map[store.NodeID]struct{})
+
+	s.mu.RLock()
+	for id := range s.deltaNodes {
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	s.mu.RUnlock()
+
+	if s.csr != nil {
+		for i := 1; i < len(s.csr.nodes); i++ {
+			n := s.csr.nodes[i]
+			if n.ID == store.InvalidNodeID {
+				continue
+			}
+			if _, ok := seen[n.ID]; !ok {
+				seen[n.ID] = struct{}{}
+				out = append(out, n.ID)
+			}
+		}
+	}
+
+	return out
+}
+
+func (s *Store) collectCandidateEdgeIDs(ids []store.EdgeID) []store.EdgeID {
+	if len(ids) > 0 {
+		out := make([]store.EdgeID, 0, len(ids))
+		seen := make(map[store.EdgeID]struct{}, len(ids))
+		for _, id := range ids {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			if _, err := s.GetEdge(id); err == nil {
+				seen[id] = struct{}{}
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+
+	out := make([]store.EdgeID, 0)
+	seen := make(map[store.EdgeID]struct{})
+
+	s.mu.RLock()
+	for id := range s.deltaEdges {
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	s.mu.RUnlock()
+
+	if s.csr != nil {
+		for i := 1; i < len(s.csr.edges); i++ {
+			e := s.csr.edges[i]
+			if e.ID == store.InvalidEdgeID {
+				continue
+			}
+			if _, ok := seen[e.ID]; !ok {
+				seen[e.ID] = struct{}{}
+				out = append(out, e.ID)
+			}
+		}
+	}
+
+	return out
+}
+
+func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) map[store.NodeID]struct{} {
+	if len(filters) == 0 {
+		return nil
+	}
+	allEntries := s.propIdx.NodeEntries()
+	sets := make([]map[store.NodeID]struct{}, 0, len(filters))
+	for _, f := range filters {
+		set := make(map[store.NodeID]struct{})
+		if f.Op == store.PropertyOpEqual {
+			for _, id := range s.propIdx.NodesByProperty(f.Key, f.Value) {
+				set[id] = struct{}{}
+			}
+		} else {
+			for _, entry := range allEntries {
+				if entry.Key != f.Key {
+					continue
+				}
+				if store.PropertyFilterMatches(f, entry.Value) {
+					set[entry.ID] = struct{}{}
+				}
+			}
+		}
+		sets = append(sets, set)
+	}
+	if mode == store.MatchAny {
+		out := make(map[store.NodeID]struct{})
+		for _, set := range sets {
+			for id := range set {
+				out[id] = struct{}{}
+			}
+		}
+		return out
+	}
+	out := make(map[store.NodeID]struct{})
+	for id := range sets[0] {
+		out[id] = struct{}{}
+	}
+	for i := 1; i < len(sets); i++ {
+		for id := range out {
+			if _, ok := sets[i][id]; !ok {
+				delete(out, id)
+			}
+		}
+	}
+	return out
+}
+
+func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) map[store.EdgeID]struct{} {
+	if len(filters) == 0 {
+		return nil
+	}
+	allEntries := s.propIdx.EdgeEntries()
+	sets := make([]map[store.EdgeID]struct{}, 0, len(filters))
+	for _, f := range filters {
+		set := make(map[store.EdgeID]struct{})
+		if f.Op == store.PropertyOpEqual {
+			for _, id := range s.propIdx.EdgesByProperty(f.Key, f.Value) {
+				set[id] = struct{}{}
+			}
+		} else {
+			for _, entry := range allEntries {
+				if entry.Key != f.Key {
+					continue
+				}
+				if store.PropertyFilterMatches(f, entry.Value) {
+					set[entry.ID] = struct{}{}
+				}
+			}
+		}
+		sets = append(sets, set)
+	}
+	if mode == store.MatchAny {
+		out := make(map[store.EdgeID]struct{})
+		for _, set := range sets {
+			for id := range set {
+				out[id] = struct{}{}
+			}
+		}
+		return out
+	}
+	out := make(map[store.EdgeID]struct{})
+	for id := range sets[0] {
+		out[id] = struct{}{}
+	}
+	for i := 1; i < len(sets); i++ {
+		for id := range out {
+			if _, ok := sets[i][id]; !ok {
+				delete(out, id)
+			}
+		}
+	}
+	return out
+}
+
+func nodeHasAnyType(n *store.Node, typeSet map[store.NodeType]struct{}) bool {
+	for _, lbl := range n.Labels {
+		if _, ok := typeSet[lbl]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func edgeHasAnyType(e *store.Edge, typeSet map[store.EdgeType]struct{}) bool {
+	for _, lbl := range e.Labels {
+		if _, ok := typeSet[lbl]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func makeNodeIDSet(ids []store.NodeID) map[store.NodeID]struct{} {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[store.NodeID]struct{}, len(ids))
+	for _, id := range ids {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
+func intersectNodeIDSet(candidates []store.NodeID, keep map[store.NodeID]struct{}) []store.NodeID {
+	out := make([]store.NodeID, 0, len(candidates))
+	for _, id := range candidates {
+		if _, ok := keep[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func intersectEdgeIDSet(candidates []store.EdgeID, keep map[store.EdgeID]struct{}) []store.EdgeID {
+	out := make([]store.EdgeID, 0, len(candidates))
+	for _, id := range candidates {
+		if _, ok := keep[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // marshalNodeProp encodes a node property index entry:

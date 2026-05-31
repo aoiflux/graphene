@@ -32,9 +32,9 @@ results:
 
 **Benchmarking Conditions:**
 
-- **Date**: 2026-04-23
-- **OS**: Windows 10/11 (amd64)
-- **Go Version**: go1.25.5
+- **Date**: 2026-06-01
+- **OS**: Windows 11 (amd64)
+- **Go Version**: go1.26.2
 - **Hardware**: AMD Ryzen 9 5980HS with Radeon Graphics (16 cores)
 - **Architecture**: amd64
 - **Command**: `./test.ps1 -Bench -BenchTime 1s`
@@ -43,11 +43,11 @@ results:
 
 | Benchmark             |       Result |                      Memory |
 | --------------------- | -----------: | --------------------------: |
-| Add node              |  587.2 ns/op |       303 B/op, 3 allocs/op |
-| Get node              |  4.758 ns/op |         0 B/op, 0 allocs/op |
-| BFS traversal         | 303155 ns/op | 223561 B/op, 3058 allocs/op |
-| Shortest path         | 179960 ns/op | 124865 B/op, 2061 allocs/op |
-| Property index lookup |  36.13 ns/op |          8 B/op, 1 alloc/op |
+| Add node              |  831.5 ns/op |       248 B/op, 3 allocs/op |
+| Get node              |  6.719 ns/op |         0 B/op, 0 allocs/op |
+| BFS traversal         | 475381 ns/op | 223565 B/op, 3058 allocs/op |
+| Shortest path         | 278819 ns/op | 124866 B/op, 2061 allocs/op |
+| Property index lookup |  55.19 ns/op |          8 B/op, 1 alloc/op |
 
 Scale validation covered by stress tests:
 
@@ -63,6 +63,37 @@ Scale validation covered by stress tests:
 - Pattern discovery: scoped VF2-inspired subgraph matching.
 - Persistence lifecycle: open, replay, compact, reopen.
 - Visualization export: interactive HTML graph maps for quick analysis.
+
+## Query Model
+
+GrapheneDB is API-first. It does not use a SQL-like or string-based query
+language.
+
+Query behavior is exposed as typed Go functions on Graph and GraphStore, for
+example:
+
+- Node and edge retrieval by indexed properties.
+- Multi-property matching through function parameters.
+- Typed query functions for nodes, edges, and relations.
+- Traversal and pattern functions for graph-structured analysis.
+- Built-in deterministic ordering with offset/limit pagination.
+- Sort direction control with `Order: store.QueryOrderAsc|QueryOrderDesc`.
+- Custom type selectors for user-defined labels (for example `custom:7`).
+
+This keeps query behavior explicit, type-safe, and easy to compose inside Go
+code.
+
+```go
+ids, _ := g.QueryNodeIDs(store.NodeQuery{
+  Types:  []store.NodeType{store.NodeTypeMicroArtefact},
+  Filters: []store.PropertyFilter{
+    {Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("bucket-0")},
+  },
+  Order:  store.QueryOrderDesc,
+  Offset: 0,
+  Limit:  50,
+})
+```
 
 ## Quick Start
 
@@ -102,6 +133,26 @@ go run ./examples
 - Deep technical architecture and LLD:
   [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md)
 - Engine comparison notes: [comparison.md](comparison.md)
+
+## Query Migration
+
+Legacy property helpers remain supported:
+
+- `NodesByProperty`, `EdgesByProperty`
+- `NodesByProperties`, `EdgesByProperties`
+
+Preferred new typed APIs for new code:
+
+- `QueryNodeIDs` / `QueryNodes`
+- `QueryEdgeIDs` / `QueryEdges`
+- `QueryRelationIDs` / `QueryRelations`
+
+Migration approach:
+
+1. Keep existing property-index calls (`IndexNodeProperty`,
+   `IndexEdgeProperty`).
+2. Move single/multi-property lookups into typed query filters.
+3. Add explicit `Order`, `Offset`, and `Limit` where paged output is required.
 
 ## Project Layout
 

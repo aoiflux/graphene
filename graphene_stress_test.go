@@ -168,6 +168,93 @@ func TestStress_PropertyIndexScale(t *testing.T) {
 	}
 }
 
+func TestStress_QueryCompositeFilters(t *testing.T) {
+	g := graphene.NewInMemory()
+	const count = 40_000
+
+	ids := make([]store.NodeID, count)
+	for i := 0; i < count; i++ {
+		id, err := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+		if err != nil {
+			t.Fatalf("AddNode %d: %v", i, err)
+		}
+		ids[i] = id
+		if err := g.IndexNodeProperty(id, "bucket", []byte(fmt.Sprintf("bucket-%03d", i%200))); err != nil {
+			t.Fatalf("IndexNodeProperty bucket %d: %v", i, err)
+		}
+		if err := g.IndexNodeProperty(id, "score", []byte(fmt.Sprintf("%d", i%1000))); err != nil {
+			t.Fatalf("IndexNodeProperty score %d: %v", i, err)
+		}
+	}
+
+	for i := 1; i < count; i++ {
+		eid, err := g.AddEdge(&store.Edge{Src: ids[i-1], Dst: ids[i], Labels: []store.EdgeType{store.EdgeTypeSimilarTo}, Weight: 0.9})
+		if err != nil {
+			t.Fatalf("AddEdge %d: %v", i, err)
+		}
+		if err := g.IndexEdgeProperty(eid, "kind", []byte("near")); err != nil {
+			t.Fatalf("IndexEdgeProperty kind %d: %v", i, err)
+		}
+		if err := g.IndexEdgeProperty(eid, "score", []byte(fmt.Sprintf("%d", i%1000))); err != nil {
+			t.Fatalf("IndexEdgeProperty score %d: %v", i, err)
+		}
+	}
+
+	nodeHits, err := g.QueryNodeIDs(store.NodeQuery{
+		Types: []store.NodeType{store.NodeTypeMicroArtefact},
+		Filters: []store.PropertyFilter{
+			{Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("bucket-0")},
+			{Key: "score", Op: store.PropertyOpGreaterThanOrEqual, Value: []byte("800")},
+		},
+		FilterMode: store.MatchAll,
+		Order:      store.QueryOrderDesc,
+		Offset:     0,
+		Limit:      500,
+	})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs composite: %v", err)
+	}
+	if len(nodeHits) == 0 {
+		t.Fatal("QueryNodeIDs composite returned 0 hits")
+	}
+
+	edgeHits, err := g.QueryEdgeIDs(store.EdgeQuery{
+		Types: []store.EdgeType{store.EdgeTypeSimilarTo},
+		Filters: []store.PropertyFilter{
+			{Key: "kind", Op: store.PropertyOpEqual, Value: []byte("near")},
+			{Key: "score", Op: store.PropertyOpBetweenInclusive, Value: []byte("100"), ValueUpper: []byte("200")},
+		},
+		FilterMode: store.MatchAll,
+		Order:      store.QueryOrderAsc,
+		Offset:     0,
+		Limit:      500,
+	})
+	if err != nil {
+		t.Fatalf("QueryEdgeIDs composite: %v", err)
+	}
+	if len(edgeHits) == 0 {
+		t.Fatal("QueryEdgeIDs composite returned 0 hits")
+	}
+
+	relHits, err := g.QueryRelationIDs(store.RelationQuery{
+		Anchors:   []store.NodeID{ids[count/2]},
+		Direction: store.DirectionBoth,
+		EdgeTypes: []store.EdgeType{store.EdgeTypeSimilarTo},
+		Filters: []store.PropertyFilter{
+			{Key: "kind", Op: store.PropertyOpEqual, Value: []byte("near")},
+		},
+		Order:  store.QueryOrderDesc,
+		Offset: 0,
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatalf("QueryRelationIDs composite: %v", err)
+	}
+	if len(relHits) == 0 {
+		t.Fatal("QueryRelationIDs composite returned 0 hits")
+	}
+}
+
 // --- Compact under load (disk store) ---
 
 func TestStress_CompactUnderLoad(t *testing.T) {

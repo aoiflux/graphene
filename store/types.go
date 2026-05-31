@@ -1,6 +1,10 @@
 package store
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // NodeID and EdgeID are globally unique uint64 identifiers.
 // IDs are assigned monotonically by the store and never reused.
@@ -35,6 +39,60 @@ func CustomNodeType(offset uint8) NodeType {
 		panic("graphene: CustomNodeType offset must be in [0, 127]")
 	}
 	return NodeTypeCustomBase + NodeType(offset)
+}
+
+// IsCustom reports whether t is in the user-defined custom range.
+func (t NodeType) IsCustom() bool {
+	return t >= NodeTypeCustomBase
+}
+
+// ParseNodeType resolves selector into a NodeType.
+//
+// Supported built-ins (case-insensitive):
+//   - "case"
+//   - "evidencefile" / "evidence_file"
+//   - "microartefact" / "micro_artefact"
+//   - "tag"
+//
+// Supported custom forms:
+//   - "custom:7"
+//   - "custom(7)"
+//   - "custom-7"
+//
+// Numeric forms are also accepted:
+//   - "130" -> NodeType(130)
+func ParseNodeType(selector string) (NodeType, error) {
+	s := strings.TrimSpace(selector)
+	if s == "" {
+		return NodeTypeUnknown, fmt.Errorf("parse node type: empty selector")
+	}
+	if v, ok, err := parseNodeTypeCustomSelector(s); ok || err != nil {
+		return v, err
+	}
+
+	norm := normalizeTypeSelector(s)
+	switch norm {
+	case "unknown":
+		return NodeTypeUnknown, nil
+	case "evidencefile":
+		return NodeTypeEvidenceFile, nil
+	case "microartefact":
+		return NodeTypeMicroArtefact, nil
+	case "tag":
+		return NodeTypeTag, nil
+	case "case":
+		return NodeTypeCase, nil
+	}
+
+	num, err := strconv.Atoi(norm)
+	if err == nil {
+		if num < 0 || num > 255 {
+			return NodeTypeUnknown, fmt.Errorf("parse node type: numeric value out of range [0,255]: %d", num)
+		}
+		return NodeType(uint8(num)), nil
+	}
+
+	return NodeTypeUnknown, fmt.Errorf("parse node type: unsupported selector %q", selector)
 }
 
 func (t NodeType) String() string {
@@ -79,6 +137,120 @@ func CustomEdgeType(offset uint8) EdgeType {
 		panic("graphene: CustomEdgeType offset must be in [0, 127]")
 	}
 	return EdgeTypeCustomBase + EdgeType(offset)
+}
+
+// IsCustom reports whether t is in the user-defined custom range.
+func (t EdgeType) IsCustom() bool {
+	return t >= EdgeTypeCustomBase
+}
+
+// ParseEdgeType resolves selector into an EdgeType.
+//
+// Supported built-ins (case-insensitive):
+//   - "contains"
+//   - "similarto" / "similar_to"
+//   - "reuse"
+//   - "temporal"
+//   - "taggedwith" / "tagged_with"
+//   - "belongsto" / "belongs_to"
+//
+// Supported custom forms:
+//   - "custom:7"
+//   - "custom(7)"
+//   - "custom-7"
+//
+// Numeric forms are also accepted:
+//   - "130" -> EdgeType(130)
+func ParseEdgeType(selector string) (EdgeType, error) {
+	s := strings.TrimSpace(selector)
+	if s == "" {
+		return EdgeTypeUnknown, fmt.Errorf("parse edge type: empty selector")
+	}
+	if v, ok, err := parseEdgeTypeCustomSelector(s); ok || err != nil {
+		return v, err
+	}
+
+	norm := normalizeTypeSelector(s)
+	switch norm {
+	case "unknown":
+		return EdgeTypeUnknown, nil
+	case "contains":
+		return EdgeTypeContains, nil
+	case "similarto":
+		return EdgeTypeSimilarTo, nil
+	case "reuse":
+		return EdgeTypeReuse, nil
+	case "temporal":
+		return EdgeTypeTemporal, nil
+	case "taggedwith":
+		return EdgeTypeTaggedWith, nil
+	case "belongsto":
+		return EdgeTypeBelongsTo, nil
+	}
+
+	num, err := strconv.Atoi(norm)
+	if err == nil {
+		if num < 0 || num > 255 {
+			return EdgeTypeUnknown, fmt.Errorf("parse edge type: numeric value out of range [0,255]: %d", num)
+		}
+		return EdgeType(uint8(num)), nil
+	}
+
+	return EdgeTypeUnknown, fmt.Errorf("parse edge type: unsupported selector %q", selector)
+}
+
+func normalizeTypeSelector(s string) string {
+	n := strings.ToLower(strings.TrimSpace(s))
+	n = strings.ReplaceAll(n, "_", "")
+	n = strings.ReplaceAll(n, " ", "")
+	return n
+}
+
+func parseNodeTypeCustomSelector(s string) (NodeType, bool, error) {
+	offset, ok, err := parseCustomOffset(s)
+	if !ok || err != nil {
+		if err != nil {
+			return NodeTypeUnknown, true, fmt.Errorf("parse node type: %w", err)
+		}
+		return NodeTypeUnknown, false, nil
+	}
+	return CustomNodeType(offset), true, nil
+}
+
+func parseEdgeTypeCustomSelector(s string) (EdgeType, bool, error) {
+	offset, ok, err := parseCustomOffset(s)
+	if !ok || err != nil {
+		if err != nil {
+			return EdgeTypeUnknown, true, fmt.Errorf("parse edge type: %w", err)
+		}
+		return EdgeTypeUnknown, false, nil
+	}
+	return CustomEdgeType(offset), true, nil
+}
+
+func parseCustomOffset(s string) (uint8, bool, error) {
+	raw := strings.TrimSpace(strings.ToLower(s))
+	var payload string
+	if strings.HasPrefix(raw, "custom:") {
+		payload = strings.TrimSpace(raw[len("custom:"):])
+	} else if strings.HasPrefix(raw, "custom-") {
+		payload = strings.TrimSpace(raw[len("custom-"):])
+	} else if strings.HasPrefix(raw, "custom(") && strings.HasSuffix(raw, ")") {
+		payload = strings.TrimSpace(raw[len("custom(") : len(raw)-1])
+	} else {
+		return 0, false, nil
+	}
+	if payload == "" {
+		return 0, true, fmt.Errorf("custom selector missing offset")
+	}
+	n, err := strconv.Atoi(payload)
+	if err != nil {
+		return 0, true, fmt.Errorf("invalid custom offset %q", payload)
+	}
+	if n < 0 || n > 127 {
+		return 0, true, fmt.Errorf("custom offset out of range [0,127]: %d", n)
+	}
+	return uint8(n), true, nil
 }
 
 func (t EdgeType) String() string {

@@ -150,6 +150,9 @@ if err != nil {
 
 Property indexing is explicit. You decide which keys become queryable.
 
+GrapheneDB query behavior is API-first. It does not use a text query language or
+DSL parser. You compose queries through typed Go functions.
+
 ### Node property indexing
 
 ```go
@@ -179,6 +182,112 @@ hits, _ := g.NodesByProperties(map[string][]byte{
     "sha256": []byte("deadbeef"),
     "tool":   []byte("strings"),
 })
+```
+
+### Function-based query APIs
+
+Use typed query structs and helper functions when you need richer filtering:
+
+- `QueryNodeIDs`, `QueryNodes`
+- `QueryEdgeIDs`, `QueryEdges`
+- `QueryRelationIDs`, `QueryRelations`
+- `NodesWithProperties`, `EdgesWithProperties`
+
+Type-selector helpers are also available for user-defined custom labels:
+
+- `NodesByTypeSelector`, `NodesByAnyTypeSelector`
+- `EdgesByTypeSelector`, `EdgesByAnyTypeSelector`
+
+These are API calls, not query strings.
+
+Node query with pagination:
+
+```go
+nodeIDs, _ := g.QueryNodeIDs(store.NodeQuery{
+    Types: []store.NodeType{store.NodeTypeMicroArtefact},
+    Filters: []store.PropertyFilter{
+        {Key: "size", Op: store.PropertyOpGreaterThanOrEqual, Value: []byte("1024")},
+    },
+    Order:  store.QueryOrderAsc,
+    Offset: 100,
+    Limit:  25,
+})
+
+nodes, _ := g.QueryNodes(store.NodeQuery{IDs: nodeIDs})
+_ = nodes
+```
+
+Edge query with endpoint constraints and pagination:
+
+```go
+edgeIDs, _ := g.QueryEdgeIDs(store.EdgeQuery{
+    Types:  []store.EdgeType{store.EdgeTypeSimilarTo},
+    SrcIDs: []store.NodeID{artifactID},
+    Filters: []store.PropertyFilter{
+        {Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("sim-")},
+    },
+    Order:  store.QueryOrderDesc,
+    Offset: 0,
+    Limit:  100,
+})
+_ = edgeIDs
+```
+
+`Order` is optional. If omitted, queries default to `store.QueryOrderAsc`.
+
+Custom type selection example:
+
+```go
+customNodeType := store.CustomNodeType(7)
+_, _ = g.AddNode(&store.Node{Labels: []store.NodeType{customNodeType}})
+
+customNodes, _ := g.NodesByTypeSelector("custom:7")
+_ = customNodes
+```
+
+Migration map from legacy helpers:
+
+- `NodesByProperty(key, value)` ->
+  `QueryNodeIDs(NodeQuery{Filters: []PropertyFilter{{Key: key, Op: PropertyOpEqual, Value: value}}})`
+- `EdgesByProperty(key, value)` ->
+  `QueryEdgeIDs(EdgeQuery{Filters: []PropertyFilter{{Key: key, Op: PropertyOpEqual, Value: value}}})`
+- `NodesByProperties(map)` ->
+  `QueryNodeIDs(NodeQuery{Filters: ..., FilterMode: MatchAll})`
+- `EdgesByProperties(map)` ->
+  `QueryEdgeIDs(EdgeQuery{Filters: ..., FilterMode: MatchAll})`
+
+Prefer typed query APIs when you need AND/OR composition, range/prefix/contains,
+ordering, or pagination.
+
+Relation query (function API, no DSL):
+
+```go
+rels, _ := g.QueryRelations(store.RelationQuery{
+    Anchors:   []store.NodeID{artifactID},
+    Direction: store.DirectionBoth,
+    EdgeTypes: []store.EdgeType{store.EdgeTypeSimilarTo, store.EdgeTypeReuse},
+    Filters: []store.PropertyFilter{
+        {Key: "kind", Op: store.PropertyOpContains, Value: []byte("near")},
+    },
+    Order:  store.QueryOrderDesc,
+    Offset: 0,
+    Limit:  50,
+})
+_ = rels
+```
+
+ID-first relation query (useful for paged API responses):
+
+```go
+relIDs, _ := g.QueryRelationIDs(store.RelationQuery{
+    Anchors:   []store.NodeID{artifactID},
+    Direction: store.DirectionBoth,
+    EdgeTypes: []store.EdgeType{store.EdgeTypeSimilarTo},
+    Order:     store.QueryOrderDesc,
+    Offset:    0,
+    Limit:     25,
+})
+_ = relIDs
 ```
 
 ## 6. Traversal and Multi-Hop Analysis

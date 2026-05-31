@@ -46,6 +46,10 @@ func main() {
 	example15_InducedSubgraph()
 	example16_CycleDetection()
 	example17_ResultHelpers()
+	example23_TypedQueryAPIsWithPagination()
+	example24_QueryNodesAdvanced()
+	example25_QueryEdgesAdvanced()
+	example26_QueryRelationsAdvanced()
 
 	fmt.Println("--- Limit Showcase (Opt-In) ---")
 	fmt.Println()
@@ -923,6 +927,66 @@ func example17_ResultHelpers() {
 	fmt.Printf("  EdgesFromBFS(nil): %v\n", graphene.EdgesFromBFS(nil))
 
 	_ = caseID
+	fmt.Println()
+}
+
+// ----------------------------------------------------------------------------
+// Example 23 — Typed query APIs with pagination
+// ----------------------------------------------------------------------------
+//
+// Demonstrates function-based node/edge/relation queries with filter operators
+// and deterministic offset/limit pagination.
+func example23_TypedQueryAPIsWithPagination() {
+	fmt.Println("--- Example 23: Typed query APIs with pagination ---")
+
+	g := graphene.NewInMemory()
+
+	artA, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	artB, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	artC, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+
+	g.IndexNodeProperty(artA, "bucket", []byte("bucket-001"))
+	g.IndexNodeProperty(artB, "bucket", []byte("bucket-002"))
+	g.IndexNodeProperty(artC, "bucket", []byte("bucket-010"))
+	g.IndexNodeProperty(artA, "score", []byte("30"))
+	g.IndexNodeProperty(artB, "score", []byte("50"))
+	g.IndexNodeProperty(artC, "score", []byte("90"))
+
+	e1, _ := g.AddEdge(&store.Edge{Src: artA, Dst: artB, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}, Weight: 0.88})
+	e2, _ := g.AddEdge(&store.Edge{Src: artC, Dst: artA, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}, Weight: 0.77})
+	g.IndexEdgeProperty(e1, "kind", []byte("near"))
+	g.IndexEdgeProperty(e2, "kind", []byte("near"))
+
+	nodePage, _ := g.QueryNodeIDs(store.NodeQuery{
+		Types: []store.NodeType{store.NodeTypeMicroArtefact},
+		Filters: []store.PropertyFilter{
+			{Key: "score", Op: store.PropertyOpGreaterThanOrEqual, Value: []byte("40")},
+		},
+		Offset: 0,
+		Limit:  2,
+	})
+	fmt.Printf("  QueryNodeIDs page: %v\n", nodePage)
+
+	edgePage, _ := g.QueryEdgeIDs(store.EdgeQuery{
+		Types: []store.EdgeType{store.EdgeTypeSimilarTo},
+		Filters: []store.PropertyFilter{
+			{Key: "kind", Op: store.PropertyOpEqual, Value: []byte("near")},
+		},
+		Offset: 0,
+		Limit:  1,
+	})
+	fmt.Printf("  QueryEdgeIDs page: %v\n", edgePage)
+
+	rels, _ := g.QueryRelations(store.RelationQuery{
+		Anchors:   []store.NodeID{artA},
+		Direction: store.DirectionBoth,
+		EdgeTypes: []store.EdgeType{store.EdgeTypeSimilarTo},
+		Filters: []store.PropertyFilter{
+			{Key: "kind", Op: store.PropertyOpContains, Value: []byte("near")},
+		},
+	})
+	fmt.Printf("  QueryRelations around artA: %d edges\n", len(rels))
+
 	fmt.Println()
 }
 

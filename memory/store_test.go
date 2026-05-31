@@ -267,6 +267,260 @@ func TestStore_EdgePropertyIndex(t *testing.T) {
 	}
 }
 
+func TestStore_QueryNodeIDs_PropertyFilters(t *testing.T) {
+	s := New()
+	n1, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	n2, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	n3, _ := s.AddNode(newNode(store.NodeTypeCase))
+
+	s.IndexNodeProperty(n1, "size", []byte("12"))
+	s.IndexNodeProperty(n2, "size", []byte("30"))
+	s.IndexNodeProperty(n3, "size", []byte("90"))
+	s.IndexNodeProperty(n1, "name", []byte("artefact-alpha"))
+	s.IndexNodeProperty(n2, "name", []byte("artefact-beta"))
+	s.IndexNodeProperty(n3, "name", []byte("case-main"))
+
+	hits, err := s.QueryNodeIDs(store.NodeQuery{
+		Types: []store.NodeType{store.NodeTypeMicroArtefact},
+		Filters: []store.PropertyFilter{
+			{Key: "size", Op: store.PropertyOpGreaterThanOrEqual, Value: []byte("20")},
+			{Key: "name", Op: store.PropertyOpContains, Value: []byte("artefact")},
+		},
+		FilterMode: store.MatchAll,
+	})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs: %v", err)
+	}
+	if len(hits) != 1 || hits[0] != n2 {
+		t.Fatalf("QueryNodeIDs: got %v, want [%d]", hits, n2)
+	}
+}
+
+func TestStore_QueryEdgeIDs_EndpointAndPrefix(t *testing.T) {
+	s := New()
+	a, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	b, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	c, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	e1, _ := s.AddEdge(newEdge(a, b, store.EdgeTypeSimilarTo))
+	e2, _ := s.AddEdge(newEdge(c, b, store.EdgeTypeSimilarTo))
+	s.IndexEdgeProperty(e1, "bucket", []byte("sim-high"))
+	s.IndexEdgeProperty(e2, "bucket", []byte("sim-low"))
+
+	hits, err := s.QueryEdgeIDs(store.EdgeQuery{
+		Types:  []store.EdgeType{store.EdgeTypeSimilarTo},
+		SrcIDs: []store.NodeID{a},
+		Filters: []store.PropertyFilter{
+			{Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("sim-h")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("QueryEdgeIDs: %v", err)
+	}
+	if len(hits) != 1 || hits[0] != e1 {
+		t.Fatalf("QueryEdgeIDs: got %v, want [%d]", hits, e1)
+	}
+}
+
+func TestStore_QueryNodeIDs_Pagination(t *testing.T) {
+	s := New()
+	for i := 0; i < 5; i++ {
+		_, _ = s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	}
+
+	hits, err := s.QueryNodeIDs(store.NodeQuery{Offset: 1, Limit: 2})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("QueryNodeIDs: got %d hits, want 2", len(hits))
+	}
+	if hits[0] != 2 || hits[1] != 3 {
+		t.Fatalf("QueryNodeIDs pagination: got %v, want [2 3]", hits)
+	}
+}
+
+func TestStore_QueryEdgeIDs_Pagination(t *testing.T) {
+	s := New()
+	a, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	b, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	_, _ = s.AddEdge(newEdge(a, b, store.EdgeTypeSimilarTo))
+	_, _ = s.AddEdge(newEdge(a, b, store.EdgeTypeSimilarTo))
+	_, _ = s.AddEdge(newEdge(a, b, store.EdgeTypeSimilarTo))
+
+	hits, err := s.QueryEdgeIDs(store.EdgeQuery{Offset: 1, Limit: 1})
+	if err != nil {
+		t.Fatalf("QueryEdgeIDs: %v", err)
+	}
+	if len(hits) != 1 || hits[0] != 2 {
+		t.Fatalf("QueryEdgeIDs pagination: got %v, want [2]", hits)
+	}
+}
+
+func TestStore_QueryNodeIDs_OrderDesc(t *testing.T) {
+	s := New()
+	for i := 0; i < 5; i++ {
+		_, _ = s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	}
+
+	hits, err := s.QueryNodeIDs(store.NodeQuery{Order: store.QueryOrderDesc, Offset: 1, Limit: 2})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs: %v", err)
+	}
+	if len(hits) != 2 || hits[0] != 4 || hits[1] != 3 {
+		t.Fatalf("QueryNodeIDs descending pagination: got %v, want [4 3]", hits)
+	}
+}
+
+func TestStore_QueryEdgeIDs_OrderDesc(t *testing.T) {
+	s := New()
+	a, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	b, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	_, _ = s.AddEdge(newEdge(a, b, store.EdgeTypeSimilarTo))
+	_, _ = s.AddEdge(newEdge(a, b, store.EdgeTypeSimilarTo))
+	_, _ = s.AddEdge(newEdge(a, b, store.EdgeTypeSimilarTo))
+
+	hits, err := s.QueryEdgeIDs(store.EdgeQuery{Order: store.QueryOrderDesc, Offset: 0, Limit: 2})
+	if err != nil {
+		t.Fatalf("QueryEdgeIDs: %v", err)
+	}
+	if len(hits) != 2 || hits[0] != 3 || hits[1] != 2 {
+		t.Fatalf("QueryEdgeIDs descending pagination: got %v, want [3 2]", hits)
+	}
+}
+
+func TestStore_QueryNodeIDs_Combinators_TableDriven(t *testing.T) {
+	s := New()
+	a, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	b, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	c, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+
+	s.IndexNodeProperty(a, "family", []byte("artefact"))
+	s.IndexNodeProperty(a, "bucket", []byte("bucket-001"))
+	s.IndexNodeProperty(b, "family", []byte("artifact"))
+	s.IndexNodeProperty(b, "bucket", []byte("bucket-001"))
+	s.IndexNodeProperty(c, "family", []byte("case"))
+	s.IndexNodeProperty(c, "bucket", []byte("bucket-999"))
+
+	tests := []struct {
+		name string
+		q    store.NodeQuery
+		want []store.NodeID
+	}{
+		{
+			name: "match all",
+			q: store.NodeQuery{
+				Filters: []store.PropertyFilter{
+					{Key: "family", Op: store.PropertyOpContains, Value: []byte("arte")},
+					{Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("bucket-00")},
+				},
+				FilterMode: store.MatchAll,
+			},
+			want: []store.NodeID{a},
+		},
+		{
+			name: "match any",
+			q: store.NodeQuery{
+				Filters: []store.PropertyFilter{
+					{Key: "family", Op: store.PropertyOpContains, Value: []byte("arte")},
+					{Key: "bucket", Op: store.PropertyOpEqual, Value: []byte("bucket-999")},
+				},
+				FilterMode: store.MatchAny,
+			},
+			want: []store.NodeID{a, c},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := s.QueryNodeIDs(tc.q)
+			if err != nil {
+				t.Fatalf("QueryNodeIDs: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("QueryNodeIDs(%s): got %v, want %v", tc.name, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("QueryNodeIDs(%s): got %v, want %v", tc.name, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestStore_QueryRegression_UnknownKeysAndEmptyFilters(t *testing.T) {
+	s := New()
+	n1, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	n2, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+	e1, _ := s.AddEdge(newEdge(n1, n2, store.EdgeTypeSimilarTo))
+
+	s.IndexNodeProperty(n1, "name", []byte("a"))
+	s.IndexEdgeProperty(e1, "kind", []byte("near"))
+
+	nodesAll, err := s.QueryNodeIDs(store.NodeQuery{})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs empty: %v", err)
+	}
+	if len(nodesAll) != 2 {
+		t.Fatalf("QueryNodeIDs empty: got %d, want 2", len(nodesAll))
+	}
+
+	nodesMissing, err := s.QueryNodeIDs(store.NodeQuery{Filters: []store.PropertyFilter{{Key: "missing", Op: store.PropertyOpEqual, Value: []byte("x")}}})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs missing key: %v", err)
+	}
+	if len(nodesMissing) != 0 {
+		t.Fatalf("QueryNodeIDs missing key: got %v, want []", nodesMissing)
+	}
+
+	edgesMissing, err := s.QueryEdgeIDs(store.EdgeQuery{Filters: []store.PropertyFilter{{Key: "missing", Op: store.PropertyOpEqual, Value: []byte("x")}}})
+	if err != nil {
+		t.Fatalf("QueryEdgeIDs missing key: %v", err)
+	}
+	if len(edgesMissing) != 0 {
+		t.Fatalf("QueryEdgeIDs missing key: got %v, want []", edgesMissing)
+	}
+}
+
+func TestStore_QueryRegression_MixedNumericEncodingsAndWindowBounds(t *testing.T) {
+	s := New()
+	ids := make([]store.NodeID, 0, 10)
+	for i := 0; i < 10; i++ {
+		id, _ := s.AddNode(newNode(store.NodeTypeMicroArtefact))
+		ids = append(ids, id)
+	}
+
+	s.IndexNodeProperty(ids[0], "score", []byte("2"))
+	s.IndexNodeProperty(ids[1], "score", []byte("002"))
+	s.IndexNodeProperty(ids[2], "score", []byte("10"))
+
+	hits, err := s.QueryNodeIDs(store.NodeQuery{
+		Filters: []store.PropertyFilter{{Key: "score", Op: store.PropertyOpBetweenInclusive, Value: []byte("2"), ValueUpper: []byte("2")}},
+	})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs mixed numeric encodings: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("QueryNodeIDs mixed numeric encodings: got %v, want 2 hits", hits)
+	}
+
+	pageTail, err := s.QueryNodeIDs(store.NodeQuery{Offset: 9, Limit: 5})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs tail window: %v", err)
+	}
+	if len(pageTail) != 1 || pageTail[0] != ids[9] {
+		t.Fatalf("QueryNodeIDs tail window: got %v, want [%d]", pageTail, ids[9])
+	}
+
+	pagePastEnd, err := s.QueryNodeIDs(store.NodeQuery{Offset: 20, Limit: 5})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs past-end window: %v", err)
+	}
+	if len(pagePastEnd) != 0 {
+		t.Fatalf("QueryNodeIDs past-end window: got %v, want []", pagePastEnd)
+	}
+}
+
 // --- Close ---
 
 func TestStore_Close(t *testing.T) {

@@ -277,6 +277,292 @@ func TestNodesByProperties_NoMatch(t *testing.T) {
 	}
 }
 
+func TestQueryNodes_RangeAndContains(t *testing.T) {
+	g := graphene.NewInMemory()
+	n1, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	n2, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	n3, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+
+	g.IndexNodeProperty(n1, "size", []byte("10"))
+	g.IndexNodeProperty(n2, "size", []byte("25"))
+	g.IndexNodeProperty(n3, "size", []byte("40"))
+	g.IndexNodeProperty(n1, "name", []byte("artefact-alpha"))
+	g.IndexNodeProperty(n2, "name", []byte("artefact-beta"))
+	g.IndexNodeProperty(n3, "name", []byte("artifact-gamma"))
+
+	hits, err := g.QueryNodeIDs(store.NodeQuery{
+		Types: []store.NodeType{store.NodeTypeMicroArtefact},
+		Filters: []store.PropertyFilter{
+			{Key: "size", Op: store.PropertyOpBetweenInclusive, Value: []byte("20"), ValueUpper: []byte("50")},
+			{Key: "name", Op: store.PropertyOpContains, Value: []byte("artefact")},
+		},
+		FilterMode: store.MatchAll,
+	})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs: %v", err)
+	}
+	if len(hits) != 1 || hits[0] != n2 {
+		t.Fatalf("QueryNodeIDs: got %v, want [%d]", hits, n2)
+	}
+}
+
+func TestQueryEdges_ByEndpointTypeAndPrefix(t *testing.T) {
+	g := graphene.NewInMemory()
+	a, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	b, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	c, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+
+	e1, _ := g.AddEdge(&store.Edge{Src: a, Dst: b, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
+	e2, _ := g.AddEdge(&store.Edge{Src: a, Dst: c, Labels: []store.EdgeType{store.EdgeTypeReuse}})
+
+	g.IndexEdgeProperty(e1, "bucket", []byte("sim-high"))
+	g.IndexEdgeProperty(e2, "bucket", []byte("reuse-mid"))
+
+	hits, err := g.QueryEdgeIDs(store.EdgeQuery{
+		SrcIDs: []store.NodeID{a},
+		Types:  []store.EdgeType{store.EdgeTypeSimilarTo},
+		Filters: []store.PropertyFilter{
+			{Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("sim")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("QueryEdgeIDs: %v", err)
+	}
+	if len(hits) != 1 || hits[0] != e1 {
+		t.Fatalf("QueryEdgeIDs: got %v, want [%d]", hits, e1)
+	}
+}
+
+func TestQueryRelations_BothDirections(t *testing.T) {
+	g := graphene.NewInMemory()
+	a, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	b, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	c, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+
+	e1, _ := g.AddEdge(&store.Edge{Src: a, Dst: b, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
+	e2, _ := g.AddEdge(&store.Edge{Src: c, Dst: a, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
+	g.AddEdge(&store.Edge{Src: b, Dst: c, Labels: []store.EdgeType{store.EdgeTypeReuse}})
+
+	g.IndexEdgeProperty(e1, "kind", []byte("near"))
+	g.IndexEdgeProperty(e2, "kind", []byte("near"))
+
+	rels, err := g.QueryRelations(store.RelationQuery{
+		Anchors:   []store.NodeID{a},
+		Direction: store.DirectionBoth,
+		EdgeTypes: []store.EdgeType{store.EdgeTypeSimilarTo},
+		Filters: []store.PropertyFilter{
+			{Key: "kind", Op: store.PropertyOpEqual, Value: []byte("near")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("QueryRelations: %v", err)
+	}
+	if len(rels) != 2 {
+		t.Fatalf("QueryRelations: got %d, want 2", len(rels))
+	}
+}
+
+func TestQueryNodeIDs_Combinators_TableDriven(t *testing.T) {
+	g := graphene.NewInMemory()
+	a, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	b, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	c, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+
+	g.IndexNodeProperty(a, "family", []byte("artefact"))
+	g.IndexNodeProperty(a, "bucket", []byte("bucket-001"))
+	g.IndexNodeProperty(b, "family", []byte("artifact"))
+	g.IndexNodeProperty(b, "bucket", []byte("bucket-001"))
+	g.IndexNodeProperty(c, "family", []byte("case"))
+	g.IndexNodeProperty(c, "bucket", []byte("bucket-999"))
+
+	tests := []struct {
+		name string
+		q    store.NodeQuery
+		want []store.NodeID
+	}{
+		{
+			name: "match all",
+			q: store.NodeQuery{
+				Filters: []store.PropertyFilter{
+					{Key: "family", Op: store.PropertyOpContains, Value: []byte("arte")},
+					{Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("bucket-00")},
+				},
+				FilterMode: store.MatchAll,
+			},
+			want: []store.NodeID{a},
+		},
+		{
+			name: "match any",
+			q: store.NodeQuery{
+				Filters: []store.PropertyFilter{
+					{Key: "family", Op: store.PropertyOpContains, Value: []byte("arte")},
+					{Key: "bucket", Op: store.PropertyOpEqual, Value: []byte("bucket-999")},
+				},
+				FilterMode: store.MatchAny,
+			},
+			want: []store.NodeID{a, c},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := g.QueryNodeIDs(tc.q)
+			if err != nil {
+				t.Fatalf("QueryNodeIDs: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("QueryNodeIDs(%s): got %v, want %v", tc.name, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("QueryNodeIDs(%s): got %v, want %v", tc.name, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestQueryRegression_UnknownKeysAndEmptyFilters(t *testing.T) {
+	g := graphene.NewInMemory()
+	n1, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	n2, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	e1, _ := g.AddEdge(&store.Edge{Src: n1, Dst: n2, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
+
+	g.IndexNodeProperty(n1, "name", []byte("a"))
+	g.IndexEdgeProperty(e1, "kind", []byte("near"))
+
+	nodesAll, err := g.QueryNodeIDs(store.NodeQuery{})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs empty: %v", err)
+	}
+	if len(nodesAll) != 2 {
+		t.Fatalf("QueryNodeIDs empty: got %d, want 2", len(nodesAll))
+	}
+
+	nodesMissing, err := g.QueryNodeIDs(store.NodeQuery{Filters: []store.PropertyFilter{{Key: "missing", Op: store.PropertyOpEqual, Value: []byte("x")}}})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs missing key: %v", err)
+	}
+	if len(nodesMissing) != 0 {
+		t.Fatalf("QueryNodeIDs missing key: got %v, want []", nodesMissing)
+	}
+
+	edgesMissing, err := g.QueryEdgeIDs(store.EdgeQuery{Filters: []store.PropertyFilter{{Key: "missing", Op: store.PropertyOpEqual, Value: []byte("x")}}})
+	if err != nil {
+		t.Fatalf("QueryEdgeIDs missing key: %v", err)
+	}
+	if len(edgesMissing) != 0 {
+		t.Fatalf("QueryEdgeIDs missing key: got %v, want []", edgesMissing)
+	}
+}
+
+func TestQueryRegression_MixedNumericEncodingsAndWindowBounds(t *testing.T) {
+	g := graphene.NewInMemory()
+	ids := make([]store.NodeID, 0, 10)
+	for i := 0; i < 10; i++ {
+		id, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+		ids = append(ids, id)
+	}
+
+	g.IndexNodeProperty(ids[0], "score", []byte("2"))
+	g.IndexNodeProperty(ids[1], "score", []byte("002"))
+	g.IndexNodeProperty(ids[2], "score", []byte("10"))
+
+	hits, err := g.QueryNodeIDs(store.NodeQuery{
+		Filters: []store.PropertyFilter{{Key: "score", Op: store.PropertyOpBetweenInclusive, Value: []byte("2"), ValueUpper: []byte("2")}},
+	})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs mixed numeric encodings: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("QueryNodeIDs mixed numeric encodings: got %v, want 2 hits", hits)
+	}
+
+	pageTail, err := g.QueryNodeIDs(store.NodeQuery{Offset: 9, Limit: 5})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs tail window: %v", err)
+	}
+	if len(pageTail) != 1 || pageTail[0] != ids[9] {
+		t.Fatalf("QueryNodeIDs tail window: got %v, want [%d]", pageTail, ids[9])
+	}
+
+	pagePastEnd, err := g.QueryNodeIDs(store.NodeQuery{Offset: 20, Limit: 5})
+	if err != nil {
+		t.Fatalf("QueryNodeIDs past-end window: %v", err)
+	}
+	if len(pagePastEnd) != 0 {
+		t.Fatalf("QueryNodeIDs past-end window: got %v, want []", pagePastEnd)
+	}
+}
+
+func TestQueryRelationIDs_OrderAndPagination(t *testing.T) {
+	g := graphene.NewInMemory()
+	a, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	b, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	c, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	d, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+
+	e1, _ := g.AddEdge(&store.Edge{Src: a, Dst: b, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
+	e2, _ := g.AddEdge(&store.Edge{Src: c, Dst: a, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
+	e3, _ := g.AddEdge(&store.Edge{Src: d, Dst: a, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
+
+	g.IndexEdgeProperty(e1, "kind", []byte("near"))
+	g.IndexEdgeProperty(e2, "kind", []byte("near"))
+	g.IndexEdgeProperty(e3, "kind", []byte("near"))
+
+	ids, err := g.QueryRelationIDs(store.RelationQuery{
+		Anchors:   []store.NodeID{a},
+		Direction: store.DirectionBoth,
+		EdgeTypes: []store.EdgeType{store.EdgeTypeSimilarTo},
+		Filters: []store.PropertyFilter{
+			{Key: "kind", Op: store.PropertyOpEqual, Value: []byte("near")},
+		},
+		Order:  store.QueryOrderDesc,
+		Offset: 1,
+		Limit:  1,
+	})
+	if err != nil {
+		t.Fatalf("QueryRelationIDs: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != e2 {
+		t.Fatalf("QueryRelationIDs descending pagination: got %v, want [%d]", ids, e2)
+	}
+}
+
+func TestQueryRelations_OutboundPagination(t *testing.T) {
+	g := graphene.NewInMemory()
+	a, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	b, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	c, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+
+	e1, _ := g.AddEdge(&store.Edge{Src: a, Dst: b, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
+	e2, _ := g.AddEdge(&store.Edge{Src: a, Dst: c, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
+	g.IndexEdgeProperty(e1, "kind", []byte("near"))
+	g.IndexEdgeProperty(e2, "kind", []byte("near"))
+
+	rels, err := g.QueryRelations(store.RelationQuery{
+		Anchors:   []store.NodeID{a},
+		Direction: store.DirectionOutbound,
+		EdgeTypes: []store.EdgeType{store.EdgeTypeSimilarTo},
+		Filters: []store.PropertyFilter{
+			{Key: "kind", Op: store.PropertyOpEqual, Value: []byte("near")},
+		},
+		Order:  store.QueryOrderDesc,
+		Offset: 0,
+		Limit:  1,
+	})
+	if err != nil {
+		t.Fatalf("QueryRelations outbound pagination: %v", err)
+	}
+	if len(rels) != 1 || rels[0].ID != e2 {
+		got := make([]store.EdgeID, 0, len(rels))
+		for _, e := range rels {
+			got = append(got, e.ID)
+		}
+		t.Fatalf("QueryRelations outbound pagination: got %v, want [%d]", got, e2)
+	}
+}
+
 // --- Multi-type queries ---
 
 func TestNodesByAnyType(t *testing.T) {
@@ -318,6 +604,62 @@ func TestEdgesByAnyType(t *testing.T) {
 	// 2 SimilarTo + 1 Reuse = 3
 	if len(hits) != 3 {
 		t.Errorf("EdgesByAnyType(SimilarTo|Reuse): got %d, want 3", len(hits))
+	}
+}
+
+func TestNodesByTypeSelector_Custom(t *testing.T) {
+	g := graphene.NewInMemory()
+	custom := store.CustomNodeType(7)
+	id, err := g.AddNode(&store.Node{Labels: []store.NodeType{custom}})
+	if err != nil {
+		t.Fatalf("AddNode custom: %v", err)
+	}
+	_, _ = g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}})
+
+	hits, err := g.NodesByTypeSelector("custom:7")
+	if err != nil {
+		t.Fatalf("NodesByTypeSelector(custom:7): %v", err)
+	}
+	if len(hits) != 1 || hits[0] != id {
+		t.Fatalf("NodesByTypeSelector(custom:7): got %v, want [%d]", hits, id)
+	}
+}
+
+func TestNodesByAnyTypeSelector_Mixed(t *testing.T) {
+	g := graphene.NewInMemory()
+	custom := store.CustomNodeType(3)
+	cid, _ := g.AddNode(&store.Node{Labels: []store.NodeType{custom}})
+	caseID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}})
+
+	hits, err := g.NodesByAnyTypeSelector([]string{"case", "custom:3"})
+	if err != nil {
+		t.Fatalf("NodesByAnyTypeSelector: %v", err)
+	}
+	set := map[store.NodeID]bool{}
+	for _, id := range hits {
+		set[id] = true
+	}
+	if !set[cid] || !set[caseID] {
+		t.Fatalf("NodesByAnyTypeSelector: missing expected IDs in %v", hits)
+	}
+}
+
+func TestEdgesByTypeSelector_Custom(t *testing.T) {
+	g := graphene.NewInMemory()
+	a, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	b, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	custom := store.CustomEdgeType(5)
+	eid, err := g.AddEdge(&store.Edge{Src: a, Dst: b, Labels: []store.EdgeType{custom}})
+	if err != nil {
+		t.Fatalf("AddEdge custom: %v", err)
+	}
+
+	hits, err := g.EdgesByTypeSelector("custom:5")
+	if err != nil {
+		t.Fatalf("EdgesByTypeSelector(custom:5): %v", err)
+	}
+	if len(hits) != 1 || hits[0] != eid {
+		t.Fatalf("EdgesByTypeSelector(custom:5): got %v, want [%d]", hits, eid)
 	}
 }
 

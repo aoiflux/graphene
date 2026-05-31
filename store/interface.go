@@ -55,6 +55,14 @@ type GraphStore interface {
 	// EdgesByProperty returns all EdgeIDs that have an indexed entry for key=value.
 	EdgesByProperty(key string, value []byte) ([]EdgeID, error)
 
+	// QueryNodeIDs returns NodeIDs that satisfy the provided constraints.
+	// Implementations should return deterministic ordering.
+	QueryNodeIDs(query NodeQuery) ([]NodeID, error)
+
+	// QueryEdgeIDs returns EdgeIDs that satisfy the provided constraints.
+	// Implementations should return deterministic ordering.
+	QueryEdgeIDs(query EdgeQuery) ([]EdgeID, error)
+
 	// --- Lifecycle ---
 
 	// NodeCount returns the total number of nodes in the store.

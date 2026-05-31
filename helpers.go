@@ -2,6 +2,7 @@ package graphene
 
 import (
 	"errors"
+	"sort"
 
 	"github.com/aoiflux/graphene/store"
 	"github.com/aoiflux/graphene/traversal"
@@ -174,6 +175,112 @@ func (g *Graph) EdgesByProperties(props map[string][]byte) ([]store.EdgeID, erro
 	return result, nil
 }
 
+// NodesWithProperties returns hydrated nodes matching all key-value pairs.
+func (g *Graph) NodesWithProperties(props map[string][]byte) ([]*store.Node, error) {
+	ids, err := g.NodesByProperties(props)
+	if err != nil {
+		return nil, err
+	}
+	return g.GetNodes(ids)
+}
+
+// EdgesWithProperties returns hydrated edges matching all key-value pairs.
+func (g *Graph) EdgesWithProperties(props map[string][]byte) ([]*store.Edge, error) {
+	ids, err := g.EdgesByProperties(props)
+	if err != nil {
+		return nil, err
+	}
+	return g.GetEdges(ids)
+}
+
+// QueryNodeIDs returns node IDs that satisfy query constraints.
+func (g *Graph) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
+	return g.GraphStore.QueryNodeIDs(query)
+}
+
+// QueryNodes returns hydrated nodes that satisfy query constraints.
+func (g *Graph) QueryNodes(query store.NodeQuery) ([]*store.Node, error) {
+	ids, err := g.QueryNodeIDs(query)
+	if err != nil {
+		return nil, err
+	}
+	return g.GetNodes(ids)
+}
+
+// QueryEdgeIDs returns edge IDs that satisfy query constraints.
+func (g *Graph) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
+	return g.GraphStore.QueryEdgeIDs(query)
+}
+
+// QueryEdges returns hydrated edges that satisfy query constraints.
+func (g *Graph) QueryEdges(query store.EdgeQuery) ([]*store.Edge, error) {
+	ids, err := g.QueryEdgeIDs(query)
+	if err != nil {
+		return nil, err
+	}
+	return g.GetEdges(ids)
+}
+
+// QueryRelations returns relation edges around anchor nodes using direction-aware matching.
+func (g *Graph) QueryRelationIDs(query store.RelationQuery) ([]store.EdgeID, error) {
+	if len(query.Anchors) == 0 {
+		return nil, nil
+	}
+	mode := store.NormalizedFilterMode(query.FilterMode)
+	order := store.NormalizedQueryOrder(query.Order)
+
+	buildEdgeQuery := func(srcIDs, dstIDs []store.NodeID, withWindow bool) store.EdgeQuery {
+		eq := store.EdgeQuery{
+			SrcIDs:     srcIDs,
+			DstIDs:     dstIDs,
+			Types:      query.EdgeTypes,
+			Filters:    query.Filters,
+			FilterMode: mode,
+			Order:      order,
+		}
+		if withWindow {
+			eq.Offset = query.Offset
+			eq.Limit = query.Limit
+		}
+		return eq
+	}
+
+	switch query.Direction {
+	case store.DirectionInbound:
+		return g.QueryEdgeIDs(buildEdgeQuery(query.Counterparts, query.Anchors, true))
+	case store.DirectionBoth:
+		outbound, err := g.QueryEdgeIDs(buildEdgeQuery(query.Anchors, query.Counterparts, false))
+		if err != nil {
+			return nil, err
+		}
+		inbound, err := g.QueryEdgeIDs(buildEdgeQuery(query.Counterparts, query.Anchors, false))
+		if err != nil {
+			return nil, err
+		}
+		ids := dedupeEdgeIDs(append(outbound, inbound...))
+		sort.Slice(ids, func(i, j int) bool {
+			if order == store.QueryOrderDesc {
+				return ids[i] > ids[j]
+			}
+			return ids[i] < ids[j]
+		})
+		return store.ApplyEdgeQueryWindow(ids, query.Offset, query.Limit), nil
+	case store.DirectionOutbound:
+		fallthrough
+	default:
+		return g.QueryEdgeIDs(buildEdgeQuery(query.Anchors, query.Counterparts, true))
+	}
+}
+
+// QueryRelations returns relation edges around anchor nodes using direction-aware matching.
+func (g *Graph) QueryRelations(query store.RelationQuery) ([]*store.Edge, error) {
+	ids, err := g.QueryRelationIDs(query)
+	if err != nil {
+		return nil, err
+	}
+	return g.GetEdges(ids)
+}
+
 // --- Multi-type queries ---
 
 // NodesByAnyType returns all NodeIDs that carry at least one of the given labels
@@ -214,6 +321,52 @@ func (g *Graph) EdgesByAnyType(types []store.EdgeType) ([]store.EdgeID, error) {
 		}
 	}
 	return out, nil
+}
+
+// NodesByTypeSelector parses selector and returns matching node IDs.
+// Supports built-in names and custom selectors such as "custom:7".
+func (g *Graph) NodesByTypeSelector(selector string) ([]store.NodeID, error) {
+	t, err := store.ParseNodeType(selector)
+	if err != nil {
+		return nil, err
+	}
+	return g.NodesByType(t)
+}
+
+// NodesByAnyTypeSelector returns all NodeIDs matching at least one selector.
+func (g *Graph) NodesByAnyTypeSelector(selectors []string) ([]store.NodeID, error) {
+	types := make([]store.NodeType, 0, len(selectors))
+	for _, s := range selectors {
+		t, err := store.ParseNodeType(s)
+		if err != nil {
+			return nil, err
+		}
+		types = append(types, t)
+	}
+	return g.NodesByAnyType(types)
+}
+
+// EdgesByTypeSelector parses selector and returns matching edge IDs.
+// Supports built-in names and custom selectors such as "custom:7".
+func (g *Graph) EdgesByTypeSelector(selector string) ([]store.EdgeID, error) {
+	t, err := store.ParseEdgeType(selector)
+	if err != nil {
+		return nil, err
+	}
+	return g.EdgesByType(t)
+}
+
+// EdgesByAnyTypeSelector returns all EdgeIDs matching at least one selector.
+func (g *Graph) EdgesByAnyTypeSelector(selectors []string) ([]store.EdgeID, error) {
+	types := make([]store.EdgeType, 0, len(selectors))
+	for _, s := range selectors {
+		t, err := store.ParseEdgeType(s)
+		if err != nil {
+			return nil, err
+		}
+		types = append(types, t)
+	}
+	return g.EdgesByAnyType(types)
 }
 
 // --- Degree helpers ---
@@ -474,6 +627,38 @@ func intersectEdgeIDs(a, b []store.EdgeID) []store.EdgeID {
 		if _, ok := set[id]; ok {
 			out = append(out, id)
 		}
+	}
+	return out
+}
+
+func dedupeEdgesByID(edges []*store.Edge) []*store.Edge {
+	if len(edges) == 0 {
+		return nil
+	}
+	seen := make(map[store.EdgeID]struct{}, len(edges))
+	out := make([]*store.Edge, 0, len(edges))
+	for _, e := range edges {
+		if _, ok := seen[e.ID]; ok {
+			continue
+		}
+		seen[e.ID] = struct{}{}
+		out = append(out, e)
+	}
+	return out
+}
+
+func dedupeEdgeIDs(ids []store.EdgeID) []store.EdgeID {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[store.EdgeID]struct{}, len(ids))
+	out := make([]store.EdgeID, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
 	}
 	return out
 }

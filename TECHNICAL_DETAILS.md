@@ -152,6 +152,52 @@ not through a built-in declarative query runtime.
 - Sorted temporal entries with binary-search range access.
 - Optimized for time-window filters.
 
+### 5.4 Query Execution Model (Typed APIs)
+
+The query system is API-first and intentionally function-driven:
+
+- `QueryNodeIDs` / `QueryNodes`
+- `QueryEdgeIDs` / `QueryEdges`
+- `QueryRelationIDs` / `QueryRelations`
+
+Execution behavior is shared across memory and disk backends:
+
+1. Build candidate IDs from explicit ID filters or full keyspace.
+2. Apply type filters (`Types`, `SrcIDs`, `DstIDs`) as pre-filters.
+3. Evaluate property filters:
+   - exact match uses property-index fast path,
+   - range/prefix/contains use post-filter evaluation over indexed entries.
+4. Apply combinator semantics:
+   - `MatchAll` = intersection,
+   - `MatchAny` = union.
+5. Apply deterministic ordering:
+   - `QueryOrderAsc` or `QueryOrderDesc`.
+6. Apply pagination window:
+   - `Offset`, `Limit`.
+
+Numeric comparison semantics for range operators:
+
+- attempts numeric comparison first (`ParseFloat` on both sides),
+- falls back to byte-wise lexicographic comparison when parsing fails.
+
+Disk-store parity notes:
+
+- query candidates merge delta + CSR data,
+- dedupe and ordering are applied after merge,
+- property index state is replayed from WAL and re-emitted across compaction.
+
+Relation-query semantics:
+
+- `QueryRelationIDs` is ID-first for service/pagination workflows,
+- `QueryRelations` hydrates IDs into edge entities,
+- `DirectionBoth` performs global dedupe, then global ordering and pagination.
+
+Custom type-selector semantics:
+
+- selector APIs parse built-ins and custom forms (`custom:7`, `custom(7)`,
+  `custom-7`),
+- custom labels are treated as first-class types, not unknown labels.
+
 ## 6. Traversal and Pattern Engine
 
 ### 6.1 Traversal Coverage
@@ -237,6 +283,7 @@ delta-only state.
 | Explicit property indexing | Stable query costs                       | Requires up-front key planning     |
 | Typed labels               | Clear domain APIs                        | Less dynamic than free-form labels |
 | Embedded architecture      | No external infra dependency             | No built-in query language server  |
+| API-first query model      | Type-safe integration in Go              | No declarative language optimizer  |
 
 Positioning note: these trade-offs make Graphene a strong fit for embedded,
 controlled graph workloads, while leaving some of the product surface expected
@@ -248,6 +295,13 @@ from full graph database platforms intentionally out of scope for now.
 2. Index only keys that appear in recurring query paths.
 3. Use scoped traversal before expensive pattern matching.
 4. Keep stress data directories isolated per run for reproducibility.
+
+## 13. Current Query Limitations
+
+1. No declarative query planner or cost model.
+2. No regex/fuzzy search operators in the current phase.
+3. Range behavior for non-numeric encodings falls back to lexicographic bytes.
+4. Property indexing remains explicit and key-specific by design.
 
 ---
 
