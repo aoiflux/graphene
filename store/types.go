@@ -13,12 +13,19 @@ type EdgeID uint64
 
 // InvalidNodeID and InvalidEdgeID are sentinel zero values.
 const (
-	InvalidNodeID NodeID = 0
-	InvalidEdgeID EdgeID = 0
+	InvalidNodeID           NodeID   = 0
+	InvalidEdgeID           EdgeID   = 0
+	typeValueMaxInt                  = int(^uint16(0))
+	nodeEdgeCustomBase               = NodeType(1 << 15)
+	nodeEdgeCustomOffsetMax          = nodeEdgeCustomBase - 1
+	NodeCustomBase          NodeType = nodeEdgeCustomBase
+	NodeCustomEnd           NodeType = nodeEdgeCustomOffsetMax
+	EdgeCustomBase          EdgeType = EdgeType(nodeEdgeCustomBase)
+	EdgeCustomEnd           EdgeType = EdgeType(nodeEdgeCustomOffsetMax)
 )
 
 // NodeType classifies the kind of entity a node represents.
-type NodeType uint8
+type NodeType uint16
 
 const (
 	NodeTypeUnknown       NodeType = 0
@@ -27,16 +34,16 @@ const (
 	NodeTypeTag           NodeType = 3
 	NodeTypeCase          NodeType = 4
 
-	// NodeTypeCustomBase is the first value of the user-defined range (128–255).
+	// NodeTypeCustomBase is the first value of the user-defined range (32768-65535).
 	// Use CustomNodeType to create values in this range.
-	NodeTypeCustomBase NodeType = 128
+	NodeTypeCustomBase NodeType = NodeCustomBase
 )
 
-// CustomNodeType returns a NodeType in the user-defined range [128, 255].
-// offset must be in [0, 127]; values outside that range panic.
-func CustomNodeType(offset uint8) NodeType {
-	if offset > 127 {
-		panic("graphene: CustomNodeType offset must be in [0, 127]")
+// CustomNodeType returns a NodeType in the user-defined range [32768, 65535].
+// offset must be in [0, 32767]; values outside that range panic.
+func CustomNodeType(offset uint16) NodeType {
+	if NodeType(offset) > NodeCustomEnd {
+		panic(fmt.Sprintf("graphene: CustomNodeType offset must be in [0, %d]", NodeCustomEnd))
 	}
 	return NodeTypeCustomBase + NodeType(offset)
 }
@@ -86,10 +93,10 @@ func ParseNodeType(selector string) (NodeType, error) {
 
 	num, err := strconv.Atoi(norm)
 	if err == nil {
-		if num < 0 || num > 255 {
-			return NodeTypeUnknown, fmt.Errorf("parse node type: numeric value out of range [0,255]: %d", num)
+		if num < 0 || num > typeValueMaxInt {
+			return NodeTypeUnknown, fmt.Errorf("parse node type: numeric value out of range [0,%d]: %d", typeValueMaxInt, num)
 		}
-		return NodeType(uint8(num)), nil
+		return NodeType(uint16(num)), nil
 	}
 
 	return NodeTypeUnknown, fmt.Errorf("parse node type: unsupported selector %q", selector)
@@ -114,7 +121,7 @@ func (t NodeType) String() string {
 }
 
 // EdgeType classifies the semantic relationship an edge represents.
-type EdgeType uint8
+type EdgeType uint16
 
 const (
 	EdgeTypeUnknown    EdgeType = 0
@@ -125,16 +132,16 @@ const (
 	EdgeTypeTaggedWith EdgeType = 5 // MicroArtefact → Tag
 	EdgeTypeBelongsTo  EdgeType = 6 // EvidenceFile / MicroArtefact → Case
 
-	// EdgeTypeCustomBase is the first value of the user-defined range (128–255).
+	// EdgeTypeCustomBase is the first value of the user-defined range (32768-65535).
 	// Use CustomEdgeType to create values in this range.
-	EdgeTypeCustomBase EdgeType = 128
+	EdgeTypeCustomBase EdgeType = EdgeCustomBase
 )
 
-// CustomEdgeType returns an EdgeType in the user-defined range [128, 255].
-// offset must be in [0, 127]; values outside that range panic.
-func CustomEdgeType(offset uint8) EdgeType {
-	if offset > 127 {
-		panic("graphene: CustomEdgeType offset must be in [0, 127]")
+// CustomEdgeType returns an EdgeType in the user-defined range [32768, 65535].
+// offset must be in [0, 32767]; values outside that range panic.
+func CustomEdgeType(offset uint16) EdgeType {
+	if EdgeType(offset) > EdgeCustomEnd {
+		panic(fmt.Sprintf("graphene: CustomEdgeType offset must be in [0, %d]", EdgeCustomEnd))
 	}
 	return EdgeTypeCustomBase + EdgeType(offset)
 }
@@ -190,10 +197,10 @@ func ParseEdgeType(selector string) (EdgeType, error) {
 
 	num, err := strconv.Atoi(norm)
 	if err == nil {
-		if num < 0 || num > 255 {
-			return EdgeTypeUnknown, fmt.Errorf("parse edge type: numeric value out of range [0,255]: %d", num)
+		if num < 0 || num > typeValueMaxInt {
+			return EdgeTypeUnknown, fmt.Errorf("parse edge type: numeric value out of range [0,%d]: %d", typeValueMaxInt, num)
 		}
-		return EdgeType(uint8(num)), nil
+		return EdgeType(uint16(num)), nil
 	}
 
 	return EdgeTypeUnknown, fmt.Errorf("parse edge type: unsupported selector %q", selector)
@@ -228,7 +235,7 @@ func parseEdgeTypeCustomSelector(s string) (EdgeType, bool, error) {
 	return CustomEdgeType(offset), true, nil
 }
 
-func parseCustomOffset(s string) (uint8, bool, error) {
+func parseCustomOffset(s string) (uint16, bool, error) {
 	raw := strings.TrimSpace(strings.ToLower(s))
 	var payload string
 	if strings.HasPrefix(raw, "custom:") {
@@ -247,10 +254,10 @@ func parseCustomOffset(s string) (uint8, bool, error) {
 	if err != nil {
 		return 0, true, fmt.Errorf("invalid custom offset %q", payload)
 	}
-	if n < 0 || n > 127 {
-		return 0, true, fmt.Errorf("custom offset out of range [0,127]: %d", n)
+	if n < 0 || n > int(NodeCustomEnd) {
+		return 0, true, fmt.Errorf("custom offset out of range [0,%d]: %d", NodeCustomEnd, n)
 	}
-	return uint8(n), true, nil
+	return uint16(n), true, nil
 }
 
 func (t EdgeType) String() string {

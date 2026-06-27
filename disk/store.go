@@ -54,6 +54,24 @@ type deltaAdj struct {
 const (
 	walFileName = "graphene.wal"
 	csrFileName = "graphene.csr"
+
+	labelCountFieldBytes      = 1
+	legacyLabelBytesPerValue  = 1
+	currentLabelBytesPerValue = 2
+
+	nodePayloadIDBytes      = 8
+	nodePayloadLabelStart   = nodePayloadIDBytes + labelCountFieldBytes
+	nodePayloadPropLenBytes = 4
+
+	edgePayloadIDsBytes      = 8 + 8 + 8
+	edgePayloadLabelStart    = edgePayloadIDsBytes + labelCountFieldBytes
+	edgePayloadWeightBytes   = 4
+	edgePayloadPropLenBytes  = 4
+	edgePayloadTailFixedSize = edgePayloadWeightBytes + edgePayloadPropLenBytes
+
+	csrVersionV2            = 2
+	csrVersionV3            = 3
+	csrVersionWithU16Labels = 4
 )
 
 // Open opens (or creates) a disk-backed Store rooted at dir.
@@ -113,7 +131,7 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 		copy(stored.Properties, n.Properties)
 	}
 
-	// Serialise to WAL payload: id(8) + labelCount(1) + labels(N) + propLen(4) + props
+	// Serialise to WAL payload: id(8) + labelCount(1) + labels(2*N) + propLen(4) + props
 	payload := marshalNode(stored)
 	if err := s.wal.AppendNode(payload); err != nil {
 		return store.InvalidNodeID, fmt.Errorf("AddNode: wal: %w", err)
@@ -787,18 +805,20 @@ func (s *Store) loadCSR(path string) error {
 
 // --- serialisation helpers ---
 
-// marshalNode encodes a Node: id(8) labelCount(1) labels(N) propLen(4) props(n)
+// marshalNode encodes a Node: id(8) labelCount(1) labels(2*N) propLen(4) props(n)
 func marshalNode(n *store.Node) []byte {
 	labelCount := len(n.Labels)
 	propLen := len(n.Properties)
-	// 8 (id) + 1 (labelCount) + N (labels) + 4 (propLen) + propLen
-	buf := make([]byte, 8+1+labelCount+4+propLen)
-	binary.LittleEndian.PutUint64(buf[0:8], uint64(n.ID))
-	buf[8] = byte(labelCount)
+	labelsBytes := currentLabelBytesPerValue * labelCount
+	// 8 (id) + 1 (labelCount) + 2*N (labels) + 4 (propLen) + propLen
+	buf := make([]byte, nodePayloadLabelStart+labelsBytes+nodePayloadPropLenBytes+propLen)
+	binary.LittleEndian.PutUint64(buf[0:nodePayloadIDBytes], uint64(n.ID))
+	buf[nodePayloadIDBytes] = byte(labelCount)
 	for i, lbl := range n.Labels {
-		buf[9+i] = byte(lbl)
+		base := nodePayloadLabelStart + (currentLabelBytesPerValue * i)
+		binary.LittleEndian.PutUint16(buf[base:base+2], uint16(lbl))
 	}
-	base := 9 + labelCount
+	base := nodePayloadLabelStart + labelsBytes
 	binary.LittleEndian.PutUint32(buf[base:base+4], uint32(propLen))
 	if propLen > 0 {
 		copy(buf[base+4:], n.Properties)
@@ -807,19 +827,48 @@ func marshalNode(n *store.Node) []byte {
 }
 
 func unmarshalNode(b []byte) (*store.Node, error) {
-	if len(b) < 9 {
+	if len(b) < nodePayloadLabelStart {
 		return nil, fmt.Errorf("unmarshalNode: payload too short (%d bytes)", len(b))
 	}
-	id := store.NodeID(binary.LittleEndian.Uint64(b[0:8]))
-	labelCount := int(b[8])
-	if len(b) < 9+labelCount+4 {
+	id := store.NodeID(binary.LittleEndian.Uint64(b[0:nodePayloadIDBytes]))
+	labelCount := int(b[nodePayloadIDBytes])
+
+	newBase := nodePayloadLabelStart + (currentLabelBytesPerValue * labelCount)
+	oldBase := nodePayloadLabelStart + (legacyLabelBytesPerValue * labelCount)
+
+	decodeV2 := false
+	decodeV1 := false
+
+	if len(b) >= newBase+4 {
+		propLenNew := int(binary.LittleEndian.Uint32(b[newBase : newBase+4]))
+		if newBase+4+propLenNew == len(b) {
+			decodeV2 = true
+		}
+	}
+	if !decodeV2 && len(b) >= oldBase+4 {
+		propLenOld := int(binary.LittleEndian.Uint32(b[oldBase : oldBase+4]))
+		if oldBase+4+propLenOld == len(b) {
+			decodeV1 = true
+		}
+	}
+	if !decodeV2 && !decodeV1 {
 		return nil, fmt.Errorf("unmarshalNode: payload truncated (labels)")
 	}
+
 	labels := make([]store.NodeType, labelCount)
-	for i := 0; i < labelCount; i++ {
-		labels[i] = store.NodeType(b[9+i])
+	base := oldBase
+	if decodeV2 {
+		for i := 0; i < labelCount; i++ {
+			lb := nodePayloadLabelStart + (currentLabelBytesPerValue * i)
+			labels[i] = store.NodeType(binary.LittleEndian.Uint16(b[lb : lb+2]))
+		}
+		base = newBase
+	} else {
+		for i := 0; i < labelCount; i++ {
+			labels[i] = store.NodeType(b[nodePayloadLabelStart+i])
+		}
 	}
-	base := 9 + labelCount
+
 	propLen := int(binary.LittleEndian.Uint32(b[base : base+4]))
 	if len(b) < base+4+propLen {
 		return nil, fmt.Errorf("unmarshalNode: payload truncated (props)")
@@ -832,20 +881,22 @@ func unmarshalNode(b []byte) (*store.Node, error) {
 	return &store.Node{ID: id, Labels: labels, Properties: props}, nil
 }
 
-// marshalEdge encodes an Edge: id(8) src(8) dst(8) labelCount(1) labels(N) weight(4) propLen(4) props(n)
+// marshalEdge encodes an Edge: id(8) src(8) dst(8) labelCount(1) labels(2*N) weight(4) propLen(4) props(n)
 func marshalEdge(e *store.Edge) []byte {
 	labelCount := len(e.Labels)
 	propLen := len(e.Properties)
-	// 8+8+8 (ids) + 1 (labelCount) + N (labels) + 4 (weight) + 4 (propLen) + propLen
-	buf := make([]byte, 24+1+labelCount+4+4+propLen)
+	labelsBytes := currentLabelBytesPerValue * labelCount
+	// 8+8+8 (ids) + 1 (labelCount) + 2*N (labels) + 4 (weight) + 4 (propLen) + propLen
+	buf := make([]byte, edgePayloadLabelStart+labelsBytes+edgePayloadTailFixedSize+propLen)
 	binary.LittleEndian.PutUint64(buf[0:8], uint64(e.ID))
 	binary.LittleEndian.PutUint64(buf[8:16], uint64(e.Src))
 	binary.LittleEndian.PutUint64(buf[16:24], uint64(e.Dst))
-	buf[24] = byte(labelCount)
+	buf[edgePayloadIDsBytes] = byte(labelCount)
 	for i, lbl := range e.Labels {
-		buf[25+i] = byte(lbl)
+		base := edgePayloadLabelStart + (currentLabelBytesPerValue * i)
+		binary.LittleEndian.PutUint16(buf[base:base+2], uint16(lbl))
 	}
-	base := 25 + labelCount
+	base := edgePayloadLabelStart + labelsBytes
 	binary.LittleEndian.PutUint32(buf[base:base+4], math.Float32bits(e.Weight))
 	binary.LittleEndian.PutUint32(buf[base+4:base+8], uint32(propLen))
 	if propLen > 0 {
@@ -855,21 +906,50 @@ func marshalEdge(e *store.Edge) []byte {
 }
 
 func unmarshalEdge(b []byte) (*store.Edge, error) {
-	if len(b) < 25 {
+	if len(b) < edgePayloadLabelStart {
 		return nil, fmt.Errorf("unmarshalEdge: payload too short (%d bytes)", len(b))
 	}
 	id := store.EdgeID(binary.LittleEndian.Uint64(b[0:8]))
 	src := store.NodeID(binary.LittleEndian.Uint64(b[8:16]))
 	dst := store.NodeID(binary.LittleEndian.Uint64(b[16:24]))
-	labelCount := int(b[24])
-	if len(b) < 25+labelCount+8 {
+	labelCount := int(b[edgePayloadIDsBytes])
+
+	newBase := edgePayloadLabelStart + (currentLabelBytesPerValue * labelCount)
+	oldBase := edgePayloadLabelStart + (legacyLabelBytesPerValue * labelCount)
+
+	decodeV2 := false
+	decodeV1 := false
+
+	if len(b) >= newBase+8 {
+		propLenNew := int(binary.LittleEndian.Uint32(b[newBase+4 : newBase+8]))
+		if newBase+8+propLenNew == len(b) {
+			decodeV2 = true
+		}
+	}
+	if !decodeV2 && len(b) >= oldBase+8 {
+		propLenOld := int(binary.LittleEndian.Uint32(b[oldBase+4 : oldBase+8]))
+		if oldBase+8+propLenOld == len(b) {
+			decodeV1 = true
+		}
+	}
+	if !decodeV2 && !decodeV1 {
 		return nil, fmt.Errorf("unmarshalEdge: payload truncated (labels)")
 	}
+
 	labels := make([]store.EdgeType, labelCount)
-	for i := 0; i < labelCount; i++ {
-		labels[i] = store.EdgeType(b[25+i])
+	base := oldBase
+	if decodeV2 {
+		for i := 0; i < labelCount; i++ {
+			lb := edgePayloadLabelStart + (currentLabelBytesPerValue * i)
+			labels[i] = store.EdgeType(binary.LittleEndian.Uint16(b[lb : lb+2]))
+		}
+		base = newBase
+	} else {
+		for i := 0; i < labelCount; i++ {
+			labels[i] = store.EdgeType(b[edgePayloadLabelStart+i])
+		}
 	}
-	base := 25 + labelCount
+
 	weight := math.Float32frombits(binary.LittleEndian.Uint32(b[base : base+4]))
 	propLen := int(binary.LittleEndian.Uint32(b[base+4 : base+8]))
 	if len(b) < base+8+propLen {
@@ -896,7 +976,8 @@ func rawEdgeToStore(re rawEdge) *store.Edge {
 
 // deserialiseCSR reconstructs a CSRGraph from Serialise() byte slices.
 // Format v2 stores labels plus a reserved property offset; format v3 stores
-// labels plus inline property blobs.
+// 1-byte labels plus inline property blobs; format v4 stores uint16 labels
+// plus inline property blobs.
 func deserialiseCSR(data []byte) (*CSRGraph, error) {
 	if len(data) < 22 {
 		return nil, fmt.Errorf("deserialiseCSR: data too short")
@@ -905,8 +986,8 @@ func deserialiseCSR(data []byte) (*CSRGraph, error) {
 		return nil, fmt.Errorf("deserialiseCSR: invalid magic")
 	}
 	version := binary.LittleEndian.Uint16(data[4:6])
-	if version != 2 && version != 3 {
-		return nil, fmt.Errorf("deserialiseCSR: unsupported version %d (expected 2 or 3)", version)
+	if version != csrVersionV2 && version != csrVersionV3 && version != csrVersionWithU16Labels {
+		return nil, fmt.Errorf("deserialiseCSR: unsupported version %d (expected %d, %d or %d)", version, csrVersionV2, csrVersionV3, csrVersionWithU16Labels)
 	}
 	nodeCount := int(binary.LittleEndian.Uint64(data[6:14]))
 	edgeCount := int(binary.LittleEndian.Uint64(data[14:22]))
@@ -921,13 +1002,22 @@ func deserialiseCSR(data []byte) (*CSRGraph, error) {
 		pos += 8
 		labelCount := int(data[pos])
 		pos++
-		if pos+labelCount+8 > len(data) {
+		labelBytes := labelCount
+		if version >= csrVersionWithU16Labels {
+			labelBytes = labelCount * currentLabelBytesPerValue
+		}
+		if pos+labelBytes+8 > len(data) {
 			return nil, fmt.Errorf("deserialiseCSR: truncated node labels %d", i)
 		}
 		labels := make([]store.NodeType, labelCount)
 		for j := 0; j < labelCount; j++ {
-			labels[j] = store.NodeType(data[pos])
-			pos++
+			if version >= csrVersionWithU16Labels {
+				labels[j] = store.NodeType(binary.LittleEndian.Uint16(data[pos:]))
+				pos += currentLabelBytesPerValue
+			} else {
+				labels[j] = store.NodeType(data[pos])
+				pos++
+			}
 		}
 		props, nextPos, err := readCSRProperties(data, pos, version, "node", i)
 		if err != nil {
@@ -950,13 +1040,22 @@ func deserialiseCSR(data []byte) (*CSRGraph, error) {
 		pos += 8
 		labelCount := int(data[pos])
 		pos++
-		if pos+labelCount+12 > len(data) {
+		labelBytes := labelCount
+		if version >= csrVersionWithU16Labels {
+			labelBytes = labelCount * currentLabelBytesPerValue
+		}
+		if pos+labelBytes+12 > len(data) {
 			return nil, fmt.Errorf("deserialiseCSR: truncated edge labels %d", i)
 		}
 		labels := make([]store.EdgeType, labelCount)
 		for j := 0; j < labelCount; j++ {
-			labels[j] = store.EdgeType(data[pos])
-			pos++
+			if version >= csrVersionWithU16Labels {
+				labels[j] = store.EdgeType(binary.LittleEndian.Uint16(data[pos:]))
+				pos += currentLabelBytesPerValue
+			} else {
+				labels[j] = store.EdgeType(data[pos])
+				pos++
+			}
 		}
 		weight := math.Float32frombits(binary.LittleEndian.Uint32(data[pos:]))
 		pos += 4

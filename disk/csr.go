@@ -192,14 +192,14 @@ func (g *CSRGraph) EdgeCount() int {
 	return len(g.outEdges)
 }
 
-// Serialise writes the CSR arrays to binary format v3 (variable-length labels
+// Serialise writes the CSR arrays to binary format v4 (variable-length labels
 // and inline property blobs).
 //
 // Format:
 //
-//	[magic:4][version:2=0x0003][nodeCount:8][edgeCount:8]
-//	[nodeRecord * nodeCount] (each: id:8 + labelCount:1 + labels:N + propLen:4 + props:N)
-//	[rawEdge * edgeCount]    (each: id:8 + src:8 + dst:8 + labelCount:1 + labels:N + weight:4 + propLen:4 + props:N)
+//	[magic:4][version:2=0x0004][nodeCount:8][edgeCount:8]
+//	[nodeRecord * nodeCount] (each: id:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + propLen:4 + props:N)
+//	[rawEdge * edgeCount]    (each: id:8 + src:8 + dst:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + weight:4 + propLen:4 + props:N)
 //	[outOffset * (maxNodeID+2):8 each]
 //	[outEdges * edgeCount:8 each]
 //	[inOffset * (maxNodeID+2):8 each]
@@ -223,7 +223,7 @@ func (g *CSRGraph) Serialise() []byte {
 
 	// Header
 	buf.Write([]byte("GCSR"))
-	writeUint16(&buf, 3) // version 3
+	writeUint16(&buf, csrVersionWithU16Labels) // version 4
 	writeUint64(&buf, uint64(nodeCount))
 	writeUint64(&buf, uint64(edgeCount))
 
@@ -236,7 +236,7 @@ func (g *CSRGraph) Serialise() []byte {
 		writeUint64(&buf, uint64(n.ID))
 		buf.WriteByte(byte(len(n.Labels)))
 		for _, lbl := range n.Labels {
-			buf.WriteByte(byte(lbl))
+			writeUint16(&buf, uint16(lbl))
 		}
 		writeUint32(&buf, uint32(len(n.Properties)))
 		buf.Write(n.Properties)
@@ -253,7 +253,7 @@ func (g *CSRGraph) Serialise() []byte {
 		writeUint64(&buf, uint64(e.Dst))
 		buf.WriteByte(byte(len(e.Labels)))
 		for _, lbl := range e.Labels {
-			buf.WriteByte(byte(lbl))
+			writeUint16(&buf, uint16(lbl))
 		}
 		var wbuf [4]byte
 		binary.LittleEndian.PutUint32(wbuf[:], math.Float32bits(e.Weight))
