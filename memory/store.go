@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -131,23 +132,7 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 }
 
 func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
-	// validate src and dst exist
-	s.mu.RLock()
-	_, srcOK := s.nodes[e.Src]
-	_, dstOK := s.nodes[e.Dst]
-	s.mu.RUnlock()
-
-	if !srcOK {
-		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Src}
-	}
-	if !dstOK {
-		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Dst}
-	}
-
-	id := s.nextEdgeID()
-
 	stored := &store.Edge{
-		ID:     id,
 		Src:    e.Src,
 		Dst:    e.Dst,
 		Weight: e.Weight,
@@ -161,14 +146,27 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 		copy(stored.Properties, e.Properties)
 	}
 
+	// Validate and insert under one lock hold so an edge can never be created
+	// onto a node a concurrent DeleteNode has removed.
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.nodes[e.Src]; !ok {
+		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Src}
+	}
+	if _, ok := s.nodes[e.Dst]; !ok {
+		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Dst}
+	}
+
+	id := s.nextEdgeID()
+	stored.ID = id
+
 	s.edges[id] = stored
-	for _, lbl := range e.Labels {
+	for _, lbl := range stored.Labels {
 		s.edgesByType[lbl] = append(s.edgesByType[lbl], id)
 	}
-	s.ensureAdj(e.Src).out = append(s.ensureAdj(e.Src).out, id)
-	s.ensureAdj(e.Dst).in = append(s.ensureAdj(e.Dst).in, id)
-	s.mu.Unlock()
+	s.ensureAdj(stored.Src).out = append(s.ensureAdj(stored.Src).out, id)
+	s.ensureAdj(stored.Dst).in = append(s.ensureAdj(stored.Dst).in, id)
 
 	return id, nil
 }
@@ -218,6 +216,137 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	return ids, nil
 }
 
+func (s *Store) UpdateNode(n *store.Node) error {
+	if len(n.Labels) == 0 {
+		return fmt.Errorf("UpdateNode: node %d must carry at least one label", n.ID)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, ok := s.nodes[n.ID]
+	if !ok {
+		return &store.ErrNotFound{Kind: "node", ID: uint64(n.ID)}
+	}
+
+	// Reconcile the type index: drop old labels, add new ones.
+	for _, lbl := range existing.Labels {
+		s.nodesByType[lbl] = removeNodeID(s.nodesByType[lbl], n.ID)
+	}
+
+	updated := &store.Node{ID: n.ID}
+	updated.Labels = make([]store.NodeType, len(n.Labels))
+	copy(updated.Labels, n.Labels)
+	if len(n.Properties) > 0 {
+		updated.Properties = make([]byte, len(n.Properties))
+		copy(updated.Properties, n.Properties)
+	}
+
+	s.nodes[n.ID] = updated
+	for _, lbl := range updated.Labels {
+		s.nodesByType[lbl] = append(s.nodesByType[lbl], n.ID)
+	}
+	return nil
+}
+
+func (s *Store) UpdateEdge(e *store.Edge) error {
+	if len(e.Labels) == 0 {
+		return fmt.Errorf("UpdateEdge: edge %d must carry at least one label", e.ID)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, ok := s.edges[e.ID]
+	if !ok {
+		return &store.ErrNotFound{Kind: "edge", ID: uint64(e.ID)}
+	}
+
+	// Reconcile the type index: drop old labels, add new ones.
+	for _, lbl := range existing.Labels {
+		s.edgesByType[lbl] = removeEdgeID(s.edgesByType[lbl], e.ID)
+	}
+
+	// Endpoints are immutable — keep existing Src/Dst (and adjacency untouched).
+	updated := &store.Edge{
+		ID:     e.ID,
+		Src:    existing.Src,
+		Dst:    existing.Dst,
+		Weight: e.Weight,
+	}
+	updated.Labels = make([]store.EdgeType, len(e.Labels))
+	copy(updated.Labels, e.Labels)
+	if len(e.Properties) > 0 {
+		updated.Properties = make([]byte, len(e.Properties))
+		copy(updated.Properties, e.Properties)
+	}
+
+	s.edges[e.ID] = updated
+	for _, lbl := range updated.Labels {
+		s.edgesByType[lbl] = append(s.edgesByType[lbl], e.ID)
+	}
+	return nil
+}
+
+func (s *Store) DeleteEdge(id store.EdgeID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.edges[id]; !ok {
+		return &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
+	}
+	s.deleteEdgeLocked(id)
+	return nil
+}
+
+func (s *Store) DeleteNode(id store.NodeID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, ok := s.nodes[id]
+	if !ok {
+		return &store.ErrNotFound{Kind: "node", ID: uint64(id)}
+	}
+
+	// Cascade: delete every incident edge (outbound + inbound) first.
+	if a := s.adj[id]; a != nil {
+		incident := make([]store.EdgeID, 0, len(a.out)+len(a.in))
+		incident = append(incident, a.out...)
+		incident = append(incident, a.in...)
+		for _, eid := range incident {
+			if _, ok := s.edges[eid]; ok {
+				s.deleteEdgeLocked(eid)
+			}
+		}
+	}
+
+	for _, lbl := range node.Labels {
+		s.nodesByType[lbl] = removeNodeID(s.nodesByType[lbl], id)
+	}
+	delete(s.nodes, id)
+	delete(s.adj, id)
+	s.propIdx.RemoveNode(id)
+	return nil
+}
+
+// deleteEdgeLocked removes a single edge and all its index/adjacency entries.
+// Caller must hold s.mu.
+func (s *Store) deleteEdgeLocked(id store.EdgeID) {
+	e := s.edges[id]
+	if e == nil {
+		return
+	}
+	delete(s.edges, id)
+	if a := s.adj[e.Src]; a != nil {
+		a.out = removeEdgeID(a.out, id)
+	}
+	if a := s.adj[e.Dst]; a != nil {
+		a.in = removeEdgeID(a.in, id)
+	}
+	for _, lbl := range e.Labels {
+		s.edgesByType[lbl] = removeEdgeID(s.edgesByType[lbl], id)
+	}
+	s.propIdx.RemoveEdge(id)
+}
+
 func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
 	s.mu.RLock()
 	n, ok := s.nodes[id]
@@ -260,7 +389,11 @@ func (s *Store) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.
 	case store.DirectionInbound:
 		edgeIDs = a.in
 	case store.DirectionBoth:
-		edgeIDs = append(a.out, a.in...)
+		// Build into a fresh slice — appending onto a.out under RLock would race
+		// concurrent readers writing a.out's spare capacity.
+		edgeIDs = make([]store.EdgeID, 0, len(a.out)+len(a.in))
+		edgeIDs = append(edgeIDs, a.out...)
+		edgeIDs = append(edgeIDs, a.in...)
 	}
 
 	result := make([]*store.Edge, 0, len(edgeIDs))
@@ -625,6 +758,30 @@ func intersectEdgeIDSet(candidates []store.EdgeID, keep map[store.EdgeID]struct{
 	out := make([]store.EdgeID, 0, len(candidates))
 	for _, id := range candidates {
 		if _, ok := keep[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// removeNodeID returns ids with the first occurrence of target removed,
+// preserving order. Reuses the backing array (safe: callers hold the write lock
+// and all reads return copies).
+func removeNodeID(ids []store.NodeID, target store.NodeID) []store.NodeID {
+	out := ids[:0]
+	for _, id := range ids {
+		if id != target {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// removeEdgeID returns ids with occurrences of target removed, preserving order.
+func removeEdgeID(ids []store.EdgeID, target store.EdgeID) []store.EdgeID {
+	out := ids[:0]
+	for _, id := range ids {
+		if id != target {
 			out = append(out, id)
 		}
 	}

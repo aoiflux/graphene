@@ -27,6 +27,11 @@
 //	g.IndexNodeProperty(artID, "sha256", []byte("d4e5f6..."))
 //	hits, _ := g.NodesByProperty("sha256", []byte("d4e5f6..."))
 //
+//	// Modify or remove entities (durable; edge endpoints are immutable,
+//	// DeleteNode cascades to incident edges)
+//	g.UpdateEdge(&store.Edge{ID: eid, Labels: []store.EdgeType{store.EdgeTypeReuse}, Weight: 0.4})
+//	g.DeleteNode(artID)
+//
 //	// k-hop neighbourhood
 //	result, _ := g.BFS(artID, 2, store.DirectionBoth, nil)
 //

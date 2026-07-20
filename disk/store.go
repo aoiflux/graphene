@@ -34,6 +34,13 @@ type Store struct {
 	deltaEdges map[store.EdgeID]*store.Edge
 	deltaAdj   map[store.NodeID]*deltaAdj
 
+	// Delete masks: IDs removed since the last compaction that still live in the
+	// CSR. They hide the stale CSR record from every read until Compact rebuilds
+	// the CSR without them. Delta-only deletions are handled by removing the
+	// entry from the delta maps directly and never appear here.
+	deletedNodes map[store.NodeID]struct{}
+	deletedEdges map[store.EdgeID]struct{}
+
 	// Type indexes over delta (CSR has its own type lookups).
 	deltaNodesByType map[store.NodeType][]store.NodeID
 	deltaEdgesByType map[store.EdgeType][]store.EdgeID
@@ -72,6 +79,7 @@ const (
 	csrVersionV2            = 2
 	csrVersionV3            = 3
 	csrVersionWithU16Labels = 4
+	csrVersionWithSeqHW     = 5
 )
 
 // Open opens (or creates) a disk-backed Store rooted at dir.
@@ -93,6 +101,8 @@ func Open(dir string) (*Store, error) {
 		deltaNodes:       make(map[store.NodeID]*store.Node),
 		deltaEdges:       make(map[store.EdgeID]*store.Edge),
 		deltaAdj:         make(map[store.NodeID]*deltaAdj),
+		deletedNodes:     make(map[store.NodeID]struct{}),
+		deletedEdges:     make(map[store.EdgeID]struct{}),
 		deltaNodesByType: make(map[store.NodeType][]store.NodeID),
 		deltaEdgesByType: make(map[store.EdgeType][]store.EdgeID),
 		propIdx:          index.NewPropertyIndex(),
@@ -117,11 +127,7 @@ func Open(dir string) (*Store, error) {
 // --- GraphStore implementation ---
 
 func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
-	id := store.NodeID(s.nodeSeq.Add(1))
-
-	stored := &store.Node{
-		ID: id,
-	}
+	stored := &store.Node{}
 	if len(n.Labels) > 0 {
 		stored.Labels = make([]store.NodeType, len(n.Labels))
 		copy(stored.Labels, n.Labels)
@@ -131,19 +137,24 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 		copy(stored.Properties, n.Properties)
 	}
 
+	// ID assignment, WAL append, and delta apply are all done under s.mu so the
+	// operation is atomic w.r.t. other writers (WAL order == apply order).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	id := store.NodeID(s.nodeSeq.Add(1))
+	stored.ID = id
+
 	// Serialise to WAL payload: id(8) + labelCount(1) + labels(2*N) + propLen(4) + props
-	payload := marshalNode(stored)
-	if err := s.wal.AppendNode(payload); err != nil {
+	if err := s.wal.AppendNode(marshalNode(stored)); err != nil {
 		return store.InvalidNodeID, fmt.Errorf("AddNode: wal: %w", err)
 	}
 
-	s.mu.Lock()
 	s.deltaNodes[id] = stored
-	for _, lbl := range n.Labels {
+	for _, lbl := range stored.Labels {
 		s.deltaNodesByType[lbl] = append(s.deltaNodesByType[lbl], id)
 	}
 	s.ensureDeltaAdj(id)
-	s.mu.Unlock()
 
 	return id, nil
 }
@@ -153,7 +164,11 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 	ids := make([]store.NodeID, len(nodes))
 	stored := make([]*store.Node, len(nodes))
-	payloads := make([][]byte, len(nodes))
+
+	// The whole batch runs under one lock hold: WAL append order matches apply
+	// order and the batch is atomic w.r.t. other writers.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	for i, n := range nodes {
 		id := store.NodeID(s.nodeSeq.Add(1))
@@ -168,42 +183,24 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 			node.Properties = make([]byte, len(n.Properties))
 			copy(node.Properties, n.Properties)
 		}
-
 		stored[i] = node
-		payloads[i] = marshalNode(node)
 	}
 
 	committed := 0
-	for i := range payloads {
-		if err := s.wal.AppendNode(payloads[i]); err != nil {
-			s.mu.Lock()
+	for i := range stored {
+		if err := s.wal.AppendNode(marshalNode(stored[i])); err != nil {
 			s.commitNodesBatch(stored[:committed])
-			s.mu.Unlock()
 			return ids[:committed], fmt.Errorf("AddNodesBatch: wal: %w", err)
 		}
 		committed++
 	}
 
-	s.mu.Lock()
 	s.commitNodesBatch(stored)
-	s.mu.Unlock()
-
 	return ids, nil
 }
 
 func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
-	// Validate src/dst exist (check delta + CSR).
-	if err := s.nodeExists(e.Src); err != nil {
-		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Src}
-	}
-	if err := s.nodeExists(e.Dst); err != nil {
-		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Dst}
-	}
-
-	id := store.EdgeID(s.edgeSeq.Add(1))
-
 	stored := &store.Edge{
-		ID:     id,
 		Src:    e.Src,
 		Dst:    e.Dst,
 		Weight: e.Weight,
@@ -217,19 +214,32 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 		copy(stored.Properties, e.Properties)
 	}
 
-	payload := marshalEdge(stored)
-	if err := s.wal.AppendEdge(payload); err != nil {
+	// Endpoint validation, WAL append, and delta apply are all done under one
+	// lock hold, so an edge can never be created onto a node that a concurrent
+	// DeleteNode has already removed.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.nodeExistsLocked(e.Src) {
+		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Src}
+	}
+	if !s.nodeExistsLocked(e.Dst) {
+		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Dst}
+	}
+
+	id := store.EdgeID(s.edgeSeq.Add(1))
+	stored.ID = id
+
+	if err := s.wal.AppendEdge(marshalEdge(stored)); err != nil {
 		return store.InvalidEdgeID, fmt.Errorf("AddEdge: wal: %w", err)
 	}
 
-	s.mu.Lock()
 	s.deltaEdges[id] = stored
-	for _, lbl := range e.Labels {
+	for _, lbl := range stored.Labels {
 		s.deltaEdgesByType[lbl] = append(s.deltaEdgesByType[lbl], id)
 	}
-	s.ensureDeltaAdj(e.Src).out = append(s.ensureDeltaAdj(e.Src).out, id)
-	s.ensureDeltaAdj(e.Dst).in = append(s.ensureDeltaAdj(e.Dst).in, id)
-	s.mu.Unlock()
+	s.ensureDeltaAdj(stored.Src).out = append(s.ensureDeltaAdj(stored.Src).out, id)
+	s.ensureDeltaAdj(stored.Dst).in = append(s.ensureDeltaAdj(stored.Dst).in, id)
 
 	return id, nil
 }
@@ -239,13 +249,17 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	ids := make([]store.EdgeID, len(edges))
 	stored := make([]*store.Edge, len(edges))
-	payloads := make([][]byte, len(edges))
+
+	// Whole batch under one lock hold: endpoint validation cannot race a
+	// concurrent DeleteNode, and WAL order matches apply order.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	for i, e := range edges {
-		if err := s.nodeExists(e.Src); err != nil {
+		if !s.nodeExistsLocked(e.Src) {
 			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Src}
 		}
-		if err := s.nodeExists(e.Dst); err != nil {
+		if !s.nodeExistsLocked(e.Dst) {
 			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Dst}
 		}
 
@@ -266,37 +280,314 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 			edge.Properties = make([]byte, len(e.Properties))
 			copy(edge.Properties, e.Properties)
 		}
-
 		stored[i] = edge
-		payloads[i] = marshalEdge(edge)
 	}
 
 	committed := 0
-	for i := range payloads {
-		if err := s.wal.AppendEdge(payloads[i]); err != nil {
-			s.mu.Lock()
+	for i := range stored {
+		if err := s.wal.AppendEdge(marshalEdge(stored[i])); err != nil {
 			s.commitEdgesBatch(stored[:committed])
-			s.mu.Unlock()
 			return ids[:committed], fmt.Errorf("AddEdgesBatch: wal: %w", err)
 		}
 		committed++
 	}
 
-	s.mu.Lock()
 	s.commitEdgesBatch(stored)
-	s.mu.Unlock()
-
 	return ids, nil
 }
 
+// The four mutators hold s.mu across BOTH the WAL append and the in-memory
+// apply. This keeps the WAL record order identical to the apply order (so the
+// reopened state always matches the live state) and makes DeleteNode's cascade
+// atomic. The WAL append is safe under s.mu: WAL maintenance ops (Checkpoint /
+// Truncate) only run inside Compact, which itself holds s.mu, so they can never
+// run concurrently with a mutator.
+
+func (s *Store) UpdateNode(n *store.Node) error {
+	if len(n.Labels) == 0 {
+		return fmt.Errorf("UpdateNode: node %d must carry at least one label", n.ID)
+	}
+
+	stored := &store.Node{ID: n.ID}
+	stored.Labels = make([]store.NodeType, len(n.Labels))
+	copy(stored.Labels, n.Labels)
+	if len(n.Properties) > 0 {
+		stored.Properties = make([]byte, len(n.Properties))
+		copy(stored.Properties, n.Properties)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.nodeExistsLocked(n.ID) {
+		return &store.ErrNotFound{Kind: "node", ID: uint64(n.ID)}
+	}
+	// An edit is a fresh node record re-appended with the same ID; replay applies
+	// it as an upsert (last write wins).
+	if err := s.wal.AppendNode(marshalNode(stored)); err != nil {
+		return fmt.Errorf("UpdateNode: wal: %w", err)
+	}
+	s.applyNodeUpsert(stored)
+	return nil
+}
+
+func (s *Store) UpdateEdge(e *store.Edge) error {
+	if len(e.Labels) == 0 {
+		return fmt.Errorf("UpdateEdge: edge %d must carry at least one label", e.ID)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Endpoints are immutable: load the current edge to preserve Src/Dst.
+	cur, ok := s.getEdgeLocked(e.ID)
+	if !ok {
+		return &store.ErrNotFound{Kind: "edge", ID: uint64(e.ID)}
+	}
+
+	stored := &store.Edge{
+		ID:     e.ID,
+		Src:    cur.Src,
+		Dst:    cur.Dst,
+		Weight: e.Weight,
+	}
+	stored.Labels = make([]store.EdgeType, len(e.Labels))
+	copy(stored.Labels, e.Labels)
+	if len(e.Properties) > 0 {
+		stored.Properties = make([]byte, len(e.Properties))
+		copy(stored.Properties, e.Properties)
+	}
+
+	if err := s.wal.AppendEdge(marshalEdge(stored)); err != nil {
+		return fmt.Errorf("UpdateEdge: wal: %w", err)
+	}
+	s.applyEdgeUpsert(stored)
+	return nil
+}
+
+func (s *Store) DeleteEdge(id store.EdgeID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.edgeExistsLocked(id) {
+		return &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
+	}
+	if err := s.wal.AppendEdgeDelete(marshalID(uint64(id))); err != nil {
+		return fmt.Errorf("DeleteEdge: wal: %w", err)
+	}
+	s.applyEdgeDelete(id)
+	return nil
+}
+
+func (s *Store) DeleteNode(id store.NodeID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.nodeExistsLocked(id) {
+		return &store.ErrNotFound{Kind: "node", ID: uint64(id)}
+	}
+	incident := s.incidentEdgeIDsLocked(id)
+
+	// Durably record tombstones for the cascaded edges first, then the node, so
+	// a crash mid-delete never leaves an edge pointing at a missing node.
+	for _, eid := range incident {
+		if err := s.wal.AppendEdgeDelete(marshalID(uint64(eid))); err != nil {
+			return fmt.Errorf("DeleteNode: wal edge tombstone: %w", err)
+		}
+	}
+	if err := s.wal.AppendNodeDelete(marshalID(uint64(id))); err != nil {
+		return fmt.Errorf("DeleteNode: wal node tombstone: %w", err)
+	}
+
+	for _, eid := range incident {
+		s.applyEdgeDelete(eid)
+	}
+	s.applyNodeDelete(id)
+	return nil
+}
+
+// --- in-memory apply helpers (shared by live mutators and WAL replay) ---
+// All require s.mu held.
+
+// applyNodeUpsert inserts or updates a node in the delta overlay, reconciling
+// the delta type index and clearing any delete mask. A CSR-resident node being
+// updated simply gains a delta entry that shadows the CSR copy.
+func (s *Store) applyNodeUpsert(n *store.Node) {
+	if prev, ok := s.deltaNodes[n.ID]; ok {
+		for _, lbl := range prev.Labels {
+			s.deltaNodesByType[lbl] = removeNodeID(s.deltaNodesByType[lbl], n.ID)
+		}
+	}
+	s.deltaNodes[n.ID] = n
+	for _, lbl := range n.Labels {
+		s.deltaNodesByType[lbl] = append(s.deltaNodesByType[lbl], n.ID)
+	}
+	s.ensureDeltaAdj(n.ID)
+	delete(s.deletedNodes, n.ID)
+}
+
+// applyEdgeUpsert inserts or updates an edge in the delta overlay. Delta
+// adjacency is recorded only for a genuinely new edge (not previously in the
+// delta and not present in the CSR, whose adjacency arrays already list it), so
+// an updated edge is never double-listed.
+func (s *Store) applyEdgeUpsert(e *store.Edge) {
+	prev, inDelta := s.deltaEdges[e.ID]
+	if inDelta {
+		for _, lbl := range prev.Labels {
+			s.deltaEdgesByType[lbl] = removeEdgeID(s.deltaEdgesByType[lbl], e.ID)
+		}
+	}
+	s.deltaEdges[e.ID] = e
+	for _, lbl := range e.Labels {
+		s.deltaEdgesByType[lbl] = append(s.deltaEdgesByType[lbl], e.ID)
+	}
+	if !inDelta && !s.edgeInCSR(e.ID) {
+		s.ensureDeltaAdj(e.Src).out = append(s.ensureDeltaAdj(e.Src).out, e.ID)
+		s.ensureDeltaAdj(e.Dst).in = append(s.ensureDeltaAdj(e.Dst).in, e.ID)
+	}
+	delete(s.deletedEdges, e.ID)
+}
+
+// applyNodeDelete removes a node from the delta overlay and masks any CSR copy.
+// Incident-edge cascade is performed by the caller (DeleteNode) / by separate
+// edge tombstones on replay, so this does not touch edges.
+func (s *Store) applyNodeDelete(id store.NodeID) {
+	if n, ok := s.deltaNodes[id]; ok {
+		for _, lbl := range n.Labels {
+			s.deltaNodesByType[lbl] = removeNodeID(s.deltaNodesByType[lbl], id)
+		}
+		delete(s.deltaNodes, id)
+	}
+	delete(s.deltaAdj, id)
+	if s.nodeInCSR(id) {
+		s.deletedNodes[id] = struct{}{}
+	}
+	s.propIdx.RemoveNode(id)
+}
+
+// applyEdgeDelete removes an edge from the delta overlay and masks any CSR copy.
+func (s *Store) applyEdgeDelete(id store.EdgeID) {
+	if e, ok := s.deltaEdges[id]; ok {
+		for _, lbl := range e.Labels {
+			s.deltaEdgesByType[lbl] = removeEdgeID(s.deltaEdgesByType[lbl], id)
+		}
+		if a := s.deltaAdj[e.Src]; a != nil {
+			a.out = removeEdgeID(a.out, id)
+		}
+		if a := s.deltaAdj[e.Dst]; a != nil {
+			a.in = removeEdgeID(a.in, id)
+		}
+		delete(s.deltaEdges, id)
+	}
+	if s.edgeInCSR(id) {
+		s.deletedEdges[id] = struct{}{}
+	}
+	s.propIdx.RemoveEdge(id)
+}
+
+// nodeExistsLocked reports whether the node is live (present in delta or CSR and
+// not masked by a tombstone). Caller must hold s.mu.
+func (s *Store) nodeExistsLocked(id store.NodeID) bool {
+	if _, del := s.deletedNodes[id]; del {
+		return false
+	}
+	if _, ok := s.deltaNodes[id]; ok {
+		return true
+	}
+	return s.nodeInCSR(id)
+}
+
+// edgeExistsLocked reports whether the edge is live. Caller must hold s.mu.
+func (s *Store) edgeExistsLocked(id store.EdgeID) bool {
+	if _, del := s.deletedEdges[id]; del {
+		return false
+	}
+	if _, ok := s.deltaEdges[id]; ok {
+		return true
+	}
+	return s.edgeInCSR(id)
+}
+
+// getEdgeLocked returns the authoritative live edge (delta override or CSR copy)
+// or (nil, false) if it is missing or masked. Caller must hold s.mu.
+func (s *Store) getEdgeLocked(id store.EdgeID) (*store.Edge, bool) {
+	if _, del := s.deletedEdges[id]; del {
+		return nil, false
+	}
+	if e, ok := s.deltaEdges[id]; ok {
+		return e, true
+	}
+	if s.csr != nil {
+		if rec, found := s.csr.GetEdge(id); found {
+			return rawEdgeToStore(rec), true
+		}
+	}
+	return nil, false
+}
+
+func (s *Store) nodeInCSR(id store.NodeID) bool {
+	if s.csr == nil {
+		return false
+	}
+	_, found := s.csr.GetNode(id)
+	return found
+}
+
+func (s *Store) edgeInCSR(id store.EdgeID) bool {
+	if s.csr == nil {
+		return false
+	}
+	_, found := s.csr.GetEdge(id)
+	return found
+}
+
+// incidentEdgeIDsLocked returns the deduped, still-live edge IDs incident to id
+// (as Src or Dst) gathered from both the delta adjacency and the CSR. Caller
+// must hold s.mu.
+func (s *Store) incidentEdgeIDsLocked(id store.NodeID) []store.EdgeID {
+	seen := make(map[store.EdgeID]struct{})
+	var out []store.EdgeID
+	add := func(eid store.EdgeID) {
+		if _, del := s.deletedEdges[eid]; del {
+			return
+		}
+		if _, ok := seen[eid]; ok {
+			return
+		}
+		seen[eid] = struct{}{}
+		out = append(out, eid)
+	}
+	if a := s.deltaAdj[id]; a != nil {
+		for _, eid := range a.out {
+			add(eid)
+		}
+		for _, eid := range a.in {
+			add(eid)
+		}
+	}
+	if s.csr != nil {
+		if outE, err := s.csr.OutboundEdges(id); err == nil {
+			for _, re := range outE {
+				add(re.ID)
+			}
+		}
+		if inE, err := s.csr.InboundEdges(id); err == nil {
+			for _, re := range inE {
+				add(re.ID)
+			}
+		}
+	}
+	return out
+}
+
 func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
+	// Hold RLock across the delta + CSR lookup so the CSR pointer read is not
+	// racing a concurrent Compact swap.
 	s.mu.RLock()
-	n, ok := s.deltaNodes[id]
-	s.mu.RUnlock()
-	if ok {
+	defer s.mu.RUnlock()
+	if _, del := s.deletedNodes[id]; del {
+		return nil, &store.ErrNotFound{Kind: "node", ID: uint64(id)}
+	}
+	if n, ok := s.deltaNodes[id]; ok {
 		return n, nil
 	}
-	// Fall through to CSR.
 	if s.csr != nil {
 		rec, found := s.csr.GetNode(id)
 		if found {
@@ -308,9 +599,11 @@ func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
 
 func (s *Store) GetEdge(id store.EdgeID) (*store.Edge, error) {
 	s.mu.RLock()
-	e, ok := s.deltaEdges[id]
-	s.mu.RUnlock()
-	if ok {
+	defer s.mu.RUnlock()
+	if _, del := s.deletedEdges[id]; del {
+		return nil, &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
+	}
+	if e, ok := s.deltaEdges[id]; ok {
 		return e, nil
 	}
 	if s.csr != nil {
@@ -325,8 +618,15 @@ func (s *Store) GetEdge(id store.EdgeID) (*store.Edge, error) {
 func (s *Store) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]*store.Edge, error) {
 	var result []*store.Edge
 
-	// Collect from delta.
+	// Hold the read lock across BOTH the delta and CSR passes: the CSR pointer,
+	// its adjacency, and the delete masks must be read from one consistent
+	// snapshot, otherwise a concurrent Compact could swap the CSR between reading
+	// its adjacency and consulting the (now-cleared) masks — re-emitting a
+	// deleted edge.
 	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Collect from delta.
 	da := s.deltaAdj[id]
 	if da != nil {
 		var eids []store.EdgeID
@@ -336,7 +636,9 @@ func (s *Store) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.
 		case store.DirectionInbound:
 			eids = da.in
 		case store.DirectionBoth:
-			eids = append(da.out, da.in...)
+			eids = make([]store.EdgeID, 0, len(da.out)+len(da.in))
+			eids = append(eids, da.out...)
+			eids = append(eids, da.in...)
 		}
 		for _, eid := range eids {
 			e := s.deltaEdges[eid]
@@ -349,7 +651,6 @@ func (s *Store) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.
 			result = append(result, e)
 		}
 	}
-	s.mu.RUnlock()
 
 	// Collect from CSR.
 	if s.csr != nil {
@@ -373,6 +674,19 @@ func (s *Store) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.
 		}
 		if err == nil {
 			for _, re := range rawEdges {
+				if _, del := s.deletedEdges[re.ID]; del {
+					continue
+				}
+				// A CSR edge updated in the delta is emitted from the delta
+				// (authoritative) copy; endpoints are immutable so CSR adjacency
+				// still lists it correctly.
+				if de, ok := s.deltaEdges[re.ID]; ok {
+					if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, de) {
+						continue
+					}
+					result = append(result, de)
+					continue
+				}
 				if edgeTypes != nil && !rawEdgeMatchesFilter(edgeTypes, re.Labels) {
 					continue
 				}
@@ -415,50 +729,101 @@ func (s *Store) Neighbours(id store.NodeID, dir store.Direction, edgeTypes []sto
 
 func (s *Store) NodesByType(t store.NodeType) ([]store.NodeID, error) {
 	s.mu.RLock()
-	delta := s.deltaNodesByType[t]
-	out := make([]store.NodeID, len(delta))
-	copy(out, delta)
+	candidates := make([]store.NodeID, len(s.deltaNodesByType[t]))
+	copy(candidates, s.deltaNodesByType[t])
+	if s.csr != nil {
+		candidates = append(candidates, s.csr.NodesByType(t)...)
+	}
 	s.mu.RUnlock()
 
-	if s.csr != nil {
-		out = append(out, s.csr.NodesByType(t)...)
+	// Re-validate against the authoritative view: a candidate may be masked by a
+	// tombstone or have had label t removed/added by an update. Dedup as we go.
+	seen := make(map[store.NodeID]struct{}, len(candidates))
+	out := make([]store.NodeID, 0, len(candidates))
+	for _, id := range candidates {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		n, err := s.GetNode(id)
+		if err != nil || !n.HasLabel(t) {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
 	}
 	return out, nil
 }
 
 func (s *Store) EdgesByType(t store.EdgeType) ([]store.EdgeID, error) {
 	s.mu.RLock()
-	delta := s.deltaEdgesByType[t]
-	out := make([]store.EdgeID, len(delta))
-	copy(out, delta)
+	candidates := make([]store.EdgeID, len(s.deltaEdgesByType[t]))
+	copy(candidates, s.deltaEdgesByType[t])
+	if s.csr != nil {
+		candidates = append(candidates, s.csr.EdgesByType(t)...)
+	}
 	s.mu.RUnlock()
 
-	if s.csr != nil {
-		out = append(out, s.csr.EdgesByType(t)...)
+	seen := make(map[store.EdgeID]struct{}, len(candidates))
+	out := make([]store.EdgeID, 0, len(candidates))
+	for _, id := range candidates {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		e, err := s.GetEdge(id)
+		if err != nil || !e.HasLabel(t) {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
 	}
 	return out, nil
 }
 
 func (s *Store) NodeCount() (uint64, error) {
 	s.mu.RLock()
-	dn := uint64(len(s.deltaNodes))
-	s.mu.RUnlock()
-	csrN := uint64(0)
+	defer s.mu.RUnlock()
+	// Every delta node is live (deleted entries are removed from the map).
+	total := uint64(len(s.deltaNodes))
 	if s.csr != nil {
-		csrN = uint64(s.csr.NodeCount())
+		// Count CSR nodes that are neither overridden by a delta entry nor
+		// masked by a tombstone.
+		for i := 1; i < len(s.csr.nodes); i++ {
+			id := s.csr.nodes[i].ID
+			if id == store.InvalidNodeID {
+				continue
+			}
+			if _, over := s.deltaNodes[id]; over {
+				continue
+			}
+			if _, del := s.deletedNodes[id]; del {
+				continue
+			}
+			total++
+		}
 	}
-	return dn + csrN, nil
+	return total, nil
 }
 
 func (s *Store) EdgeCount() (uint64, error) {
 	s.mu.RLock()
-	de := uint64(len(s.deltaEdges))
-	s.mu.RUnlock()
-	csrE := uint64(0)
+	defer s.mu.RUnlock()
+	total := uint64(len(s.deltaEdges))
 	if s.csr != nil {
-		csrE = uint64(s.csr.EdgeCount())
+		for i := 1; i < len(s.csr.edges); i++ {
+			id := s.csr.edges[i].ID
+			if id == store.InvalidEdgeID {
+				continue
+			}
+			if _, over := s.deltaEdges[id]; over {
+				continue
+			}
+			if _, del := s.deletedEdges[id]; del {
+				continue
+			}
+			total++
+		}
 	}
-	return de + csrE, nil
+	return total, nil
 }
 
 func (s *Store) Close() error {
@@ -588,19 +953,35 @@ func (s *Store) Compact() error {
 	var nodes []nodeRecord
 	var edges []rawEdge
 
-	// From existing CSR.
+	// From existing CSR — skip entries that a delta update has overridden or a
+	// tombstone has deleted, so the rebuilt CSR reclaims their space and never
+	// double-counts an updated entry.
 	if s.csr != nil {
 		for i := 1; i < len(s.csr.nodes); i++ {
 			n := s.csr.nodes[i]
-			if n.ID != store.InvalidNodeID {
-				nodes = append(nodes, n)
+			if n.ID == store.InvalidNodeID {
+				continue
 			}
+			if _, over := s.deltaNodes[n.ID]; over {
+				continue
+			}
+			if _, del := s.deletedNodes[n.ID]; del {
+				continue
+			}
+			nodes = append(nodes, n)
 		}
 		for i := 1; i < len(s.csr.edges); i++ {
 			e := s.csr.edges[i]
-			if e.ID != store.InvalidEdgeID {
-				edges = append(edges, e)
+			if e.ID == store.InvalidEdgeID {
+				continue
 			}
+			if _, over := s.deltaEdges[e.ID]; over {
+				continue
+			}
+			if _, del := s.deletedEdges[e.ID]; del {
+				continue
+			}
+			edges = append(edges, e)
 		}
 	}
 
@@ -621,6 +1002,10 @@ func (s *Store) Compact() error {
 
 	// Build new CSR.
 	newCSR := Build(nodes, edges)
+	// Persist the current sequence high-water marks so a subsequent reopen never
+	// reuses an ID whose record was dropped from this rebuilt CSR.
+	newCSR.nodeSeqHW = s.nodeSeq.Load()
+	newCSR.edgeSeqHW = s.edgeSeq.Load()
 
 	// Serialise to temp file.
 	data := newCSR.Serialise()
@@ -657,11 +1042,14 @@ func (s *Store) Compact() error {
 		}
 	}
 
-	// Swap in new CSR and clear delta.
+	// Swap in new CSR and clear delta + delete masks (both are now baked into
+	// the freshly built CSR).
 	s.csr = newCSR
 	s.deltaNodes = make(map[store.NodeID]*store.Node)
 	s.deltaEdges = make(map[store.EdgeID]*store.Edge)
 	s.deltaAdj = make(map[store.NodeID]*deltaAdj)
+	s.deletedNodes = make(map[store.NodeID]struct{})
+	s.deletedEdges = make(map[store.EdgeID]struct{})
 	s.deltaNodesByType = make(map[store.NodeType][]store.NodeID)
 	s.deltaEdgesByType = make(map[store.EdgeType][]store.EdgeID)
 
@@ -669,21 +1057,6 @@ func (s *Store) Compact() error {
 }
 
 // --- internals ---
-
-func (s *Store) nodeExists(id store.NodeID) error {
-	s.mu.RLock()
-	_, ok := s.deltaNodes[id]
-	s.mu.RUnlock()
-	if ok {
-		return nil
-	}
-	if s.csr != nil {
-		if _, found := s.csr.GetNode(id); found {
-			return nil
-		}
-	}
-	return &store.ErrNotFound{Kind: "node", ID: uint64(id)}
-}
 
 func (s *Store) ensureDeltaAdj(id store.NodeID) *deltaAdj {
 	a, ok := s.deltaAdj[id]
@@ -726,11 +1099,8 @@ func (s *Store) replayWAL() error {
 			if err != nil {
 				return err
 			}
-			s.deltaNodes[n.ID] = n
-			for _, lbl := range n.Labels {
-				s.deltaNodesByType[lbl] = append(s.deltaNodesByType[lbl], n.ID)
-			}
-			s.ensureDeltaAdj(n.ID)
+			// Upsert: a re-appended record for an existing ID is an edit.
+			s.applyNodeUpsert(n)
 			if uint64(n.ID) > s.nodeSeq.Load() {
 				s.nodeSeq.Store(uint64(n.ID))
 			}
@@ -741,14 +1111,31 @@ func (s *Store) replayWAL() error {
 			if err != nil {
 				return err
 			}
-			s.deltaEdges[e.ID] = e
-			for _, lbl := range e.Labels {
-				s.deltaEdgesByType[lbl] = append(s.deltaEdgesByType[lbl], e.ID)
-			}
-			s.ensureDeltaAdj(e.Src).out = append(s.ensureDeltaAdj(e.Src).out, e.ID)
-			s.ensureDeltaAdj(e.Dst).in = append(s.ensureDeltaAdj(e.Dst).in, e.ID)
+			s.applyEdgeUpsert(e)
 			if uint64(e.ID) > s.edgeSeq.Load() {
 				s.edgeSeq.Store(uint64(e.ID))
+			}
+			return nil
+		},
+		NodeDeleteFunc: func(payload []byte) error {
+			id, err := unmarshalID(payload)
+			if err != nil {
+				return err
+			}
+			s.applyNodeDelete(store.NodeID(id))
+			if id > s.nodeSeq.Load() {
+				s.nodeSeq.Store(id)
+			}
+			return nil
+		},
+		EdgeDeleteFunc: func(payload []byte) error {
+			id, err := unmarshalID(payload)
+			if err != nil {
+				return err
+			}
+			s.applyEdgeDelete(store.EdgeID(id))
+			if id > s.edgeSeq.Load() {
+				s.edgeSeq.Store(id)
 			}
 			return nil
 		},
@@ -799,6 +1186,14 @@ func (s *Store) loadCSR(path string) error {
 			}
 			break
 		}
+	}
+	// Honour the persisted high-water marks so IDs are never reused even when the
+	// record that held the max ID was deleted before this CSR was written.
+	if csr.nodeSeqHW > s.nodeSeq.Load() {
+		s.nodeSeq.Store(csr.nodeSeqHW)
+	}
+	if csr.edgeSeqHW > s.edgeSeq.Load() {
+		s.edgeSeq.Store(csr.edgeSeqHW)
 	}
 	return nil
 }
@@ -986,12 +1381,23 @@ func deserialiseCSR(data []byte) (*CSRGraph, error) {
 		return nil, fmt.Errorf("deserialiseCSR: invalid magic")
 	}
 	version := binary.LittleEndian.Uint16(data[4:6])
-	if version != csrVersionV2 && version != csrVersionV3 && version != csrVersionWithU16Labels {
-		return nil, fmt.Errorf("deserialiseCSR: unsupported version %d (expected %d, %d or %d)", version, csrVersionV2, csrVersionV3, csrVersionWithU16Labels)
+	if version != csrVersionV2 && version != csrVersionV3 && version != csrVersionWithU16Labels && version != csrVersionWithSeqHW {
+		return nil, fmt.Errorf("deserialiseCSR: unsupported version %d (expected %d, %d, %d or %d)", version, csrVersionV2, csrVersionV3, csrVersionWithU16Labels, csrVersionWithSeqHW)
 	}
 	nodeCount := int(binary.LittleEndian.Uint64(data[6:14]))
 	edgeCount := int(binary.LittleEndian.Uint64(data[14:22]))
 	pos := 22
+
+	// Sequence high-water marks (version 5+).
+	var nodeSeqHW, edgeSeqHW uint64
+	if version >= csrVersionWithSeqHW {
+		if len(data) < 38 {
+			return nil, fmt.Errorf("deserialiseCSR: truncated sequence high-water header")
+		}
+		nodeSeqHW = binary.LittleEndian.Uint64(data[22:30])
+		edgeSeqHW = binary.LittleEndian.Uint64(data[30:38])
+		pos = 38
+	}
 
 	nodes := make([]nodeRecord, nodeCount)
 	for i := range nodes {
@@ -1068,6 +1474,8 @@ func deserialiseCSR(data []byte) (*CSRGraph, error) {
 	}
 
 	csr := Build(nodes, edges)
+	csr.nodeSeqHW = nodeSeqHW
+	csr.edgeSeqHW = edgeSeqHW
 	return csr, nil
 }
 
@@ -1123,6 +1531,44 @@ func cloneBytes(src []byte) []byte {
 	return dst
 }
 
+// marshalID encodes an 8-byte little-endian ID payload for tombstone records.
+func marshalID(id uint64) []byte {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, id)
+	return buf
+}
+
+// unmarshalID decodes an 8-byte tombstone payload.
+func unmarshalID(b []byte) (uint64, error) {
+	if len(b) < 8 {
+		return 0, fmt.Errorf("unmarshalID: payload too short (%d bytes)", len(b))
+	}
+	return binary.LittleEndian.Uint64(b[:8]), nil
+}
+
+// removeNodeID returns ids with occurrences of target removed, preserving order.
+// Reuses the backing array; safe because callers hold s.mu and reads copy out.
+func removeNodeID(ids []store.NodeID, target store.NodeID) []store.NodeID {
+	out := ids[:0]
+	for _, id := range ids {
+		if id != target {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// removeEdgeID returns ids with occurrences of target removed, preserving order.
+func removeEdgeID(ids []store.EdgeID, target store.EdgeID) []store.EdgeID {
+	out := ids[:0]
+	for _, id := range ids {
+		if id != target {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 func (s *Store) collectCandidateNodeIDs(ids []store.NodeID) []store.NodeID {
 	if len(ids) > 0 {
 		out := make([]store.NodeID, 0, len(ids))
@@ -1152,9 +1598,13 @@ func (s *Store) collectCandidateNodeIDs(ids []store.NodeID) []store.NodeID {
 	s.mu.RUnlock()
 
 	if s.csr != nil {
+		s.mu.RLock()
 		for i := 1; i < len(s.csr.nodes); i++ {
 			n := s.csr.nodes[i]
 			if n.ID == store.InvalidNodeID {
+				continue
+			}
+			if _, del := s.deletedNodes[n.ID]; del {
 				continue
 			}
 			if _, ok := seen[n.ID]; !ok {
@@ -1162,6 +1612,7 @@ func (s *Store) collectCandidateNodeIDs(ids []store.NodeID) []store.NodeID {
 				out = append(out, n.ID)
 			}
 		}
+		s.mu.RUnlock()
 	}
 
 	return out
@@ -1196,9 +1647,13 @@ func (s *Store) collectCandidateEdgeIDs(ids []store.EdgeID) []store.EdgeID {
 	s.mu.RUnlock()
 
 	if s.csr != nil {
+		s.mu.RLock()
 		for i := 1; i < len(s.csr.edges); i++ {
 			e := s.csr.edges[i]
 			if e.ID == store.InvalidEdgeID {
+				continue
+			}
+			if _, del := s.deletedEdges[e.ID]; del {
 				continue
 			}
 			if _, ok := seen[e.ID]; !ok {
@@ -1206,6 +1661,7 @@ func (s *Store) collectCandidateEdgeIDs(ids []store.EdgeID) []store.EdgeID {
 				out = append(out, e.ID)
 			}
 		}
+		s.mu.RUnlock()
 	}
 
 	return out

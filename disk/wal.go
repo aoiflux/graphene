@@ -18,13 +18,20 @@ import (
 //   0x02 = Edge record
 //   0x03 = Node property index entry
 //   0x04 = Edge property index entry
+//   0x05 = Node delete (tombstone; payload = nodeID:8)
+//   0x06 = Edge delete (tombstone; payload = edgeID:8)
 //   0xFF = Checkpoint (safe truncation marker after compaction)
+//
+// Edits reuse the 0x01/0x02 records: a node/edge record re-appended with an
+// existing ID is applied as an update (last-write-wins) on replay.
 
 const (
 	walRecordNode       byte = 0x01
 	walRecordEdge       byte = 0x02
 	walRecordNodeProp   byte = 0x03
 	walRecordEdgeProp   byte = 0x04
+	walRecordNodeDelete byte = 0x05
+	walRecordEdgeDelete byte = 0x06
 	walRecordCheckpoint byte = 0xFF
 
 	walHeaderSize     = 1 + 4 // type(1) + length(4)
@@ -104,6 +111,16 @@ func (w *WAL) AppendEdgeProp(payload []byte) error {
 	return w.append(walRecordEdgeProp, payload)
 }
 
+// AppendNodeDelete writes a node tombstone (payload = nodeID:8) to the WAL.
+func (w *WAL) AppendNodeDelete(payload []byte) error {
+	return w.append(walRecordNodeDelete, payload)
+}
+
+// AppendEdgeDelete writes an edge tombstone (payload = edgeID:8) to the WAL.
+func (w *WAL) AppendEdgeDelete(payload []byte) error {
+	return w.append(walRecordEdgeDelete, payload)
+}
+
 // Checkpoint writes a checkpoint marker and syncs. After compaction, a
 // checkpoint signals that all records before it are durable in the CSR and
 // the WAL can be safely truncated.
@@ -154,10 +171,12 @@ func (w *WAL) Truncate() error {
 // ReplayCallbacks groups the per-record-type handlers passed to Replay.
 // A nil handler causes records of that type to be silently skipped.
 type ReplayCallbacks struct {
-	NodeFunc     func([]byte) error // called for each 0x01 node record
-	EdgeFunc     func([]byte) error // called for each 0x02 edge record
-	NodePropFunc func([]byte) error // called for each 0x03 node property entry
-	EdgePropFunc func([]byte) error // called for each 0x04 edge property entry
+	NodeFunc       func([]byte) error // called for each 0x01 node record
+	EdgeFunc       func([]byte) error // called for each 0x02 edge record
+	NodePropFunc   func([]byte) error // called for each 0x03 node property entry
+	EdgePropFunc   func([]byte) error // called for each 0x04 edge property entry
+	NodeDeleteFunc func([]byte) error // called for each 0x05 node tombstone
+	EdgeDeleteFunc func([]byte) error // called for each 0x06 edge tombstone
 }
 
 // Replay reads all records from the WAL from the beginning and dispatches each
@@ -230,6 +249,18 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 		case walRecordEdgeProp:
 			if cb.EdgePropFunc != nil {
 				if err := cb.EdgePropFunc(payload); err != nil {
+					return err
+				}
+			}
+		case walRecordNodeDelete:
+			if cb.NodeDeleteFunc != nil {
+				if err := cb.NodeDeleteFunc(payload); err != nil {
+					return err
+				}
+			}
+		case walRecordEdgeDelete:
+			if cb.EdgeDeleteFunc != nil {
+				if err := cb.EdgeDeleteFunc(payload); err != nil {
 					return err
 				}
 			}

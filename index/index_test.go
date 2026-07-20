@@ -175,3 +175,35 @@ func TestPropertyIndex_Entries(t *testing.T) {
 		t.Fatalf("EdgeEntries: got %d, want 1", len(ee))
 	}
 }
+
+func TestPropertyIndex_RemoveNode(t *testing.T) {
+	pi := NewPropertyIndex()
+	pi.IndexNode(1, "sha256", []byte("aaaa"))
+	pi.IndexNode(2, "sha256", []byte("aaaa"))
+	pi.IndexNode(1, "tool", []byte("strings"))
+
+	pi.RemoveNode(1)
+
+	if got := pi.NodesByProperty("sha256", []byte("aaaa")); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("sha256=aaaa after RemoveNode(1): got %v, want [2]", got)
+	}
+	if got := pi.NodesByProperty("tool", []byte("strings")); len(got) != 0 {
+		t.Fatalf("tool=strings after RemoveNode(1): got %v, want []", got)
+	}
+	// The now-empty tool bucket should be gone; node 2 still enumerable.
+	if entries := pi.NodeEntries(); len(entries) != 1 || entries[0].ID != 2 {
+		t.Fatalf("NodeEntries after RemoveNode(1): got %+v, want single entry for node 2", entries)
+	}
+}
+
+func TestPropertyIndex_RemoveEdge(t *testing.T) {
+	pi := NewPropertyIndex()
+	pi.IndexEdge(10, "algo", []byte("tlsh"))
+	pi.IndexEdge(11, "algo", []byte("tlsh"))
+
+	pi.RemoveEdge(10)
+
+	if got := pi.EdgesByProperty("algo", []byte("tlsh")); len(got) != 1 || got[0] != 11 {
+		t.Fatalf("algo=tlsh after RemoveEdge(10): got %v, want [11]", got)
+	}
+}

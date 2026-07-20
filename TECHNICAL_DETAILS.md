@@ -86,6 +86,50 @@ flowchart TD
     SWAP --> TRUNC[Truncate or roll WAL]
 ```
 
+### 3.2.1 Mutation: update and delete
+
+Graphene supports in-place update and delete of nodes and edges without breaking
+the append-only WAL:
+
+- **Update** re-appends a normal node/edge record (`0x01`/`0x02`) carrying the
+  same ID. On replay the record is applied as an upsert (last write wins). Edge
+  endpoints (`Src`/`Dst`) are immutable — an update changes labels, weight and
+  properties only.
+- **Delete** appends a *tombstone* record — `0x05` for a node, `0x06` for an edge
+  — whose payload is just the 8-byte ID.
+
+Deleting a node **cascades**: one edge tombstone is written for every incident
+edge before the node tombstone, so a crash mid-delete never leaves an edge
+pointing at a missing node.
+
+In memory the delta overlay may now *shadow* or *mask* a CSR record with the same
+ID. Two masking sets (`deletedNodes` / `deletedEdges`) hide a still-in-CSR record
+from every read until the next compaction. Reads consult the overlay first, honour
+the masks, and re-validate `NodesByType`/`EdgesByType` candidates against the
+authoritative view so a label edit is reflected. Property-index entries for a
+deleted entity are purged immediately.
+
+**Space is reclaimed at `Compact`**: the rebuilt CSR simply omits masked and
+delta-overridden records, and the masks are cleared. Until then, a deleted CSR
+record still occupies its slot on disk (its space is freed by the next compaction).
+
+**IDs are never reused**, even across a delete-then-compact-then-reopen cycle.
+The monotonic node/edge sequence high-water marks are persisted in the CSR header
+(format v5) and restored on `Open`, so an ID whose record was dropped during
+compaction is never handed out again.
+
+WAL record types:
+
+| Byte   | Record                     |
+|--------|----------------------------|
+| `0x01` | Node (add or update)       |
+| `0x02` | Edge (add or update)       |
+| `0x03` | Node property index entry  |
+| `0x04` | Edge property index entry  |
+| `0x05` | Node tombstone (delete)    |
+| `0x06` | Edge tombstone (delete)    |
+| `0xFF` | Checkpoint                 |
+
 ### 3.3 Why CSR
 
 CSR gives contiguous adjacency reads for neighborhood operations. After

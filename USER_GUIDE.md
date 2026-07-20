@@ -146,6 +146,48 @@ if err != nil {
 }
 ```
 
+### Update nodes and edges
+
+`UpdateNode` / `UpdateEdge` replace an existing entity's labels and properties in
+place (identified by ID). Edge **endpoints are immutable** — an update changes
+labels, weight and properties only; to reconnect an edge, delete it and add a new
+one. Both are durable (survive restart and compaction).
+
+```go
+// Re-classify a node and rewrite its payload.
+_ = g.UpdateNode(&store.Node{
+    ID:         artID,
+    Labels:     []store.NodeType{store.NodeTypeTag},
+    Properties: []byte("reclassified"),
+})
+
+// Adjust an edge's weight/labels (Src/Dst on the struct are ignored).
+_ = g.UpdateEdge(&store.Edge{
+    ID:     eid,
+    Labels: []store.EdgeType{store.EdgeTypeReuse},
+    Weight: 0.42,
+})
+```
+
+> The property index is caller-maintained and is **not** auto-updated by
+> `UpdateNode`/`UpdateEdge`. If you changed an indexed field, re-index it.
+
+### Delete nodes and edges
+
+`DeleteEdge` removes a single edge. `DeleteNode` **cascades** — it also removes
+every edge incident to the node, so the graph never keeps an edge that points at a
+missing node. Deleting a missing entity returns a not-found error you can ignore
+for idempotency. IDs are never reused.
+
+```go
+_ = g.DeleteEdge(eid)  // remove one relationship
+_ = g.DeleteNode(artID) // remove the node and all its edges
+```
+
+Deletes take effect immediately for reads and persist across restart. On the disk
+store the freed space is reclaimed at the next `Compact()` (which rebuilds the CSR
+without the deleted records).
+
 ## 5. Indexing and Bucketing
 
 Property indexing is explicit. You decide which keys become queryable.

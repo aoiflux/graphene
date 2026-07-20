@@ -48,6 +48,14 @@ type CSRGraph struct {
 	// Inbound adjacency.
 	inOffset []uint64
 	inEdges  []store.EdgeID
+
+	// Sequence high-water marks: the largest node/edge IDs ever issued at the
+	// time this CSR was built. Persisted so that IDs are never reused after a
+	// delete-then-compact-then-reopen cycle drops the record that held the max
+	// ID. Zero means "unknown" (older CSR formats) — callers fall back to the
+	// max ID physically present.
+	nodeSeqHW uint64
+	edgeSeqHW uint64
 }
 
 // nodeRecord is the compact per-node record.
@@ -192,12 +200,12 @@ func (g *CSRGraph) EdgeCount() int {
 	return len(g.outEdges)
 }
 
-// Serialise writes the CSR arrays to binary format v4 (variable-length labels
-// and inline property blobs).
+// Serialise writes the CSR arrays to binary format v5 (variable-length labels,
+// inline property blobs, and persisted sequence high-water marks).
 //
 // Format:
 //
-//	[magic:4][version:2=0x0004][nodeCount:8][edgeCount:8]
+//	[magic:4][version:2=0x0005][nodeCount:8][edgeCount:8][nodeSeqHW:8][edgeSeqHW:8]
 //	[nodeRecord * nodeCount] (each: id:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + propLen:4 + props:N)
 //	[rawEdge * edgeCount]    (each: id:8 + src:8 + dst:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + weight:4 + propLen:4 + props:N)
 //	[outOffset * (maxNodeID+2):8 each]
@@ -223,9 +231,12 @@ func (g *CSRGraph) Serialise() []byte {
 
 	// Header
 	buf.Write([]byte("GCSR"))
-	writeUint16(&buf, csrVersionWithU16Labels) // version 4
+	writeUint16(&buf, csrVersionWithSeqHW) // version 5
 	writeUint64(&buf, uint64(nodeCount))
 	writeUint64(&buf, uint64(edgeCount))
+	// Sequence high-water marks (version 5+).
+	writeUint64(&buf, g.nodeSeqHW)
+	writeUint64(&buf, g.edgeSeqHW)
 
 	// Nodes (variable-length labels)
 	for i := 1; i < len(g.nodes); i++ {

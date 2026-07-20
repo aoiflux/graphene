@@ -24,6 +24,8 @@ GrapheneDB is currently in an experimental, pre-production stage.
 - Zero external runtime: no server to manage, no JVM, no sidecar.
 - Typed graph model: predictable APIs with domain-friendly node and edge labels.
 - Durable by design: WAL-backed persistence with replay and explicit compaction.
+- Full mutation lifecycle: create, read, update, and delete nodes and edges —
+  deletes cascade to incident edges and persist across restart.
 
 ## Benchmarked Snapshot (Early Signal)
 
@@ -58,11 +60,31 @@ Scale validation covered by stress tests:
 
 ## Showcased Features
 
+- Full CRUD: add, get, update, and delete nodes and edges (cascade delete).
 - Traversal toolkit: BFS, DFS, provenance chain, shortest path.
 - Query primitives: type lookups, property lookups, degree/connectivity checks.
 - Pattern discovery: scoped VF2-inspired subgraph matching.
 - Persistence lifecycle: open, replay, compact, reopen.
 - Visualization export: interactive HTML graph maps for quick analysis.
+
+## Mutation (update / delete)
+
+Entities can be edited and removed, and every change is durable:
+
+```go
+// Update replaces labels + properties in place (edge endpoints are immutable).
+_ = g.UpdateNode(&store.Node{ID: artID, Labels: []store.NodeType{store.NodeTypeTag}, Properties: []byte("reclassified")})
+_ = g.UpdateEdge(&store.Edge{ID: eid, Labels: []store.EdgeType{store.EdgeTypeReuse}, Weight: 0.42})
+
+// DeleteEdge removes one relationship; DeleteNode cascades to incident edges.
+_ = g.DeleteEdge(eid)
+_ = g.DeleteNode(artID)
+```
+
+On the disk backend, updates and deletes are written to the WAL (deletes as
+tombstone records) and take effect immediately for reads; the freed space is
+reclaimed at the next `Compact()`. IDs are monotonic and never reused. See the
+[API reference](API_REFERENCE.md#mutation) for full semantics.
 
 ## Query Model
 
@@ -130,6 +152,7 @@ go run ./examples
 ## Docs
 
 - Easy usage guide: [USER_GUIDE.md](USER_GUIDE.md)
+- Complete API reference: [API_REFERENCE.md](API_REFERENCE.md)
 - Deep technical architecture and LLD:
   [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md)
 - Engine comparison notes: [comparison.md](comparison.md)

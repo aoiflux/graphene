@@ -14,6 +14,44 @@ type GraphStore interface {
 	// Returns the assigned EdgeID.
 	AddEdge(e *Edge) (EdgeID, error)
 
+	// --- Mutate ---
+
+	// UpdateNode replaces the Labels and Properties of the node identified by
+	// n.ID with the values carried on n. n.ID must reference an existing node
+	// (otherwise *ErrNotFound is returned) and n.Labels must contain at least
+	// one label. The node's ID is never changed.
+	//
+	// UpdateNode does not touch the property index: values registered via
+	// IndexNodeProperty are caller-encoded and decoupled from Properties, so
+	// callers that change indexed fields should re-index explicitly.
+	UpdateNode(n *Node) error
+
+	// UpdateEdge replaces the Labels, Weight and Properties of the edge
+	// identified by e.ID. The endpoints (Src/Dst) are immutable: any Src/Dst
+	// set on e is ignored. Returns *ErrNotFound if the edge does not exist and
+	// requires at least one label. To reconnect an edge, delete it and add a
+	// new one.
+	//
+	// As with UpdateNode, the property index is left untouched.
+	UpdateEdge(e *Edge) error
+
+	// DeleteNode removes the node with the given id and cascades to every edge
+	// incident to it (inbound and outbound), so no edge is ever left pointing
+	// at a missing node. Property-index entries for the node and the cascaded
+	// edges are purged. Returns *ErrNotFound if the node does not exist.
+	//
+	// IDs are never reused: a deleted id is not handed out again.
+	//
+	// Concurrency: DeleteNode is atomic (validation, cascade, and apply happen
+	// under a single lock hold). It is safe to run concurrently with AddEdge on
+	// the same node — the edge is either created before the node is removed (and
+	// then cascaded) or rejected with ErrInvalidEdge. No dangling edge results.
+	DeleteNode(id NodeID) error
+
+	// DeleteEdge removes a single edge and purges its property-index entries.
+	// Returns *ErrNotFound if the edge does not exist.
+	DeleteEdge(id EdgeID) error
+
 	// --- Read: single entity ---
 
 	GetNode(id NodeID) (*Node, error)

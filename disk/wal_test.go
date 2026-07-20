@@ -243,3 +243,52 @@ func TestWAL_RingOverflow_ConcurrentAppendReplay(t *testing.T) {
 		t.Fatalf("replay count mismatch: got %d want %d", count, want)
 	}
 }
+
+func TestWAL_TombstoneRecords(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	wal, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wal.AppendNodeDelete(marshalID(7)); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.AppendEdgeDelete(marshalID(42)); err != nil {
+		t.Fatal(err)
+	}
+	wal.Close()
+
+	wal2, _ := OpenWAL(path)
+	defer wal2.Close()
+
+	var nodeDels, edgeDels []uint64
+	err = wal2.Replay(ReplayCallbacks{
+		NodeDeleteFunc: func(p []byte) error {
+			id, err := unmarshalID(p)
+			if err != nil {
+				return err
+			}
+			nodeDels = append(nodeDels, id)
+			return nil
+		},
+		EdgeDeleteFunc: func(p []byte) error {
+			id, err := unmarshalID(p)
+			if err != nil {
+				return err
+			}
+			edgeDels = append(edgeDels, id)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodeDels) != 1 || nodeDels[0] != 7 {
+		t.Errorf("node deletes: got %v, want [7]", nodeDels)
+	}
+	if len(edgeDels) != 1 || edgeDels[0] != 42 {
+		t.Errorf("edge deletes: got %v, want [42]", edgeDels)
+	}
+}

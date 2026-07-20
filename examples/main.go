@@ -37,6 +37,7 @@ func main() {
 	example9_DiskCompactAndReload()
 	example10_DiskPropertyIndexSurvivesRestart()
 	example11_DiskBulkIngestWithCompaction()
+	example11b_UpdateAndDelete()
 
 	fmt.Println("--- Helper & Utility Examples ---")
 	fmt.Println()
@@ -59,6 +60,12 @@ func main() {
 		fmt.Println("  Skipped (set GRAPHENE_RUN_LIMIT_EXAMPLE=1 to execute).")
 		fmt.Println()
 	}
+
+	fmt.Println("--- Mutation Examples (update / delete) ---")
+	fmt.Println()
+	exampleMutation1_EditEntities()
+	exampleMutation2_DeleteAndCascade()
+	exampleMutation3_ReclassifyAndReindex()
 
 	fmt.Println("--- Visualization Examples ---")
 	fmt.Println()
@@ -635,6 +642,73 @@ func example11_DiskBulkIngestWithCompaction() {
 	batch1Hits, _ := g.NodesByProperty("batch", []byte("1"))
 	batch2Hits, _ := g.NodesByProperty("batch", []byte("2"))
 	fmt.Printf("  Batch-1 artefacts indexed: %d  Batch-2: %d\n", len(batch1Hits), len(batch2Hits))
+
+	fmt.Println()
+}
+
+// ----------------------------------------------------------------------------
+// Example 11b — Update and delete nodes/edges (durable across restart)
+// ----------------------------------------------------------------------------
+//
+// Demonstrates the mutation primitives: UpdateNode/UpdateEdge replace an
+// entity's labels/properties in place (edge endpoints are immutable), and
+// DeleteNode cascades to incident edges. All of it survives Close/reopen.
+func example11b_UpdateAndDelete() {
+	fmt.Println("--- Example 11b: Update and delete (durable) ---")
+
+	dir, err := os.MkdirTemp("", "graphene-ex11b-*")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	var fileID, artID store.NodeID
+
+	// --- Session 1: build, mutate, close ---
+	{
+		g, err := graphene.Open(dir)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		fileID, _ = g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
+		artID, _ = g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}, Properties: []byte("v1")})
+		other, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+		eid, _ := g.AddEdge(&store.Edge{Src: fileID, Dst: artID, Labels: []store.EdgeType{store.EdgeTypeContains}})
+		g.AddEdge(&store.Edge{Src: artID, Dst: other, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}, Weight: 0.5})
+
+		nc, _ := g.NodeCount()
+		ec, _ := g.EdgeCount()
+		fmt.Printf("  Built — nodes: %d  edges: %d\n", nc, ec)
+
+		// Update the artefact's payload and re-weight the Contains edge.
+		g.UpdateNode(&store.Node{ID: artID, Labels: []store.NodeType{store.NodeTypeMicroArtefact}, Properties: []byte("v2-updated")})
+		g.UpdateEdge(&store.Edge{ID: eid, Labels: []store.EdgeType{store.EdgeTypeContains}, Weight: 0.9})
+
+		// Delete the "other" artefact — cascades the SimilarTo edge.
+		g.DeleteNode(other)
+
+		nc, _ = g.NodeCount()
+		ec, _ = g.EdgeCount()
+		fmt.Printf("  After update+delete — nodes: %d  edges: %d (SimilarTo cascaded)\n", nc, ec)
+		g.Close()
+	}
+
+	// --- Session 2: reopen and confirm the mutations persisted ---
+	{
+		g, err := graphene.Open(dir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer g.Close()
+
+		n, _ := g.GetNode(artID)
+		fmt.Printf("  Reopened artefact payload: %q (expected v2-updated)\n", string(n.Properties))
+
+		nc, _ := g.NodeCount()
+		ec, _ := g.EdgeCount()
+		fmt.Printf("  Reopened — nodes: %d  edges: %d\n", nc, ec)
+	}
 
 	fmt.Println()
 }

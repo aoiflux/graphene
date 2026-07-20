@@ -76,6 +76,56 @@ func (p *PropertyIndex) IndexEdge(id store.EdgeID, key string, value []byte) {
 	p.mu.Unlock()
 }
 
+// RemoveNode drops every indexed entry for the given node id across all keys
+// and values. Buckets left empty are removed so they do not accumulate.
+func (p *PropertyIndex) RemoveNode(id store.NodeID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key, m := range p.nodesByProp {
+		for vk, ids := range m {
+			filtered := ids[:0]
+			for _, existing := range ids {
+				if existing != id {
+					filtered = append(filtered, existing)
+				}
+			}
+			if len(filtered) == 0 {
+				delete(m, vk)
+			} else {
+				m[vk] = filtered
+			}
+		}
+		if len(m) == 0 {
+			delete(p.nodesByProp, key)
+		}
+	}
+}
+
+// RemoveEdge drops every indexed entry for the given edge id across all keys
+// and values. Buckets left empty are removed so they do not accumulate.
+func (p *PropertyIndex) RemoveEdge(id store.EdgeID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key, m := range p.edgesByProp {
+		for vk, ids := range m {
+			filtered := ids[:0]
+			for _, existing := range ids {
+				if existing != id {
+					filtered = append(filtered, existing)
+				}
+			}
+			if len(filtered) == 0 {
+				delete(m, vk)
+			} else {
+				m[vk] = filtered
+			}
+		}
+		if len(m) == 0 {
+			delete(p.edgesByProp, key)
+		}
+	}
+}
+
 // NodesByProperty returns all NodeIDs that have an indexed entry for key=value.
 // Returns nil if no match.
 func (p *PropertyIndex) NodesByProperty(key string, value []byte) []store.NodeID {
