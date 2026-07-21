@@ -107,16 +107,29 @@ a hub node with 1 000 inbound edges. The disk fixture is `Compact()`ed first.
 
 | Benchmark | Before | After | Change |
 |---|---:|---:|---:|
-| Equality property query (disk) | 51.83 ms | **550.6 ns** | −100.00% (~94 000×) |
-| Equality property query (memory) | 40.45 ms | **593.1 ns** | −100.00% (~68 000×) |
-| Type + equality property query | 58.09 ms | **20.81 µs** | −99.96% |
-| Typed query, `Limit: 10` (memory) | 10.95 ms | **11.58 µs** | −99.89% |
-| Typed query, `Limit: 10` (disk) | 17.16 ms | **20.83 µs** | −99.88% |
-| Edge query by type (memory) | 44.49 ms | **157.9 µs** | −99.65% |
-| Relation query, both directions (disk) | 64.99 ms | **262.4 µs** | −99.60% |
-| Anchored relation query (disk) | 32.56 ms | **215.8 µs** | −99.34% |
-| Edge query by type (disk) | 38.18 ms | **264.2 µs** | −99.31% |
-| Anchored relation query (memory) | 19.25 ms | **171.4 µs** | −99.11% |
+| Equality property query (disk) | 53.55 ms | **277.0 ns** | −100.00% (~193 000×) |
+| Equality property query (memory) | 44.00 ms | **320.1 ns** | −100.00% (~137 000×) |
+| Type + equality property query (memory) | 58.71 ms | **7.171 µs** | −99.99% (~8 200×) |
+| Typed query, `Limit: 10` (memory) | 13.76 ms | **12.36 µs** | −99.91% |
+| Typed query, `Limit: 10` (disk) | 17.72 ms | **22.29 µs** | −99.87% |
+| Edge query by type (memory) | 56.35 ms | **155.3 µs** | −99.72% |
+| Relation query, both directions (disk) | 80.81 ms | **256.8 µs** | −99.68% |
+| Anchored relation query (disk) | 43.70 ms | **228.7 µs** | −99.48% |
+| Edge query by type (disk) | 40.33 ms | **264.8 µs** | −99.34% |
+| Anchored relation query (memory) | 23.78 ms | **176.0 µs** | −99.26% |
+| `NodesByType`, selective label (disk) | 445.7 µs | **5.059 µs** | −98.87% |
+| Prefix property query (memory) | 48.34 ms | **16.26 ms** | −66.36% |
+| Range property query (disk) | 71.72 ms | **28.86 ms** | −59.75% |
+| Range property query (memory) | 63.00 ms | **28.80 ms** | −54.28% |
+| `NodesByType`, selective label (memory) | 242.5 ns | 225.4 ns | ~ (already indexed) |
+
+The last row is a useful negative: the memory backend already served selective
+labels from postings before this work, so there was nothing to win. The disk
+backend was scanning the CSR, which is the 88× difference between the two rows.
+
+The prefix and range rows are the ones still measured in **milliseconds**. They
+are scans unless the key is declared ordered — see the ordered-index section
+below, where the same queries drop to microseconds.
 
 ### Residual filters — the second filter used to cost a scan
 
@@ -330,7 +343,7 @@ never before quantified.
 
 Reported in full. Each is a trade, and the axis that won is named.
 
-### The one that matters most: property-index memory, +30–65%
+### The one that matters most: property-index memory, +22–53%
 
 This is a **P1 regression**, it is not noise, and it is the price of the P0 wins
 above.
@@ -459,3 +472,317 @@ go test . -tags=stress -bench=Parallel -cpu=1,2,4,8,16 -run='^$'
 ```
 
 Sweep the fixture size with `GRAPHENE_BENCH_NODES` (default 100 000).
+
+---
+
+## Appendix: every benchmark, both sides
+
+Generated from the final interleaved A/B (`036aac0` vs current, three usable
+rounds). `~` means benchstat found no significant difference. Read
+[the resolution caveat](#two-rounds-discarded-and-why-the-resolution-limit-is-25)
+before drawing conclusions from anything under 25%.
+
+### Time (sec/op)
+
+| Benchmark | Baseline | Current | Change |
+|---|---:|---:|---:|
+| `PointLookupNode_Memory` | 34.96n | 26.48n | -24.26% |
+| `PointLookupNode_Disk` | 54.38n | 47.42n | ~ |
+| `NodesByType_Selective_Memory` | 242.5n | 225.4n | ~ |
+| `NodesByType_Selective_Disk` | 445.731µ | 5.059µ | -98.87% |
+| `QueryNodes_TypeLimit10_Memory` | 13755.24µ | 12.36µ | -99.91% |
+| `QueryNodes_TypeLimit10_Disk` | 17718.67µ | 22.29µ | -99.87% |
+| `NodesByProperty_Equal_Memory` | 49.15n | 78.31n | +59.34% |
+| `QueryNodes_PropertyEqual_Memory` | 43995135.5n | 320.1n | -100.00% |
+| `QueryNodes_PropertyEqual_Disk` | 53546608.5n | 277.0n | -100.00% |
+| `QueryNodes_TypeAndPropertyEqual_Memory` | 58712.784µ | 7.171µ | -99.99% |
+| `QueryNodes_PropertyPrefix_Memory` | 48.34m | 16.26m | -66.36% |
+| `QueryNodes_PropertyRange_Memory` | 63.00m | 28.80m | -54.28% |
+| `QueryNodes_PropertyRange_Disk` | 71.72m | 28.86m | -59.75% |
+| `QueryRelations_Anchored_Memory` | 23784.3µ | 176.0µ | -99.26% |
+| `QueryRelations_Anchored_Disk` | 43701.9µ | 228.7µ | -99.48% |
+| `Neighbours1Hop_Memory` | 205.8n | 174.4n | -15.26% |
+| `Neighbours1Hop_Disk` | 466.4n | 414.3n | ~ |
+| `BFS3Hop_Memory` | 3.494µ | 2.628µ | -24.79% |
+| `BFS3Hop_Disk` | 5.239µ | 3.770µ | -28.04% |
+| `Degree_Hub_Memory` | 22289.00n | 27.54n | -99.88% |
+| `Degree_Hub_Disk` | 74334.00n | 15.18n | -99.98% |
+| `DeleteNode_WithPropertyIndex` | 1423.053µ | 2.075µ | -99.85% |
+| `BFS_Deep` | 4.961m | 3.864m | -22.12% |
+| `BFS_Wide` | 3.500m | 2.977m | ~ |
+| `BFS_Disk_Deep` | 84.27µ | 66.78µ | -20.75% |
+| `ReopenCompactedStore` | 1283.50m | 73.60m | -94.27% |
+| `CompactSteadyState` | 648.81m | 64.01m | -90.13% |
+| `DeleteNode_HotLabel_10k` | 3690.0n | 977.0n | -73.52% |
+| `DeleteNode_HotLabel_50k` | 31.309µ | 4.014µ | -87.18% |
+| `UpdateNode_HotLabel_50k` | 49.157µ | 5.162µ | -89.50% |
+| `IndexNodeProperty` | 896.3n | 898.9n | ~ |
+| `Ingest_AddNode_Single` | 657.6n | 699.9n | ~ |
+| `Ingest_AddNodes_Batch100` | 66.11µ | 69.48µ | ~ |
+| `Ingest_AddNodes_Batch1000` | 679.7µ | 663.9µ | ~ |
+| `Ingest_AddEdge_Single` | 394.7n | 420.1n | ~ |
+| `Ingest_EndToEnd_Disk_10k` | 588.3m | 448.8m | -23.71% |
+| `Ingest_AddNode_Disk` | 6.226µ | 6.231µ | ~ |
+| `Scale_PointLookup_10k` | 18.18n | 17.50n | ~ |
+| `Scale_PointLookup_100k` | 26.91n | 31.55n | ~ |
+| `Scale_EqualityQuery_10k` | 3296996.0n | 327.2n | -99.99% |
+| `Scale_EqualityQuery_100k` | 44828172.0n | 285.9n | -100.00% |
+| `Scale_TypeQuery_10k` | 550.956µ | 1.201µ | -99.78% |
+| `Scale_TypeQuery_100k` | 13240.05µ | 12.71µ | -99.90% |
+| `Scale_BFS4Hop_10k` | 6.361µ | 6.136µ | ~ |
+| `Scale_BFS4Hop_100k` | 5.509µ | 5.704µ | ~ |
+| `Walk_DFS_Deep` | 5.108m | 4.410m | -13.66% |
+| `Walk_ProvenanceChain` | 15.94µ | 15.82µ | ~ |
+| `Walk_ShortestPath_Disk` | 1606.4µ | 832.7µ | ~ |
+| `Pattern_TwoHop_Scoped` | 25.58m | 23.55m | ~ |
+| `Subgraph_Induced_1k` | 503.9µ | 440.6µ | -12.55% |
+| `Connect_EdgeExists` | 420.7n | 281.7n | ~ |
+| `Connect_IsConnected_Near` | 157.69µ | 53.99µ | -65.76% |
+| `Connect_NeighboursByNodeType` | 700.5n | 568.5n | -18.84% |
+| `QueryEdges_ByType_Memory` | 56350.7µ | 155.3µ | -99.72% |
+| `QueryEdges_ByType_Disk` | 40333.2µ | 264.8µ | -99.34% |
+| `QueryRelations_Both_Disk` | 80807.5µ | 256.8µ | -99.68% |
+| `Degree_Typed_Disk` | 79.430µ | 7.405µ | -90.68% |
+| `ColdOpen_UncompactedWAL_10k` | 807.8m | 735.8m | -8.91% |
+| `Parallel_PointLookup_Memory` | 48.48n | 47.98n | -1.03% |
+| `Parallel_PointLookup_Disk` | 46.09n | 12.29n | -73.34% |
+| `Parallel_PropertyEqual_Memory` | 44.87n | 37.98n | -15.38% |
+| `Parallel_Neighbours_Memory` | 113.8n | 113.7n | ~ |
+| `Parallel_BFS3Hop_Disk` | 1163.5n | 758.7n | -34.80% |
+| `Parallel_AddNode_Memory` | 815.4n | 757.0n | ~ |
+| `Parallel_IndexNodeProperty_SameKey` | 868.6n | 922.8n | ~ |
+| `Parallel_IndexNodeProperty_DistinctKeys` | 1013.6n | 427.2n | -57.85% |
+| `Parallel_MixedReadWrite_Memory` | 540.9n | 608.0n | ~ |
+| `AddNode` | 696.7n | 757.2n | ~ |
+| `GetNode` | 6.008n | 6.196n | ~ |
+| `BFS` | 426.6µ | 332.6µ | -22.04% |
+| `ShortestPath` | 242.6µ | 202.5µ | -16.55% |
+| `PropertyIndexLookup` | 46.65n | 71.18n | +52.58% |
+
+### Bytes allocated (B/op)
+
+| Benchmark | Baseline | Current | Change |
+|---|---:|---:|---:|
+| `PointLookupNode_Memory` | 0.000 | 0.000 | ~ |
+| `PointLookupNode_Disk` | 64.00 | 64.00 | ~ |
+| `NodesByType_Selective_Memory` | 896.0 | 896.0 | ~ |
+| `NodesByType_Selective_Disk` | 12.227Ki | 4.039Ki | -66.96% |
+| `QueryNodes_TypeLimit10_Memory` | 1568.133Ki | 7.242Ki | -99.54% |
+| `QueryNodes_TypeLimit10_Disk` | 15657.87Ki | 17.59Ki | -99.89% |
+| `NodesByProperty_Equal_Memory` | 8.000 | 8.000 | ~ |
+| `QueryNodes_PropertyEqual_Memory` | 92940286.0 | 176.0 | -100.00% |
+| `QueryNodes_PropertyEqual_Disk` | 100968176.0 | 176.0 | -100.00% |
+| `QueryNodes_TypeAndPropertyEqual_Memory` | 91476.466Ki | 2.781Ki | -100.00% |
+| `QueryNodes_PropertyPrefix_Memory` | 89.841Mi | 1.185Mi | -98.68% |
+| `QueryNodes_PropertyRange_Memory` | 89.841Mi | 1.185Mi | -98.68% |
+| `QueryNodes_PropertyRange_Disk` | 97.497Mi | 8.841Mi | -90.93% |
+| `QueryRelations_Anchored_Memory` | 3160.1Ki | 113.2Ki | -96.42% |
+| `QueryRelations_Anchored_Disk` | 34697.1Ki | 191.5Ki | -99.45% |
+| `Neighbours1Hop_Memory` | 48.00 | 48.00 | ~ |
+| `Neighbours1Hop_Disk` | 504.0 | 504.0 | ~ |
+| `BFS3Hop_Memory` | 1.703Ki | 1.453Ki | -14.68% |
+| `BFS3Hop_Disk` | 4.438Ki | 3.016Ki | -32.04% |
+| `Degree_Hub_Memory` | 8.000Ki | 0.000Ki | -100.00% |
+| `Degree_Hub_Disk` | 175.4Ki | 0.0Ki | -100.00% |
+| `DeleteNode_WithPropertyIndex` | 0.000 | 0.000 | ~ |
+| `BFS_Deep` | 2.102Mi | 1.720Mi | -18.14% |
+| `BFS_Wide` | 3.062Mi | 2.071Mi | -32.35% |
+| `BFS_Disk_Deep` | 81.81Ki | 50.75Ki | -37.97% |
+| `ReopenCompactedStore` | 33.89Mi | 55.29Mi | +63.13% |
+| `CompactSteadyState` | 88.06Mi | 92.23Mi | +4.73% |
+| `DeleteNode_HotLabel_10k` | 0.000 | 0.000 | ~ |
+| `DeleteNode_HotLabel_50k` | 0.000 | 0.000 | ~ |
+| `UpdateNode_HotLabel_50k` | 149.0 | 146.0 | -2.01% |
+| `IndexNodeProperty` | 265.0 | 386.0 | +45.66% |
+| `Ingest_AddNode_Single` | 306.0 | 306.0 | ~ |
+| `Ingest_AddNodes_Batch100` | 30.83Ki | 30.82Ki | ~ |
+| `Ingest_AddNodes_Batch1000` | 299.6Ki | 260.4Ki | ~ |
+| `Ingest_AddEdge_Single` | 282.0 | 282.0 | ~ |
+| `Ingest_EndToEnd_Disk_10k` | 44.85Mi | 52.20Mi | +16.39% |
+| `Ingest_AddNode_Disk` | 355.0 | 356.0 | ~ |
+| `Scale_PointLookup_10k` | 0.000 | 0.000 | ~ |
+| `Scale_PointLookup_100k` | 0.000 | 0.000 | ~ |
+| `Scale_EqualityQuery_10k` | 7190904.0 | 176.0 | -100.00% |
+| `Scale_EqualityQuery_100k` | 92940281.5 | 176.0 | -100.00% |
+| `Scale_TypeQuery_10k` | 163976.0 | 680.0 | -99.59% |
+| `Scale_TypeQuery_100k` | 1568.133Ki | 7.242Ki | -99.54% |
+| `Scale_BFS4Hop_10k` | 3.930Ki | 3.328Ki | -15.31% |
+| `Scale_BFS4Hop_100k` | 3.453Ki | 2.953Ki | -14.48% |
+| `Walk_DFS_Deep` | 1.949Mi | 1.720Mi | -11.74% |
+| `Walk_ProvenanceChain` | 8.010Ki | 8.010Ki | ~ |
+| `Walk_ShortestPath_Disk` | 1848.9Ki | 419.6Ki | -77.30% |
+| `Pattern_TwoHop_Scoped` | 3.605Mi | 3.605Mi | ~ |
+| `Subgraph_Induced_1k` | 251.7Ki | 251.7Ki | ~ |
+| `Connect_EdgeExists` | 16.00 | 16.00 | ~ |
+| `Connect_IsConnected_Near` | 106.76Ki | 51.28Ki | -51.96% |
+| `Connect_NeighboursByNodeType` | 62.00 | 62.00 | ~ |
+| `QueryEdges_ByType_Memory` | 3152.5Ki | 105.5Ki | -96.65% |
+| `QueryEdges_ByType_Disk` | 34689.5Ki | 235.8Ki | -99.32% |
+| `QueryRelations_Both_Disk` | 69446.3Ki | 251.9Ki | -99.64% |
+| `Degree_Typed_Disk` | 175.2Ki | 0.0Ki | -100.00% |
+| `ColdOpen_UncompactedWAL_10k` | 12.07Mi | 16.74Mi | +38.67% |
+| `Footprint_Memory_TopologyOnly` | 15.14Mi | 88.32Mi | +483.38% |
+| `Footprint_Disk_TopologyOnly` | 294.3Mi | 306.4Mi | +4.10% |
+| `Footprint_Memory_WithPropertyIndex` | 118.7Mi | 156.5Mi | +31.90% |
+| `Footprint_Disk_WithPropertyIndex` | 457.6Mi | 516.6Mi | +12.90% |
+| `Footprint_Memory_WithOrderedKey` | 118.7Mi | 158.6Mi | +33.61% |
+| `Footprint_Disk_HalfDeleted_Uncompacted` | 331.2Mi | 343.3Mi | +3.65% |
+| `Footprint_Disk_HalfDeleted_Compacted` | 362.8Mi | 376.7Mi | +3.84% |
+| `Footprint_PropIndex_Cardinality1` | 0.000Mi | 8.252Mi | ? |
+| `Footprint_PropIndex_Cardinality100` | 0.00Mi | 16.41Mi | ? |
+| `Footprint_PropIndex_Cardinality10k` | 0.00Mi | 43.84Mi | ? |
+| `Footprint_PropIndex_CardinalityAll` | 0.00Mi | 50.54Mi | ? |
+| `Footprint_PropIndex_NoIndex` | 0.000 | 0.000 | ~ |
+| `Footprint_DiskFileSize` | 457.6Mi | 516.6Mi | +12.90% |
+| `Parallel_PointLookup_Memory` | 0.000 | 0.000 | ~ |
+| `Parallel_PointLookup_Disk` | 64.00 | 64.00 | ~ |
+| `Parallel_PropertyEqual_Memory` | 8.000 | 8.000 | ~ |
+| `Parallel_Neighbours_Memory` | 48.00 | 48.00 | ~ |
+| `Parallel_BFS3Hop_Disk` | 4.629Ki | 3.162Ki | -31.69% |
+| `Parallel_AddNode_Memory` | 263.0 | 260.0 | ~ |
+| `Parallel_IndexNodeProperty_SameKey` | 199.5 | 376.5 | +88.72% |
+| `Parallel_IndexNodeProperty_DistinctKeys` | 217.5 | 427.0 | +96.32% |
+| `Parallel_MixedReadWrite_Memory` | 54.00 | 55.00 | ~ |
+| `AddNode` | 306.0 | 306.0 | ~ |
+| `GetNode` | 0.000 | 0.000 | ~ |
+| `BFS` | 218.3Ki | 179.5Ki | -17.77% |
+| `ShortestPath` | 114.16Ki | 98.12Ki | -14.06% |
+| `PropertyIndexLookup` | 8.000 | 8.000 | ~ |
+
+### Allocation count (allocs/op)
+
+| Benchmark | Baseline | Current | Change |
+|---|---:|---:|---:|
+| `PointLookupNode_Memory` | 0.000 | 0.000 | ~ |
+| `PointLookupNode_Disk` | 1.000 | 1.000 | ~ |
+| `NodesByType_Selective_Memory` | 1.000 | 1.000 | ~ |
+| `NodesByType_Selective_Disk` | 110.000 | 5.000 | -95.45% |
+| `QueryNodes_TypeLimit10_Memory` | 5.000 | 16.000 | +220.00% |
+| `QueryNodes_TypeLimit10_Disk` | 100562.0 | 123.0 | -99.88% |
+| `NodesByProperty_Equal_Memory` | 1.000 | 1.000 | ~ |
+| `QueryNodes_PropertyEqual_Memory` | 300043.000 | 4.000 | -100.00% |
+| `QueryNodes_PropertyEqual_Disk` | 300600.000 | 4.000 | -100.00% |
+| `QueryNodes_TypeAndPropertyEqual_Memory` | 300063.000 | 5.000 | -100.00% |
+| `QueryNodes_PropertyPrefix_Memory` | 300201.00 | 27.00 | -99.99% |
+| `QueryNodes_PropertyRange_Memory` | 300201.00 | 27.00 | -99.99% |
+| `QueryNodes_PropertyRange_Disk` | 300758.0 | 584.0 | -99.81% |
+| `QueryRelations_Anchored_Memory` | 5.000 | 36.000 | +620.00% |
+| `QueryRelations_Anchored_Disk` | 202.077k | 1.038k | -99.49% |
+| `Neighbours1Hop_Memory` | 2.000 | 2.000 | ~ |
+| `Neighbours1Hop_Disk` | 8.000 | 8.000 | ~ |
+| `BFS3Hop_Memory` | 33.00 | 23.00 | -30.30% |
+| `BFS3Hop_Disk` | 70.00 | 45.00 | -35.71% |
+| `Degree_Hub_Memory` | 1.000 | 0.000 | -100.00% |
+| `Degree_Hub_Disk` | 1.014k | 0.000k | -100.00% |
+| `DeleteNode_WithPropertyIndex` | 0.000 | 0.000 | ~ |
+| `BFS_Deep` | 30190.0 | 198.0 | -99.34% |
+| `BFS_Wide` | 1323.0 | 237.0 | -82.09% |
+| `BFS_Disk_Deep` | 913.0 | 395.0 | -56.74% |
+| `ReopenCompactedStore` | 557.4k | 558.1k | +0.13% |
+| `CompactSteadyState` | 300.2k | 100.2k | -66.61% |
+| `DeleteNode_HotLabel_10k` | 0.000 | 0.000 | ~ |
+| `DeleteNode_HotLabel_50k` | 0.000 | 0.000 | ~ |
+| `UpdateNode_HotLabel_50k` | 4.000 | 4.000 | ~ |
+| `IndexNodeProperty` | 5.000 | 5.000 | ~ |
+| `Ingest_AddNode_Single` | 3.000 | 3.000 | ~ |
+| `Ingest_AddNodes_Batch100` | 302.0 | 302.0 | ~ |
+| `Ingest_AddNodes_Batch1000` | 3.015k | 3.011k | ~ |
+| `Ingest_AddEdge_Single` | 2.000 | 2.000 | ~ |
+| `Ingest_EndToEnd_Disk_10k` | 553.3k | 523.6k | -5.36% |
+| `Ingest_AddNode_Disk` | 6.000 | 6.000 | ~ |
+| `Scale_PointLookup_10k` | 0.000 | 0.000 | ~ |
+| `Scale_PointLookup_100k` | 0.000 | 0.000 | ~ |
+| `Scale_EqualityQuery_10k` | 30032.000 | 4.000 | -99.99% |
+| `Scale_EqualityQuery_100k` | 300043.000 | 4.000 | -100.00% |
+| `Scale_TypeQuery_10k` | 5.000 | 7.000 | +40.00% |
+| `Scale_TypeQuery_100k` | 5.000 | 16.000 | +220.00% |
+| `Scale_BFS4Hop_10k` | 51.00 | 32.00 | -37.25% |
+| `Scale_BFS4Hop_100k` | 47.00 | 29.00 | -38.30% |
+| `Walk_DFS_Deep` | 20193.0 | 196.0 | -99.03% |
+| `Walk_ProvenanceChain` | 90.00 | 90.00 | ~ |
+| `Walk_ShortestPath_Disk` | 12872.0 | 124.0 | -99.04% |
+| `Pattern_TwoHop_Scoped` | 399.9k | 399.9k | ~ |
+| `Subgraph_Induced_1k` | 1.045k | 1.045k | ~ |
+| `Connect_EdgeExists` | 1.000 | 1.000 | ~ |
+| `Connect_IsConnected_Near` | 54.00 | 37.00 | -31.48% |
+| `Connect_NeighboursByNodeType` | 3.000 | 3.000 | ~ |
+| `QueryEdges_ByType_Memory` | 5.000 | 31.000 | +520.00% |
+| `QueryEdges_ByType_Disk` | 202.077k | 1.040k | -99.49% |
+| `QueryRelations_Both_Disk` | 404.164k | 1.056k | -99.74% |
+| `Degree_Typed_Disk` | 1.012k | 0.000k | -100.00% |
+| `ColdOpen_UncompactedWAL_10k` | 284.6k | 314.9k | +10.67% |
+| `Footprint_Memory_TopologyOnly` | 291.8k | 1702.4k | +483.38% |
+| `Footprint_Disk_TopologyOnly` | 2.602M | 2.603M | +0.01% |
+| `Footprint_Memory_WithPropertyIndex` | 2.967M | 3.095M | +4.29% |
+| `Footprint_Disk_WithPropertyIndex` | 5.368M | 4.895M | -8.80% |
+| `Footprint_Memory_WithOrderedKey` | 2.967M | 3.103M | +4.56% |
+| `Footprint_Disk_HalfDeleted_Uncompacted` | 3.354M | 3.354M | +0.01% |
+| `Footprint_Disk_HalfDeleted_Compacted` | 3.354M | 3.354M | +0.01% |
+| `Footprint_PropIndex_Cardinality1` | 0.0k | 128.8k | ? |
+| `Footprint_PropIndex_Cardinality100` | 0.0k | 263.4k | ? |
+| `Footprint_PropIndex_Cardinality10k` | 0.0k | 787.0k | ? |
+| `Footprint_PropIndex_CardinalityAll` | 0.0k | 826.5k | ? |
+| `Footprint_PropIndex_NoIndex` | 0.000 | 0.000 | ~ |
+| `Footprint_DiskFileSize` | 5.368M | 4.895M | -8.80% |
+| `Parallel_PointLookup_Memory` | 0.000 | 0.000 | ~ |
+| `Parallel_PointLookup_Disk` | 1.000 | 1.000 | ~ |
+| `Parallel_PropertyEqual_Memory` | 1.000 | 1.000 | ~ |
+| `Parallel_Neighbours_Memory` | 2.000 | 2.000 | ~ |
+| `Parallel_BFS3Hop_Disk` | 71.00 | 46.00 | -35.21% |
+| `Parallel_AddNode_Memory` | 3.000 | 3.000 | ~ |
+| `Parallel_IndexNodeProperty_SameKey` | 5.000 | 5.000 | ~ |
+| `Parallel_IndexNodeProperty_DistinctKeys` | 6.000 | 6.000 | ~ |
+| `Parallel_MixedReadWrite_Memory` | 2.000 | 2.000 | ~ |
+| `AddNode` | 3.000 | 3.000 | ~ |
+| `GetNode` | 0.000 | 0.000 | ~ |
+| `BFS` | 3058.00 | 66.00 | -97.84% |
+| `ShortestPath` | 1563.0 | 576.0 | -63.15% |
+| `PropertyIndexLookup` | 1.000 | 1.000 | ~ |
+
+### Time per node (sec/node)
+
+| Benchmark | Baseline | Current | Change |
+|---|---:|---:|---:|
+| `Ingest_AddNodes_Batch100` | 661.1n | 694.8n | ~ |
+| `Ingest_AddNodes_Batch1000` | 679.8n | 663.9n | ~ |
+| `Footprint_Memory_TopologyOnly` | 223.1 | 223.1 | ~ |
+| `Footprint_Disk_TopologyOnly` | 135.3 | 149.2 | +10.27% |
+| `Footprint_Memory_WithPropertyIndex` | 281.9 | 421.6 | +49.56% |
+| `Footprint_Disk_WithPropertyIndex` | 194.2 | 346.5 | +78.42% |
+| `Footprint_Memory_WithOrderedKey` | 281.9 | 426.9 | +51.44% |
+| `Footprint_Disk_HalfDeleted_Uncompacted` | 659.6 | 714.9 | +8.38% |
+| `Footprint_Disk_HalfDeleted_Compacted` | 149.0 | 158.0 | +6.04% |
+| `Footprint_DiskFileSize` | 124.0 | 111.5 | -10.08% |
+
+### Resident bytes per node (B/node)
+
+| Benchmark | Baseline | Current | Change |
+|---|---:|---:|---:|
+| `Footprint_Memory_TopologyOnly` | 446.1 | 446.2 | +0.02% |
+| `Footprint_Disk_TopologyOnly` | 270.7 | 298.3 | +10.20% |
+| `Footprint_Memory_WithPropertyIndex` | 563.8 | 843.2 | +49.56% |
+| `Footprint_Disk_WithPropertyIndex` | 388.4 | 693.0 | +78.42% |
+| `Footprint_Memory_WithOrderedKey` | 563.8 | 853.8 | +51.44% |
+| `Footprint_Disk_HalfDeleted_Uncompacted` | 659.6 | 714.9 | +8.38% |
+| `Footprint_Disk_HalfDeleted_Compacted` | 149.0 | 158.0 | +6.04% |
+| `Footprint_PropIndex_Cardinality1` | 179.0 | 295.6 | +65.14% |
+| `Footprint_PropIndex_Cardinality100` | 180.5 | 297.0 | +64.54% |
+| `Footprint_PropIndex_Cardinality10k` | 194.0 | 307.4 | +58.45% |
+| `Footprint_PropIndex_CardinalityAll` | 281.1 | 365.7 | +30.10% |
+| `Footprint_PropIndex_NoIndex` | 170.1 | 170.2 | +0.06% |
+| `Footprint_DiskFileSize` | 248.0 | 223.0 | -10.08% |
+| `Footprint_Memory_TopologyOnly` | 42.55 | 42.55 | ~ |
+| `Footprint_Disk_TopologyOnly` | 25.82 | 28.45 | +10.19% |
+| `Footprint_Memory_WithPropertyIndex` | 53.77 | 80.41 | +49.54% |
+| `Footprint_Disk_WithPropertyIndex` | 37.04 | 66.09 | +78.43% |
+| `Footprint_Memory_WithOrderedKey` | 53.77 | 81.43 | +51.44% |
+| `Footprint_Disk_HalfDeleted_Uncompacted` | 31.45 | 34.09 | +8.39% |
+| `Footprint_Disk_HalfDeleted_Compacted` | 7.106 | 7.536 | +6.05% |
+| `Footprint_PropIndex_Cardinality1` | 17.07 | 28.19 | +65.14% |
+| `Footprint_PropIndex_Cardinality100` | 17.21 | 28.32 | +64.56% |
+| `Footprint_PropIndex_Cardinality10k` | 18.50 | 29.31 | +58.43% |
+| `Footprint_PropIndex_CardinalityAll` | 26.81 | 34.87 | +30.06% |
+| `Footprint_PropIndex_NoIndex` | 16.23 | 16.23 | ~ |
+| `Footprint_DiskFileSize` | 12.68 | 21.27 | +67.74% |
+| `Footprint_DiskFileSize` | 10.97 | 0.00 | -100.00% |
+

@@ -36,6 +36,8 @@ import (
 16. [Concurrency & guarantees](#16-concurrency--guarantees)
 17. [Index maintenance](#17-index-maintenance)
 18. [Query plans](#18-query-plans)
+19. [Choosing indexes: a tuning guide](#19-choosing-indexes-a-tuning-guide)
+20. [Process lifecycle](#20-process-lifecycle)
 
 ---
 
@@ -480,6 +482,32 @@ func (g *Graph) NeighboursByNodeType(id store.NodeID, dir store.Direction, nodeT
 
 ## 12. Traversal & patterns
 
+### Walking without building records
+
+```go
+func (g *Graph) BFSIDs(origin store.NodeID, maxDepth int, dir store.Direction,
+    edgeTypes []store.EdgeType) ([]store.NodeID, error)
+```
+
+Returns the reachable node IDs within `maxDepth` and nothing else — no
+`*store.Node`, no `*store.Edge`, no property blobs copied. On a 12-hop walk this
+is **20 allocations against 394** for the record-returning `BFS`.
+
+Reach for it whenever the records are not the point: reachability checks,
+scoping a pattern match, or producing IDs to feed into a follow-up query.
+
+```go
+ids, _ := g.BFSIDs(artID, 3, store.DirectionBoth, nil)
+scoped, _ := g.QueryNodes(store.NodeQuery{
+    IDs:     ids,
+    Filters: []store.PropertyFilter{{Key: "tool", Op: store.PropertyOpEqual, Value: []byte("acquire")}},
+})
+```
+
+The node *set* is identical to `BFS`'s for the same arguments; only the absence
+of records differs.
+
+
 ```go
 func (g *Graph) BFS(origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) (*traversal.BFSResult, error)
 func (g *Graph) DFS(origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) (*traversal.BFSResult, error)
@@ -787,3 +815,149 @@ may change as the cost model improves. The results a query returns may not.
 `ExplainNodeQuery` runs the driving step for real, because the candidate count is
 what decides how each residual is applied, then stops. So it costs the driver,
 not the whole query — except for the result count, which requires running it.
+
+---
+
+## 19. Choosing indexes: a tuning guide
+
+Indexing is opt-in here, which means the decision is yours and it is possible to
+get it wrong in both directions. This section is the guidance for making it.
+
+### The one rule
+
+> Index a key when it removes an O(N) scan from a path you have measured, and
+> when you can afford the write cost on every mutation touching that key.
+
+Everything below is that rule applied to specific situations.
+
+### What each operator costs
+
+| Operator | With the key indexed | Declared ordered | Notes |
+|---|---|---|---|
+| `Equal` | **O(1)** postings lookup | same | always the fastest path |
+| `Prefix` | scan of that key's entries | **O(log n + k)** | declaring pays here |
+| `GreaterThan` / `LessThan` / `Between` (and `…OrEqual`) | scan of that key's entries | **O(log n + k)** | declaring pays here |
+| `Contains` | scan of that key's entries | **scan** — no benefit | cannot be bounded by any ordering |
+
+"Scan of that key's entries" is not a scan of the graph — it visits only what is
+registered under that key. But it is still linear in that, which is why a
+selective driver plus a `Contains` residual now probes candidates instead (§18).
+
+### When to index a key
+
+**Index it when:**
+
+- You filter on it with `Equal` and the value is selective. A `sha256` unique per
+  node is the ideal case: the postings list has one entry, so the query is
+  effectively a hash lookup.
+- You filter on it in most queries, even at moderate selectivity. A `bucket` key
+  with 1 000 distinct values across 100 000 nodes still cuts candidates 100×
+  before any residual work.
+- It is the key you would *drive* from. Only one filter drives a query; the rest
+  are residuals. Indexing a key you always pair with a better one buys less than
+  it looks.
+
+**Do not index it when:**
+
+- You only ever use `Contains` on it. No index helps, and you pay the write and
+  memory cost for nothing.
+- It is low-cardinality *and* unselective — a boolean-ish key where every value
+  matches half the graph. The postings list is enormous and the driver will
+  rightly ignore it.
+- You never filter on it. Storing a value in the property blob does **not**
+  require indexing it; the blob is opaque to the engine and costs nothing extra.
+
+### When to declare a key ordered
+
+`DeclareOrderedProperty` builds a sorted structure over one key's values. It
+turns range and prefix filters from a scan into two binary searches, measured at
+22.8 ms → 2.3 ms on a wide range and 11.8 ms → 59 µs on a narrow one.
+
+**Declare it when** you run range, `Between`, or prefix queries on that key and
+the values are encoded so byte order matches your intent — use `index/encoding`.
+
+**Do not declare it when:**
+
+- You only use `Equal` on it. Equality is already O(1); the ordered structure is
+  pure overhead.
+- You only use `Contains`. It cannot be served either way.
+- The values are numeric-looking strings you have *not* encoded. Declaring
+  switches the key to byte-wise comparison, so `"9"` sorts after `"10"`, and
+  results will change. This is a semantics change, not just a performance one —
+  see §9a.
+
+Declaring costs **~10.5 B per node** for a key with 1 000 distinct values,
+scaling with *distinct values* rather than entries.
+
+### What indexing costs you
+
+Be concrete about the bill before adding a key:
+
+| Axis | Cost |
+|---|---|
+| Memory | **~104–174 B per indexed entry**, depending on cardinality |
+| Write | registration maintains sorted postings and a reverse map; ~2× allocations |
+| Delete | *cheaper*, not dearer — the reverse map makes removal proportional to the entity's own entries |
+
+Memory is where indexing hurts most. A store indexing three keys on every node
+carries roughly **777 B per node in memory** against 446 B for topology alone.
+If a workload is memory-bound rather than query-bound, indexing fewer keys is a
+legitimate answer.
+
+### Diagnosing a slow query
+
+Use `ExplainNodeQuery` (§18) rather than guessing:
+
+```go
+plan, _ := g.ExplainNodeQuery(q)
+fmt.Println(plan)
+// driver=equality(sha256) candidates=1 residual=tool:probe~100000 results=1
+```
+
+| What you see | What it means | What to do |
+|---|---|---|
+| `driver=scan` | nothing bounded the query | index a key you filter on |
+| `driver=labels` with huge `candidates` | the label is unselective | add a selective property filter |
+| `residual=k:set~<big>` where big ≫ candidates | that filter built a large set | usually a range on an undeclared key — declare it |
+| `candidates` ≫ `results` | the driver is weak | a different key would drive better |
+
+### Rules of thumb
+
+1. **Measure before indexing.** The planner is exact about equality cardinality;
+   your intuition about selectivity usually is not.
+2. **One good driver beats three mediocre indexes.** Only one filter drives.
+3. **Property blobs are free; indexes are not.** Store everything, index what you
+   query.
+4. **`Compact()` after bulk deletion.** Uncompacted stores cost 4.5× the memory
+   per live node.
+5. **Re-declare ordered keys after reopening.** Declarations are a runtime
+   choice, not stored data.
+
+---
+
+## 20. Process lifecycle
+
+```go
+func (g *Graph) HandleSignals(signals ...os.Signal) func()
+```
+
+Installs a handler that closes the graph cleanly when the process receives one of
+`signals`, and returns a function that uninstalls it. The defaults are
+platform-specific: `os.Interrupt` and `SIGTERM` everywhere, plus `SIGQUIT` on
+Unix.
+
+```go
+g, _ := graphene.Open("./case-01")
+defer g.Close()
+stop := g.HandleSignals()
+defer stop()
+```
+
+This matters more than it looks on the disk backend. A write is durable once its
+WAL append returns, so an abrupt kill does not lose committed data — but it does
+leave the WAL unconsolidated, which makes the next `Open` replay every record
+written since the last `Compact()`. Closing cleanly is what keeps restart cost
+proportional to recent work rather than to the whole log.
+
+The returned uninstall function exists so tests and embedded uses can avoid
+leaving a global signal handler behind.

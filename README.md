@@ -187,8 +187,10 @@ resolvable here**; the order-of-magnitude results are solid and anything in the
 tens of percent is directional. The footprint table above is exempt, being
 deterministic measurement rather than timing.
 
-Full methodology and the per-benchmark detail are in
-[benchmarks.md](benchmarks.md).
+This is the summary. [benchmarks.md](benchmarks.md) carries the full detail:
+methodology, the fixture, per-area breakdowns, the regressions in full, what is
+still slow, and an appendix listing **every benchmark on both sides** across
+time, bytes, allocations and per-node footprint.
 
 Full methodology, per-benchmark detail, and the remaining slow paths are in
 [benchmarks.md](benchmarks.md); the roadmap is in [plan.md](plan.md).
