@@ -57,6 +57,9 @@ func TestMain(m *testing.M) {
 	if diskFixtureDir != "" {
 		os.RemoveAll(diskFixtureDir)
 	}
+	if orderedDskDir != "" {
+		os.RemoveAll(orderedDskDir)
+	}
 	os.Exit(code)
 }
 
@@ -352,6 +355,144 @@ func BenchmarkQueryNodes_PropertyRange_Disk(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// --- Ordered (range) index ---
+//
+// The fixture's "score" and "bucket" values are zero-padded fixed-width strings,
+// so byte order already matches their intended order and declaring them ordered
+// does not change any result — only how the range is found.
+
+var (
+	orderedMemOnce  sync.Once
+	orderedMemGraph *benchFixture
+	orderedDskOnce  sync.Once
+	orderedDskGraph *benchFixture
+	orderedDskDir   string
+)
+
+func orderedMemory() *benchFixture {
+	orderedMemOnce.Do(func() {
+		f := buildFixture(graphene.NewInMemory(), benchNodeCount)
+		declareOrdered(f.g)
+		orderedMemGraph = f
+	})
+	return orderedMemGraph
+}
+
+func orderedDisk() *benchFixture {
+	orderedDskOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "graphene-ordered-bench-*")
+		if err != nil {
+			panic(err)
+		}
+		orderedDskDir = dir
+		g, err := graphene.Open(dir)
+		if err != nil {
+			panic(err)
+		}
+		f := buildFixture(g, benchNodeCount)
+		if err := g.Compact(); err != nil {
+			panic(err)
+		}
+		declareOrdered(g)
+		orderedDskGraph = f
+	})
+	return orderedDskGraph
+}
+
+func declareOrdered(g *graphene.Graph) {
+	for _, k := range []string{"score", "bucket"} {
+		if err := g.DeclareOrderedProperty(k); err != nil {
+			panic(err)
+		}
+	}
+}
+
+func BenchmarkQueryNodes_PropertyRange_Ordered_Memory(b *testing.B) {
+	f := orderedMemory()
+	q := store.NodeQuery{Filters: []store.PropertyFilter{
+		{Key: "score", Op: store.PropertyOpBetweenInclusive, Value: []byte("000100"), ValueUpper: []byte("000200")},
+	}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryNodes_PropertyRange_Ordered_Disk(b *testing.B) {
+	f := orderedDisk()
+	q := store.NodeQuery{Filters: []store.PropertyFilter{
+		{Key: "score", Op: store.PropertyOpBetweenInclusive, Value: []byte("000100"), ValueUpper: []byte("000200")},
+	}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryNodes_PropertyPrefix_Ordered_Memory(b *testing.B) {
+	f := orderedMemory()
+	q := store.NodeQuery{Filters: []store.PropertyFilter{
+		{Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("bucket-00")},
+	}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// A narrow range — the shape an ordered index helps most, where a scan still
+// visits every entry under the key but a binary search visits almost none.
+func BenchmarkQueryNodes_PropertyRange_Narrow_Ordered_Memory(b *testing.B) {
+	f := orderedMemory()
+	q := store.NodeQuery{Filters: []store.PropertyFilter{
+		{Key: "score", Op: store.PropertyOpBetweenInclusive, Value: []byte("000500"), ValueUpper: []byte("000502")},
+	}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryNodes_PropertyRange_Narrow_Scan_Memory(b *testing.B) {
+	f := memGraph()
+	q := store.NodeQuery{Filters: []store.PropertyFilter{
+		{Key: "score", Op: store.PropertyOpBetweenInclusive, Value: []byte("000500"), ValueUpper: []byte("000502")},
+	}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Declaring an ordered key over an already-populated index: the one-off build cost.
+func BenchmarkDeclareOrderedProperty(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		g := graphene.NewInMemory()
+		buildFixture(g, 20_000)
+		b.StartTimer()
+		if err := g.DeclareOrderedProperty("score"); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -751,6 +892,80 @@ func BenchmarkVerifyIndexes_Disk(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if err := f.g.VerifyIndexes(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Deleting from a label with many members. Label postings are the last index
+// still stored unsorted, so removal rewrites the whole list: one delete from a
+// 50 000-member label costs 50 000 comparisons.
+//
+// No property index here, so label-postings maintenance is the only cost in
+// frame.
+func benchmarkDeleteFromHotLabel(b *testing.B, members int) {
+	g := graphene.NewInMemory()
+	fill := func() []store.NodeID {
+		nodes := make([]*store.Node, members)
+		for i := range nodes {
+			nodes[i] = &store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}}
+		}
+		ids, err := g.AddNodes(nodes)
+		if err != nil {
+			b.Fatal(err)
+		}
+		return ids
+	}
+
+	ids := fill()
+	cursor := 0
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if cursor >= len(ids) {
+			b.StopTimer()
+			ids = fill()
+			cursor = 0
+			b.StartTimer()
+		}
+		if err := g.GraphStore.DeleteNode(ids[cursor]); err != nil {
+			b.Fatal(err)
+		}
+		cursor++
+	}
+}
+
+func BenchmarkDeleteNode_HotLabel_10k(b *testing.B) { benchmarkDeleteFromHotLabel(b, 10_000) }
+func BenchmarkDeleteNode_HotLabel_50k(b *testing.B) { benchmarkDeleteFromHotLabel(b, 50_000) }
+
+// Relabelling also reconciles the postings: remove from every old label, append
+// to every new one.
+func BenchmarkUpdateNode_HotLabel_50k(b *testing.B) {
+	const members = 50_000
+	g := graphene.NewInMemory()
+	nodes := make([]*store.Node, members)
+	for i := range nodes {
+		nodes[i] = &store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}}
+	}
+	ids, err := g.AddNodes(nodes)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Alternate the label so each update genuinely moves the node between
+		// two large postings lists.
+		lbl := store.NodeTypeMicroArtefact
+		if i%2 == 1 {
+			lbl = store.NodeTypeEvidenceFile
+		}
+		if err := g.GraphStore.UpdateNode(&store.Node{
+			ID:     ids[i%len(ids)],
+			Labels: []store.NodeType{lbl},
+		}); err != nil {
 			b.Fatal(err)
 		}
 	}

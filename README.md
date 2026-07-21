@@ -45,11 +45,15 @@ results:
 
 | Benchmark             |       Result |                      Memory |
 | --------------------- | -----------: | --------------------------: |
-| Add node              |  698.8 ns/op |       305 B/op, 3 allocs/op |
-| Get node              |  6.088 ns/op |         0 B/op, 0 allocs/op |
-| BFS traversal         | 637700 ns/op |   234240 B/op, 77 allocs/op |
-| Shortest path         | 351200 ns/op |  100472 B/op, 576 allocs/op |
-| Property index lookup |  46.95 ns/op |          8 B/op, 1 alloc/op |
+| Add node              |  814.0 ns/op |       306 B/op, 3 allocs/op |
+| Get node              |  5.815 ns/op |         0 B/op, 0 allocs/op |
+| BFS traversal         | 353200 ns/op |   234240 B/op, 77 allocs/op |
+| Shortest path         | 188300 ns/op |  100472 B/op, 576 allocs/op |
+| Property index lookup |  42.78 ns/op |          8 B/op, 1 alloc/op |
+
+The suite now runs **68 benchmarks** covering reads, writes, concurrency, a
+10k→100k scale sweep, and resident memory footprint — up from 5. See
+[benchmarks.md](benchmarks.md) for methodology and the full table.
 
 **Query operations** — measured on a 100,000-node / 201,000-edge graph with
 300,000 indexed property entries, disk backend compacted to CSR:
@@ -88,8 +92,12 @@ results:
 
 The read path was reworked so queries start from an index rather than a full
 enumeration of the graph, and the property index is now stored in the CSR file
-instead of being rebuilt from the WAL on every restart. Measured as an
-interleaved A/B against the previous release:
+instead of being rebuilt from the WAL on every restart.
+
+Measured as an **interleaved** A/B against `036aac0`, 6 samples per side. The
+interleaving is not incidental: measuring the two sides back to back produced a
+~25% shift on benchmarks the changes never touched. See
+[benchmarks.md](benchmarks.md#why-interleaving-demonstrated).
 
 | Operation                              |    Before |       After |         Change |
 | -------------------------------------- | --------: | ----------: | -------------: |
@@ -103,8 +111,14 @@ interleaved A/B against the previous release:
 | `NodesByType` on a selective label     | 415.1 µs  |   4.995 µs  |     ~83× faster |
 | **Reopen a compacted store**           | **1 176 ms** | **62.26 ms** |  **~19× faster** |
 | **Compaction, steady state**           | **619.3 ms** | **39.22 ms** |  **~16× faster** |
-| Prefix property query                  |  46.44 ms |   7.644 ms  |     6.1× faster |
-| Range property query                   |  59.00 ms |   21.72 ms  |     2.7× faster |
+| Prefix property query                  |  45.67 ms |   7.656 ms  |     6.0× faster |
+| Range property query                   |  60.39 ms |   20.00 ms  |     3.0× faster |
+| `UpdateNode` in a 50k-member label     |  50.43 µs |   4.435 µs  |    11.4× faster |
+| `DeleteNode` from a 50k-member label   |  27.98 µs |   3.732 µs  |     7.5× faster |
+| Edge query by type (memory)            |  44.49 ms |   157.9 µs  |    ~282× faster |
+
+Cost no longer tracks the graph. A 10× larger graph used to make an equality
+query 14× slower (2.91 ms → 41.38 ms); it is now flat (704 ns → 590 ns).
 
 Traversal was reworked separately, where the metric is **allocations per walk**
 rather than latency — allocation is what the GC turns into tail latency:
@@ -217,18 +231,45 @@ Queries are served from indexes, not from scans. What exists today:
 | Adjacency                 | CSR prefix-sum arrays, plus a delta overlay            | Neighbours, traversal, anchored relations, degree |
 | Label (type)              | Postings per label, built for both the delta and CSR   | `NodesByType`, `EdgesByType`, `Types` filters  |
 | Property (secondary)      | Sorted postings per `(key, value)` + reverse ID map    | Equality filters, `NodesByProperty`            |
+| Ordered (range)           | Sorted values per *declared* key, ascending postings   | `>`, `>=`, `<`, `<=`, `Between`, `Prefix`      |
 
 The query planner picks whichever of these bounds the result most tightly —
-property postings, label postings, or the anchors' incident-edge lists — and
-falls back to a full scan only when none applies. Property indexing stays
-explicit and opt-in: you register the fields you want indexed with
+property postings, a declared ordered key's range, label postings, or the
+anchors' incident-edge lists — and falls back to a full scan only when none
+applies. Property indexing stays explicit and opt-in: you register the fields you want indexed with
 `IndexNodeProperty` / `IndexNodeProperties`, so the storage layer never has to
 understand your property encoding.
 
-Index-accelerated operators: `PropertyOpEqual`. Prefix, range (`>`, `>=`, `<`,
-`<=`, `Between`) and `Contains` filters scan the buckets for that one key —
-bounded, but still linear in the number of entries under it. Ordered indexes for
-range and prefix are planned; see [plan.md](plan.md).
+Index-accelerated operators: `PropertyOpEqual` always; the range operators and
+`Prefix` once the key is declared ordered (below). `Contains` is a scan and will
+stay one — no ordering can bound a substring match.
+
+### Ordered keys for range queries
+
+Declaring a key builds a sorted structure over its values, turning a range filter
+into two binary searches:
+
+```go
+import "github.com/aoiflux/graphene/index/encoding"
+
+g.IndexNodeProperty(id, "score", encoding.Int64(score))
+g.DeclareOrderedProperty("score")            // absorbs entries already indexed
+
+g.QueryNodes(store.NodeQuery{Filters: []store.PropertyFilter{{
+    Key: "score", Op: store.PropertyOpBetweenInclusive,
+    Value: encoding.Int64(100), ValueUpper: encoding.Int64(200),
+}}})
+```
+
+**Declaring changes how that key compares.** Undeclared keys use the scan rule —
+numeric when both sides parse, byte order otherwise — which is fine value by
+value but is not a valid sort order: under it `"9" < "10" < "1x" < "9"`, a cycle.
+A declared key is compared byte-wise throughout, so encode values with
+`index/encoding` (or use a naturally ordered form such as zero-padded fixed-width
+digits or hex). Equality lookups are unaffected either way.
+
+Measured on 1,000 distinct values: a wide range goes 22.84 ms → 2.310 ms, and a
+narrow one 11.76 ms → 59 µs.
 
 ### Durability
 
@@ -334,8 +375,8 @@ Migration approach:
 
 - `graphene.go` and `helpers.go`: public API surface.
 - `memory/` and `disk/`: storage backends.
-- `index/`: property index (sorted postings + reverse map); a standalone type
-  index and temporal index also live here but are not yet wired into the stores.
+- `index/`: property index (sorted postings + reverse map), ordered range index,
+  and `index/encoding` order-preserving value encoders.
 - `traversal/`: graph traversal and pattern matching.
 - `viz/`: interactive HTML export.
 

@@ -79,41 +79,76 @@ func dfsInbound(
 }
 
 // DFS performs a general depth-first traversal from origin, following edges in
-// the given direction, up to maxDepth hops. It returns all reachable nodes and
-// edges in DFS discovery order.
+// the given direction, up to maxDepth hops. It returns every node and edge
+// within maxDepth hops of origin, in DFS discovery order.
+//
+// The node set is identical to what BFS returns for the same arguments; only the
+// order differs. Use BFS when you want level order, DFS when you want a
+// depth-first walk, and BFSIDs when you only need the reachable IDs.
 //
 // Pass nil edgeTypes to follow all edge types.
 func DFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) (*BFSResult, error) {
-	visited := make(map[store.NodeID]struct{})
+	if maxDepth < 0 {
+		maxDepth = 0
+	}
+	// bestRemaining records the largest remaining budget each node has been
+	// expanded with — not merely whether it has been seen. See dfsGeneral.
+	bestRemaining := make(map[store.NodeID]int)
 	seenEdges := make(map[store.EdgeID]struct{})
 	result := &BFSResult{}
 
-	if err := dfsGeneral(newWalker(g), origin, maxDepth, dir, edgeTypes, visited, seenEdges, result); err != nil {
+	if err := dfsGeneral(newWalker(g), origin, maxDepth, dir, edgeTypes, bestRemaining, seenEdges, result); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
+// dfsGeneral is the recursive kernel.
+//
+// # Why bestRemaining is a depth, not a visited flag
+//
+// A boolean visited set is wrong for a *depth-limited* walk. Depth-first order
+// means a node is often first reached by a long path, arriving with little
+// budget left; marking it visited then blocks the shorter path that would have
+// arrived with budget to spare, and everything beyond it is never explored.
+//
+//	A → B → C → E   plus a shortcut   A → C
+//
+// At maxDepth 2 the walk reaches C via A→B→C with remaining=0 and stops. The
+// shortcut A→C would arrive with remaining=1 — enough to reach E — but a visited
+// flag would skip it, and E would be missed even though it is two hops away.
+// BFS does not have this problem because it always reaches a node by its
+// shortest path first.
+//
+// Recording the best budget instead lets a node be re-expanded when a later path
+// reaches it with more depth to spend. Each node is expanded at most once per
+// distinct remaining value, so the walk is bounded by O(V × maxDepth) expansions
+// rather than O(V) — the price of a correct answer. Nodes are appended to the
+// result only on first arrival, so no duplicates appear.
 func dfsGeneral(
 	w *walker,
 	id store.NodeID,
 	remaining int,
 	dir store.Direction,
 	edgeTypes []store.EdgeType,
-	visited map[store.NodeID]struct{},
+	bestRemaining map[store.NodeID]int,
 	seenEdges map[store.EdgeID]struct{},
 	result *BFSResult,
 ) error {
-	if _, seen := visited[id]; seen {
+	prev, seen := bestRemaining[id]
+	if seen && prev >= remaining {
+		// Already expanded with at least this much budget; nothing new to find.
 		return nil
 	}
-	visited[id] = struct{}{}
+	bestRemaining[id] = remaining
 
-	node, err := w.g.GetNode(id)
-	if err != nil {
-		return err
+	if !seen {
+		node, err := w.g.GetNode(id)
+		if err != nil {
+			return err
+		}
+		result.Nodes = append(result.Nodes, node)
 	}
-	result.Nodes = append(result.Nodes, node)
 
 	if remaining == 0 {
 		return nil
@@ -139,7 +174,7 @@ func dfsGeneral(
 		seenThisLevel[nbID] = struct{}{}
 
 		// Neighbours drops pairs whose node cannot be resolved, edge included.
-		if _, alreadyVisited := visited[nbID]; !alreadyVisited && !w.nodeExists(nbID) {
+		if _, alreadySeen := bestRemaining[nbID]; !alreadySeen && !w.nodeExists(nbID) {
 			continue
 		}
 
@@ -151,7 +186,7 @@ func dfsGeneral(
 			seenEdges[eid] = struct{}{}
 			result.Edges = append(result.Edges, edge)
 		}
-		if err := dfsGeneral(w, nbID, remaining-1, dir, edgeTypes, visited, seenEdges, result); err != nil {
+		if err := dfsGeneral(w, nbID, remaining-1, dir, edgeTypes, bestRemaining, seenEdges, result); err != nil {
 			return err
 		}
 	}

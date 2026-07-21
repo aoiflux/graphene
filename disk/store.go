@@ -45,6 +45,27 @@ type Store struct {
 	deltaNodesByType map[store.NodeType][]store.NodeID
 	deltaEdgesByType map[store.EdgeType][]store.EdgeID
 
+	// --- lock-free read support ---
+	//
+	// A CSRGraph is immutable once published, so a reader that gets the pointer
+	// atomically can read a record from it without holding s.mu. The lock is
+	// still needed for the delta maps and the delete masks, which are ordinary Go
+	// maps — but those only *shadow* CSR records, they never rewrite them.
+	//
+	// csrShadowed counts CSR records that a delta update or a tombstone has
+	// superseded within the current epoch. While it is zero, every CSR record is
+	// still the truth, so a point read that finds its answer in the CSR needs no
+	// lock at all. Crucially, appending new entities does not shadow anything, so
+	// ongoing writes do not disable the fast path for pre-existing records.
+	//
+	// The counter is only ever incremented (Compact resets it), so reading zero
+	// after a lookup proves it was zero throughout. csrEpoch guards against a
+	// Compact swapping the CSR mid-read and resetting the counter underneath us:
+	// readers sample the epoch first and re-check it last.
+	csrPtr      atomic.Pointer[CSRGraph]
+	csrEpoch    atomic.Uint64
+	csrShadowed atomic.Int64
+
 	// Property index (in-memory; rebuilt from WAL on restart).
 	propIdx *index.PropertyIndex
 
@@ -346,6 +367,24 @@ func (s *Store) ReindexPolicy() store.ReindexPolicy {
 	return p
 }
 
+// DeclareOrderedNodeProperty implements store.OrderedIndexDeclarer.
+func (s *Store) DeclareOrderedNodeProperty(key string) error {
+	s.propIdx.DeclareOrderedNodeKey(key)
+	return nil
+}
+
+// DeclareOrderedEdgeProperty implements store.OrderedIndexDeclarer.
+func (s *Store) DeclareOrderedEdgeProperty(key string) error {
+	s.propIdx.DeclareOrderedEdgeKey(key)
+	return nil
+}
+
+// OrderedNodeProperties implements store.OrderedIndexDeclarer.
+func (s *Store) OrderedNodeProperties() []string { return s.propIdx.OrderedNodeKeys() }
+
+// OrderedEdgeProperties implements store.OrderedIndexDeclarer.
+func (s *Store) OrderedEdgeProperties() []string { return s.propIdx.OrderedEdgeKeys() }
+
 // PurgeNodeIndex implements store.Reindexer. The purge is journalled so replay
 // does not resurrect the superseded entries.
 func (s *Store) PurgeNodeIndex(id store.NodeID) error {
@@ -491,6 +530,34 @@ func (s *Store) DeleteNode(id store.NodeID) error {
 	return nil
 }
 
+// publishCSR makes csr visible to lock-free readers and starts a fresh epoch.
+// Caller must hold s.mu.
+//
+// The shadow counter resets because a freshly built CSR already incorporates
+// every update and tombstone that had accumulated against the previous one.
+func (s *Store) publishCSR(csr *CSRGraph) {
+	s.csr = csr
+	s.csrShadowed.Store(0)
+	s.csrEpoch.Add(1)
+	s.csrPtr.Store(csr)
+}
+
+// shadowCSRNode records that a CSR-resident node has been superseded by the
+// delta layer, disabling the lock-free read path until the next Compact.
+// Caller must hold s.mu.
+func (s *Store) shadowCSRNode(id store.NodeID) {
+	if s.nodeInCSR(id) {
+		s.csrShadowed.Add(1)
+	}
+}
+
+// shadowCSREdge is shadowCSRNode for edges. Caller must hold s.mu.
+func (s *Store) shadowCSREdge(id store.EdgeID) {
+	if s.edgeInCSR(id) {
+		s.csrShadowed.Add(1)
+	}
+}
+
 // --- in-memory apply helpers (shared by live mutators and WAL replay) ---
 // All require s.mu held.
 
@@ -498,10 +565,9 @@ func (s *Store) DeleteNode(id store.NodeID) error {
 // the delta type index and clearing any delete mask. A CSR-resident node being
 // updated simply gains a delta entry that shadows the CSR copy.
 func (s *Store) applyNodeUpsert(n *store.Node) {
+	s.shadowCSRNode(n.ID)
 	if prev, ok := s.deltaNodes[n.ID]; ok {
-		for _, lbl := range prev.Labels {
-			s.deltaNodesByType[lbl] = removeNodeID(s.deltaNodesByType[lbl], n.ID)
-		}
+		s.unindexDeltaNodeLabels(n.ID, prev.Labels)
 	}
 	s.deltaNodes[n.ID] = n
 	s.indexDeltaNodeLabels(n.ID, n.Labels)
@@ -514,11 +580,10 @@ func (s *Store) applyNodeUpsert(n *store.Node) {
 // delta and not present in the CSR, whose adjacency arrays already list it), so
 // an updated edge is never double-listed.
 func (s *Store) applyEdgeUpsert(e *store.Edge) {
+	s.shadowCSREdge(e.ID)
 	prev, inDelta := s.deltaEdges[e.ID]
 	if inDelta {
-		for _, lbl := range prev.Labels {
-			s.deltaEdgesByType[lbl] = removeEdgeID(s.deltaEdgesByType[lbl], e.ID)
-		}
+		s.unindexDeltaEdgeLabels(e.ID, prev.Labels)
 	}
 	s.deltaEdges[e.ID] = e
 	s.indexDeltaEdgeLabels(e.ID, e.Labels)
@@ -533,10 +598,9 @@ func (s *Store) applyEdgeUpsert(e *store.Edge) {
 // Incident-edge cascade is performed by the caller (DeleteNode) / by separate
 // edge tombstones on replay, so this does not touch edges.
 func (s *Store) applyNodeDelete(id store.NodeID) {
+	s.shadowCSRNode(id)
 	if n, ok := s.deltaNodes[id]; ok {
-		for _, lbl := range n.Labels {
-			s.deltaNodesByType[lbl] = removeNodeID(s.deltaNodesByType[lbl], id)
-		}
+		s.unindexDeltaNodeLabels(id, n.Labels)
 		delete(s.deltaNodes, id)
 	}
 	delete(s.deltaAdj, id)
@@ -548,10 +612,9 @@ func (s *Store) applyNodeDelete(id store.NodeID) {
 
 // applyEdgeDelete removes an edge from the delta overlay and masks any CSR copy.
 func (s *Store) applyEdgeDelete(id store.EdgeID) {
+	s.shadowCSREdge(id)
 	if e, ok := s.deltaEdges[id]; ok {
-		for _, lbl := range e.Labels {
-			s.deltaEdgesByType[lbl] = removeEdgeID(s.deltaEdgesByType[lbl], id)
-		}
+		s.unindexDeltaEdgeLabels(id, e.Labels)
 		if a := s.deltaAdj[e.Src]; a != nil {
 			a.out = removeEdgeID(a.out, id)
 		}
@@ -661,7 +724,40 @@ func (s *Store) incidentEdgeIDsLocked(id store.NodeID) []store.EdgeID {
 	return out
 }
 
+// csrFastRead returns the published CSR when a point read may safely bypass the
+// store lock, along with the epoch the caller must re-check afterwards.
+//
+// It returns nil when no CSR exists or something has already shadowed part of
+// it. Callers must confirm with csrFastReadValid *after* reading the record;
+// only then is the answer known to have been current throughout.
+func (s *Store) csrFastRead() (*CSRGraph, uint64, bool) {
+	// Epoch first: sampling it after loading the pointer would let a Compact
+	// slip in between and make the final check pass against a stale CSR.
+	epoch := s.csrEpoch.Load()
+	csr := s.csrPtr.Load()
+	if csr == nil || s.csrShadowed.Load() != 0 {
+		return nil, 0, false
+	}
+	return csr, epoch, true
+}
+
+// csrFastReadValid reports whether nothing invalidated the CSR during the read.
+func (s *Store) csrFastReadValid(epoch uint64) bool {
+	return s.csrShadowed.Load() == 0 && s.csrEpoch.Load() == epoch
+}
+
 func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
+	// Unlocked path first: if the record lives in an unshadowed CSR, the store
+	// lock buys nothing — the CSR cannot change under us.
+	if csr, epoch, ok := s.csrFastRead(); ok {
+		if rec, found := csr.GetNode(id); found {
+			node := &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: cloneBytes(rec.Properties)}
+			if s.csrFastReadValid(epoch) {
+				return node, nil
+			}
+		}
+	}
+
 	// Hold RLock across the delta + CSR lookup so the CSR pointer read is not
 	// racing a concurrent Compact swap.
 	s.mu.RLock()
@@ -682,6 +778,15 @@ func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
 }
 
 func (s *Store) GetEdge(id store.EdgeID) (*store.Edge, error) {
+	if csr, epoch, ok := s.csrFastRead(); ok {
+		if rec, found := csr.GetEdge(id); found {
+			edge := rawEdgeToStore(rec)
+			if s.csrFastReadValid(epoch) {
+				return edge, nil
+			}
+		}
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if _, del := s.deletedEdges[id]; del {
@@ -867,6 +972,12 @@ func (s *Store) IncidentEdges(dst []store.IncidentEdge, id store.NodeID, dir sto
 
 // NodeExists implements store.AdjacencyReader.
 func (s *Store) NodeExists(id store.NodeID) bool {
+	if csr, epoch, ok := s.csrFastRead(); ok {
+		if _, found := csr.GetNode(id); found && s.csrFastReadValid(epoch) {
+			return true
+		}
+	}
+
 	s.mu.RLock()
 	ok := s.nodeExistsLocked(id)
 	s.mu.RUnlock()
@@ -1088,13 +1199,25 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 
 	if len(query.Filters) > 0 {
 		matched := s.matchNodeIDsByFilters(query.Filters, store.NormalizedFilterMode(query.FilterMode))
-		candidates = intersectNodeIDSet(candidates, matched)
+		// Both sides must be ascending for the merge. The driving set often
+		// already is; when it is not, sorting it once here is repaid immediately
+		// because the merge output is ascending too, which retires the sort below.
+		if !sortedAsc {
+			candidates = store.SortDedupeIDs(candidates)
+			sortedAsc = true
+		}
+		candidates = store.IntersectSortedIDs(candidates, matched)
 	}
 
 	order := store.NormalizedQueryOrder(query.Order)
-	// The driving index may already yield ascending IDs, in which case the sort
-	// is pure overhead.
-	if !(sortedAsc && order == store.QueryOrderAsc) {
+	// An ascending candidate set needs no sort at all, and only a linear reverse
+	// to satisfy a descending query.
+	switch {
+	case sortedAsc && order == store.QueryOrderAsc:
+		// already in the requested order
+	case sortedAsc:
+		store.ReverseIDs(candidates)
+	default:
 		sort.Slice(candidates, func(i, j int) bool {
 			if order == store.QueryOrderDesc {
 				return candidates[i] > candidates[j]
@@ -1142,11 +1265,20 @@ func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 
 	if len(query.Filters) > 0 {
 		matched := s.matchEdgeIDsByFilters(query.Filters, store.NormalizedFilterMode(query.FilterMode))
-		candidates = intersectEdgeIDSet(candidates, matched)
+		if !sortedAsc {
+			candidates = store.SortDedupeIDs(candidates)
+			sortedAsc = true
+		}
+		candidates = store.IntersectSortedIDs(candidates, matched)
 	}
 
 	order := store.NormalizedQueryOrder(query.Order)
-	if !(sortedAsc && order == store.QueryOrderAsc) {
+	switch {
+	case sortedAsc && order == store.QueryOrderAsc:
+		// already in the requested order
+	case sortedAsc:
+		store.ReverseIDs(candidates)
+	default:
 		sort.Slice(candidates, func(i, j int) bool {
 			if order == store.QueryOrderDesc {
 				return candidates[i] > candidates[j]
@@ -1182,6 +1314,9 @@ func (s *Store) VerifyIndexes() error {
 	// record would make verification quadratic in the size of the largest label.
 	deltaNodeMembers := make(map[store.NodeType]map[store.NodeID]struct{}, len(s.deltaNodesByType))
 	for lbl, ids := range s.deltaNodesByType {
+		if !store.IsSortedIDs(ids) {
+			return fmt.Errorf("delta node label index: %v postings are not strictly ascending", lbl)
+		}
 		seen := make(map[store.NodeID]struct{}, len(ids))
 		for _, id := range ids {
 			if _, dup := seen[id]; dup {
@@ -1208,6 +1343,9 @@ func (s *Store) VerifyIndexes() error {
 
 	deltaEdgeMembers := make(map[store.EdgeType]map[store.EdgeID]struct{}, len(s.deltaEdgesByType))
 	for lbl, ids := range s.deltaEdgesByType {
+		if !store.IsSortedIDs(ids) {
+			return fmt.Errorf("delta edge label index: %v postings are not strictly ascending", lbl)
+		}
 		seen := make(map[store.EdgeID]struct{}, len(ids))
 		for _, id := range ids {
 			if _, dup := seen[id]; dup {
@@ -1335,6 +1473,40 @@ func (s *Store) RebuildIndexes() error {
 	return nil
 }
 
+// sortDedupeNodeIDs sorts ids ascending and removes duplicates, in place.
+//
+// The ordered index emits IDs in value order, and an entity registered under two
+// values for the same key appears once per value, so both properties have to be
+// restored before the result can be used as a driving set.
+func sortDedupeNodeIDs(ids []store.NodeID) []store.NodeID {
+	if len(ids) < 2 {
+		return ids
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	out := ids[:1]
+	for _, id := range ids[1:] {
+		if id != out[len(out)-1] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// sortDedupeEdgeIDs is sortDedupeNodeIDs for edge IDs.
+func sortDedupeEdgeIDs(ids []store.EdgeID) []store.EdgeID {
+	if len(ids) < 2 {
+		return ids
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	out := ids[:1]
+	for _, id := range ids[1:] {
+		if id != out[len(out)-1] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // --- query planning ---
 //
 // Queries used to start from a full enumeration of the delta layer plus every
@@ -1363,6 +1535,14 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 	}
 	if bestFilter != nil {
 		return s.liveNodeIDs(s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)), true
+	}
+
+	// A range or prefix filter on a key declared ordered bounds the result too,
+	// and resolving it here means the query never enumerates the whole graph.
+	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
+		if ids, served := s.propIdx.NodesMatchingOrdered(nil, f); served {
+			return s.liveNodeIDs(sortDedupeNodeIDs(ids)), true
+		}
 	}
 
 	// Label lookup still scans the CSR (there is no persisted label index yet),
@@ -1460,6 +1640,12 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 		return s.liveEdgeIDs(s.propIdx.EdgesByProperty(bestFilter.Key, bestFilter.Value)), true
 	case anchorSize >= 0:
 		return s.incidentEdgeIDs(anchors, anchorDir), false
+	}
+
+	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
+		if ids, served := s.propIdx.EdgesMatchingOrdered(nil, f); served {
+			return s.liveEdgeIDs(sortDedupeEdgeIDs(ids)), true
+		}
 	}
 
 	if len(query.Types) > 0 {
@@ -1588,18 +1774,99 @@ func (s *Store) incidentEdgeIDs(ids []store.NodeID, dir store.Direction) []store
 // from the CSR offset arrays and the delta adjacency lists without materialising
 // a single edge record.
 func (s *Store) DegreeOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) (int, error) {
+	// Deliberately mirrors EdgesOf, which reports an unknown node as an empty
+	// adjacency rather than an error on this backend.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if edgeTypes == nil {
-		// Deliberately mirrors EdgesOf, which reports an unknown node as an empty
-		// adjacency rather than an error on this backend.
-		s.mu.RLock()
-		defer s.mu.RUnlock()
 		return s.degreeLocked(id, dir), nil
 	}
-	edges, err := s.EdgesOf(id, dir, edgeTypes)
-	if err != nil {
-		return 0, err
+	return s.degreeFilteredLocked(id, dir, edgeTypes), nil
+}
+
+// degreeFilteredLocked counts incident edges carrying one of edgeTypes, without
+// materialising any of them.
+//
+// The untyped path reads offsets and is O(1); this one has to inspect each
+// incident edge's labels, so it is O(degree) — but O(degree) reads, not
+// O(degree) allocations. Routing this through EdgesOf instead, as it used to,
+// built a *store.Edge and cloned a property blob per incident edge just to take
+// len() of the result: 73.8 µs against 14.22 ns for the same node untyped.
+//
+// The order of checks mirrors EdgesOf exactly — delta layer first, then CSR with
+// tombstones skipped and delta overrides taking precedence — so the count always
+// equals len(EdgesOf(...)).
+// Caller must hold s.mu.
+func (s *Store) degreeFilteredLocked(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) int {
+	total := 0
+
+	if da := s.deltaAdj[id]; da != nil {
+		countDelta := func(eids []store.EdgeID) {
+			for _, eid := range eids {
+				e := s.deltaEdges[eid]
+				if e == nil {
+					continue
+				}
+				if storeEdgeMatchesFilter(edgeTypes, e) {
+					total++
+				}
+			}
+		}
+		switch dir {
+		case store.DirectionOutbound:
+			countDelta(da.out)
+		case store.DirectionInbound:
+			countDelta(da.in)
+		default:
+			countDelta(da.out)
+			countDelta(da.in)
+		}
 	}
-	return len(edges), nil
+
+	if s.csr == nil {
+		return total
+	}
+	// On a compacted store with no pending deletions — the steady state for a
+	// read-heavy workload — no CSR edge can be masked or overridden, so the two
+	// map probes per edge are pure overhead and are skipped entirely.
+	pristine := len(s.deletedEdges) == 0 && len(s.deltaEdges) == 0
+	countCSR := func(eids []store.EdgeID) {
+		if pristine {
+			for _, eid := range eids {
+				if rec, found := s.csr.GetEdge(eid); found && rawEdgeMatchesFilter(edgeTypes, rec.Labels) {
+					total++
+				}
+			}
+			return
+		}
+		for _, eid := range eids {
+			if _, del := s.deletedEdges[eid]; del {
+				continue
+			}
+			// A CSR edge updated in the delta is authoritative there, and its
+			// labels may have changed.
+			if de, ok := s.deltaEdges[eid]; ok {
+				if storeEdgeMatchesFilter(edgeTypes, de) {
+					total++
+				}
+				continue
+			}
+			rec, found := s.csr.GetEdge(eid)
+			if found && rawEdgeMatchesFilter(edgeTypes, rec.Labels) {
+				total++
+			}
+		}
+	}
+	switch dir {
+	case store.DirectionOutbound:
+		countCSR(s.csr.OutboundEdgeIDs(id))
+	case store.DirectionInbound:
+		countCSR(s.csr.InboundEdgeIDs(id))
+	default:
+		countCSR(s.csr.OutboundEdgeIDs(id))
+		countCSR(s.csr.InboundEdgeIDs(id))
+	}
+	return total
 }
 
 // Compact merges the delta layer into the CSR and truncates the WAL.
@@ -1697,7 +1964,7 @@ func (s *Store) Compact() error {
 
 	// Swap in new CSR and clear delta + delete masks (both are now baked into
 	// the freshly built CSR).
-	s.csr = newCSR
+	s.publishCSR(newCSR)
 	s.deltaNodes = make(map[store.NodeID]*store.Node)
 	s.deltaEdges = make(map[store.EdgeID]*store.Edge)
 	s.deltaAdj = make(map[store.NodeID]*deltaAdj)
@@ -1722,7 +1989,30 @@ func (s *Store) indexDeltaNodeLabels(id store.NodeID, labels []store.NodeType) {
 		if containsNodeTypeValue(labels[:i], lbl) {
 			continue
 		}
-		s.deltaNodesByType[lbl] = append(s.deltaNodesByType[lbl], id)
+		ids := s.deltaNodesByType[lbl]
+		if n := len(ids); n == 0 || ids[n-1] < id {
+			s.deltaNodesByType[lbl] = append(ids, id)
+			continue
+		}
+		if updated, added := store.InsertSortedID(ids, id); added {
+			s.deltaNodesByType[lbl] = updated
+		}
+	}
+}
+
+// unindexDeltaNodeLabels removes id from the delta postings for each of its
+// labels. Caller must hold s.mu.
+func (s *Store) unindexDeltaNodeLabels(id store.NodeID, labels []store.NodeType) {
+	for _, lbl := range labels {
+		ids, removed := store.DeleteSortedID(s.deltaNodesByType[lbl], id)
+		if !removed {
+			continue
+		}
+		if len(ids) == 0 {
+			delete(s.deltaNodesByType, lbl)
+			continue
+		}
+		s.deltaNodesByType[lbl] = ids
 	}
 }
 
@@ -1733,7 +2023,30 @@ func (s *Store) indexDeltaEdgeLabels(id store.EdgeID, labels []store.EdgeType) {
 		if containsEdgeTypeValue(labels[:i], lbl) {
 			continue
 		}
-		s.deltaEdgesByType[lbl] = append(s.deltaEdgesByType[lbl], id)
+		ids := s.deltaEdgesByType[lbl]
+		if n := len(ids); n == 0 || ids[n-1] < id {
+			s.deltaEdgesByType[lbl] = append(ids, id)
+			continue
+		}
+		if updated, added := store.InsertSortedID(ids, id); added {
+			s.deltaEdgesByType[lbl] = updated
+		}
+	}
+}
+
+// unindexDeltaEdgeLabels removes id from the delta postings for each of its
+// labels. Caller must hold s.mu.
+func (s *Store) unindexDeltaEdgeLabels(id store.EdgeID, labels []store.EdgeType) {
+	for _, lbl := range labels {
+		ids, removed := store.DeleteSortedID(s.deltaEdgesByType[lbl], id)
+		if !removed {
+			continue
+		}
+		if len(ids) == 0 {
+			delete(s.deltaEdgesByType, lbl)
+			continue
+		}
+		s.deltaEdgesByType[lbl] = ids
 	}
 }
 
@@ -1878,7 +2191,7 @@ func (s *Store) loadCSR(path string) error {
 	if err != nil {
 		return err
 	}
-	s.csr = csr
+	s.publishCSR(csr)
 
 	// Load the persisted property index (v6+). This happens before WAL replay so
 	// that post-compaction WAL records — including purges — apply on top of it.
@@ -2374,19 +2687,11 @@ func unmarshalID(b []byte) (uint64, error) {
 	return binary.LittleEndian.Uint64(b[:8]), nil
 }
 
-// removeNodeID returns ids with occurrences of target removed, preserving order.
-// Reuses the backing array; safe because callers hold s.mu and reads copy out.
-func removeNodeID(ids []store.NodeID, target store.NodeID) []store.NodeID {
-	out := ids[:0]
-	for _, id := range ids {
-		if id != target {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
 // removeEdgeID returns ids with occurrences of target removed, preserving order.
+//
+// This is for **adjacency lists only**. Delta label postings are sorted and use
+// store.DeleteSortedID instead; adjacency cannot be sorted because EdgesOf must
+// return edges in insertion order for traversal results to stay stable.
 func removeEdgeID(ids []store.EdgeID, target store.EdgeID) []store.EdgeID {
 	out := ids[:0]
 	for _, id := range ids {
@@ -2495,94 +2800,99 @@ func (s *Store) collectCandidateEdgeIDs(ids []store.EdgeID) []store.EdgeID {
 	return out
 }
 
-func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) map[store.NodeID]struct{} {
+// matchNodeIDsByFilters returns the ascending, deduplicated set of node IDs
+// satisfying the filters under the given mode.
+//
+// Each filter is resolved to a sorted slice and the slices are merged, rather
+// than each being built into a map and the maps intersected. Merging is one pass
+// per side with no hashing, the output stays sorted so the query path can skip
+// its final sort, and an empty intersection under MatchAll can stop early.
+func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) []store.NodeID {
 	if len(filters) == 0 {
 		return nil
 	}
-	sets := make([]map[store.NodeID]struct{}, 0, len(filters))
-	for _, f := range filters {
-		set := make(map[store.NodeID]struct{})
-		if f.Op == store.PropertyOpEqual {
-			for _, id := range s.propIdx.NodesByProperty(f.Key, f.Value) {
-				set[id] = struct{}{}
-			}
-		} else {
-			// Operators the index cannot answer directly scan only the buckets
-			// belonging to this key, never the whole index.
-			s.propIdx.ForEachNodeEntry(f.Key, func(id store.NodeID, value []byte) bool {
-				if store.PropertyFilterMatches(f, value) {
-					set[id] = struct{}{}
-				}
-				return true
-			})
+	var acc []store.NodeID
+	for i, f := range filters {
+		set := s.matchOneNodeFilter(f)
+		if i == 0 {
+			acc = set
+			continue
 		}
-		sets = append(sets, set)
-	}
-	if mode == store.MatchAny {
-		out := make(map[store.NodeID]struct{})
-		for _, set := range sets {
-			for id := range set {
-				out[id] = struct{}{}
-			}
+		if mode == store.MatchAny {
+			acc = store.UnionSortedIDs(acc, set)
+			continue
 		}
-		return out
-	}
-	out := make(map[store.NodeID]struct{})
-	for id := range sets[0] {
-		out[id] = struct{}{}
-	}
-	for i := 1; i < len(sets); i++ {
-		for id := range out {
-			if _, ok := sets[i][id]; !ok {
-				delete(out, id)
-			}
+		acc = store.IntersectSortedIDs(acc, set)
+		if len(acc) == 0 {
+			// Nothing can re-enter an empty intersection.
+			return acc
 		}
 	}
-	return out
+	return acc
 }
 
-func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) map[store.EdgeID]struct{} {
+// matchOneNodeFilter resolves a single filter to an ascending, deduplicated set.
+func (s *Store) matchOneNodeFilter(f store.PropertyFilter) []store.NodeID {
+	if f.Op == store.PropertyOpEqual {
+		// Postings are already ascending and deduplicated.
+		return s.propIdx.NodesByProperty(f.Key, f.Value)
+	}
+	// A key declared ordered answers ranges and prefixes by binary search. Its
+	// comparison is byte-wise, so the whole predicate is resolved there — mixing
+	// it with the scan matcher below would apply two orderings to one key.
+	if ids, served := s.propIdx.NodesMatchingOrdered(nil, f); served {
+		return store.SortDedupeIDs(ids)
+	}
+	// Otherwise scan only the buckets belonging to this key, never the whole index.
+	var out []store.NodeID
+	s.propIdx.ForEachNodeEntry(f.Key, func(id store.NodeID, value []byte) bool {
+		if store.PropertyFilterMatches(f, value) {
+			out = append(out, id)
+		}
+		return true
+	})
+	return store.SortDedupeIDs(out)
+}
+
+// matchEdgeIDsByFilters is matchNodeIDsByFilters for edge properties.
+func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) []store.EdgeID {
 	if len(filters) == 0 {
 		return nil
 	}
-	sets := make([]map[store.EdgeID]struct{}, 0, len(filters))
-	for _, f := range filters {
-		set := make(map[store.EdgeID]struct{})
-		if f.Op == store.PropertyOpEqual {
-			for _, id := range s.propIdx.EdgesByProperty(f.Key, f.Value) {
-				set[id] = struct{}{}
-			}
-		} else {
-			s.propIdx.ForEachEdgeEntry(f.Key, func(id store.EdgeID, value []byte) bool {
-				if store.PropertyFilterMatches(f, value) {
-					set[id] = struct{}{}
-				}
-				return true
-			})
+	var acc []store.EdgeID
+	for i, f := range filters {
+		set := s.matchOneEdgeFilter(f)
+		if i == 0 {
+			acc = set
+			continue
 		}
-		sets = append(sets, set)
-	}
-	if mode == store.MatchAny {
-		out := make(map[store.EdgeID]struct{})
-		for _, set := range sets {
-			for id := range set {
-				out[id] = struct{}{}
-			}
+		if mode == store.MatchAny {
+			acc = store.UnionSortedIDs(acc, set)
+			continue
 		}
-		return out
-	}
-	out := make(map[store.EdgeID]struct{})
-	for id := range sets[0] {
-		out[id] = struct{}{}
-	}
-	for i := 1; i < len(sets); i++ {
-		for id := range out {
-			if _, ok := sets[i][id]; !ok {
-				delete(out, id)
-			}
+		acc = store.IntersectSortedIDs(acc, set)
+		if len(acc) == 0 {
+			return acc
 		}
 	}
-	return out
+	return acc
+}
+
+func (s *Store) matchOneEdgeFilter(f store.PropertyFilter) []store.EdgeID {
+	if f.Op == store.PropertyOpEqual {
+		return s.propIdx.EdgesByProperty(f.Key, f.Value)
+	}
+	if ids, served := s.propIdx.EdgesMatchingOrdered(nil, f); served {
+		return store.SortDedupeIDs(ids)
+	}
+	var out []store.EdgeID
+	s.propIdx.ForEachEdgeEntry(f.Key, func(id store.EdgeID, value []byte) bool {
+		if store.PropertyFilterMatches(f, value) {
+			out = append(out, id)
+		}
+		return true
+	})
+	return store.SortDedupeIDs(out)
 }
 
 func nodeHasAnyType(n *store.Node, typeSet map[store.NodeType]struct{}) bool {
@@ -2610,26 +2920,6 @@ func makeNodeIDSet(ids []store.NodeID) map[store.NodeID]struct{} {
 	out := make(map[store.NodeID]struct{}, len(ids))
 	for _, id := range ids {
 		out[id] = struct{}{}
-	}
-	return out
-}
-
-func intersectNodeIDSet(candidates []store.NodeID, keep map[store.NodeID]struct{}) []store.NodeID {
-	out := make([]store.NodeID, 0, len(candidates))
-	for _, id := range candidates {
-		if _, ok := keep[id]; ok {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-func intersectEdgeIDSet(candidates []store.EdgeID, keep map[store.EdgeID]struct{}) []store.EdgeID {
-	out := make([]store.EdgeID, 0, len(candidates))
-	for _, id := range candidates {
-		if _, ok := keep[id]; ok {
-			out = append(out, id)
-		}
 	}
 	return out
 }

@@ -64,28 +64,81 @@ func (s *Store) nextEdgeID() store.EdgeID {
 
 // indexNodeLabels adds id to the postings for each distinct label.
 //
-// Labels are deduplicated here because a caller may legitimately pass the same
-// label twice; without this, the postings would list id once per repetition and
-// NodesByType would return duplicates. The node's own Labels slice is left
-// exactly as the caller supplied it.
+// Postings are kept in ascending ID order so removal is a binary search plus a
+// memmove rather than a rewrite of the whole list. Insertion is usually O(1)
+// anyway: IDs are issued monotonically, so a new node appends to the end.
+//
+// Repeated labels are skipped. A caller may legitimately pass the same label
+// twice, and without this the postings would list id once per repetition — the
+// sorted insert would reject the duplicate, but the check keeps the intent
+// explicit. The node's own Labels slice is left exactly as the caller supplied.
 // Must be called with s.mu write-locked.
 func (s *Store) indexNodeLabels(id store.NodeID, labels []store.NodeType) {
 	for i, lbl := range labels {
 		if containsNodeType(labels[:i], lbl) {
 			continue
 		}
-		s.nodesByType[lbl] = append(s.nodesByType[lbl], id)
+		// Append directly when id already sorts last, which is the ingest case.
+		// Calling through the generic helper costs a non-inlined call per label;
+		// ingest does this for every node, so the branch is worth spelling out.
+		ids := s.nodesByType[lbl]
+		if n := len(ids); n == 0 || ids[n-1] < id {
+			s.nodesByType[lbl] = append(ids, id)
+			continue
+		}
+		if updated, added := store.InsertSortedID(ids, id); added {
+			s.nodesByType[lbl] = updated
+		}
 	}
 }
 
-// indexEdgeLabels adds id to the postings for each distinct label.
-// Must be called with s.mu write-locked.
+// indexEdgeLabels adds id to the postings for each distinct label, keeping them
+// in ascending ID order. Must be called with s.mu write-locked.
 func (s *Store) indexEdgeLabels(id store.EdgeID, labels []store.EdgeType) {
 	for i, lbl := range labels {
 		if containsEdgeType(labels[:i], lbl) {
 			continue
 		}
-		s.edgesByType[lbl] = append(s.edgesByType[lbl], id)
+		ids := s.edgesByType[lbl]
+		if n := len(ids); n == 0 || ids[n-1] < id {
+			s.edgesByType[lbl] = append(ids, id)
+			continue
+		}
+		if updated, added := store.InsertSortedID(ids, id); added {
+			s.edgesByType[lbl] = updated
+		}
+	}
+}
+
+// unindexNodeLabels removes id from the postings for each of its labels.
+// Must be called with s.mu write-locked.
+func (s *Store) unindexNodeLabels(id store.NodeID, labels []store.NodeType) {
+	for _, lbl := range labels {
+		ids, removed := store.DeleteSortedID(s.nodesByType[lbl], id)
+		if !removed {
+			continue
+		}
+		if len(ids) == 0 {
+			delete(s.nodesByType, lbl)
+			continue
+		}
+		s.nodesByType[lbl] = ids
+	}
+}
+
+// unindexEdgeLabels removes id from the postings for each of its labels.
+// Must be called with s.mu write-locked.
+func (s *Store) unindexEdgeLabels(id store.EdgeID, labels []store.EdgeType) {
+	for _, lbl := range labels {
+		ids, removed := store.DeleteSortedID(s.edgesByType[lbl], id)
+		if !removed {
+			continue
+		}
+		if len(ids) == 0 {
+			delete(s.edgesByType, lbl)
+			continue
+		}
+		s.edgesByType[lbl] = ids
 	}
 }
 
@@ -262,6 +315,24 @@ func (s *Store) ReindexPolicy() store.ReindexPolicy {
 	return p
 }
 
+// DeclareOrderedNodeProperty implements store.OrderedIndexDeclarer.
+func (s *Store) DeclareOrderedNodeProperty(key string) error {
+	s.propIdx.DeclareOrderedNodeKey(key)
+	return nil
+}
+
+// DeclareOrderedEdgeProperty implements store.OrderedIndexDeclarer.
+func (s *Store) DeclareOrderedEdgeProperty(key string) error {
+	s.propIdx.DeclareOrderedEdgeKey(key)
+	return nil
+}
+
+// OrderedNodeProperties implements store.OrderedIndexDeclarer.
+func (s *Store) OrderedNodeProperties() []string { return s.propIdx.OrderedNodeKeys() }
+
+// OrderedEdgeProperties implements store.OrderedIndexDeclarer.
+func (s *Store) OrderedEdgeProperties() []string { return s.propIdx.OrderedEdgeKeys() }
+
 // PurgeNodeIndex implements store.Reindexer.
 func (s *Store) PurgeNodeIndex(id store.NodeID) error {
 	s.propIdx.RemoveNode(id)
@@ -292,9 +363,7 @@ func (s *Store) UpdateNode(n *store.Node) error {
 	}
 
 	// Reconcile the type index: drop old labels, add new ones.
-	for _, lbl := range existing.Labels {
-		s.nodesByType[lbl] = removeNodeID(s.nodesByType[lbl], n.ID)
-	}
+	s.unindexNodeLabels(n.ID, existing.Labels)
 
 	updated := &store.Node{ID: n.ID}
 	updated.Labels = make([]store.NodeType, len(n.Labels))
@@ -327,9 +396,7 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 	}
 
 	// Reconcile the type index: drop old labels, add new ones.
-	for _, lbl := range existing.Labels {
-		s.edgesByType[lbl] = removeEdgeID(s.edgesByType[lbl], e.ID)
-	}
+	s.unindexEdgeLabels(e.ID, existing.Labels)
 
 	// Endpoints are immutable — keep existing Src/Dst (and adjacency untouched).
 	updated := &store.Edge{
@@ -380,9 +447,7 @@ func (s *Store) DeleteNode(id store.NodeID) error {
 		}
 	}
 
-	for _, lbl := range node.Labels {
-		s.nodesByType[lbl] = removeNodeID(s.nodesByType[lbl], id)
-	}
+	s.unindexNodeLabels(id, node.Labels)
 	delete(s.nodes, id)
 	delete(s.adj, id)
 	s.propIdx.RemoveNode(id)
@@ -403,9 +468,7 @@ func (s *Store) deleteEdgeLocked(id store.EdgeID) {
 	if a := s.adj[e.Dst]; a != nil {
 		a.in = removeEdgeID(a.in, id)
 	}
-	for _, lbl := range e.Labels {
-		s.edgesByType[lbl] = removeEdgeID(s.edgesByType[lbl], id)
-	}
+	s.unindexEdgeLabels(id, e.Labels)
 	s.propIdx.RemoveEdge(id)
 }
 
@@ -679,13 +742,25 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 
 	if len(query.Filters) > 0 {
 		matched := s.matchNodeIDsByFilters(query.Filters, store.NormalizedFilterMode(query.FilterMode))
-		candidates = intersectNodeIDSet(candidates, matched)
+		// Both sides must be ascending for the merge. The driving set often
+		// already is; when it is not, sorting it once here is repaid immediately
+		// because the merge output is ascending too, which retires the sort below.
+		if !sortedAsc {
+			candidates = store.SortDedupeIDs(candidates)
+			sortedAsc = true
+		}
+		candidates = store.IntersectSortedIDs(candidates, matched)
 	}
 
 	order := store.NormalizedQueryOrder(query.Order)
-	// The driving index may already yield ascending IDs, in which case the sort
-	// is pure overhead.
-	if !(sortedAsc && order == store.QueryOrderAsc) {
+	// An ascending candidate set needs no sort at all, and only a linear reverse
+	// to satisfy a descending query.
+	switch {
+	case sortedAsc && order == store.QueryOrderAsc:
+		// already in the requested order
+	case sortedAsc:
+		store.ReverseIDs(candidates)
+	default:
 		sort.Slice(candidates, func(i, j int) bool {
 			if order == store.QueryOrderDesc {
 				return candidates[i] > candidates[j]
@@ -733,11 +808,20 @@ func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 
 	if len(query.Filters) > 0 {
 		matched := s.matchEdgeIDsByFilters(query.Filters, store.NormalizedFilterMode(query.FilterMode))
-		candidates = intersectEdgeIDSet(candidates, matched)
+		if !sortedAsc {
+			candidates = store.SortDedupeIDs(candidates)
+			sortedAsc = true
+		}
+		candidates = store.IntersectSortedIDs(candidates, matched)
 	}
 
 	order := store.NormalizedQueryOrder(query.Order)
-	if !(sortedAsc && order == store.QueryOrderAsc) {
+	switch {
+	case sortedAsc && order == store.QueryOrderAsc:
+		// already in the requested order
+	case sortedAsc:
+		store.ReverseIDs(candidates)
+	default:
 		sort.Slice(candidates, func(i, j int) bool {
 			if order == store.QueryOrderDesc {
 				return candidates[i] > candidates[j]
@@ -766,6 +850,9 @@ func (s *Store) VerifyIndexes() error {
 	// make verification quadratic in the size of the largest label.
 	nodeMembers := make(map[store.NodeType]map[store.NodeID]struct{}, len(s.nodesByType))
 	for lbl, ids := range s.nodesByType {
+		if !store.IsSortedIDs(ids) {
+			return fmt.Errorf("node label index: %v postings are not strictly ascending", lbl)
+		}
 		seen := make(map[store.NodeID]struct{}, len(ids))
 		for _, id := range ids {
 			if _, dup := seen[id]; dup {
@@ -792,6 +879,9 @@ func (s *Store) VerifyIndexes() error {
 
 	edgeMembers := make(map[store.EdgeType]map[store.EdgeID]struct{}, len(s.edgesByType))
 	for lbl, ids := range s.edgesByType {
+		if !store.IsSortedIDs(ids) {
+			return fmt.Errorf("edge label index: %v postings are not strictly ascending", lbl)
+		}
 		seen := make(map[store.EdgeID]struct{}, len(ids))
 		for _, id := range ids {
 			if _, dup := seen[id]; dup {
@@ -938,6 +1028,40 @@ func (s *Store) RebuildIndexes() error {
 	return nil
 }
 
+// sortDedupeNodeIDs sorts ids ascending and removes duplicates, in place.
+//
+// The ordered index emits IDs in value order, and an entity registered under two
+// values for the same key appears once per value, so both properties have to be
+// restored before the result can be used as a driving set.
+func sortDedupeNodeIDs(ids []store.NodeID) []store.NodeID {
+	if len(ids) < 2 {
+		return ids
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	out := ids[:1]
+	for _, id := range ids[1:] {
+		if id != out[len(out)-1] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// sortDedupeEdgeIDs is sortDedupeNodeIDs for edge IDs.
+func sortDedupeEdgeIDs(ids []store.EdgeID) []store.EdgeID {
+	if len(ids) < 2 {
+		return ids
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	out := ids[:1]
+	for _, id := range ids[1:] {
+		if id != out[len(out)-1] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // --- query planning ---
 //
 // Every query used to start from "all nodes" / "all edges" and filter down. The
@@ -993,8 +1117,19 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 		ids := s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)
 		return s.liveNodeIDs(ids), true
 	}
+
+	// A range or prefix filter on a key declared ordered bounds the result too,
+	// and resolving it here means the query never enumerates the whole graph.
+	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
+		if ids, served := s.propIdx.NodesMatchingOrdered(nil, f); served {
+			return s.liveNodeIDs(sortDedupeNodeIDs(ids)), true
+		}
+	}
+
 	if typeSize >= 0 && typeSize <= total {
-		return s.nodeIDsForTypes(query.Types), false
+		// A single label's postings are already ascending, so the query path can
+		// skip its sort entirely. A union of several is not.
+		return s.nodeIDsForTypes(query.Types), len(query.Types) == 1
 	}
 
 	s.mu.RLock()
@@ -1114,7 +1249,13 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 	case "anchor":
 		return s.incidentEdgeIDs(anchors, anchorDir), false
 	case "type":
-		return s.edgeIDsForTypes(query.Types), false
+		return s.edgeIDsForTypes(query.Types), len(query.Types) == 1
+	}
+
+	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
+		if ids, served := s.propIdx.EdgesMatchingOrdered(nil, f); served {
+			return s.liveEdgeIDs(sortDedupeEdgeIDs(ids)), true
+		}
 	}
 
 	s.mu.RLock()
@@ -1215,94 +1356,99 @@ func (s *Store) edgeIDsForTypes(types []store.EdgeType) []store.EdgeID {
 
 // --- helpers ---
 
-func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) map[store.NodeID]struct{} {
+// matchNodeIDsByFilters returns the ascending, deduplicated set of node IDs
+// satisfying the filters under the given mode.
+//
+// Each filter is resolved to a sorted slice and the slices are merged, rather
+// than each being built into a map and the maps intersected. Merging is one pass
+// per side with no hashing, the output stays sorted so the query path can skip
+// its final sort, and an empty intersection under MatchAll can stop early.
+func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) []store.NodeID {
 	if len(filters) == 0 {
 		return nil
 	}
-	sets := make([]map[store.NodeID]struct{}, 0, len(filters))
-	for _, f := range filters {
-		set := make(map[store.NodeID]struct{})
-		if f.Op == store.PropertyOpEqual {
-			for _, id := range s.propIdx.NodesByProperty(f.Key, f.Value) {
-				set[id] = struct{}{}
-			}
-		} else {
-			// Operators the index cannot answer directly scan only the buckets
-			// belonging to this key, never the whole index.
-			s.propIdx.ForEachNodeEntry(f.Key, func(id store.NodeID, value []byte) bool {
-				if store.PropertyFilterMatches(f, value) {
-					set[id] = struct{}{}
-				}
-				return true
-			})
+	var acc []store.NodeID
+	for i, f := range filters {
+		set := s.matchOneNodeFilter(f)
+		if i == 0 {
+			acc = set
+			continue
 		}
-		sets = append(sets, set)
-	}
-	if mode == store.MatchAny {
-		out := make(map[store.NodeID]struct{})
-		for _, set := range sets {
-			for id := range set {
-				out[id] = struct{}{}
-			}
+		if mode == store.MatchAny {
+			acc = store.UnionSortedIDs(acc, set)
+			continue
 		}
-		return out
-	}
-	out := make(map[store.NodeID]struct{})
-	for id := range sets[0] {
-		out[id] = struct{}{}
-	}
-	for i := 1; i < len(sets); i++ {
-		for id := range out {
-			if _, ok := sets[i][id]; !ok {
-				delete(out, id)
-			}
+		acc = store.IntersectSortedIDs(acc, set)
+		if len(acc) == 0 {
+			// Nothing can re-enter an empty intersection.
+			return acc
 		}
 	}
-	return out
+	return acc
 }
 
-func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) map[store.EdgeID]struct{} {
+// matchOneNodeFilter resolves a single filter to an ascending, deduplicated set.
+func (s *Store) matchOneNodeFilter(f store.PropertyFilter) []store.NodeID {
+	if f.Op == store.PropertyOpEqual {
+		// Postings are already ascending and deduplicated.
+		return s.propIdx.NodesByProperty(f.Key, f.Value)
+	}
+	// A key declared ordered answers ranges and prefixes by binary search. Its
+	// comparison is byte-wise, so the whole predicate is resolved there — mixing
+	// it with the scan matcher below would apply two orderings to one key.
+	if ids, served := s.propIdx.NodesMatchingOrdered(nil, f); served {
+		return store.SortDedupeIDs(ids)
+	}
+	// Otherwise scan only the buckets belonging to this key, never the whole index.
+	var out []store.NodeID
+	s.propIdx.ForEachNodeEntry(f.Key, func(id store.NodeID, value []byte) bool {
+		if store.PropertyFilterMatches(f, value) {
+			out = append(out, id)
+		}
+		return true
+	})
+	return store.SortDedupeIDs(out)
+}
+
+// matchEdgeIDsByFilters is matchNodeIDsByFilters for edge properties.
+func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) []store.EdgeID {
 	if len(filters) == 0 {
 		return nil
 	}
-	sets := make([]map[store.EdgeID]struct{}, 0, len(filters))
-	for _, f := range filters {
-		set := make(map[store.EdgeID]struct{})
-		if f.Op == store.PropertyOpEqual {
-			for _, id := range s.propIdx.EdgesByProperty(f.Key, f.Value) {
-				set[id] = struct{}{}
-			}
-		} else {
-			s.propIdx.ForEachEdgeEntry(f.Key, func(id store.EdgeID, value []byte) bool {
-				if store.PropertyFilterMatches(f, value) {
-					set[id] = struct{}{}
-				}
-				return true
-			})
+	var acc []store.EdgeID
+	for i, f := range filters {
+		set := s.matchOneEdgeFilter(f)
+		if i == 0 {
+			acc = set
+			continue
 		}
-		sets = append(sets, set)
-	}
-	if mode == store.MatchAny {
-		out := make(map[store.EdgeID]struct{})
-		for _, set := range sets {
-			for id := range set {
-				out[id] = struct{}{}
-			}
+		if mode == store.MatchAny {
+			acc = store.UnionSortedIDs(acc, set)
+			continue
 		}
-		return out
-	}
-	out := make(map[store.EdgeID]struct{})
-	for id := range sets[0] {
-		out[id] = struct{}{}
-	}
-	for i := 1; i < len(sets); i++ {
-		for id := range out {
-			if _, ok := sets[i][id]; !ok {
-				delete(out, id)
-			}
+		acc = store.IntersectSortedIDs(acc, set)
+		if len(acc) == 0 {
+			return acc
 		}
 	}
-	return out
+	return acc
+}
+
+func (s *Store) matchOneEdgeFilter(f store.PropertyFilter) []store.EdgeID {
+	if f.Op == store.PropertyOpEqual {
+		return s.propIdx.EdgesByProperty(f.Key, f.Value)
+	}
+	if ids, served := s.propIdx.EdgesMatchingOrdered(nil, f); served {
+		return store.SortDedupeIDs(ids)
+	}
+	var out []store.EdgeID
+	s.propIdx.ForEachEdgeEntry(f.Key, func(id store.EdgeID, value []byte) bool {
+		if store.PropertyFilterMatches(f, value) {
+			out = append(out, id)
+		}
+		return true
+	})
+	return store.SortDedupeIDs(out)
 }
 
 func nodeHasAnyType(n *store.Node, typeSet map[store.NodeType]struct{}) bool {
@@ -1334,40 +1480,12 @@ func makeNodeIDSet(ids []store.NodeID) map[store.NodeID]struct{} {
 	return out
 }
 
-func intersectNodeIDSet(candidates []store.NodeID, keep map[store.NodeID]struct{}) []store.NodeID {
-	out := make([]store.NodeID, 0, len(candidates))
-	for _, id := range candidates {
-		if _, ok := keep[id]; ok {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-func intersectEdgeIDSet(candidates []store.EdgeID, keep map[store.EdgeID]struct{}) []store.EdgeID {
-	out := make([]store.EdgeID, 0, len(candidates))
-	for _, id := range candidates {
-		if _, ok := keep[id]; ok {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-// removeNodeID returns ids with the first occurrence of target removed,
-// preserving order. Reuses the backing array (safe: callers hold the write lock
-// and all reads return copies).
-func removeNodeID(ids []store.NodeID, target store.NodeID) []store.NodeID {
-	out := ids[:0]
-	for _, id := range ids {
-		if id != target {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
 // removeEdgeID returns ids with occurrences of target removed, preserving order.
+//
+// This is for **adjacency lists only**. Label postings are sorted and use
+// store.DeleteSortedID instead; adjacency cannot be sorted because EdgesOf must
+// return edges in insertion order for traversal results to stay stable.
+// Reuses the backing array (safe: callers hold the write lock and reads copy).
 func removeEdgeID(ids []store.EdgeID, target store.EdgeID) []store.EdgeID {
 	out := ids[:0]
 	for _, id := range ids {

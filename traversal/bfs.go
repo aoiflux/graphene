@@ -37,64 +37,70 @@ func BFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direct
 	visited := map[store.NodeID]struct{}{origin: {}}
 	seenEdges := make(map[store.EdgeID]struct{})
 
-	type qitem struct {
-		id    store.NodeID
-		depth int
-	}
-	// The queue is consumed with a head index rather than by re-slicing.
-	// `queue = queue[1:]` slides the window forward through the backing array, so
-	// every append past the original capacity has to reallocate — one allocation
-	// per visited node on a long walk.
-	queue := []qitem{{id: origin, depth: 0}}
-	for head := 0; head < len(queue); head++ {
-		cur := queue[head]
+	// Two buffers holding one level each, swapped at every depth, rather than one
+	// growing queue.
+	//
+	// A single queue consumed with a head index never releases what it has already
+	// visited, so its memory is O(nodes visited). Two level buffers that are
+	// reused bound it at O(widest level) instead — on a long chain that is two
+	// entries rather than ten thousand. Depth becomes the loop counter, so the
+	// entries are bare IDs rather than {id, depth} pairs, halving them again.
+	//
+	// (The predecessor to both was `queue = queue[1:]`, which slid the window
+	// through the backing array and reallocated on every append past capacity —
+	// one allocation per visited node.)
+	current := []store.NodeID{origin}
+	var next []store.NodeID
 
-		if cur.depth >= maxDepth {
-			continue
-		}
+	for depth := 0; depth < maxDepth && len(current) > 0; depth++ {
+		next = next[:0]
 
-		incident, err := w.incidentEdges(cur.id, dir, edgeTypes)
-		if err != nil {
-			return nil, err
-		}
-
-		w.beginExpansion()
-		for _, step := range incident {
-			eid, nbID := step.Edge, step.Neighbour
-			// One result per distinct neighbour per expansion, matching Neighbours.
-			if !w.markNeighbour(nbID) {
-				continue
+		for _, id := range current {
+			incident, err := w.incidentEdges(id, dir, edgeTypes)
+			if err != nil {
+				return nil, err
 			}
 
-			// A visited neighbour was already resolved, so its node exists and
-			// need not be fetched again. An unvisited one is fetched now, and a
-			// node that cannot be resolved drops its edge too — Neighbours omits
-			// such pairs entirely, and BFS must not diverge from that.
-			_, alreadyVisited := visited[nbID]
-			var nbNode *store.Node
-			if !alreadyVisited {
-				nbNode, err = g.GetNode(nbID)
-				if err != nil {
+			w.beginExpansion()
+			for _, step := range incident {
+				eid, nbID := step.Edge, step.Neighbour
+				// One result per distinct neighbour per expansion, matching Neighbours.
+				if !w.markNeighbour(nbID) {
 					continue
 				}
-			}
 
-			if _, edgeSeen := seenEdges[eid]; !edgeSeen {
-				edge, err := g.GetEdge(eid)
-				if err != nil {
+				// A visited neighbour was already resolved, so its node exists and
+				// need not be fetched again. An unvisited one is fetched now, and a
+				// node that cannot be resolved drops its edge too — Neighbours omits
+				// such pairs entirely, and BFS must not diverge from that.
+				_, alreadyVisited := visited[nbID]
+				var nbNode *store.Node
+				if !alreadyVisited {
+					nbNode, err = g.GetNode(nbID)
+					if err != nil {
+						continue
+					}
+				}
+
+				if _, edgeSeen := seenEdges[eid]; !edgeSeen {
+					edge, err := g.GetEdge(eid)
+					if err != nil {
+						continue
+					}
+					seenEdges[eid] = struct{}{}
+					result.Edges = append(result.Edges, edge)
+				}
+
+				if alreadyVisited {
 					continue
 				}
-				seenEdges[eid] = struct{}{}
-				result.Edges = append(result.Edges, edge)
+				visited[nbID] = struct{}{}
+				result.Nodes = append(result.Nodes, nbNode)
+				next = append(next, nbID)
 			}
-
-			if alreadyVisited {
-				continue
-			}
-			visited[nbID] = struct{}{}
-			result.Nodes = append(result.Nodes, nbNode)
-			queue = append(queue, qitem{id: nbID, depth: cur.depth + 1})
 		}
+
+		current, next = next, current
 	}
 
 	return result, nil

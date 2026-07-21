@@ -105,6 +105,56 @@ func (g *Graph) VerifyIndexes() error {
 	return v.VerifyIndexes()
 }
 
+// DeclareOrderedProperty builds and maintains an ordered index over a node
+// property key, so that range filters (`>`, `>=`, `<`, `<=`, `Between`) and
+// `Prefix` on that key are answered by binary search instead of by scanning
+// every entry registered under it. Entries already present are absorbed, so this
+// can be called at any point.
+//
+// **Declaring a key changes how its range predicates compare.** Undeclared keys
+// use the scan-path rule: try numeric comparison, fall back to byte order. That
+// rule is fine value-by-value but is not a valid sort order — "9" < "10" < "1x"
+// < "9" under it — so no ordered structure can be built on it. A declared key is
+// compared byte-wise throughout. Encode values so byte order matches your intent:
+//
+//	// zero-padded fixed width, or index/encoding for real numbers
+//	g.IndexNodeProperty(id, "score", encoding.Int64(score))
+//	g.DeclareOrderedProperty("score")
+//
+//	g.QueryNodes(store.NodeQuery{Filters: []store.PropertyFilter{{
+//	    Key: "score", Op: store.PropertyOpBetweenInclusive,
+//	    Value: encoding.Int64(100), ValueUpper: encoding.Int64(200),
+//	}}})
+//
+// Equality lookups are unaffected. Backends without the extension ignore this
+// and keep scanning.
+func (g *Graph) DeclareOrderedProperty(key string) error {
+	d, ok := g.GraphStore.(store.OrderedIndexDeclarer)
+	if !ok {
+		return nil
+	}
+	return d.DeclareOrderedNodeProperty(key)
+}
+
+// DeclareOrderedEdgeProperty is DeclareOrderedProperty for edge properties.
+func (g *Graph) DeclareOrderedEdgeProperty(key string) error {
+	d, ok := g.GraphStore.(store.OrderedIndexDeclarer)
+	if !ok {
+		return nil
+	}
+	return d.DeclareOrderedEdgeProperty(key)
+}
+
+// OrderedProperties returns the node and edge property keys currently backed by
+// an ordered index, each sorted.
+func (g *Graph) OrderedProperties() (nodeKeys, edgeKeys []string) {
+	d, ok := g.GraphStore.(store.OrderedIndexDeclarer)
+	if !ok {
+		return nil, nil
+	}
+	return d.OrderedNodeProperties(), d.OrderedEdgeProperties()
+}
+
 // RebuildIndexes discards and recomputes every index derivable from the stored
 // records — label postings and adjacency — and drops property-index entries
 // whose entity no longer exists. Backends that do not support it return nil.

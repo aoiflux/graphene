@@ -88,12 +88,12 @@ that backend's data layout.
 
 | Index type                         | Graphene                                                                                            | Cayley                                  | Neo4j                                               |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------- | --------------------------------------------------- |
-| Node type index                    | Yes — `TypeIndex`: O(1) lookup of all node IDs by label; nodes indexed under each of their N labels | Implicit via predicate/label quads      | Yes — label scan via token index                    |
-| Edge type index                    | Yes — `TypeIndex`: O(1) lookup of all edge IDs by label; edges indexed under each of their N labels | Implicit via predicate index in backend | Yes — relationship type index                       |
-| Temporal / range index             | Yes — `TemporalIndex`: sorted slice, binary-search range queries                                    | No                                      | Yes — B-tree range index on numeric/date properties |
+| Node type index                    | Yes — label postings in both backends, built into the CSR at load; nodes indexed under each of their N labels | Implicit via predicate/label quads      | Yes — label scan via token index                    |
+| Edge type index                    | Yes — label postings in both backends; edges indexed under each of their N labels | Implicit via predicate index in backend | Yes — relationship type index                       |
+| Temporal / range index             | Yes — opt-in ordered index per key (`DeclareOrderedProperty`): sorted values, binary-search range and prefix queries; timestamps via `encoding.Time` | No                                      | Yes — B-tree range index on numeric/date properties |
 | Full-text search                   | No                                                                                                  | No                                      | Yes — Lucene-backed full-text index                 |
 | Vector / similarity index          | No                                                                                                  | No                                      | Yes — vector index (ANN search)                     |
-| Property index                     | Yes — explicit secondary index over selected decoded key/value pairs                                | Depends on backend                      | Yes — index on any property key                     |
+| Property index                     | Yes — explicit secondary index over selected decoded key/value pairs; sorted postings, persisted in the CSR | Depends on backend                      | Yes — index on any property key                     |
 | Secondary indexes on custom fields | No                                                                                                  | No                                      | Yes — composite and token indexes                   |
 
 ---

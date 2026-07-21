@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/aoiflux/graphene"
@@ -277,6 +278,160 @@ func TestTraversal_AgreesAfterDeletes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Regression: depth-limited DFS used to mark a node visited on first arrival
+// regardless of how much depth budget was left, so a node first reached by a long
+// path blocked the shorter path that would have reached it with budget to spare —
+// and everything beyond it went unexplored.
+//
+//	A -> B -> C -> E   plus a shortcut   A -> C
+//
+// At depth 2, E is reachable via A->C->E. The old DFS reached C via A->B->C with
+// no budget left, marked it visited, then skipped the shortcut and missed E.
+func TestDFS_DepthLimitFindsShortcutPaths(t *testing.T) {
+	for name, open := range traversalBackends() {
+		t.Run(name, func(t *testing.T) {
+			g := open(t)
+			mk := func() store.NodeID {
+				id, err := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+				if err != nil {
+					t.Fatalf("AddNode: %v", err)
+				}
+				return id
+			}
+			a, b, c, e := mk(), mk(), mk(), mk()
+			link := func(s, d store.NodeID) {
+				if _, err := g.AddEdge(&store.Edge{Src: s, Dst: d,
+					Labels: []store.EdgeType{store.EdgeTypeContains}}); err != nil {
+					t.Fatalf("AddEdge: %v", err)
+				}
+			}
+			link(a, b) // explored first, the long way round
+			link(b, c)
+			link(c, e)
+			link(a, c) // the shortcut, explored second
+
+			res, err := g.DFS(a, 2, store.DirectionOutbound, nil)
+			if err != nil {
+				t.Fatalf("DFS: %v", err)
+			}
+			got := graphene.NodeIDsFromBFS(res)
+			if !resultContainsNode(got, e) {
+				t.Fatalf("DFS at depth 2 missed node E, reachable via the A->C shortcut: got %v", got)
+			}
+			if len(got) != 4 {
+				t.Fatalf("DFS at depth 2 = %v, want all four nodes", got)
+			}
+		})
+	}
+}
+
+func resultContainsNode(ids []store.NodeID, target store.NodeID) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
+}
+
+// BFS is correct for k-hop neighbourhoods by construction — it always reaches a
+// node by its shortest path first. So it is the oracle for DFS: the two must
+// agree on the *set* of nodes within maxDepth, whatever order they report them
+// in. Nothing checked this before, which is how the depth-limit bug survived.
+func TestDFS_NodeSetMatchesBFS(t *testing.T) {
+	dirs := []store.Direction{store.DirectionOutbound, store.DirectionInbound, store.DirectionBoth}
+	depths := []int{0, 1, 2, 3, 5, 10}
+
+	for name, open := range traversalBackends() {
+		for _, compact := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/compacted=%v", name, compact), func(t *testing.T) {
+				g := open(t)
+				ids := buildTraversalFixture(t, g, 60)
+				if compact {
+					if err := g.Compact(); err != nil {
+						t.Fatalf("Compact: %v", err)
+					}
+				}
+
+				for _, origin := range []store.NodeID{ids[0], ids[7], ids[len(ids)-1]} {
+					for _, dir := range dirs {
+						for _, depth := range depths {
+							for _, et := range [][]store.EdgeType{nil, {store.EdgeTypeContains}} {
+								bfs, err := g.BFS(origin, depth, dir, et)
+								if err != nil {
+									t.Fatalf("BFS: %v", err)
+								}
+								dfs, err := g.DFS(origin, depth, dir, et)
+								if err != nil {
+									t.Fatalf("DFS: %v", err)
+								}
+
+								want := sortedIDSet(graphene.NodeIDsFromBFS(bfs))
+								got := sortedIDSet(graphene.NodeIDsFromBFS(dfs))
+								if !reflect.DeepEqual(got, want) {
+									t.Fatalf("origin=%d dir=%v depth=%d types=%v\n DFS: %v\n BFS: %v",
+										origin, dir, depth, et, got, want)
+								}
+
+								// And no node may be reported twice.
+								if len(dfs.Nodes) != len(got) {
+									t.Fatalf("origin=%d depth=%d: DFS returned %d nodes but only %d distinct",
+										origin, depth, len(dfs.Nodes), len(got))
+								}
+							}
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// sortedIDSet returns the distinct IDs, ascending — order-independent comparison.
+func sortedIDSet(ids []store.NodeID) []store.NodeID {
+	seen := make(map[store.NodeID]struct{}, len(ids))
+	out := make([]store.NodeID, 0, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// Every edge DFS reports must be real and must join two nodes it also reported.
+func TestDFS_EdgesAreWellFormed(t *testing.T) {
+	g := graphene.NewInMemory()
+	ids := buildTraversalFixture(t, g, 40)
+
+	for _, depth := range []int{1, 2, 4} {
+		res, err := g.DFS(ids[0], depth, store.DirectionBoth, nil)
+		if err != nil {
+			t.Fatalf("DFS: %v", err)
+		}
+		inResult := make(map[store.NodeID]struct{}, len(res.Nodes))
+		for _, n := range res.Nodes {
+			inResult[n.ID] = struct{}{}
+		}
+		seen := make(map[store.EdgeID]struct{}, len(res.Edges))
+		for _, e := range res.Edges {
+			if _, dup := seen[e.ID]; dup {
+				t.Fatalf("depth=%d: edge %d reported twice", depth, e.ID)
+			}
+			seen[e.ID] = struct{}{}
+			if _, ok := inResult[e.Src]; !ok {
+				t.Fatalf("depth=%d: edge %d has Src %d outside the result set", depth, e.ID, e.Src)
+			}
+			if _, ok := inResult[e.Dst]; !ok {
+				t.Fatalf("depth=%d: edge %d has Dst %d outside the result set", depth, e.ID, e.Dst)
+			}
+		}
 	}
 }
 

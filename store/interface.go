@@ -163,6 +163,35 @@ type Reindexer interface {
 	PurgeEdgeIndex(id EdgeID) error
 }
 
+// OrderedIndexDeclarer is an optional extension implemented by stores that can
+// maintain an ordered index over a property key, so range and prefix filters on
+// it are answered by binary search instead of by scanning the key's entries.
+//
+// Declaring a key changes how its range predicates compare. Undeclared keys use
+// PropertyFilterMatches, which tries numeric comparison first and falls back to
+// byte order; that rule is fine for evaluating one value at a time but is not a
+// valid sort order, so an ordered index cannot be built on it (see
+// index/encoding for a worked example). A declared key is therefore compared
+// byte-wise throughout. Encode its values so byte order matches your intent —
+// index/encoding provides order-preserving encoders — or use a naturally ordered
+// form such as fixed-width zero-padded digits or hex.
+//
+// Equality lookups are unaffected: they go through the hash postings either way.
+type OrderedIndexDeclarer interface {
+	// DeclareOrderedNodeProperty builds and maintains an ordered index over a
+	// node property key, absorbing entries already registered under it.
+	DeclareOrderedNodeProperty(key string) error
+
+	// DeclareOrderedEdgeProperty is the edge-property equivalent.
+	DeclareOrderedEdgeProperty(key string) error
+
+	// OrderedNodeProperties returns the declared node keys, sorted.
+	OrderedNodeProperties() []string
+
+	// OrderedEdgeProperties returns the declared edge keys, sorted.
+	OrderedEdgeProperties() []string
+}
+
 // IndexVerifier is an optional extension implemented by stores that can
 // self-check their indexes against the records those indexes describe.
 type IndexVerifier interface {

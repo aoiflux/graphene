@@ -23,7 +23,7 @@ import (
 // so any deterministic encoding (msgpack, raw bytes, string cast) works as long
 // as the same encoding is used for both IndexNode and NodesByProperty calls.
 //
-// Structure:
+// # Structure
 //
 //   - Postings lists are kept sorted by ID. Membership and insertion are
 //     O(log n) + memmove, lookups return an already-ordered slice (so the query
@@ -32,11 +32,62 @@ import (
 //     RemoveNode / RemoveEdge proportional to that entity's own entries rather
 //     than to the size of the whole index.
 //
+// # Sharding
+//
+// The index is split into propertyShards independent shards, chosen by hashing
+// the property key. One global lock meant that registering "sha256" on one
+// goroutine blocked a lookup of "bucket" on another even though the two share no
+// state; with per-key shards, unrelated keys no longer contend.
+//
+// **The reverse map is sharded alongside the forward map, not by ID.** Each
+// shard holds only the (key, value) pairs for keys it owns, so removing an
+// entity is a pass over the shards with each one taking its own lock
+// independently — no operation ever needs two shard locks at once, which means
+// there is no lock ordering to get wrong and no deadlock to reason about. The
+// cost is that RemoveNode touches every shard instead of one map, which is a
+// handful of lookups against work that is already proportional to the entity's
+// entries.
+//
 // PropertyIndex is safe for concurrent use.
 type PropertyIndex struct {
+	shards [propertyShards]propertyShard
+}
+
+// propertyShards must be a power of two so the hash can be masked.
+const propertyShards = 16
+
+type propertyShard struct {
 	mu    sync.RWMutex
 	nodes postings[store.NodeID]
 	edges postings[store.EdgeID]
+
+	// Keys declared ordered, with their sorted value structures. Declaring a key
+	// is opt-in because it changes how that key's range predicates compare —
+	// see orderedIndex and index/encoding.
+	orderedNodeKeys map[string]*orderedIndex[store.NodeID]
+	orderedEdgeKeys map[string]*orderedIndex[store.EdgeID]
+}
+
+// shardFor returns the shard owning key.
+//
+// FNV-1a: cheap, allocation-free over a string, and well enough distributed for
+// the handful of distinct property keys a workload typically registers.
+func (p *PropertyIndex) shardFor(key string) *propertyShard {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= prime64
+	}
+	return &p.shards[h&(propertyShards-1)]
+}
+
+// errIndexf builds an index consistency error.
+func errIndexf(format string, args ...any) error {
+	return fmt.Errorf(format, args...)
 }
 
 // NodePropEntry is a single (nodeID, key, value) tuple used when enumerating
@@ -56,59 +107,221 @@ type EdgePropEntry struct {
 
 // NewPropertyIndex returns an empty PropertyIndex.
 func NewPropertyIndex() *PropertyIndex {
-	return &PropertyIndex{
-		nodes: newPostings[store.NodeID](),
-		edges: newPostings[store.EdgeID](),
+	p := &PropertyIndex{}
+	for i := range p.shards {
+		p.shards[i] = propertyShard{
+			nodes:           newPostings[store.NodeID](),
+			edges:           newPostings[store.EdgeID](),
+			orderedNodeKeys: make(map[string]*orderedIndex[store.NodeID]),
+			orderedEdgeKeys: make(map[string]*orderedIndex[store.EdgeID]),
+		}
 	}
+	return p
+}
+
+// DeclareOrderedNodeKey builds and maintains an ordered index over key, so that
+// range and prefix filters on it are answered by binary search instead of a scan
+// of every entry under that key.
+//
+// Entries already registered under key are absorbed, so this can be called at
+// any point in a store's life.
+//
+// Declaring a key changes how its range predicates compare: from the scan path's
+// "numeric when both sides parse, byte-wise otherwise" rule to plain byte order.
+// Encode values with index/encoding (or use a naturally byte-ordered form such
+// as fixed-width zero-padded digits or hex) so byte order means what you intend.
+// Equality lookups are unaffected.
+func (p *PropertyIndex) DeclareOrderedNodeKey(key string) {
+	sh := p.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if _, exists := sh.orderedNodeKeys[key]; exists {
+		return
+	}
+	idx := newOrderedIndex[store.NodeID]()
+	for value, ids := range sh.nodes.byKey[key] {
+		for _, id := range ids {
+			idx.add(id, value)
+		}
+	}
+	sh.orderedNodeKeys[key] = idx
+}
+
+// DeclareOrderedEdgeKey is DeclareOrderedNodeKey for edge properties.
+func (p *PropertyIndex) DeclareOrderedEdgeKey(key string) {
+	sh := p.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if _, exists := sh.orderedEdgeKeys[key]; exists {
+		return
+	}
+	idx := newOrderedIndex[store.EdgeID]()
+	for value, ids := range sh.edges.byKey[key] {
+		for _, id := range ids {
+			idx.add(id, value)
+		}
+	}
+	sh.orderedEdgeKeys[key] = idx
+}
+
+// OrderedNodeKeys returns the declared ordered node keys, sorted.
+func (p *PropertyIndex) OrderedNodeKeys() []string {
+	var out []string
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		for k := range sh.orderedNodeKeys {
+			out = append(out, k)
+		}
+		sh.mu.RUnlock()
+	}
+	sort.Strings(out)
+	return out
+}
+
+// OrderedEdgeKeys returns the declared ordered edge keys, sorted.
+func (p *PropertyIndex) OrderedEdgeKeys() []string {
+	var out []string
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		for k := range sh.orderedEdgeKeys {
+			out = append(out, k)
+		}
+		sh.mu.RUnlock()
+	}
+	sort.Strings(out)
+	return out
 }
 
 // IndexNode records that nodeID has property key=value. Re-registering an
 // identical (id, key, value) triple is a no-op.
 func (p *PropertyIndex) IndexNode(id store.NodeID, key string, value []byte) {
-	p.mu.Lock()
-	p.nodes.add(id, key, string(value))
-	p.mu.Unlock()
+	vk := string(value)
+	sh := p.shardFor(key)
+	sh.mu.Lock()
+	sh.nodes.add(id, key, vk)
+	if idx := sh.orderedNodeKeys[key]; idx != nil {
+		idx.add(id, vk)
+	}
+	sh.mu.Unlock()
 }
 
 // IndexEdge records that edgeID has property key=value. Re-registering an
 // identical (id, key, value) triple is a no-op.
 func (p *PropertyIndex) IndexEdge(id store.EdgeID, key string, value []byte) {
-	p.mu.Lock()
-	p.edges.add(id, key, string(value))
-	p.mu.Unlock()
+	vk := string(value)
+	sh := p.shardFor(key)
+	sh.mu.Lock()
+	sh.edges.add(id, key, vk)
+	if idx := sh.orderedEdgeKeys[key]; idx != nil {
+		idx.add(id, vk)
+	}
+	sh.mu.Unlock()
 }
 
 // RemoveNode drops every indexed entry for the given node id across all keys
 // and values. Buckets left empty are removed so they do not accumulate.
 func (p *PropertyIndex) RemoveNode(id store.NodeID) {
-	p.mu.Lock()
-	p.nodes.remove(id)
-	p.mu.Unlock()
+	// Each shard owns the entries for its own keys, so they are removed
+	// independently — one lock at a time, never two. That is what keeps this
+	// deadlock-free without any lock ordering rule.
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.Lock()
+		if len(sh.orderedNodeKeys) > 0 {
+			for _, ref := range sh.nodes.refs[id] {
+				if idx := sh.orderedNodeKeys[ref.key]; idx != nil {
+					idx.remove(id, ref.value)
+				}
+			}
+		}
+		sh.nodes.remove(id)
+		sh.mu.Unlock()
+	}
 }
 
 // RemoveEdge drops every indexed entry for the given edge id across all keys
 // and values. Buckets left empty are removed so they do not accumulate.
 func (p *PropertyIndex) RemoveEdge(id store.EdgeID) {
-	p.mu.Lock()
-	p.edges.remove(id)
-	p.mu.Unlock()
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.Lock()
+		if len(sh.orderedEdgeKeys) > 0 {
+			for _, ref := range sh.edges.refs[id] {
+				if idx := sh.orderedEdgeKeys[ref.key]; idx != nil {
+					idx.remove(id, ref.value)
+				}
+			}
+		}
+		sh.edges.remove(id)
+		sh.mu.Unlock()
+	}
+}
+
+// NodesMatchingOrdered appends the IDs matching a range or prefix filter to dst,
+// using the ordered index for f.Key. ok is false when the key is not declared
+// ordered or the operator cannot be served from an ordering, in which case the
+// caller must fall back to scanning the key's entries.
+//
+// Results are appended in ascending value order, then ascending ID within each
+// value — not in overall ID order, so callers that need sorted IDs must sort.
+func (p *PropertyIndex) NodesMatchingOrdered(dst []store.NodeID, f store.PropertyFilter) ([]store.NodeID, bool) {
+	sh := p.shardFor(f.Key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	idx := sh.orderedNodeKeys[f.Key]
+	if idx == nil {
+		return dst, false
+	}
+	lo, hi, ok := idx.rangeFor(f)
+	if !ok {
+		return dst, false
+	}
+	idx.forEachInRange(lo, hi, func(id store.NodeID) bool {
+		dst = append(dst, id)
+		return true
+	})
+	return dst, true
+}
+
+// EdgesMatchingOrdered is NodesMatchingOrdered for edge properties.
+func (p *PropertyIndex) EdgesMatchingOrdered(dst []store.EdgeID, f store.PropertyFilter) ([]store.EdgeID, bool) {
+	sh := p.shardFor(f.Key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	idx := sh.orderedEdgeKeys[f.Key]
+	if idx == nil {
+		return dst, false
+	}
+	lo, hi, ok := idx.rangeFor(f)
+	if !ok {
+		return dst, false
+	}
+	idx.forEachInRange(lo, hi, func(id store.EdgeID) bool {
+		dst = append(dst, id)
+		return true
+	})
+	return dst, true
 }
 
 // NodesByProperty returns all NodeIDs that have an indexed entry for key=value,
 // in ascending ID order. Returns nil if no match.
 func (p *PropertyIndex) NodesByProperty(key string, value []byte) []store.NodeID {
-	p.mu.RLock()
-	out := p.nodes.lookup(key, string(value))
-	p.mu.RUnlock()
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	out := sh.nodes.lookup(key, string(value))
+	sh.mu.RUnlock()
 	return out
 }
 
 // EdgesByProperty returns all EdgeIDs that have an indexed entry for key=value,
 // in ascending ID order. Returns nil if no match.
 func (p *PropertyIndex) EdgesByProperty(key string, value []byte) []store.EdgeID {
-	p.mu.RLock()
-	out := p.edges.lookup(key, string(value))
-	p.mu.RUnlock()
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	out := sh.edges.lookup(key, string(value))
+	sh.mu.RUnlock()
 	return out
 }
 
@@ -116,17 +329,19 @@ func (p *PropertyIndex) EdgesByProperty(key string, value []byte) []store.EdgeID
 // without copying the postings list. Used by the query planner to pick the most
 // selective driving index.
 func (p *PropertyIndex) NodeCardinality(key string, value []byte) int {
-	p.mu.RLock()
-	n := p.nodes.cardinality(key, string(value))
-	p.mu.RUnlock()
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	n := sh.nodes.cardinality(key, string(value))
+	sh.mu.RUnlock()
 	return n
 }
 
 // EdgeCardinality returns the number of edge IDs registered under key=value.
 func (p *PropertyIndex) EdgeCardinality(key string, value []byte) int {
-	p.mu.RLock()
-	n := p.edges.cardinality(key, string(value))
-	p.mu.RUnlock()
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	n := sh.edges.cardinality(key, string(value))
+	sh.mu.RUnlock()
 	return n
 }
 
@@ -137,17 +352,19 @@ func (p *PropertyIndex) EdgeCardinality(key string, value []byte) int {
 // contains, and the ordered comparisons). It touches only the buckets belonging
 // to key, unlike NodeEntries which materialises the entire index.
 func (p *PropertyIndex) ForEachNodeEntry(key string, fn func(id store.NodeID, value []byte) bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	p.nodes.forEach(key, fn)
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	sh.nodes.forEach(key, fn)
 }
 
 // ForEachEdgeEntry calls fn for every (id, value) registered under key.
 // Return false from fn to stop early.
 func (p *PropertyIndex) ForEachEdgeEntry(key string, fn func(id store.EdgeID, value []byte) bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	p.edges.forEach(key, fn)
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	sh.edges.forEach(key, fn)
 }
 
 // NodeEntries returns all indexed node property entries.
@@ -155,25 +372,31 @@ func (p *PropertyIndex) ForEachEdgeEntry(key string, fn func(id store.EdgeID, va
 //
 // This materialises the whole index; query paths should use ForEachNodeEntry.
 func (p *PropertyIndex) NodeEntries() []NodePropEntry {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make([]NodePropEntry, 0, p.nodes.count)
-	p.nodes.forEachAll(func(id store.NodeID, key string, value []byte) bool {
-		out = append(out, NodePropEntry{ID: id, Key: key, Value: value})
-		return true
-	})
+	var out []NodePropEntry
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		sh.nodes.forEachAll(func(id store.NodeID, key string, value []byte) bool {
+			out = append(out, NodePropEntry{ID: id, Key: key, Value: value})
+			return true
+		})
+		sh.mu.RUnlock()
+	}
 	return out
 }
 
 // EdgeEntries returns all indexed edge property entries.
 func (p *PropertyIndex) EdgeEntries() []EdgePropEntry {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make([]EdgePropEntry, 0, p.edges.count)
-	p.edges.forEachAll(func(id store.EdgeID, key string, value []byte) bool {
-		out = append(out, EdgePropEntry{ID: id, Key: key, Value: value})
-		return true
-	})
+	var out []EdgePropEntry
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		sh.edges.forEachAll(func(id store.EdgeID, key string, value []byte) bool {
+			out = append(out, EdgePropEntry{ID: id, Key: key, Value: value})
+			return true
+		})
+		sh.mu.RUnlock()
+	}
 	return out
 }
 
@@ -193,33 +416,75 @@ func (p *PropertyIndex) EdgeEntries() []EdgePropEntry {
 // properties — values are caller-encoded opaque bytes, so only the caller knows
 // that. See store.ReindexPolicy for how that staleness is managed.
 func (p *PropertyIndex) Verify() error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if err := p.nodes.verify("node"); err != nil {
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		err := sh.verify()
+		sh.mu.RUnlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verify checks one shard's invariants. Caller must hold sh.mu.
+func (sh *propertyShard) verify() error {
+	if err := sh.nodes.verify("node"); err != nil {
 		return err
 	}
-	return p.edges.verify("edge")
+	if err := sh.edges.verify("edge"); err != nil {
+		return err
+	}
+	// Each ordered index must mirror the hash postings for its key exactly.
+	for key, idx := range sh.orderedNodeKeys {
+		if err := idx.verify("node", key, sh.nodes.byKey[key]); err != nil {
+			return err
+		}
+	}
+	for key, idx := range sh.orderedEdgeKeys {
+		if err := idx.verify("edge", key, sh.edges.byKey[key]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // IndexedNodeIDs returns every node ID that has at least one indexed entry.
 // Used by integrity checks to detect postings that outlived their entity.
 func (p *PropertyIndex) IndexedNodeIDs() []store.NodeID {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make([]store.NodeID, 0, len(p.nodes.refs))
-	for id := range p.nodes.refs {
-		out = append(out, id)
+	seen := make(map[store.NodeID]struct{})
+	var out []store.NodeID
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		for id := range sh.nodes.refs {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+		sh.mu.RUnlock()
 	}
 	return out
 }
 
 // IndexedEdgeIDs returns every edge ID that has at least one indexed entry.
 func (p *PropertyIndex) IndexedEdgeIDs() []store.EdgeID {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make([]store.EdgeID, 0, len(p.edges.refs))
-	for id := range p.edges.refs {
-		out = append(out, id)
+	seen := make(map[store.EdgeID]struct{})
+	var out []store.EdgeID
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		for id := range sh.edges.refs {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+		sh.mu.RUnlock()
 	}
 	return out
 }

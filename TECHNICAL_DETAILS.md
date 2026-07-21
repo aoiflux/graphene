@@ -180,23 +180,62 @@ not through a built-in declarative query runtime.
 
 ## 5. Indexing Internals
 
-### 5.1 Type Index
+Every index below is consulted by the query planner; none of them is decorative.
+Which operators each one accelerates is the practical question, so that is stated
+per index.
 
-- Maps node label to node IDs.
-- Maps edge label to edge IDs.
-- Supports multi-label entities by indexing under each label.
+### 5.1 Label (type) index
 
-### 5.2 Property Index
+- Maps node label to node IDs and edge label to edge IDs, indexing multi-label
+  entities under each of their labels.
+- Postings are **sorted by ID**. That makes removal a binary search plus a
+  memmove instead of a full rewrite, and lets a lookup hand the query path an
+  already-ordered result it does not need to sort again.
+- The disk backend builds the same postings over the CSR at load
+  (`buildLabelIndex`), so `NodesByType` is proportional to the number of matches
+  rather than to the size of the graph. They are derived state, rebuilt on open,
+  and deliberately not part of the file format.
+- Duplicate labels on one entity are collapsed at every insertion site, so an
+  entity created with `[Tag, Tag]` appears once.
 
-- Explicit indexing model: properties are queryable only after indexing calls.
-- Keeps query behavior predictable and avoids implicit indexing costs.
+### 5.2 Property index
 
-### 5.3 Temporal Index
+- Explicit indexing model: properties are queryable only after an indexing call.
+  This keeps behaviour predictable and the storage layer free of any need to
+  understand your property encoding.
+- Postings per `(key, value)` are sorted and deduplicated; registering the same
+  triple twice is a no-op.
+- A reverse `ID → [(key, value)]` map makes removal proportional to the entity's
+  own entries rather than to the size of the whole index.
+- **Persisted** inside the CSR file (format v6), so a compacted store reopens
+  without replaying anything and the WAL is left empty.
+- **Sharded 16 ways by key hash.** The reverse map is sharded alongside the
+  forward map rather than by ID, so no operation ever holds two shard locks —
+  there is no lock ordering to get wrong.
+- Accelerates: equality (`PropertyOpEqual`).
 
-- Sorted temporal entries with binary-search range access.
-- Optimized for time-window filters.
+### 5.3 Ordered (range) index
 
-### 5.4 Query Execution Model (Typed APIs)
+- Opt-in per key via `Graph.DeclareOrderedProperty`. Keeps that key's distinct
+  values sorted, answering range and prefix predicates with two binary searches.
+- Accelerates: `>`, `>=`, `<`, `<=`, `Between`, and `Prefix`.
+- **Declaring a key changes how it compares.** Undeclared keys use the scan rule —
+  numeric when both sides parse, byte order otherwise — which is fine value by
+  value but is *not a valid sort order*: under it `"9" < "10" < "1x" < "9"`, a
+  cycle, so no sorted structure can be built on it. A declared key is compared
+  byte-wise throughout. Encode values with `index/encoding`, which supplies
+  order-preserving encoders for int64, uint64, float64, string and time.
+- Not persisted: a declaration is a runtime choice about how to index, like an
+  index definition elsewhere, and must be re-issued after reopening.
+
+### 5.4 What is not indexed
+
+- `PropertyOpContains` is a scan and will remain one — no ordering can bound a
+  substring match. A trigram index is the only route and is out of scope.
+- A range or prefix filter on an *undeclared* key scans that key's buckets. That
+  is bounded by the key, not by the whole index, but it is still linear.
+
+### 5.5 Query Execution Model (Typed APIs)
 
 The query system is API-first and intentionally function-driven:
 
@@ -264,23 +303,77 @@ Practical recommendation:
 
 ## 7. Concurrency and Safety
 
-- Concurrent operations are guarded by backend synchronization where needed.
 - WAL replay restores disk-backed state after unclean exits.
-- Compaction uses rebuild + atomic swap semantics to avoid torn base snapshots.
+- Compaction rebuilds and atomically swaps the base snapshot, so readers never
+  observe a torn one.
+
+### 7.1 Lock-free reads on the disk backend
+
+A published `CSRGraph` is immutable, so a reader that obtains the pointer
+atomically can read a record from it without taking the store lock at all.
+
+The delta maps and delete masks still need the lock — they are ordinary Go maps —
+but they only ever *shadow* CSR records, never rewrite them. The store therefore
+keeps a count of CSR records superseded by an update or tombstone in the current
+epoch. While that count is zero, every CSR record is still authoritative and a
+point read that finds its answer there needs no lock.
+
+Counting shadows rather than asking "is the delta empty" is what makes this
+useful under concurrent writes: **appending new entities shadows nothing**, so
+ongoing ingest does not disable the fast path for pre-existing records.
+
+Two invariants make it sound. The counter is only incremented within an epoch, so
+observing zero *after* a lookup proves it was zero throughout. And the epoch is
+sampled *before* the CSR pointer and re-checked afterwards, so a compaction that
+swaps the CSR and resets the counter mid-read cannot make a stale answer look
+valid.
+
+### 7.2 Scaling characteristics
+
+`b.RunParallel` reports wall-time per operation, so lower is better and perfect
+scaling would divide by the core count.
+
+| Path | 1 core | 16 cores | Scaling |
+|---|---:|---:|---|
+| Point lookup (disk) | 59.61 ns | 12.46 ns | 4.8× |
+| 3-hop BFS (disk) | 5 706 ns | 1 056 ns | 5.4× |
+| Property registration, 16 distinct keys | 1 127 ns | 402 ns | 2.8× |
+
+Known limits, stated rather than glossed:
+
+- **The in-memory backend does not scale on reads.** It has no CSR, so it gets
+  none of the above and still serialises on one `RWMutex`. It is the reference
+  implementation for development and testing; the disk backend is the one to
+  measure.
+- **Writes serialise.** The store takes an exclusive lock, and on disk the WAL is
+  a single append-only file, so ingest throughput does not grow with cores.
+- **Single-key property traffic caps out around four cores.** Sharding is by key,
+  so traffic concentrated on one key contends on that one shard.
 
 ## 8. Benchmark and Stress Evidence
 
 ### 8.1 Current Benchmark Sample
 
-Source run: `./test.ps1 -Bench -BenchTime 1s` on Windows (Ryzen 9 5980HS).
+The suite runs 68+ benchmarks covering reads, writes, concurrency, a 10k→100k
+scale sweep, and resident memory footprint. Full methodology and results are in
+[benchmarks.md](benchmarks.md); a representative slice:
 
-| Benchmark           | Throughput Signal |           Allocation Signal |
-| ------------------- | ----------------: | --------------------------: |
-| AddNode             |       728.9 ns/op |       268 B/op, 3 allocs/op |
-| GetNode             |       7.945 ns/op |         0 B/op, 0 allocs/op |
-| BFS                 |      447459 ns/op | 223560 B/op, 3058 allocs/op |
-| ShortestPath        |      260022 ns/op | 124864 B/op, 2061 allocs/op |
-| PropertyIndexLookup |       51.42 ns/op |          8 B/op, 1 alloc/op |
+| Benchmark | Result | Allocation |
+|---|---:|---:|
+| GetNode | 5.8 ns/op | 0 B, 0 allocs |
+| Point lookup, disk | 50.2 ns/op | 64 B, 1 alloc |
+| Equality property query, disk | 290.7 ns/op | 184 B, 5 allocs |
+| Typed degree on a 1000-edge hub, disk | 8.21 µs/op | 0 B, 0 allocs |
+| `NodesByType`, selective label, disk | 4.90 µs/op | 4.0 KiB, 5 allocs |
+| BFS over a 1000-node chain | 353 µs/op | 229 KiB, 77 allocs |
+| Reopen a compacted 50k store | 60.6 ms/op | — |
+
+**Numbers here are comparative, not absolute.** They come from a warm laptop, and
+measuring the same commit in two different sessions has shown 10–23% drift. Any
+performance claim in this repository is produced by running baseline and current
+**interleaved** — alternating rounds against a `git worktree` at the comparison
+commit — with untouched code paths included as controls. If those controls do not
+read "no significant change", the measurement is discarded.
 
 ### 8.2 Stress Scenarios Covered
 

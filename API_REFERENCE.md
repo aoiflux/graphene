@@ -26,6 +26,7 @@ import (
 7. [Mutation](#7-mutation)  ← update / delete
 8. [Type lookups](#8-type-lookups)
 9. [Property index](#9-property-index)
+9a. [Ordered (range) keys](#9a-ordered-range-keys)
 10. [Typed queries](#10-typed-queries)
 11. [Degree & connectivity](#11-degree--connectivity)
 12. [Traversal & patterns](#12-traversal--patterns)
@@ -33,6 +34,7 @@ import (
 14. [Persistence lifecycle](#14-persistence-lifecycle)
 15. [Visualization export](#15-visualization-export)
 16. [Concurrency & guarantees](#16-concurrency--guarantees)
+17. [Index maintenance](#17-index-maintenance)
 
 ---
 
@@ -331,6 +333,60 @@ hits, _ := g.NodesByProperty("sha256", []byte("deadbeef"))
 
 ---
 
+## 9a. Ordered (range) keys
+
+Declaring a key builds a sorted structure over its values, so range and prefix
+filters on that key are answered by binary search instead of by scanning every
+entry registered under it.
+
+```go
+func (g *Graph) DeclareOrderedProperty(key string) error
+func (g *Graph) DeclareOrderedEdgeProperty(key string) error
+func (g *Graph) OrderedProperties() (nodeKeys, edgeKeys []string)
+```
+
+Entries already registered are absorbed, so a key can be declared at any point.
+
+**Declaring a key changes how it compares.** Undeclared keys use the scan rule:
+numeric when both sides parse, byte order otherwise. That is fine value by value
+but is not a valid sort order — under it `"9" < "10" < "1x" < "9"`, a cycle — so
+no sorted structure can be built on it. A declared key is compared **byte-wise
+throughout**, in the index and in the residual filter alike.
+
+Encode values so byte order matches your intent. `index/encoding` provides
+order-preserving encoders:
+
+```go
+import "github.com/aoiflux/graphene/index/encoding"
+
+g.IndexNodeProperty(id, "score", encoding.Int64(score))
+g.DeclareOrderedProperty("score")
+
+g.QueryNodes(store.NodeQuery{Filters: []store.PropertyFilter{{
+    Key: "score", Op: store.PropertyOpBetweenInclusive,
+    Value: encoding.Int64(100), ValueUpper: encoding.Int64(200),
+}}})
+```
+
+| Encoder | Use for |
+|---|---|
+| `encoding.Int64` / `Uint64` | integers — do not hand-pad decimal strings |
+| `encoding.Float64` | floating point, including negatives |
+| `encoding.Time` | timestamps (Unix nanoseconds; valid 1678–2262) |
+| `encoding.String` | text, which already sorts lexicographically |
+| `encoding.PrefixUpperBound` | the exclusive end of a prefix range |
+
+Values encoded with different encoders must not share a key — their byte ranges
+are not comparable.
+
+Equality lookups are unaffected either way. `PropertyOpContains` cannot be served
+by any ordering and remains a scan.
+
+A declaration is a runtime choice about how to index, not part of the stored
+data: after reopening a store, re-declare the keys you want ordered.
+
+---
+
 ## 10. Typed queries
 
 Composable, deterministic queries with filters and pagination.
@@ -554,3 +610,64 @@ _ = viz.ExportInteractiveHTMLWithOptions(nodes, edges, "graph.html", viz.ExportO
 - IDs are monotonic and never reused across the lifetime of a store, including
   across restarts and compactions.
 ```
+
+---
+
+## 17. Index maintenance
+
+### Keeping the property index truthful across updates
+
+The engine cannot re-derive property-index entries on its own: indexed values are
+supplied by you in your own encoding, and the `Properties` blob is opaque to the
+storage layer. Updating an indexed entity therefore needs a choice, and the API
+makes it explicit rather than silent.
+
+```go
+func (g *Graph) UpdateNodeIndexed(n *store.Node, props map[string][]byte) error
+func (g *Graph) UpdateEdgeIndexed(e *store.Edge, props map[string][]byte) error
+func (g *Graph) SetReindexPolicy(p store.ReindexPolicy)
+func (g *Graph) ReindexPolicy() store.ReindexPolicy
+```
+
+**Prefer `UpdateNodeIndexed`.** It updates the record and replaces its index
+entries in one step, so neither failure mode below can occur:
+
+```go
+_ = g.UpdateNodeIndexed(
+    &store.Node{ID: artID, Labels: []store.NodeType{store.NodeTypeTag}},
+    map[string][]byte{"sha256": newHash},
+)
+```
+
+For plain `UpdateNode` / `UpdateEdge`, the policy decides:
+
+| Policy | Behaviour | Failure mode |
+|---|---|---|
+| `store.ReindexKeep` (default) | entries are left alone | entries go **stale** — the old value still matches |
+| `store.ReindexPurge` | the entity's entries are dropped | entries are **lost**, including ones the update did not touch |
+
+On the disk backend a purge is journalled, so replay cannot resurrect superseded
+values.
+
+### Verification and repair
+
+```go
+func (g *Graph) VerifyIndexes() error
+func (g *Graph) RebuildIndexes() error
+```
+
+`VerifyIndexes` cross-checks every index against the records it describes —
+postings ordering and deduplication, postings ↔ reverse-map agreement in both
+directions, label postings against live labels, adjacency against edge endpoints,
+and that no index entry outlives its entity. It cannot check that an indexed
+*value* still matches the entity's properties: those values are caller-encoded
+and opaque.
+
+`RebuildIndexes` recomputes everything derivable from the records — label
+postings and adjacency — and drops property entries whose entity is gone. It
+repairs structure, not content.
+
+**Neither runs automatically on `Open`.** Verification is O(V+E) — roughly 200 ms
+on a 100k-node store — and a damaged index section is already rejected while the
+file is parsed, so the scan would be a startup tax for little gain. Run them
+explicitly in tests, in CI, or when recovering a suspect store.

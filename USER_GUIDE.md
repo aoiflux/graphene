@@ -332,7 +332,105 @@ relIDs, _ := g.QueryRelationIDs(store.RelationQuery{
 _ = relIDs
 ```
 
+### Range and prefix queries: declare the key first
+
+An equality lookup works on any key you have indexed. A **range** query (`>`,
+`>=`, `<`, `<=`, `Between`) or a **prefix** query is a scan unless you declare
+the key ordered:
+
+```go
+import "github.com/aoiflux/graphene/index/encoding"
+
+// Encode the value so byte order matches numeric order, then declare the key.
+_ = g.IndexNodeProperty(artID, "size", encoding.Int64(fileSize))
+_ = g.DeclareOrderedProperty("size")
+
+big, _ := g.QueryNodes(store.NodeQuery{Filters: []store.PropertyFilter{{
+    Key: "size", Op: store.PropertyOpGreaterThan, Value: encoding.Int64(1 << 20),
+}}})
+_ = big
+```
+
+Declaring absorbs entries you have already indexed, so it can be done at any
+point. On a thousand distinct values this took a wide range query from 22.8 ms to
+2.3 ms, and a narrow one from 11.8 ms to 59 µs.
+
+**Two things to know before you declare a key.**
+
+First, it changes how that key compares. Undeclared keys try numeric comparison
+and fall back to byte order; a declared key is compared byte-wise throughout.
+That matters because the fallback rule is not a valid ordering — under it
+`"9" < "10" < "1x" < "9"`, which is a cycle — so a sorted index cannot be built on
+it. Use `index/encoding` and the two agree.
+
+Second, the declaration is not stored. After reopening a store, declare the keys
+again.
+
+Timestamps work the same way:
+
+```go
+_ = g.IndexNodeProperty(evtID, "seen_at", encoding.Time(t))
+_ = g.DeclareOrderedProperty("seen_at")
+
+window, _ := g.QueryNodes(store.NodeQuery{Filters: []store.PropertyFilter{{
+    Key:   "seen_at",
+    Op:    store.PropertyOpBetweenInclusive,
+    Value: encoding.Time(from), ValueUpper: encoding.Time(to),
+}}})
+_ = window
+```
+
+`Contains` cannot be accelerated by any ordering and always scans.
+
+### Keeping the index correct when you update
+
+The engine cannot re-derive your index entries: you supply the values in your own
+encoding, and the properties blob is opaque to it. So an update has to say what
+should happen to them.
+
+The safe call updates the record and its entries together:
+
+```go
+_ = g.UpdateNodeIndexed(
+    &store.Node{ID: artID, Labels: []store.NodeType{store.NodeTypeTag}},
+    map[string][]byte{"sha256": newHash},
+)
+```
+
+If you use plain `UpdateNode`, pick a policy and know its failure mode:
+
+| Policy | Behaviour | What goes wrong |
+|---|---|---|
+| `store.ReindexKeep` (default) | entries kept | they go **stale** — the old value still matches |
+| `store.ReindexPurge` | entries dropped | they are **lost**, including untouched keys |
+
+```go
+g.SetReindexPolicy(store.ReindexPurge)
+```
+
+### Checking the indexes
+
+```go
+if err := g.VerifyIndexes(); err != nil {
+    // structural inconsistency between an index and the records it describes
+}
+_ = g.RebuildIndexes() // recompute what is derivable from the records
+```
+
+Neither runs automatically on `Open` — verification is O(V+E), around 200 ms on a
+100k-node store, and a damaged file is already rejected while parsing. Call them
+in tests, in CI, or when recovering a store you do not trust.
+
 ## 6. Traversal and Multi-Hop Analysis
+
+> **If you only need the IDs, use `BFSIDs`.** It walks the graph without
+> building a single node or edge record — 20 allocations against 394 for the
+> record-returning walk on the same 12-hop traversal. Reachability checks,
+> scoping a pattern match, and feeding IDs into a follow-up query all want it.
+>
+> ```go
+> ids, _ := g.BFSIDs(artID, 3, store.DirectionBoth, nil)
+> ```
 
 ### BFS (multi-hop neighborhood)
 
