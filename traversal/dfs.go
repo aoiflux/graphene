@@ -88,14 +88,14 @@ func DFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direct
 	seenEdges := make(map[store.EdgeID]struct{})
 	result := &BFSResult{}
 
-	if err := dfsGeneral(g, origin, maxDepth, dir, edgeTypes, visited, seenEdges, result); err != nil {
+	if err := dfsGeneral(newWalker(g), origin, maxDepth, dir, edgeTypes, visited, seenEdges, result); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
 func dfsGeneral(
-	g store.GraphStore,
+	w *walker,
 	id store.NodeID,
 	remaining int,
 	dir store.Direction,
@@ -109,7 +109,7 @@ func dfsGeneral(
 	}
 	visited[id] = struct{}{}
 
-	node, err := g.GetNode(id)
+	node, err := w.g.GetNode(id)
 	if err != nil {
 		return err
 	}
@@ -119,17 +119,39 @@ func dfsGeneral(
 		return nil
 	}
 
-	neighbours, err := g.Neighbours(id, dir, edgeTypes)
+	// DFS recurses, so the walker's shared edge buffer cannot be held across the
+	// recursive call — the callee reuses it. Copy this frontier out first. It is
+	// the one unavoidable allocation per visited node in a depth-first walk.
+	incident, err := w.incidentEdges(id, dir, edgeTypes)
 	if err != nil {
 		return err
 	}
+	frontier := make([]store.IncidentEdge, len(incident))
+	copy(frontier, incident)
 
-	for _, nb := range neighbours {
-		if _, edgeSeen := seenEdges[nb.Edge.ID]; !edgeSeen {
-			seenEdges[nb.Edge.ID] = struct{}{}
-			result.Edges = append(result.Edges, nb.Edge)
+	seenThisLevel := make(map[store.NodeID]struct{}, len(frontier))
+	for _, step := range frontier {
+		eid, nbID := step.Edge, step.Neighbour
+		// One visit per distinct neighbour at this level, matching Neighbours.
+		if _, dup := seenThisLevel[nbID]; dup {
+			continue
 		}
-		if err := dfsGeneral(g, nb.Node.ID, remaining-1, dir, edgeTypes, visited, seenEdges, result); err != nil {
+		seenThisLevel[nbID] = struct{}{}
+
+		// Neighbours drops pairs whose node cannot be resolved, edge included.
+		if _, alreadyVisited := visited[nbID]; !alreadyVisited && !w.nodeExists(nbID) {
+			continue
+		}
+
+		if _, edgeSeen := seenEdges[eid]; !edgeSeen {
+			edge, err := w.g.GetEdge(eid)
+			if err != nil {
+				continue
+			}
+			seenEdges[eid] = struct{}{}
+			result.Edges = append(result.Edges, edge)
+		}
+		if err := dfsGeneral(w, nbID, remaining-1, dir, edgeTypes, visited, seenEdges, result); err != nil {
 			return err
 		}
 	}

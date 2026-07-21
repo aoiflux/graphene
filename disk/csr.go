@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 
+	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -49,6 +50,16 @@ type CSRGraph struct {
 	inOffset []uint64
 	inEdges  []store.EdgeID
 
+	// Label postings, built once at construction time. Answering NodesByType /
+	// EdgesByType used to mean scanning every record in the CSR; these give the
+	// same answer in time proportional to the number of matches.
+	//
+	// Both are keyed by label and hold ascending ID lists (construction walks the
+	// record arrays in ID order). They are derived state: Build recomputes them,
+	// so they are not part of the on-disk format and cost one pass at load time.
+	nodesByLabel map[store.NodeType][]store.NodeID
+	edgesByLabel map[store.EdgeType][]store.EdgeID
+
 	// Sequence high-water marks: the largest node/edge IDs ever issued at the
 	// time this CSR was built. Persisted so that IDs are never reused after a
 	// delete-then-compact-then-reopen cycle drops the record that held the max
@@ -69,7 +80,10 @@ type nodeRecord struct {
 // nodes and edges must be complete at build time (this is the bulk-ingest path).
 func Build(nodes []nodeRecord, edges []rawEdge) *CSRGraph {
 	if len(nodes) == 0 {
-		return &CSRGraph{}
+		return &CSRGraph{
+			nodesByLabel: make(map[store.NodeType][]store.NodeID),
+			edgesByLabel: make(map[store.EdgeType][]store.EdgeID),
+		}
 	}
 
 	// Determine max node ID.
@@ -137,7 +151,46 @@ func Build(nodes []nodeRecord, edges []rawEdge) *CSRGraph {
 		inCur[e.Dst]++
 	}
 
+	g.buildLabelIndex()
+
 	return g
+}
+
+// buildLabelIndex populates the label postings by walking the record arrays in
+// ID order, which yields ascending postings lists for free.
+//
+// A record's labels are deduplicated as we go: a repeated label would otherwise
+// append the same ID twice in a row, breaking the strict-ascending invariant the
+// postings rely on. Records carrying duplicates can come from a caller or from a
+// CSR file written before that was normalised, so this cannot assume clean input.
+func (g *CSRGraph) buildLabelIndex() {
+	g.nodesByLabel = make(map[store.NodeType][]store.NodeID)
+	g.edgesByLabel = make(map[store.EdgeType][]store.EdgeID)
+
+	for i := 1; i < len(g.nodes); i++ {
+		n := g.nodes[i]
+		if n.ID == store.InvalidNodeID {
+			continue
+		}
+		for j, lbl := range n.Labels {
+			if nodeRecordHasLabel(n.Labels[:j], lbl) {
+				continue
+			}
+			g.nodesByLabel[lbl] = append(g.nodesByLabel[lbl], n.ID)
+		}
+	}
+	for i := 1; i < len(g.edges); i++ {
+		e := g.edges[i]
+		if e.ID == store.InvalidEdgeID {
+			continue
+		}
+		for j, lbl := range e.Labels {
+			if rawEdgeHasLabel(e.Labels[:j], lbl) {
+				continue
+			}
+			g.edgesByLabel[lbl] = append(g.edgesByLabel[lbl], e.ID)
+		}
+	}
 }
 
 // OutboundEdges returns the raw edges for nodeID in outbound direction.
@@ -164,6 +217,156 @@ func (g *CSRGraph) adjacentEdges(id store.NodeID, offsets []uint64, edgeList []s
 		}
 	}
 	return result, nil
+}
+
+// verifyLabelIndex checks that the label postings describe exactly the records
+// present in the CSR, in ascending order.
+func (g *CSRGraph) verifyLabelIndex() error {
+	for lbl, ids := range g.nodesByLabel {
+		for i, id := range ids {
+			if i > 0 && ids[i-1] >= id {
+				return fmt.Errorf("csr node label index: %v postings not strictly ascending at %d", lbl, i)
+			}
+			n, ok := g.GetNode(id)
+			if !ok {
+				return fmt.Errorf("csr node label index: %v lists node %d, which is not in the CSR", lbl, id)
+			}
+			if !nodeRecordHasLabel(n.Labels, lbl) {
+				return fmt.Errorf("csr node label index: %v lists node %d, which does not carry that label", lbl, id)
+			}
+		}
+	}
+	for i := 1; i < len(g.nodes); i++ {
+		n := g.nodes[i]
+		if n.ID == store.InvalidNodeID {
+			continue
+		}
+		for _, lbl := range n.Labels {
+			// Postings are ascending, so membership is a binary search. A linear
+			// scan here would make verification quadratic in the size of the
+			// largest label.
+			if !sortedContainsNodeID(g.nodesByLabel[lbl], n.ID) {
+				return fmt.Errorf("csr node label index: node %d carries %v but is missing from the postings", n.ID, lbl)
+			}
+		}
+	}
+
+	for lbl, ids := range g.edgesByLabel {
+		for i, id := range ids {
+			if i > 0 && ids[i-1] >= id {
+				return fmt.Errorf("csr edge label index: %v postings not strictly ascending at %d", lbl, i)
+			}
+			e, ok := g.GetEdge(id)
+			if !ok {
+				return fmt.Errorf("csr edge label index: %v lists edge %d, which is not in the CSR", lbl, id)
+			}
+			if !rawEdgeHasLabel(e.Labels, lbl) {
+				return fmt.Errorf("csr edge label index: %v lists edge %d, which does not carry that label", lbl, id)
+			}
+		}
+	}
+	for i := 1; i < len(g.edges); i++ {
+		e := g.edges[i]
+		if e.ID == store.InvalidEdgeID {
+			continue
+		}
+		for _, lbl := range e.Labels {
+			if !sortedContainsEdgeID(g.edgesByLabel[lbl], e.ID) {
+				return fmt.Errorf("csr edge label index: edge %d carries %v but is missing from the postings", e.ID, lbl)
+			}
+		}
+	}
+	return nil
+}
+
+// sortedContainsNodeID reports membership in an ascending slice in O(log n).
+func sortedContainsNodeID(ids []store.NodeID, target store.NodeID) bool {
+	i := sort.Search(len(ids), func(i int) bool { return ids[i] >= target })
+	return i < len(ids) && ids[i] == target
+}
+
+// sortedContainsEdgeID reports membership in an ascending slice in O(log n).
+func sortedContainsEdgeID(ids []store.EdgeID, target store.EdgeID) bool {
+	i := sort.Search(len(ids), func(i int) bool { return ids[i] >= target })
+	return i < len(ids) && ids[i] == target
+}
+
+// verifyAdjacency checks that the offset arrays are monotonic and that every
+// adjacency entry points at an edge whose endpoint matches.
+func (g *CSRGraph) verifyAdjacency() error {
+	if len(g.outOffset) != len(g.inOffset) {
+		return fmt.Errorf("csr adjacency: offset arrays differ in length (%d vs %d)", len(g.outOffset), len(g.inOffset))
+	}
+	for i := 1; i < len(g.outOffset); i++ {
+		if g.outOffset[i] < g.outOffset[i-1] {
+			return fmt.Errorf("csr adjacency: outOffset not monotonic at %d", i)
+		}
+		if g.inOffset[i] < g.inOffset[i-1] {
+			return fmt.Errorf("csr adjacency: inOffset not monotonic at %d", i)
+		}
+	}
+	if n := len(g.outOffset); n > 0 && int(g.outOffset[n-1]) != len(g.outEdges) {
+		return fmt.Errorf("csr adjacency: outOffset tail %d != len(outEdges) %d", g.outOffset[n-1], len(g.outEdges))
+	}
+	if n := len(g.inOffset); n > 0 && int(g.inOffset[n-1]) != len(g.inEdges) {
+		return fmt.Errorf("csr adjacency: inOffset tail %d != len(inEdges) %d", g.inOffset[n-1], len(g.inEdges))
+	}
+
+	for id := 1; id < len(g.outOffset)-1; id++ {
+		nodeID := store.NodeID(id)
+		for _, eid := range g.OutboundEdgeIDs(nodeID) {
+			e, ok := g.GetEdge(eid)
+			if !ok {
+				return fmt.Errorf("csr adjacency: node %d lists outbound edge %d, which is not in the CSR", nodeID, eid)
+			}
+			if e.Src != nodeID {
+				return fmt.Errorf("csr adjacency: node %d lists outbound edge %d, whose Src is %d", nodeID, eid, e.Src)
+			}
+		}
+		for _, eid := range g.InboundEdgeIDs(nodeID) {
+			e, ok := g.GetEdge(eid)
+			if !ok {
+				return fmt.Errorf("csr adjacency: node %d lists inbound edge %d, which is not in the CSR", nodeID, eid)
+			}
+			if e.Dst != nodeID {
+				return fmt.Errorf("csr adjacency: node %d lists inbound edge %d, whose Dst is %d", nodeID, eid, e.Dst)
+			}
+		}
+	}
+	return nil
+}
+
+// OutboundEdgeIDs returns the outbound edge IDs for nodeID as a sub-slice of the
+// CSR's internal adjacency array — no copy, no rawEdge materialisation. The
+// result aliases CSR-owned memory: callers must hold the store lock and must not
+// retain or mutate it.
+func (g *CSRGraph) OutboundEdgeIDs(id store.NodeID) []store.EdgeID {
+	return adjacencySlice(id, g.outOffset, g.outEdges)
+}
+
+// InboundEdgeIDs returns the inbound edge IDs for nodeID. Same aliasing contract
+// as OutboundEdgeIDs.
+func (g *CSRGraph) InboundEdgeIDs(id store.NodeID) []store.EdgeID {
+	return adjacencySlice(id, g.inOffset, g.inEdges)
+}
+
+// OutDegree returns the outbound degree of nodeID in constant time, straight
+// from the offset array. It counts edges present in the CSR, so callers must
+// still account for any delete masks held by the store.
+func (g *CSRGraph) OutDegree(id store.NodeID) int {
+	return len(adjacencySlice(id, g.outOffset, g.outEdges))
+}
+
+// InDegree returns the inbound degree of nodeID in constant time.
+func (g *CSRGraph) InDegree(id store.NodeID) int {
+	return len(adjacencySlice(id, g.inOffset, g.inEdges))
+}
+
+func adjacencySlice(id store.NodeID, offsets []uint64, edgeList []store.EdgeID) []store.EdgeID {
+	if int(id) >= len(offsets)-1 {
+		return nil
+	}
+	return edgeList[offsets[id]:offsets[id+1]]
 }
 
 // GetNode returns the nodeRecord for the given ID.
@@ -200,19 +403,43 @@ func (g *CSRGraph) EdgeCount() int {
 	return len(g.outEdges)
 }
 
-// Serialise writes the CSR arrays to binary format v5 (variable-length labels,
-// inline property blobs, and persisted sequence high-water marks).
+// Serialise writes the CSR arrays to binary format v6.
 //
 // Format:
 //
-//	[magic:4][version:2=0x0005][nodeCount:8][edgeCount:8][nodeSeqHW:8][edgeSeqHW:8]
+//	[magic:4]["GCSR"][version:2=0x0006][nodeCount:8][edgeCount:8]
+//	[nodeSeqHW:8][edgeSeqHW:8][indexOffset:8]
 //	[nodeRecord * nodeCount] (each: id:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + propLen:4 + props:N)
 //	[rawEdge * edgeCount]    (each: id:8 + src:8 + dst:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + weight:4 + propLen:4 + props:N)
 //	[outOffset * (maxNodeID+2):8 each]
 //	[outEdges * edgeCount:8 each]
 //	[inOffset * (maxNodeID+2):8 each]
 //	[inEdges * edgeCount:8 each]
+//	--- index section, at byte indexOffset (v6+) ---
+//	[magic:4]["GIDX"]
+//	[nodePropCount:8][entry * nodePropCount] (each: id:8 + keyLen:2 + key + valLen:4 + val)
+//	[edgePropCount:8][entry * edgePropCount]
+//
+// # What is persisted, and what is not
+//
+// The property index IS persisted: its entries are supplied by the caller in the
+// caller's own encoding, so nothing in the file can reconstruct them. Before v6
+// they lived only in the WAL, which meant every Compact re-emitted the whole
+// index and every restart replayed it — a cost that grew forever.
+//
+// The label postings are NOT persisted: they are derivable from the node and
+// edge records in a single pass at load time (see buildLabelIndex), so storing
+// them would add file size and a consistency risk to save very little.
+//
+// indexOffset makes the index section directly addressable, so the reader never
+// has to compute its position from the adjacency array sizes.
 func (g *CSRGraph) Serialise() []byte {
+	return g.SerialiseWithIndex(nil, nil)
+}
+
+// SerialiseWithIndex writes the CSR plus the given property-index entries.
+// Passing nil for both writes a v6 file with an empty index section.
+func (g *CSRGraph) SerialiseWithIndex(nodeProps []index.NodePropEntry, edgeProps []index.EdgePropEntry) []byte {
 	var buf bytes.Buffer
 
 	// Count valid nodes and edges.
@@ -231,12 +458,15 @@ func (g *CSRGraph) Serialise() []byte {
 
 	// Header
 	buf.Write([]byte("GCSR"))
-	writeUint16(&buf, csrVersionWithSeqHW) // version 5
+	writeUint16(&buf, csrVersionCurrent)
 	writeUint64(&buf, uint64(nodeCount))
 	writeUint64(&buf, uint64(edgeCount))
 	// Sequence high-water marks (version 5+).
 	writeUint64(&buf, g.nodeSeqHW)
 	writeUint64(&buf, g.edgeSeqHW)
+	// Placeholder for indexOffset (version 6+); patched once the body is written.
+	indexOffsetPos := buf.Len()
+	writeUint64(&buf, 0)
 
 	// Nodes (variable-length labels)
 	for i := 1; i < len(g.nodes); i++ {
@@ -287,7 +517,31 @@ func (g *CSRGraph) Serialise() []byte {
 		writeUint64(&buf, uint64(v))
 	}
 
-	return buf.Bytes()
+	// Index section
+	indexOffset := buf.Len()
+	buf.WriteString(csrIndexSectionMagic)
+	writeUint64(&buf, uint64(len(nodeProps)))
+	for _, e := range nodeProps {
+		writePropEntry(&buf, uint64(e.ID), e.Key, e.Value)
+	}
+	writeUint64(&buf, uint64(len(edgeProps)))
+	for _, e := range edgeProps {
+		writePropEntry(&buf, uint64(e.ID), e.Key, e.Value)
+	}
+
+	out := buf.Bytes()
+	binary.LittleEndian.PutUint64(out[indexOffsetPos:indexOffsetPos+8], uint64(indexOffset))
+	return out
+}
+
+// writePropEntry appends one property-index entry:
+// id:8 + keyLen:2 + key + valLen:4 + value.
+func writePropEntry(buf *bytes.Buffer, id uint64, key string, value []byte) {
+	writeUint64(buf, id)
+	writeUint16(buf, uint16(len(key)))
+	buf.WriteString(key)
+	writeUint32(buf, uint32(len(value)))
+	buf.Write(value)
 }
 
 // writeUint16 appends a little-endian uint16 to buf.
@@ -311,35 +565,28 @@ func writeUint32(buf *bytes.Buffer, v uint32) {
 	buf.Write(b[:])
 }
 
-// NodesByType returns all node IDs that carry the given label from the CSR.
+// NodesByType returns the ascending node IDs carrying the given label, served
+// from the label index. The result aliases CSR-owned memory: callers must hold
+// the store lock and must not retain or mutate it.
 func (g *CSRGraph) NodesByType(t store.NodeType) []store.NodeID {
-	var out []store.NodeID
-	for i := 1; i < len(g.nodes); i++ {
-		n := g.nodes[i]
-		if n.ID != store.InvalidNodeID && nodeRecordHasLabel(n.Labels, t) {
-			out = append(out, n.ID)
-		}
-	}
-	return out
+	return g.nodesByLabel[t]
 }
 
-// EdgesByType returns all edge IDs that carry the given label from the CSR.
+// EdgesByType returns the ascending edge IDs carrying the given label. Same
+// aliasing contract as NodesByType.
 func (g *CSRGraph) EdgesByType(t store.EdgeType) []store.EdgeID {
-	var out []store.EdgeID
-	for i := 1; i < len(g.edges); i++ {
-		e := g.edges[i]
-		if e.ID != store.InvalidEdgeID && rawEdgeHasLabel(e.Labels, t) {
-			out = append(out, e.ID)
-		}
-	}
-	return out
+	return g.edgesByLabel[t]
 }
 
-// SortedEdgesByType returns edge IDs sorted for deterministic output.
+// SortedEdgesByType returns edge IDs sorted for deterministic output, as a copy
+// the caller owns. The label index is already built in ascending ID order, so
+// this only has to detach the result from CSR-owned memory.
 func (g *CSRGraph) SortedEdgesByType(t store.EdgeType) []store.EdgeID {
 	ids := g.EdgesByType(t)
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	return ids
+	out := make([]store.EdgeID, len(ids))
+	copy(out, ids)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // nodeRecordHasLabel returns true if the label slice contains t.

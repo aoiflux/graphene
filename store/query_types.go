@@ -97,6 +97,33 @@ type RelationQuery struct {
 	Limit        int
 }
 
+// EqualityDrivers returns the subset of filters that a store may use on its own
+// as the driving index for a query — that is, filters whose property-index
+// postings list is guaranteed to be a superset of the query's result.
+//
+// Under MatchAll every equality filter qualifies, because the result is the
+// intersection of all filter match sets and therefore contained in each one.
+// Under MatchAny the result is a union, so a single filter's postings is only a
+// superset when it is the only filter.
+//
+// Non-equality operators never qualify: the index is keyed by exact value, so a
+// prefix or range match cannot be resolved to a postings list without a scan.
+func EqualityDrivers(filters []PropertyFilter, mode MatchMode) []PropertyFilter {
+	if len(filters) == 0 {
+		return nil
+	}
+	if NormalizedFilterMode(mode) == MatchAny && len(filters) > 1 {
+		return nil
+	}
+	var out []PropertyFilter
+	for _, f := range filters {
+		if f.Op == PropertyOpEqual {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // NormalizedFilterMode returns mode when set, otherwise MatchAll.
 func NormalizedFilterMode(mode MatchMode) MatchMode {
 	if mode == MatchAny {

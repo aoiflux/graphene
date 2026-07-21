@@ -20,19 +20,30 @@ import (
 //   0x04 = Edge property index entry
 //   0x05 = Node delete (tombstone; payload = nodeID:8)
 //   0x06 = Edge delete (tombstone; payload = edgeID:8)
+//   0x07 = Node property purge (payload = nodeID:8)
+//   0x08 = Edge property purge (payload = edgeID:8)
 //   0xFF = Checkpoint (safe truncation marker after compaction)
 //
 // Edits reuse the 0x01/0x02 records: a node/edge record re-appended with an
 // existing ID is applied as an update (last-write-wins) on replay.
+//
+// The purge records (0x07/0x08) drop every property-index entry for an ID
+// without deleting the entity, which is what store.ReindexPurge needs: without
+// them, replay would re-apply the superseded 0x03/0x04 entries and resurrect
+// values the entity no longer has. Replay skips unknown record types, so a
+// binary predating these records reads a newer WAL without erroring — it just
+// does not honour the purges.
 
 const (
-	walRecordNode       byte = 0x01
-	walRecordEdge       byte = 0x02
-	walRecordNodeProp   byte = 0x03
-	walRecordEdgeProp   byte = 0x04
-	walRecordNodeDelete byte = 0x05
-	walRecordEdgeDelete byte = 0x06
-	walRecordCheckpoint byte = 0xFF
+	walRecordNode          byte = 0x01
+	walRecordEdge          byte = 0x02
+	walRecordNodeProp      byte = 0x03
+	walRecordEdgeProp      byte = 0x04
+	walRecordNodeDelete    byte = 0x05
+	walRecordEdgeDelete    byte = 0x06
+	walRecordNodePropPurge byte = 0x07
+	walRecordEdgePropPurge byte = 0x08
+	walRecordCheckpoint    byte = 0xFF
 
 	walHeaderSize     = 1 + 4 // type(1) + length(4)
 	walFooterSize     = 4     // crc32(4)
@@ -121,6 +132,18 @@ func (w *WAL) AppendEdgeDelete(payload []byte) error {
 	return w.append(walRecordEdgeDelete, payload)
 }
 
+// AppendNodePropPurge records that every property-index entry for a node is to
+// be dropped (payload = nodeID:8).
+func (w *WAL) AppendNodePropPurge(payload []byte) error {
+	return w.append(walRecordNodePropPurge, payload)
+}
+
+// AppendEdgePropPurge records that every property-index entry for an edge is to
+// be dropped (payload = edgeID:8).
+func (w *WAL) AppendEdgePropPurge(payload []byte) error {
+	return w.append(walRecordEdgePropPurge, payload)
+}
+
 // Checkpoint writes a checkpoint marker and syncs. After compaction, a
 // checkpoint signals that all records before it are durable in the CSR and
 // the WAL can be safely truncated.
@@ -177,6 +200,9 @@ type ReplayCallbacks struct {
 	EdgePropFunc   func([]byte) error // called for each 0x04 edge property entry
 	NodeDeleteFunc func([]byte) error // called for each 0x05 node tombstone
 	EdgeDeleteFunc func([]byte) error // called for each 0x06 edge tombstone
+
+	NodePropPurgeFunc func([]byte) error // called for each 0x07 node property purge
+	EdgePropPurgeFunc func([]byte) error // called for each 0x08 edge property purge
 }
 
 // Replay reads all records from the WAL from the beginning and dispatches each
@@ -261,6 +287,18 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 		case walRecordEdgeDelete:
 			if cb.EdgeDeleteFunc != nil {
 				if err := cb.EdgeDeleteFunc(payload); err != nil {
+					return err
+				}
+			}
+		case walRecordNodePropPurge:
+			if cb.NodePropPurgeFunc != nil {
+				if err := cb.NodePropPurgeFunc(payload); err != nil {
+					return err
+				}
+			}
+		case walRecordEdgePropPurge:
+			if cb.EdgePropPurgeFunc != nil {
+				if err := cb.EdgePropPurgeFunc(payload); err != nil {
 					return err
 				}
 			}

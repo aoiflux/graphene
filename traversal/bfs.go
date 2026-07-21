@@ -18,59 +18,131 @@ type BFSResult struct {
 //
 // The returned BFSResult includes the origin node and all nodes/edges within
 // the requested depth.
+//
+// If you only need the reachable node IDs, use BFSIDs: it does the same walk
+// without materialising a single node or edge record.
 func BFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) (*BFSResult, error) {
 	if maxDepth < 0 {
 		maxDepth = 0
 	}
 
-	visited := make(map[store.NodeID]struct{})
-	seenEdges := make(map[store.EdgeID]struct{})
-
-	result := &BFSResult{}
+	w := newWalker(g)
 
 	originNode, err := g.GetNode(origin)
 	if err != nil {
 		return nil, err
 	}
 
-	result.Nodes = append(result.Nodes, originNode)
-	visited[origin] = struct{}{}
+	result := &BFSResult{Nodes: []*store.Node{originNode}}
+	visited := map[store.NodeID]struct{}{origin: {}}
+	seenEdges := make(map[store.EdgeID]struct{})
 
 	type qitem struct {
 		id    store.NodeID
 		depth int
 	}
-
+	// The queue is consumed with a head index rather than by re-slicing.
+	// `queue = queue[1:]` slides the window forward through the backing array, so
+	// every append past the original capacity has to reallocate — one allocation
+	// per visited node on a long walk.
 	queue := []qitem{{id: origin, depth: 0}}
-
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
+	for head := 0; head < len(queue); head++ {
+		cur := queue[head]
 
 		if cur.depth >= maxDepth {
 			continue
 		}
 
-		neighbours, err := g.Neighbours(cur.id, dir, edgeTypes)
+		incident, err := w.incidentEdges(cur.id, dir, edgeTypes)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, nb := range neighbours {
-			if _, edgeSeen := seenEdges[nb.Edge.ID]; !edgeSeen {
-				seenEdges[nb.Edge.ID] = struct{}{}
-				result.Edges = append(result.Edges, nb.Edge)
-			}
-
-			if _, nodeSeen := visited[nb.Node.ID]; nodeSeen {
+		w.beginExpansion()
+		for _, step := range incident {
+			eid, nbID := step.Edge, step.Neighbour
+			// One result per distinct neighbour per expansion, matching Neighbours.
+			if !w.markNeighbour(nbID) {
 				continue
 			}
 
-			visited[nb.Node.ID] = struct{}{}
-			result.Nodes = append(result.Nodes, nb.Node)
-			queue = append(queue, qitem{id: nb.Node.ID, depth: cur.depth + 1})
+			// A visited neighbour was already resolved, so its node exists and
+			// need not be fetched again. An unvisited one is fetched now, and a
+			// node that cannot be resolved drops its edge too — Neighbours omits
+			// such pairs entirely, and BFS must not diverge from that.
+			_, alreadyVisited := visited[nbID]
+			var nbNode *store.Node
+			if !alreadyVisited {
+				nbNode, err = g.GetNode(nbID)
+				if err != nil {
+					continue
+				}
+			}
+
+			if _, edgeSeen := seenEdges[eid]; !edgeSeen {
+				edge, err := g.GetEdge(eid)
+				if err != nil {
+					continue
+				}
+				seenEdges[eid] = struct{}{}
+				result.Edges = append(result.Edges, edge)
+			}
+
+			if alreadyVisited {
+				continue
+			}
+			visited[nbID] = struct{}{}
+			result.Nodes = append(result.Nodes, nbNode)
+			queue = append(queue, qitem{id: nbID, depth: cur.depth + 1})
 		}
 	}
 
 	return result, nil
+}
+
+// BFSIDs performs the same walk as BFS and returns only the reachable node IDs,
+// in discovery order, starting with origin.
+//
+// It never materialises a node or edge record, so its cost is the graph walk
+// itself: on a backend implementing store.AdjacencyReader the whole traversal
+// allocates only the visited set and the queue, independent of how many edges it
+// crosses. Prefer it whenever the records themselves are not needed — reachability
+// checks, scoping a pattern match, or feeding IDs into a query.
+func BFSIDs(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) ([]store.NodeID, error) {
+	if maxDepth < 0 {
+		maxDepth = 0
+	}
+
+	w := newWalker(g)
+	if !w.nodeExists(origin) {
+		return nil, &store.ErrNotFound{Kind: "node", ID: uint64(origin)}
+	}
+
+	out := []store.NodeID{origin}
+	visited := map[store.NodeID]struct{}{origin: {}}
+
+	// Level-synchronous walk: `out` doubles as the queue, so no separate
+	// allocation is needed. levelEnd marks where the current depth stops.
+	for depth, start, levelEnd := 0, 0, 1; depth < maxDepth && start < levelEnd; depth++ {
+		for ; start < levelEnd; start++ {
+			incident, err := w.incidentEdges(out[start], dir, edgeTypes)
+			if err != nil {
+				return nil, err
+			}
+			for _, step := range incident {
+				nbID := step.Neighbour
+				if _, seen := visited[nbID]; seen {
+					continue
+				}
+				if !w.nodeExists(nbID) {
+					continue
+				}
+				visited[nbID] = struct{}{}
+				out = append(out, nbID)
+			}
+		}
+		levelEnd = len(out)
+	}
+
+	return out, nil
 }

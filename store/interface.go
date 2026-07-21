@@ -113,6 +113,127 @@ type GraphStore interface {
 	Close() error
 }
 
+// ReindexPolicy controls what happens to an entity's property-index entries
+// when UpdateNode / UpdateEdge replaces its properties.
+//
+// The store cannot re-derive index entries itself: indexed values are supplied
+// by the caller in the caller's own encoding (see IndexNodeProperty), and the
+// Properties blob is opaque to the storage layer. So the only two honest
+// options are to keep the old entries or to drop them, and each has a failure
+// mode the caller has to choose between.
+type ReindexPolicy uint8
+
+const (
+	// ReindexKeep leaves property-index entries untouched on update. This is the
+	// default and preserves historical behaviour.
+	//
+	// Failure mode: entries become STALE. A node whose indexed field changed is
+	// still returned by NodesByProperty for its old value, and the query planner
+	// trusts that answer. Callers must re-register changed fields themselves.
+	ReindexKeep ReindexPolicy = iota
+
+	// ReindexPurge drops all property-index entries for the updated entity, so
+	// the index can never report a value the entity no longer has.
+	//
+	// Failure mode: entries are LOST. Updating a node drops index entries that
+	// were still accurate — including ones for fields the update did not touch —
+	// so queries silently return fewer results until the caller re-registers.
+	//
+	// Prefer UpdateNodeIndexed / UpdateEdgeIndexed, which purge and re-register
+	// in one step and therefore avoid both failure modes.
+	ReindexPurge
+)
+
+// Reindexer is an optional extension implemented by stores that support
+// configuring how updates interact with the property index. Both bundled
+// backends implement it.
+type Reindexer interface {
+	// SetReindexPolicy sets the policy for subsequent updates. It does not
+	// retroactively affect entries already registered.
+	SetReindexPolicy(p ReindexPolicy)
+
+	// ReindexPolicy returns the currently configured policy.
+	ReindexPolicy() ReindexPolicy
+
+	// PurgeNodeIndex drops every property-index entry for id. On durable stores
+	// the purge is written to the log so it survives a restart.
+	PurgeNodeIndex(id NodeID) error
+
+	// PurgeEdgeIndex drops every property-index entry for id.
+	PurgeEdgeIndex(id EdgeID) error
+}
+
+// IndexVerifier is an optional extension implemented by stores that can
+// self-check their indexes against the records those indexes describe.
+type IndexVerifier interface {
+	// VerifyIndexes reports the first structural inconsistency it finds between
+	// the store's indexes and its live records, or nil if everything agrees.
+	VerifyIndexes() error
+}
+
+// IndexRebuilder is an optional extension implemented by stores that can
+// reconstruct their derived indexes from the records they hold.
+type IndexRebuilder interface {
+	// RebuildIndexes discards and recomputes every index that is derivable from
+	// the stored records — label postings and adjacency — and drops property
+	// index entries whose entity no longer exists.
+	//
+	// It cannot recreate property entries themselves: those values come from the
+	// caller and are not recoverable from the records. RebuildIndexes therefore
+	// repairs structure, not content.
+	RebuildIndexes() error
+}
+
+// AdjacencyReader is an optional extension for allocation-free traversal.
+//
+// Neighbours and EdgesOf each allocate a result slice (and Neighbours a dedupe
+// map) on every call, which is what makes a k-hop walk allocate proportionally
+// to the number of nodes it visits. These methods let a traversal reuse one
+// buffer across the whole walk and materialise a *Node or *Edge only when it
+// actually needs one.
+//
+// Both bundled backends implement it; callers must type-assert and fall back to
+// EdgesOf / Neighbours when a backend does not.
+type AdjacencyReader interface {
+	// IncidentEdges appends one entry per edge incident to id in the given
+	// direction, filtered by edgeTypes (nil means all types), to dst and returns
+	// the extended slice. Passing a reused dst (sliced to :0) makes repeated
+	// calls allocation-free.
+	//
+	// Each entry carries the node at the far end as well as the edge, because
+	// the store already has the edge record in hand while filtering. Resolving
+	// the neighbour separately would mean re-acquiring the store lock once per
+	// incident edge, which costs more than the allocation it saves.
+	//
+	// Entries are produced in the same order EdgesOf returns the corresponding
+	// edges, so a caller can switch between the two without changing results.
+	// Returns *ErrNotFound on backends whose EdgesOf does so for a missing node.
+	IncidentEdges(dst []IncidentEdge, id NodeID, dir Direction, edgeTypes []EdgeType) ([]IncidentEdge, error)
+
+	// NodeExists reports whether a node is live, without materialising it.
+	NodeExists(id NodeID) bool
+}
+
+// IncidentEdge is one step out of a node: the edge and the node it leads to.
+// For a self-loop, Neighbour is the node itself.
+type IncidentEdge struct {
+	Edge      EdgeID
+	Neighbour NodeID
+}
+
+// DegreeCounter is an optional extension implemented by stores that can count
+// incident edges without materialising them. Callers should type-assert against
+// it and fall back to len(EdgesOf(...)) when it is not implemented.
+//
+// It is deliberately not part of GraphStore so that third-party implementations
+// remain valid without change.
+type DegreeCounter interface {
+	// DegreeOf returns the number of edges incident to id in the given
+	// direction, counting only edges carrying one of edgeTypes (nil means all
+	// types). Returns *ErrNotFound if the node does not exist.
+	DegreeOf(id NodeID, dir Direction, edgeTypes []EdgeType) (int, error)
+}
+
 // ErrNotFound is returned when a requested node or edge does not exist.
 type ErrNotFound struct {
 	Kind string // "node" or "edge"

@@ -371,35 +371,37 @@ func (g *Graph) EdgesByAnyTypeSelector(selectors []string) ([]store.EdgeID, erro
 
 // --- Degree helpers ---
 
-// InDegree returns the number of inbound edges for node id.
-// Pass nil edgeTypes to count all inbound edges.
-func (g *Graph) InDegree(id store.NodeID, edgeTypes []store.EdgeType) (int, error) {
-	edges, err := g.EdgesOf(id, store.DirectionInbound, edgeTypes)
+// degreeOf counts incident edges, using the store's DegreeCounter fast path when
+// the backend provides one (both bundled backends do) and falling back to
+// materialising the edge slice otherwise.
+func (g *Graph) degreeOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) (int, error) {
+	if counter, ok := g.GraphStore.(store.DegreeCounter); ok {
+		return counter.DegreeOf(id, dir, edgeTypes)
+	}
+	edges, err := g.EdgesOf(id, dir, edgeTypes)
 	if err != nil {
 		return 0, err
 	}
 	return len(edges), nil
 }
 
+// InDegree returns the number of inbound edges for node id.
+// Pass nil edgeTypes to count all inbound edges.
+func (g *Graph) InDegree(id store.NodeID, edgeTypes []store.EdgeType) (int, error) {
+	return g.degreeOf(id, store.DirectionInbound, edgeTypes)
+}
+
 // OutDegree returns the number of outbound edges for node id.
 // Pass nil edgeTypes to count all outbound edges.
 func (g *Graph) OutDegree(id store.NodeID, edgeTypes []store.EdgeType) (int, error) {
-	edges, err := g.EdgesOf(id, store.DirectionOutbound, edgeTypes)
-	if err != nil {
-		return 0, err
-	}
-	return len(edges), nil
+	return g.degreeOf(id, store.DirectionOutbound, edgeTypes)
 }
 
 // Degree returns the total (in + out) edge count for node id.
 // Pass nil edgeTypes to count all edges. Note that for undirected use-cases,
 // edges that appear in both directions are counted twice.
 func (g *Graph) Degree(id store.NodeID, edgeTypes []store.EdgeType) (int, error) {
-	edges, err := g.EdgesOf(id, store.DirectionBoth, edgeTypes)
-	if err != nil {
-		return 0, err
-	}
-	return len(edges), nil
+	return g.degreeOf(id, store.DirectionBoth, edgeTypes)
 }
 
 // --- Connectivity helpers ---
