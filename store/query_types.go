@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -339,24 +340,41 @@ func NormalizedQueryOrder(order QueryOrder) QueryOrder {
 // numeric comparison using ParseFloat on both values. If parsing fails for either
 // side, it falls back to byte-wise lexicographic comparison.
 func PropertyFilterMatches(filter PropertyFilter, actual []byte) bool {
+	return propertyFilterMatches(filter, actual, comparePropertyValues)
+}
+
+// PropertyFilterMatchesOrdered is PropertyFilterMatches under byte-wise
+// comparison, which is how a key declared ordered is compared.
+//
+// The two rules disagree, and deliberately so: the scan rule in
+// comparePropertyValues prefers numeric order when both operands parse as
+// numbers, which reads better for un-encoded values but is not a valid ordering
+// (under it "9" < "10" < "1x" < "9", a cycle), so no sorted structure can be
+// built on it. Anything evaluating a filter against a declared key must use this
+// function, or it will disagree with the index that serves the same predicate.
+func PropertyFilterMatchesOrdered(filter PropertyFilter, actual []byte) bool {
+	return propertyFilterMatches(filter, actual, bytes.Compare)
+}
+
+func propertyFilterMatches(filter PropertyFilter, actual []byte, cmp func(a, b []byte) int) bool {
 	switch filter.Op {
 	case PropertyOpPrefix:
 		return strings.HasPrefix(string(actual), string(filter.Value))
 	case PropertyOpContains:
 		return strings.Contains(string(actual), string(filter.Value))
 	case PropertyOpGreaterThan:
-		return comparePropertyValues(actual, filter.Value) > 0
+		return cmp(actual, filter.Value) > 0
 	case PropertyOpGreaterThanOrEqual:
-		return comparePropertyValues(actual, filter.Value) >= 0
+		return cmp(actual, filter.Value) >= 0
 	case PropertyOpLessThan:
-		return comparePropertyValues(actual, filter.Value) < 0
+		return cmp(actual, filter.Value) < 0
 	case PropertyOpLessThanOrEqual:
-		return comparePropertyValues(actual, filter.Value) <= 0
+		return cmp(actual, filter.Value) <= 0
 	case PropertyOpBetweenInclusive:
 		if len(filter.ValueUpper) == 0 {
 			return false
 		}
-		return comparePropertyValues(actual, filter.Value) >= 0 && comparePropertyValues(actual, filter.ValueUpper) <= 0
+		return cmp(actual, filter.Value) >= 0 && cmp(actual, filter.ValueUpper) <= 0
 	case PropertyOpEqual:
 		fallthrough
 	default:
@@ -426,4 +444,93 @@ func ApplyEdgeQueryWindow(ids []EdgeID, offset, limit int) []EdgeID {
 	out := make([]EdgeID, end-offset)
 	copy(out, ids[offset:end])
 	return out
+}
+
+// FilterIndexOf returns the position of f within filters, or -1 if absent.
+//
+// The query planner uses this to tell the residual pass which filter it already
+// applied to build the candidate set. Two identical filters in one query make
+// the answer ambiguous, which is harmless: under MatchAll applying either copy
+// is idempotent, so skipping one and evaluating the other changes nothing.
+func FilterIndexOf(filters []PropertyFilter, f PropertyFilter) int {
+	for i, c := range filters {
+		if c.Key == f.Key && c.Op == f.Op &&
+			bytes.Equal(c.Value, f.Value) && bytes.Equal(c.ValueUpper, f.ValueUpper) {
+			return i
+		}
+	}
+	return -1
+}
+
+// --- Query plans ---
+
+// DriverKind names the source a query was driven from — the set the planner
+// chose as its starting point because it is guaranteed to contain the answer.
+type DriverKind uint8
+
+const (
+	DriverScan     DriverKind = iota // every entity; nothing better was available
+	DriverIDs                        // the query's explicit ID list
+	DriverEquality                   // an equality filter's postings
+	DriverOrdered                    // a range or prefix on a key declared ordered
+	DriverLabels                     // the label postings for the query's types
+	DriverAdjacency                  // incident-edge lists of the anchored endpoints
+)
+
+func (d DriverKind) String() string {
+	switch d {
+	case DriverIDs:
+		return "ids"
+	case DriverEquality:
+		return "equality"
+	case DriverOrdered:
+		return "ordered"
+	case DriverLabels:
+		return "labels"
+	case DriverAdjacency:
+		return "adjacency"
+	default:
+		return "scan"
+	}
+}
+
+// ResidualStep describes one filter that was not used to drive the query, and
+// how the planner decided to apply it.
+type ResidualStep struct {
+	Key   string
+	Op    PropertyOp
+	Probe bool // test the candidates directly, rather than build this filter's set
+	Cost  int  // estimated size of this filter's own set
+}
+
+// QueryPlan reports how a query was resolved. It is diagnostic output: the
+// planner's choices are not part of the API contract and may change as the cost
+// model improves. Results never do.
+type QueryPlan struct {
+	Driver       DriverKind
+	DriverKey    string // property key, when the driver was a filter
+	DriverFilter int    // index into the query's Filters, or -1
+	Candidates   int    // size of the driving set
+	Residuals    []ResidualStep
+	Results      int
+}
+
+// String renders a plan as a single line, for tests and for humans.
+func (p QueryPlan) String() string {
+	var b strings.Builder
+	b.WriteString("driver=")
+	b.WriteString(p.Driver.String())
+	if p.DriverKey != "" {
+		b.WriteString("(" + p.DriverKey + ")")
+	}
+	fmt.Fprintf(&b, " candidates=%d", p.Candidates)
+	for _, r := range p.Residuals {
+		method := "set"
+		if r.Probe {
+			method = "probe"
+		}
+		fmt.Fprintf(&b, " residual=%s:%s~%d", r.Key, method, r.Cost)
+	}
+	fmt.Fprintf(&b, " results=%d", p.Results)
+	return b.String()
 }

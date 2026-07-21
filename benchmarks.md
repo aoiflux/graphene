@@ -19,6 +19,32 @@ P2 allocations**.
 68 benchmarks, up from the 29 this work started with and the 5 the project had
 before that.
 
+### Two rounds discarded, and why the resolution limit is ~25%
+
+The final comparison ran four interleaved rounds after a cooldown. **Round four
+was dropped from both sides**, symmetrically: its samples on the new side roughly
+doubled (`GetNode` 6.1 ns → 11.5 ns) while rounds one to three matched the
+baseline closely. It ran last, after ~50 minutes of continuous benchmarking, and
+the new side is the longer of the two because it carries benchmarks the baseline
+has no equivalent for — so it absorbed peak thermal load. That is the machine,
+not the code, and keeping a round measured in a demonstrably different state
+would have inflated every figure in the same direction.
+
+**The two controls then disagreed**, and that sets an honest floor on what this
+data can resolve. `GetNode` came out flat (p=0.288) with tight variance, which is
+correct — it is byte-identical on both sides. But `PointLookupNode_Memory`, also
+byte-identical, reported −24% (p=0.015) off ±25% variance on the base side. A
+statistically significant improvement on code that did not change is a false
+positive, so:
+
+> **Timing effects below roughly 25% are not resolvable in this dataset.** The
+> order-of-magnitude results are safe; anything in the tens of percent should be
+> read as directional.
+
+The footprint numbers are exempt. They are deterministic measurements of resident
+bytes, reported at ±0% variance, and they do not depend on how warm the machine
+was.
+
 ### Why interleaving, demonstrated
 
 An earlier attempt ran the two suites back to back and the second came out ~25%
@@ -91,6 +117,84 @@ a hub node with 1 000 inbound edges. The disk fixture is `Compact()`ed first.
 | Anchored relation query (disk) | 32.56 ms | **215.8 µs** | −99.34% |
 | Edge query by type (disk) | 38.18 ms | **264.2 µs** | −99.31% |
 | Anchored relation query (memory) | 19.25 ms | **171.4 µs** | −99.11% |
+
+### Residual filters — the second filter used to cost a scan
+
+Driving a query from the most selective index is only half the job. The filters
+that did *not* drive it still have to be applied, and resolving each to its own
+set means a filter no index can serve — a `Contains`, or a range on a key never
+declared ordered — scans every entry under its key. A query driven down to a
+single candidate was still doing work proportional to the whole graph.
+
+Costing each residual both ways and probing the candidates when that is cheaper:
+
+| Benchmark | Before | After | Change |
+|---|---:|---:|---:|
+| Equality + `Contains` (memory) | 12.97 ms | **443.1 ns** | −100.00% (~29 000×) |
+| Equality + `Contains` (disk) | 12.94 ms | **429.2 ns** | −100.00% (~30 000×) |
+| — allocated bytes | 4.10 MB | **304 B** | −99.99% |
+| Two equality filters (memory) | 717.1 ns | **567.9 ns** | −20.8% (allocs −64%) |
+| Single equality filter (memory) | 324.9 ns | **254.8 ns** | −21.6% |
+| Single equality filter (disk) | 308.6 ns | **243.2 ns** | −21.2% |
+| *Control:* point lookup (memory) | 23.42 ns | 23.23 ns | ~ (p=0.198) |
+
+The single-filter rows were not the target. The driving filter used to be
+re-resolved to its own set and intersected against the candidates it had itself
+produced; skipping it is where that 21% comes from.
+
+**This first shipped as a regression, in the same run that produced the 29 000×.**
+Single-filter queries measured +14% (memory) and +23% (disk) with +70%
+allocations, because they still built a residual plan — allocating a slice and
+consulting the index to establish there was nothing to do. A short-circuit for
+"the driver consumed every filter" fixed it and turned the row into the win
+above. It is recorded here because the headline number and the regression came
+out of the same benchmark run, and only a set wide enough to include the boring
+case would have caught it.
+
+#### The edge path, and a run where the control failed
+
+The same evaluation on edge queries, measured separately because the edge half
+had been written and left unreachable — only the node path was wired into the
+stores, and a method nobody calls draws no complaint from the compiler, `go vet`,
+or any test:
+
+| Benchmark | Before | After | Change |
+|---|---:|---:|---:|
+| Edge equality + `Contains` (memory) | 2.357 ms | **575.5 ns** | −99.98% (~4 100×) |
+
+**That run's control moved**, and it is worth saying so rather than quoting the
+row alone. `PointLookupNode_Memory` shifted +23.7% (p=0.001) with ±17–31%
+variance, because the race and stress suites had finished moments earlier and the
+machine was still hot. Two conclusions follow, and they differ:
+
+- the edge figure is four orders of magnitude, so no plausible drift touches it;
+- the smaller readings in the same run — notably +14% on an unrelated node query
+  — are **drift, not signal**. The control moved further, in the same direction,
+  on a path the change cannot affect.
+
+The final full-suite comparison waits out a cooldown before it starts, for
+exactly this reason.
+
+### Read consistency — what it costs to resolve postings against the records
+
+`NodesByProperty` and `EdgesByProperty` went straight to the property index,
+which is a separate structure under a separate lock from the records. A lookup
+could therefore read postings that a concurrent `DeleteNode` had not reached yet
+and return an entity the records no longer had. Resolving postings against the
+records before returning makes the records the authority:
+
+| Benchmark | Unfiltered | Filtered | Change |
+|---|---:|---:|---:|
+| Raw single-key lookup (memory) | 70.60 ns | **91.10 ns** | +29.0% (p=0.000) |
+| Typed equality query (memory) | 380.6 ns | 406.9 ns | ~ (p=0.089) |
+| Typed equality query (disk) | 420.8 ns | 352.9 ns | ~ |
+| *Control:* point lookup (memory) | 28.73 ns | 31.05 ns | ~ (p=0.713) |
+
+Twenty nanoseconds on the raw lookup, nothing measurable on the typed query path
+— which already resolved its candidates that way — and no change in allocations,
+since the filter runs in place over a slice the index had already copied. That
+buys a guarantee that can be stated in a sentence: *every ID returned named an
+entity that was live at the moment it was checked.*
 
 ### Scale sweep — does cost track the answer, or the graph?
 
@@ -226,41 +330,90 @@ never before quantified.
 
 Reported in full. Each is a trade, and the axis that won is named.
 
+### The one that matters most: property-index memory, +30–65%
+
+This is a **P1 regression**, it is not noise, and it is the price of the P0 wins
+above.
+
+| Footprint (B/node) | Before | After | Change |
+|---|---:|---:|---:|
+| *Topology only, memory* | 446.1 | 446.2 | **+0.02%** |
+| *No property index* | 170.1 | 170.2 | **+0.06%** |
+| Memory store + property index | 563.8 | **843.2** | +49.56% |
+| Disk store + property index | 388.4 | **693.0** | +78.42% |
+| Index at cardinality 1 | 179.0 | **295.6** | +65.14% |
+| Index at cardinality 100 | 180.5 | 297.0 | +64.54% |
+| Index at cardinality 10 000 | 194.0 | 307.4 | +58.45% |
+| Index, all values distinct | 281.1 | 365.7 | +30.10% |
+| On-disk file size | 248.0 | **223.0** | −10.08% |
+
+The first two rows are controls, and they are what make the rest interpretable:
+both sit at ~0%, so **the entire increase lives in the property index**, not in
+the graph structures. These figures carry ±0% variance because they are
+deterministic memory measurements rather than timings, so unlike the latency
+numbers they are unaffected by the thermal caveats in the methodology section.
+
+Three things drive it, in descending order:
+
+1. **The reverse `ID → (key, value)` map.** This is what makes `RemoveNode`
+   proportional to an entity's own entries instead of to the whole index, and it
+   is what bought `DeleteNode` its −99.85%. It costs one map entry and one slice
+   header per indexed entity.
+2. **Sharding sixteen ways.** Each shard carries its own maps, so the fixed map
+   overhead is paid sixteen times over. That is what bought concurrent
+   distinct-key registration its −57.85%.
+3. **The per-key entry counter**, added so the query planner can cost a scan of
+   a key without walking its buckets.
+
+The pattern across cardinalities is the tell: the overhead is worst where values
+are *shared* (+65% at cardinality 1) and mildest where every value is distinct
+(+30%). At low cardinality the forward map is tiny while the reverse map still
+holds one entry per entity, so the reverse map dominates the ratio.
+
+**What would recover it**, in the order worth trying: the value bucket layout is
+`map[string][]ID` per shard, and the fixed overhead of a Go map header repeated
+across 16 shards × N keys is the largest single component — that is the map
+layout, not the postings. Compressing the postings lists themselves is the
+obvious idea and the wrong one; they are 8 B of a 125 B floor (see the
+cardinality sweep above), so the ceiling on that work is ~5%.
+
+### Latency and allocation
+
 | Benchmark | Before | After | Change |
 |---|---:|---:|---:|
-| `Parallel_BFS3Hop_Disk` | 1.078 µs | 1.456 µs | **+35.1%** |
-| `Parallel_IndexNodeProperty_DistinctKeys` | 1.003 µs | 1.188 µs | **+18.5%** |
-| `Parallel_AddNode_Memory` | 775.1 ns | 860.5 ns | **+11.0%** |
-| `Ingest_AddNodes_Batch1000` | 572.7 µs | 631.3 µs | **+10.2%** |
-| `Ingest_AddEdge_Single` | 342.3 ns | 376.2 ns | **+9.9%** |
-| `Ingest_AddNodes_Batch100` | 61.15 µs | 63.81 µs | **+4.4%** |
-| `Parallel_MixedReadWrite_Memory` | 646.5 ns | 671.8 ns | **+3.9%** |
-| `ColdOpen_UncompactedWAL_10k` bytes | 12.07 MiB | 15.45 MiB | **+28.0%** |
-| `BFS_Deep` bytes | 2.102 MiB | 2.374 MiB | **+13.0%** |
+| `NodesByProperty_Equal_Memory` | 49.15 ns | 78.31 ns | **+59.3%** |
+| `PropertyIndexLookup` | 46.65 ns | 71.18 ns | **+52.6%** |
+| `Parallel_IndexNodeProperty_DistinctKeys` bytes | 217.5 B | 427.0 B | **+96.3%** |
+| `Parallel_IndexNodeProperty_SameKey` bytes | 199.5 B | 376.5 B | **+88.7%** |
+| `ReopenCompactedStore` bytes | 33.89 MiB | 55.29 MiB | **+63.1%** |
 
-**Parallel BFS on disk, +35%** — the most interesting one, and only visible
-because the concurrency benchmarks are new. Single-threaded the same walk is
-−18%; contended it is worse. The walker takes more, smaller store-lock
-acquisitions per expansion (`IncidentEdges`, then `GetNode`/`GetEdge` per kept
-record) than the single `Neighbours` call it replaced. Uncontended those locks
-are nearly free; contended, each is cache-line traffic between cores. The fix is
-to batch record resolution behind one lock hold — now an open Phase 9 item.
+**The raw single-key lookup, +52–59%.** Two costs, both deliberate. The larger is
+read consistency: postings are now resolved against the records before being
+returned, because the index and the records are separate structures under
+separate locks and a lookup consulting only the index could hand back an entity a
+concurrent delete had already removed. An isolated A/B put that at +29% on its
+own (70.6 → 91.1 ns). The remainder is sharding, which added a hash per lookup to
+buy the concurrency win. The absolute figure is ~78 ns against a path that used
+to be a 40 ms scan.
 
-**Write path, +4–10%** — the cost of keeping label postings sorted, which is what
-made deletes 5–11× cheaper. Two rounds of fixing brought it down from an initial
-+12–30%: an append fast path for the monotonic-ID case (the insert position is
-almost always the end, so the binary search was pure waste), then inlining that
-branch at the call sites because the generic helper would not inline. Single
-`AddNode` is back to parity; batch ingest and `AddEdge` retain ~10%.
+**Property-index registration allocates roughly twice as much.** The reverse map
+entry per registration. This is the same purchase as the memory row above, seen
+on the write path.
 
-**Property-index registration under contention, +18%** — sorted insert plus the
-reverse map. `PropertyIndex` still holds one global `RWMutex`, so the same-key
-and distinct-key cases perform alike; sharding by key hash is the open item, and
-these two benchmarks exist to measure it.
+**Reopen allocates 63% more** while running 94% faster, because the index now
+arrives as one file read rather than streaming from the log. Peak memory during
+open is the cost; restart latency is what it bought.
 
-**Bytes on cold open and deep BFS** — the reverse map during WAL replay, and the
-BFS queue retaining consumed entries (the change that bought 140× fewer
-allocations). Both spend P1 to buy P0, which the priority ordering endorses.
+### Previously reported regressions, now fixed
+
+Recorded because they were published as regressions and should not stay that way:
+
+| Benchmark | Was | Now |
+|---|---:|---:|
+| `Parallel_BFS3Hop_Disk` | +35.1% | **−34.8%** (lock-free CSR reads) |
+| `Parallel_IndexNodeProperty_DistinctKeys` | +18.5% | **−57.9%** (key sharding) |
+| `BFS_Deep` bytes | +13.0% | **−18.1%** (two-buffer BFS) |
+| `Ingest_AddNodes_Batch1000` | +10.2% | not significant |
 
 ---
 

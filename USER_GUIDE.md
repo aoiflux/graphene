@@ -421,6 +421,70 @@ Neither runs automatically on `Open` — verification is O(V+E), around 200 ms o
 100k-node store, and a damaged file is already rejected while parsing. Call them
 in tests, in CI, or when recovering a store you do not trust.
 
+### Checking what a query actually does
+
+A query can return exactly the right answer while doing far more work than it
+needed to, and you cannot tell from the results. `ExplainNodeQuery` says which
+index drove the query and what happened to the remaining filters:
+
+```go
+plan, _ := g.ExplainNodeQuery(store.NodeQuery{Filters: []store.PropertyFilter{
+    {Key: "sha256", Op: store.PropertyOpEqual, Value: hash},
+    {Key: "tool", Op: store.PropertyOpContains, Value: []byte("acquire")},
+}})
+fmt.Println(plan)
+// driver=equality(sha256) candidates=1 residual=tool:probe~100000 results=1
+```
+
+Read it as: the `sha256` equality drove the query down to one candidate, and the
+`tool` filter was then tested against that one candidate (`probe`) rather than
+resolved to its own set — which would have meant scanning all 100,000 entries
+under `tool`, since `Contains` cannot be served by any index.
+
+Two things worth looking for:
+
+- **`driver=scan`** on a query you expected to be indexed. Nothing was
+  selective enough to drive it, usually because the key is not indexed at all.
+- **`residual=<key>:set~<big>`** where `<big>` dwarfs `candidates`. The planner
+  judged building that filter's set cheaper; if that looks wrong, the usual cause
+  is a range filter on a key you have not declared ordered.
+
+The plan is diagnostic. Which index gets picked may change between versions; the
+results a query returns will not.
+
+### What a read guarantees when something else is writing
+
+Every operation is atomic on its own, and a completed `DeleteNode` leaves nothing
+behind — no dangling edge, no index entry, under any key. What a read gives you
+is:
+
+> every ID returned named an entity that was live at the moment it was checked.
+
+**The moment is inside the call, not after it.** By the time you act on a result
+the entity may be gone, so `GetNode` on an ID you were just handed can
+legitimately fail:
+
+```go
+ids, _ := g.NodesByProperty("sha256", hash)
+for _, id := range ids {
+    n, err := g.GetNode(id)
+    if err != nil {
+        continue // deleted between the lookup and here — expected, not a bug
+    }
+    _ = n
+}
+```
+
+Measured against a deleter running flat out with six concurrent readers, this hit
+**0.7%** of IDs from a single-key `NodesByProperty` and **4–11%** of IDs from a
+typed `QueryNodeIDs` — a typed query returns more IDs over a longer call, so more
+of them go stale before you reach them. Closing it would require snapshot
+isolation, which Graphene does not offer, so treat any result set as candidates
+rather than a guarantee.
+
+A *sequence* of calls is not a transaction. If an invariant has to hold across
+several calls — read-decide-write is the usual one — enforce it in your own code.
+
 ## 6. Traversal and Multi-Hop Analysis
 
 > **If you only need the IDs, use `BFSIDs`.** It walks the graph without

@@ -235,7 +235,11 @@ func TestConcurrent_ReadsDuringCompaction(t *testing.T) {
 		}(r * 53)
 	}
 
-	for c := 0; c < 5; c++ {
+	// Many compactions, because the window this guards is only a couple of
+	// instructions wide: between publishing the new CSR and clearing the shadow
+	// count. A reader holding the old pointer must never be fooled by the cleared
+	// count, which is why validity is checked against the pointer itself.
+	for c := 0; c < 200; c++ {
 		if err := g.Compact(); err != nil {
 			t.Errorf("Compact: %v", err)
 			break

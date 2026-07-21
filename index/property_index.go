@@ -73,6 +73,12 @@ type propertyShard struct {
 // FNV-1a: cheap, allocation-free over a string, and well enough distributed for
 // the handful of distinct property keys a workload typically registers.
 func (p *PropertyIndex) shardFor(key string) *propertyShard {
+	return &p.shards[p.shardIndexFor(key)]
+}
+
+// shardIndexFor is shardFor as an index, which bulk loading needs so it can
+// group entries by shard before touching any of them.
+func (p *PropertyIndex) shardIndexFor(key string) int {
 	const (
 		offset64 = 14695981039346656037
 		prime64  = 1099511628211
@@ -82,7 +88,7 @@ func (p *PropertyIndex) shardFor(key string) *propertyShard {
 		h ^= uint64(key[i])
 		h *= prime64
 	}
-	return &p.shards[h&(propertyShards-1)]
+	return int(h & (propertyShards - 1))
 }
 
 // errIndexf builds an index consistency error.
@@ -509,12 +515,17 @@ type postings[T entityID] struct {
 	byKey map[string]map[string][]T
 	refs  map[T][]propRef
 	count int // total number of (id, key, value) triples
+
+	// Entries per key, so the query planner can cost a scan of a key without
+	// walking that key's buckets to find out how big it is.
+	perKey map[string]int
 }
 
 func newPostings[T entityID]() postings[T] {
 	return postings[T]{
-		byKey: make(map[string]map[string][]T),
-		refs:  make(map[T][]propRef),
+		byKey:  make(map[string]map[string][]T),
+		refs:   make(map[T][]propRef),
+		perKey: make(map[string]int),
 	}
 }
 
@@ -531,6 +542,7 @@ func (p *postings[T]) add(id T, key, value string) {
 	}
 	bucket[value] = ids
 	p.refs[id] = append(p.refs[id], propRef{key: key, value: value})
+	p.perKey[key]++
 	p.count++
 }
 
@@ -548,6 +560,9 @@ func (p *postings[T]) remove(id T) {
 		ids, removed := deleteSorted(bucket[ref.value], id)
 		if removed {
 			p.count--
+			if p.perKey[ref.key]--; p.perKey[ref.key] <= 0 {
+				delete(p.perKey, ref.key)
+			}
 		}
 		if len(ids) == 0 {
 			delete(bucket, ref.value)

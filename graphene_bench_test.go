@@ -986,3 +986,221 @@ func BenchmarkIndexNodeProperty(b *testing.B) {
 		}
 	}
 }
+
+// =============================================================================
+// Residual filter evaluation
+// =============================================================================
+//
+// A selective driver paired with a filter no index can serve. Resolving the
+// second filter to its own set costs a scan of every entry under its key; testing
+// the handful of candidates against it costs a lookup each. These measure the gap.
+
+func BenchmarkQueryNodes_EqualityPlusContains_Memory(b *testing.B) {
+	benchmarkResidual(b, memGraph())
+}
+
+func BenchmarkQueryNodes_EqualityPlusContains_Disk(b *testing.B) {
+	benchmarkResidual(b, diskGraph())
+}
+
+func benchmarkResidual(b *testing.B, f *benchFixture) {
+	q := store.NodeQuery{
+		Filters: []store.PropertyFilter{
+			{Key: "sha256", Op: store.PropertyOpEqual,
+				Value: []byte(fmt.Sprintf("hash-%07d", benchNodeCount/2))},
+			{Key: "bucket", Op: store.PropertyOpContains, Value: []byte("bucket")},
+		},
+		FilterMode: store.MatchAll,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Two equality filters of very different selectivity: the residual is served
+// from postings either way, so this is the case where probing must not lose.
+func BenchmarkQueryNodes_TwoEqualities_Memory(b *testing.B) {
+	f := memGraph()
+	q := store.NodeQuery{
+		Filters: []store.PropertyFilter{
+			{Key: "sha256", Op: store.PropertyOpEqual,
+				Value: []byte(fmt.Sprintf("hash-%07d", benchNodeCount/2))},
+			{Key: "bucket", Op: store.PropertyOpEqual, Value: []byte("bucket-0500")},
+		},
+		FilterMode: store.MatchAll,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The edge equivalent of the residual case: a selective driver plus a filter no
+// index can serve.
+//
+// This builds its own fixture rather than extending the shared one. Adding edge
+// properties to the shared graph would change the memory profile of every other
+// benchmark that uses it, which would silently invalidate their comparison
+// against the published baseline.
+var (
+	edgePropOnce  sync.Once
+	edgePropGraph *graphene.Graph
+)
+
+const edgePropCount = 20_000
+
+func edgePropFixture() *graphene.Graph {
+	edgePropOnce.Do(func() {
+		g := graphene.NewInMemory()
+		nodes := make([]*store.Node, edgePropCount+1)
+		for i := range nodes {
+			nodes[i] = &store.Node{Labels: []store.NodeType{store.NodeTypeTag}}
+		}
+		nodeIDs, err := g.AddNodes(nodes)
+		if err != nil {
+			panic(err)
+		}
+		edges := make([]*store.Edge, edgePropCount)
+		for i := range edges {
+			edges[i] = &store.Edge{Src: nodeIDs[i], Dst: nodeIDs[i+1],
+				Labels: []store.EdgeType{store.EdgeTypeContains}}
+		}
+		ids, err := g.AddEdges(edges)
+		if err != nil {
+			panic(err)
+		}
+		for i, id := range ids {
+			if err := g.IndexEdgeProperties(id, map[string][]byte{
+				"edge_sha":  []byte(fmt.Sprintf("esha-%07d", i)),
+				"edge_kind": []byte(fmt.Sprintf("kind-%d", i%8)),
+			}); err != nil {
+				panic(err)
+			}
+		}
+		edgePropGraph = g
+	})
+	return edgePropGraph
+}
+
+func BenchmarkQueryEdges_EqualityPlusContains_Memory(b *testing.B) {
+	g := edgePropFixture()
+	q := store.EdgeQuery{
+		Filters: []store.PropertyFilter{
+			{Key: "edge_sha", Op: store.PropertyOpEqual,
+				Value: []byte(fmt.Sprintf("esha-%07d", edgePropCount/2))},
+			{Key: "edge_kind", Op: store.PropertyOpContains, Value: []byte("kind")},
+		},
+		FilterMode: store.MatchAll,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := g.QueryEdgeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// =============================================================================
+// Where does reopen time actually go?
+// =============================================================================
+//
+// Open eagerly materialises the whole graph: it reads the CSR file, parses every
+// node and edge record, and inserts every property entry into the index. Making
+// it faster means knowing which of those dominates, and the honest way to find
+// out is to vary one while holding the others fixed.
+//
+// These build the same node and edge counts every time and change only how many
+// property entries each node carries. The slope across them is the per-entry
+// index cost; the intercept is the CSR parse plus the fixed overhead.
+
+// buildReopenFixture is buildDurabilityFixture with a controllable number of
+// indexed properties per node.
+func buildReopenFixture(b *testing.B, n, propsPerNode int) string {
+	b.Helper()
+	dir, err := os.MkdirTemp("", "graphene-reopen-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	g, err := graphene.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	nodes := make([]*store.Node, n)
+	for i := range nodes {
+		nodes[i] = &store.Node{Labels: []store.NodeType{benchLabel(i)}}
+	}
+	ids, err := g.AddNodes(nodes)
+	if err != nil {
+		b.Fatal(err)
+	}
+	keys := []string{"sha256", "bucket", "tool", "stage", "owner", "phase", "zone", "tier"}
+	if propsPerNode > len(keys) {
+		b.Fatalf("propsPerNode %d exceeds %d available keys", propsPerNode, len(keys))
+	}
+	for i, id := range ids {
+		props := make(map[string][]byte, propsPerNode)
+		for k := 0; k < propsPerNode; k++ {
+			// Key 0 is unique per node; the rest are low-cardinality, matching
+			// the shape of a real key mix rather than a best or worst case.
+			if k == 0 {
+				props[keys[k]] = []byte(fmt.Sprintf("hash-%07d", i))
+			} else {
+				props[keys[k]] = []byte(fmt.Sprintf("%s-%04d", keys[k], i%1000))
+			}
+		}
+		if len(props) > 0 {
+			if err := g.IndexNodeProperties(id, props); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	edges := make([]*store.Edge, 0, n-1)
+	for i := 0; i < n-1; i++ {
+		edges = append(edges, &store.Edge{
+			Src: ids[i], Dst: ids[i+1],
+			Labels: []store.EdgeType{store.EdgeTypeContains},
+		})
+	}
+	if _, err := g.AddEdges(edges); err != nil {
+		b.Fatal(err)
+	}
+	if err := g.Compact(); err != nil {
+		b.Fatal(err)
+	}
+	if err := g.Close(); err != nil {
+		b.Fatal(err)
+	}
+	return dir
+}
+
+func benchmarkReopenWithProps(b *testing.B, propsPerNode int) {
+	dir := buildReopenFixture(b, 50_000, propsPerNode)
+	defer os.RemoveAll(dir)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		g, err := graphene.Open(dir)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := g.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The intercept: no property entries at all, so this is CSR parse + WAL + fixed
+// cost, with the index doing nothing.
+func BenchmarkReopen_Props0(b *testing.B) { benchmarkReopenWithProps(b, 0) }
+func BenchmarkReopen_Props1(b *testing.B) { benchmarkReopenWithProps(b, 1) }
+func BenchmarkReopen_Props2(b *testing.B) { benchmarkReopenWithProps(b, 2) }
+func BenchmarkReopen_Props4(b *testing.B) { benchmarkReopenWithProps(b, 4) }
+func BenchmarkReopen_Props8(b *testing.B) { benchmarkReopenWithProps(b, 8) }

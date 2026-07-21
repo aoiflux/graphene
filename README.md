@@ -99,23 +99,21 @@ interleaving is not incidental: measuring the two sides back to back produced a
 ~25% shift on benchmarks the changes never touched. See
 [benchmarks.md](benchmarks.md#why-interleaving-demonstrated).
 
-| Operation                              |    Before |       After |         Change |
-| -------------------------------------- | --------: | ----------: | -------------: |
-| Equality property query (disk)         |  50.40 ms |   539.9 ns  | ~93 000× faster |
-| Equality property query (memory)       |  39.74 ms |   567.8 ns  | ~70 000× faster |
-| Node in-degree on a hub (disk)         |  70.01 µs |   15.46 ns  |  ~4 528× faster |
-| Type + property query (memory)         |  56.55 ms |   20.78 µs  |  ~2 720× faster |
-| Typed query with `Limit: 10` (disk)    |  16.40 ms |   20.47 µs  |    ~801× faster |
-| `DeleteNode` with a populated index    |  1.222 ms |   6.757 µs  |    ~181× faster |
-| Anchored relation query (disk)         |  33.10 ms |   206.6 µs  |    ~160× faster |
-| `NodesByType` on a selective label     | 415.1 µs  |   4.995 µs  |     ~83× faster |
-| **Reopen a compacted store**           | **1 176 ms** | **62.26 ms** |  **~19× faster** |
-| **Compaction, steady state**           | **619.3 ms** | **39.22 ms** |  **~16× faster** |
-| Prefix property query                  |  45.67 ms |   7.656 ms  |     6.0× faster |
-| Range property query                   |  60.39 ms |   20.00 ms  |     3.0× faster |
-| `UpdateNode` in a 50k-member label     |  50.43 µs |   4.435 µs  |    11.4× faster |
-| `DeleteNode` from a 50k-member label   |  27.98 µs |   3.732 µs  |     7.5× faster |
-| Edge query by type (memory)            |  44.49 ms |   157.9 µs  |    ~282× faster |
+| Operation                              |     Before |       After |          Change |
+| -------------------------------------- | ---------: | ----------: | --------------: |
+| Equality property query (disk)         |   53.55 ms |    277.0 ns | ~193 000× faster |
+| Equality property query (memory)       |   44.00 ms |    320.1 ns | ~137 000× faster |
+| Type + property query (memory)         |   58.71 ms |    7.171 µs |   ~8 200× faster |
+| Node in-degree on a hub (disk)         |   74.33 µs |    15.18 ns |   ~4 900× faster |
+| Typed query with `Limit: 10` (disk)    |   17.72 ms |    22.29 µs |     ~795× faster |
+| `DeleteNode` with a populated index    |   1.423 ms |    2.075 µs |     ~686× faster |
+| Edge query by type (memory)            |   56.35 ms |    155.3 µs |     ~363× faster |
+| Anchored relation query (disk)         |   43.70 ms |    228.7 µs |     ~191× faster |
+| `NodesByType` on a selective label     |  445.7 µs  |    5.059 µs |      ~88× faster |
+| **Reopen a compacted store**           | **1 284 ms** | **73.60 ms** |  **~17× faster** |
+| **Compaction, steady state**           | **648.8 ms** | **64.01 ms** |  **~10× faster** |
+| `UpdateNode` in a 50k-member label     |   49.16 µs |    5.162 µs |     9.5× faster |
+| `DeleteNode` from a 50k-member label   |   31.31 µs |    4.014 µs |     7.8× faster |
 
 Cost no longer tracks the graph. A 10× larger graph used to make an equality
 query 14× slower (2.91 ms → 41.38 ms); it is now flat (704 ns → 590 ns).
@@ -137,20 +135,60 @@ the record-returning walk needs 394.
 
 Allocation dropped alongside latency: a filtered query that used to allocate
 **93 MB** now allocates **576 bytes**, and hub degree counting allocates nothing
-at all. Geomean across the whole suite: **−94.6%**.
+at all. Geomean across the whole suite: **−88.7%**.
 
 Restart and compaction no longer scale with index size. Before, every `Compact()`
 re-emitted the entire property index into the fresh WAL and every restart
 replayed it; now the index lives in the CSR file and the WAL is left empty after
 a compaction.
 
-The costs are on the write side and honest: `IndexNodeProperty` is ~15% slower
-(723 → 835 ns/op) because registering a property maintains sorted postings and a
-reverse `ID → (key, value)` map — that map is what makes deletes ~181× cheaper —
-and reopening allocates ~53% more peak memory because the index arrives as one
-file read rather than streaming from the log. A 3-hop in-memory walk is ~9%
-slower in wall-clock, where the traversal setup outweighs what it saves on a
-handful of nodes. Ingest and point lookups are unchanged.
+### What it cost
+
+**The property index now uses 30–65% more memory per node.** This is the largest
+regression in the project and it is the direct price of the speed above:
+
+| Footprint (B/node) | Before | After |
+|---|---:|---:|
+| *Topology only* | 446.1 | 446.2 (+0.02%) |
+| *No property index* | 170.1 | 170.2 (+0.06%) |
+| With property index (memory) | 563.8 | **843.2** (+49.6%) |
+| With property index (disk) | 388.4 | **693.0** (+78.4%) |
+| Index at cardinality 1 | 179.0 | **295.6** (+65.1%) |
+| Index, all values distinct | 281.1 | 365.7 (+30.1%) |
+
+The first two rows are controls at ~0%, which places the whole increase inside
+the property index rather than the graph itself. It comes from the reverse
+`ID → (key, value)` map — the thing that makes `DeleteNode` ~700× cheaper — plus
+sixteen-way sharding paying map overhead sixteen times, which is what makes
+concurrent registration on distinct keys 2.4× faster. It is worst where values
+are shared and mildest where they are all distinct.
+
+Smaller costs, all on the property path: a raw single-key lookup is **+52–59%**
+(≈78 ns, against what used to be a 40 ms scan) — roughly half of that is read
+consistency, which resolves postings against the records so a lookup cannot
+return an entity a concurrent delete already removed. Registering a property
+allocates about twice as much, again the reverse map. Reopening allocates 63%
+more peak memory while running 94% faster, because the index arrives as one file
+read instead of streaming from the log.
+
+Ingest and point lookups are unchanged.
+
+### How much to trust these numbers
+
+Measured as an interleaved A/B against `036aac0` after a cooldown, with the
+benchmark files copied into the baseline tree so both sides run identical
+benchmark code against different implementations.
+
+One round of four was discarded from **both** sides: its samples on the new side
+roughly doubled, having run last under peak thermal load. And the two controls
+then disagreed — `GetNode` flat as expected, but `PointLookupNode_Memory`
+reporting −24% on byte-identical code. So **timing effects below ~25% are not
+resolvable here**; the order-of-magnitude results are solid and anything in the
+tens of percent is directional. The footprint table above is exempt, being
+deterministic measurement rather than timing.
+
+Full methodology and the per-benchmark detail are in
+[benchmarks.md](benchmarks.md).
 
 Full methodology, per-benchmark detail, and the remaining slow paths are in
 [benchmarks.md](benchmarks.md); the roadmap is in [plan.md](plan.md).
@@ -203,6 +241,7 @@ example:
 - Typed query functions for nodes, edges, and relations.
 - Traversal and pattern functions for graph-structured analysis.
 - Built-in deterministic ordering with offset/limit pagination.
+- Query plans via `ExplainNodeQuery` / `ExplainEdgeQuery`.
 - Sort direction control with `Order: store.QueryOrderAsc|QueryOrderDesc`.
 - Custom type selectors for user-defined labels (for example `custom:7`).
 
@@ -244,6 +283,26 @@ Index-accelerated operators: `PropertyOpEqual` always; the range operators and
 `Prefix` once the key is declared ordered (below). `Contains` is a scan and will
 stay one — no ordering can bound a substring match.
 
+**A filter that cannot be served no longer costs a scan of its whole key.** Only
+one filter drives a query; the rest are applied afterwards, and each is costed
+both ways — probe the candidates through the index's reverse map, or resolve the
+filter to its own set and intersect. A query driven down to a single candidate
+used to scan every entry under a `Contains` key to eliminate it, which is what
+made the pairing 12.97 ms; probing that one candidate instead makes it 443 ns.
+
+You can see what the planner decided:
+
+```go
+plan, _ := g.ExplainNodeQuery(q)
+fmt.Println(plan)
+// driver=equality(sha256) candidates=1 residual=tool:probe~100000 results=1
+```
+
+`ExplainNodeQuery` and `ExplainEdgeQuery` exist because results alone cannot tell
+an index lookup from a full scan that happened to agree with it. The plan is
+diagnostic — which index gets picked may change between versions; the results a
+query returns may not.
+
 ### Ordered keys for range queries
 
 Declaring a key builds a sorted structure over its values, turning a range filter
@@ -278,6 +337,28 @@ store reopens without replaying anything: the WAL is left empty by `Compact()`
 and restart cost no longer grows with the number of indexed entries. Files
 written by earlier versions (v2–v5) still open, with the WAL supplying the index
 as before, and are upgraded on the next `Compact()`.
+
+### What a read guarantees
+
+Every operation is atomic on its own. A completed `DeleteNode` leaves no dangling
+edge and no index entry, in any index, under any key. Reads give you:
+
+> every ID returned named an entity that was live at the moment it was checked.
+
+**The moment is inside the call, not after it.** By the time you act on a result
+the entity may be gone, so `GetNode` on an ID you were just handed can
+legitimately fail — measured at 0.7% of IDs from a single-key lookup and 4–11%
+from a typed query, against a deleter running flat out. Treat a result set as
+candidates. Closing that gap needs snapshot isolation, which Graphene does not
+offer, and a sequence of calls is not a transaction.
+
+Holding that line needed one fix worth naming: property lookups consulted the
+index without consulting the records, and the two are separate structures under
+separate locks — so a lookup could return an entity a concurrent delete had
+already removed from the records. Postings are now resolved against the records.
+`graphene_consistency_test.go` asserts this under concurrent mutation, and
+distinguishes a genuinely torn read from the benign race above; conflating the
+two is what made its first version report 82 failures that were not bugs.
 
 ### Keeping the index truthful
 

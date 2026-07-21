@@ -35,6 +35,7 @@ import (
 15. [Visualization export](#15-visualization-export)
 16. [Concurrency & guarantees](#16-concurrency--guarantees)
 17. [Index maintenance](#17-index-maintenance)
+18. [Query plans](#18-query-plans)
 
 ---
 
@@ -588,28 +589,84 @@ _ = viz.ExportInteractiveHTMLWithOptions(nodes, edges, "graph.html", viz.ExportO
 
 ## 16. Concurrency & guarantees
 
-- Both backends are safe for concurrent use; each method takes the appropriate
-  lock internally.
-- **Every individual operation is atomic.** Each `Add*`/`Update*`/`Delete*` call
-  validates, appends to the WAL, and applies to memory under a single lock hold,
-  so operations never interleave into an inconsistent state — including
-  `AddEdge` racing `DeleteNode` on the same node (the edge is either created
-  before the node is gone and then cascaded, or rejected with `ErrInvalidEdge`).
-  A completed `DeleteNode` never leaves a dangling edge, and the reopened state
-  always matches the live state (WAL order equals apply order).
-- **A *sequence* of calls is not a transaction.** There is no multi-operation
-  rollback or snapshot isolation: if you need a higher-level invariant to hold
-  across several calls (e.g. read-decide-write), coordinate that in your own
-  code. Individual calls are always safe and consistent.
-- Reads may return pointers into internal state for speed — treat results as
+Both backends are safe for concurrent use; every method takes the locks it needs
+internally. What follows is what that safety does and does not buy you.
+
+### Writes
+
+**Every individual operation is atomic.** Each `Add*`/`Update*`/`Delete*` call
+validates, appends to the WAL, and applies to memory under a single lock hold, so
+operations never interleave into a half-applied state. `AddEdge` racing
+`DeleteNode` on the same node resolves one of two ways — the edge is created
+before the node is gone and is then cascaded, or it is rejected with
+`ErrInvalidEdge` — and never leaves an edge pointing at a missing node. A
+completed `DeleteNode` leaves no dangling edge and no index entry behind, in any
+index, under any key.
+
+**A sequence of calls is not a transaction.** There is no multi-operation
+rollback and no snapshot isolation. If an invariant has to hold across several
+calls — read-decide-write being the usual one — enforce it in your own code.
+
+### Reads
+
+A read returns data that was correct at some instant during the call:
+
+> Every ID a lookup or query returns named an entity that was live at the moment
+> it was checked, and every record it returns is internally coherent — an edge is
+> incident to the node it was requested for, and a neighbour is that edge's far
+> endpoint.
+
+**The instant is inside the call, not after it.** By the time you act on a result
+the entity may already be gone, and `GetNode` on an ID you were just handed can
+legitimately fail. That is not a bug in the store, and closing it would require
+snapshot isolation, which is not on offer.
+
+How often it happens depends on how much the call returns and how long it takes.
+Measured against a deleter running flat out with six concurrent readers:
+
+| Call | IDs that no longer resolved |
+|---|---|
+| `NodesByProperty`, single key | **0.7%** |
+| `QueryNodeIDs`, typed query | **4–11%** |
+
+A typed query returns far more IDs over a longer call, so more of them go stale
+before the caller reaches them. Treat any result set as candidates, and expect a
+lookup on one to fail.
+
+This guarantee is not free, and it is not automatic either. Property lookups
+resolve their postings against the records before returning, because the index
+and the records are separate structures under separate locks: `DeleteNode` holds
+the store lock across the whole cascade, but a lookup that consulted only the
+index could read postings the delete had not reached yet and hand back an entity
+the records no longer had. Making the records the authority costs about 20 ns on
+a raw single-key lookup and nothing measurable on the typed query path, which
+already resolved its candidates that way.
+
+The same filter covers a second case: index writes do not verify that the entity
+exists, so an entry can outlive — or precede — any record. Such an entry is
+invisible to reads and reported by `VerifyIndexes`.
+
+### What is actually enforced
+
+`graphene_consistency_test.go` asserts these properties under concurrent
+mutation rather than leaving them as prose. It separates the two failure modes
+that a naive test conflates: a lookup returning an entity whose deletion had
+already *completed* is a torn read and fails the suite, while a lookup returning
+an entity deleted after the lookup began is the benign race above and is counted
+and logged, never failed. The deleter publishes progress through an atomic that
+readers sample before each lookup, which is what makes the two distinguishable.
+
+### Other properties
+
+- Reads may return pointers into internal state for speed. Treat results as
   read-only and mutate exclusively through the API.
-- Ordering: type-lookup and property-lookup results are not sorted unless you use
-  the typed `Query*` APIs, which apply deterministic ordering + pagination.
+- Type-lookup and property-lookup results are unordered. The typed `Query*` APIs
+  apply deterministic ordering and pagination.
 - Durability boundary (disk): a write is recoverable once its WAL append returns.
-  Deleted/updated CSR space is reclaimed at the next `Compact()`.
-- IDs are monotonic and never reused across the lifetime of a store, including
-  across restarts and compactions.
-```
+  Space held by deleted or superseded records is reclaimed at the next
+  `Compact()`.
+- IDs are monotonic and never reused for the lifetime of a store, across restarts
+  and compactions alike.
 
 ---
 
@@ -671,3 +728,62 @@ repairs structure, not content.
 on a 100k-node store — and a damaged index section is already rejected while the
 file is parsed, so the scan would be a startup tax for little gain. Run them
 explicitly in tests, in CI, or when recovering a suspect store.
+
+---
+
+## 18. Query plans
+
+```go
+func (g *Graph) ExplainNodeQuery(q store.NodeQuery) (store.QueryPlan, error)
+func (g *Graph) ExplainEdgeQuery(q store.EdgeQuery) (store.QueryPlan, error)
+```
+
+Reports how the planner resolves a query: which index drove it, how many
+candidates that produced, and how each remaining filter was applied.
+
+```go
+plan, _ := g.ExplainNodeQuery(store.NodeQuery{Filters: []store.PropertyFilter{
+    {Key: "sha256", Op: store.PropertyOpEqual, Value: hash},
+    {Key: "tool", Op: store.PropertyOpContains, Value: []byte("acquire")},
+}})
+fmt.Println(plan)
+// driver=equality(sha256) candidates=1 residual=tool:probe~100000 results=1
+```
+
+| Field | Meaning |
+|---|---|
+| `Driver` | `ids`, `equality`, `ordered`, `labels`, `adjacency`, or `scan` |
+| `DriverKey` | the property key, when a filter drove the query |
+| `DriverFilter` | index into the query's `Filters`, or −1 |
+| `Candidates` | size of the driving set |
+| `Residuals` | the remaining filters, in the order they were applied |
+| `Results` | final result count |
+
+A residual is applied one of two ways. `Probe` tests the candidates directly
+through the index's reverse map, costing one lookup each. Otherwise the filter is
+resolved to its own set and intersected, costing that set's size — which for a
+filter no index can serve means scanning every entry under its key. `Cost` is the
+planner's estimate of that set's size: exact for equality, and the key's entry
+count otherwise.
+
+**What this is for.** A query can return exactly the right answer while doing far
+more work than it needed to, and the difference is invisible from the results —
+a test asserting only on results cannot tell an index lookup from a full scan
+that happened to agree with it. This is how that gets checked, in tests and by
+hand.
+
+`adjacency` appears only for edge queries, where an anchored query is bounded by
+the incident-edge lists of its endpoints.
+
+**`Probe` is a forecast, the rest is fact.** The executor re-decides probe versus
+set at each step, because every step shrinks the candidate set and a filter not
+worth probing against a thousand candidates may be worth it against the five that
+survive. The plan reports the decision as it stands at the start of the pass; the
+residual order and the cost estimates are exact.
+
+**The plan is diagnostic output, not contract.** Which index the planner picks
+may change as the cost model improves. The results a query returns may not.
+
+`ExplainNodeQuery` runs the driving step for real, because the candidate count is
+what decides how each residual is applied, then stops. So it costs the driver,
+not the whole query — except for the result count, which requires running it.

@@ -296,3 +296,15 @@ func uint64ToStr(v uint64) string {
 	}
 	return string(buf[pos:])
 }
+
+// NodeQueryExplainer is implemented by stores that can report how they would
+// resolve a node query. It is optional: Graph.ExplainNodeQuery reports an error
+// for a store that does not implement it.
+type NodeQueryExplainer interface {
+	ExplainNodeQuery(query NodeQuery) (QueryPlan, error)
+}
+
+// EdgeQueryExplainer is NodeQueryExplainer for edge queries.
+type EdgeQueryExplainer interface {
+	ExplainEdgeQuery(query EdgeQuery) (QueryPlan, error)
+}

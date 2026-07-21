@@ -2,6 +2,7 @@ package graphene
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/aoiflux/graphene/store"
@@ -663,4 +664,33 @@ func dedupeEdgeIDs(ids []store.EdgeID) []store.EdgeID {
 		out = append(out, id)
 	}
 	return out
+}
+
+// --- Query diagnostics ---
+
+// ExplainNodeQuery reports how the planner resolves q: which index drove it, how
+// many candidates that produced, and how each remaining filter was applied.
+//
+// This is how planner behaviour gets verified. A query can return the right
+// answer while doing far more work than it needed to, and the difference is
+// invisible from the results alone — a test that asserts only on results cannot
+// tell an index lookup from a full scan that happened to agree with it.
+//
+// The plan is diagnostic output. Which index the planner picks may change as the
+// cost model improves; the results a query returns may not.
+func (g *Graph) ExplainNodeQuery(q store.NodeQuery) (store.QueryPlan, error) {
+	ex, ok := g.GraphStore.(store.NodeQueryExplainer)
+	if !ok {
+		return store.QueryPlan{}, fmt.Errorf("ExplainNodeQuery: %T does not support query plans", g.GraphStore)
+	}
+	return ex.ExplainNodeQuery(q)
+}
+
+// ExplainEdgeQuery reports how the planner resolves q. See ExplainNodeQuery.
+func (g *Graph) ExplainEdgeQuery(q store.EdgeQuery) (store.QueryPlan, error) {
+	ex, ok := g.GraphStore.(store.EdgeQueryExplainer)
+	if !ok {
+		return store.QueryPlan{}, fmt.Errorf("ExplainEdgeQuery: %T does not support query plans", g.GraphStore)
+	}
+	return ex.ExplainEdgeQuery(q)
 }

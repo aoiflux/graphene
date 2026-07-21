@@ -58,12 +58,12 @@ type Store struct {
 	// lock at all. Crucially, appending new entities does not shadow anything, so
 	// ongoing writes do not disable the fast path for pre-existing records.
 	//
-	// The counter is only ever incremented (Compact resets it), so reading zero
-	// after a lookup proves it was zero throughout. csrEpoch guards against a
-	// Compact swapping the CSR mid-read and resetting the counter underneath us:
-	// readers sample the epoch first and re-check it last.
+	// The counter is only ever incremented within the life of one CSR (Compact
+	// resets it when it publishes the next), so reading zero after a lookup proves
+	// it was zero throughout. A reader also re-checks the CSR *pointer* it read
+	// from, which is what catches a Compact that swapped the CSR and cleared the
+	// counter underneath it.
 	csrPtr      atomic.Pointer[CSRGraph]
-	csrEpoch    atomic.Uint64
 	csrShadowed atomic.Int64
 
 	// Property index (in-memory; rebuilt from WAL on restart).
@@ -537,9 +537,15 @@ func (s *Store) DeleteNode(id store.NodeID) error {
 // every update and tombstone that had accumulated against the previous one.
 func (s *Store) publishCSR(csr *CSRGraph) {
 	s.csr = csr
-	s.csrShadowed.Store(0)
-	s.csrEpoch.Add(1)
+	// Order matters: publish the pointer *before* clearing the shadow count.
+	//
+	// Clearing first would open a window in which a reader still holding the old
+	// pointer sees a clean count and concludes the old CSR is authoritative —
+	// even though the CSR it is about to read from was just superseded, tombstones
+	// and all. Publishing first means any reader that trusts a zero count is
+	// re-checking against a pointer that has already moved, and bails out.
 	s.csrPtr.Store(csr)
+	s.csrShadowed.Store(0)
 }
 
 // shadowCSRNode records that a CSR-resident node has been superseded by the
@@ -730,29 +736,39 @@ func (s *Store) incidentEdgeIDsLocked(id store.NodeID) []store.EdgeID {
 // It returns nil when no CSR exists or something has already shadowed part of
 // it. Callers must confirm with csrFastReadValid *after* reading the record;
 // only then is the answer known to have been current throughout.
-func (s *Store) csrFastRead() (*CSRGraph, uint64, bool) {
-	// Epoch first: sampling it after loading the pointer would let a Compact
-	// slip in between and make the final check pass against a stale CSR.
-	epoch := s.csrEpoch.Load()
+func (s *Store) csrFastRead() (*CSRGraph, bool) {
 	csr := s.csrPtr.Load()
 	if csr == nil || s.csrShadowed.Load() != 0 {
-		return nil, 0, false
+		return nil, false
 	}
-	return csr, epoch, true
+	return csr, true
 }
 
-// csrFastReadValid reports whether nothing invalidated the CSR during the read.
-func (s *Store) csrFastReadValid(epoch uint64) bool {
-	return s.csrShadowed.Load() == 0 && s.csrEpoch.Load() == epoch
+// csrFastReadValid reports whether nothing invalidated csr during the read.
+//
+// The validity check is on the **pointer itself**, not a separate generation
+// counter. An earlier version used a counter and was wrong: `Compact` bumped the
+// generation before storing the new pointer, so a reader could sample the new
+// generation, load the *old* pointer, see a shadow count that had already been
+// cleared, and accept a superseded CSR — tombstoned records and all. Every
+// ordering of two independent atomics has some such window, because the reader
+// needs the pointer and its validity to agree and they were separate words.
+//
+// Comparing the pointer removes the second word entirely. It is sound because
+// the caller still holds a reference to the CSR it read, so that object cannot
+// be collected and its address cannot be reused by a later one while the check
+// is running.
+func (s *Store) csrFastReadValid(csr *CSRGraph) bool {
+	return s.csrShadowed.Load() == 0 && s.csrPtr.Load() == csr
 }
 
 func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
 	// Unlocked path first: if the record lives in an unshadowed CSR, the store
 	// lock buys nothing — the CSR cannot change under us.
-	if csr, epoch, ok := s.csrFastRead(); ok {
+	if csr, ok := s.csrFastRead(); ok {
 		if rec, found := csr.GetNode(id); found {
 			node := &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: cloneBytes(rec.Properties)}
-			if s.csrFastReadValid(epoch) {
+			if s.csrFastReadValid(csr) {
 				return node, nil
 			}
 		}
@@ -778,10 +794,10 @@ func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
 }
 
 func (s *Store) GetEdge(id store.EdgeID) (*store.Edge, error) {
-	if csr, epoch, ok := s.csrFastRead(); ok {
+	if csr, ok := s.csrFastRead(); ok {
 		if rec, found := csr.GetEdge(id); found {
 			edge := rawEdgeToStore(rec)
-			if s.csrFastReadValid(epoch) {
+			if s.csrFastReadValid(csr) {
 				return edge, nil
 			}
 		}
@@ -972,8 +988,8 @@ func (s *Store) IncidentEdges(dst []store.IncidentEdge, id store.NodeID, dir sto
 
 // NodeExists implements store.AdjacencyReader.
 func (s *Store) NodeExists(id store.NodeID) bool {
-	if csr, epoch, ok := s.csrFastRead(); ok {
-		if _, found := csr.GetNode(id); found && s.csrFastReadValid(epoch) {
+	if csr, ok := s.csrFastRead(); ok {
+		if _, found := csr.GetNode(id); found && s.csrFastReadValid(csr) {
 			return true
 		}
 	}
@@ -1168,16 +1184,31 @@ func (s *Store) IndexEdgeProperty(id store.EdgeID, key string, value []byte) err
 	return nil
 }
 
+// NodesByProperty returns the nodes indexed under key with exactly value.
+//
+// The postings are resolved against the records before being returned. Without
+// that step a caller can observe a deletion mid-flight: DeleteNode journals its
+// tombstones and applies them under one write lock, but this path only locks the
+// index, so it can read postings that the delete has not reached yet and hand
+// back an entity the records no longer have. Filtering makes the records the
+// authority, so every ID returned resolved to a live node at the instant it was
+// checked.
+//
+// That is the guarantee, and it is deliberately not stronger: the node may be
+// deleted the moment this returns. Ruling that out needs snapshot isolation,
+// which the store does not offer.
 func (s *Store) NodesByProperty(key string, value []byte) ([]store.NodeID, error) {
-	return s.propIdx.NodesByProperty(key, value), nil
+	return s.liveNodeIDs(s.propIdx.NodesByProperty(key, value)), nil
 }
 
+// EdgesByProperty returns the edges indexed under key with exactly value. It
+// resolves postings against the records for the reason given on NodesByProperty.
 func (s *Store) EdgesByProperty(key string, value []byte) ([]store.EdgeID, error) {
-	return s.propIdx.EdgesByProperty(key, value), nil
+	return s.liveEdgeIDs(s.propIdx.EdgesByProperty(key, value)), nil
 }
 
 func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
-	candidates, sortedAsc := s.driveNodeCandidates(query)
+	candidates, sortedAsc, plan := s.driveNodeCandidates(query)
 
 	if len(query.Types) > 0 {
 		typeSet := make(map[store.NodeType]struct{}, len(query.Types))
@@ -1198,7 +1229,6 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 	}
 
 	if len(query.Filters) > 0 {
-		matched := s.matchNodeIDsByFilters(query.Filters, store.NormalizedFilterMode(query.FilterMode))
 		// Both sides must be ascending for the merge. The driving set often
 		// already is; when it is not, sorting it once here is repaid immediately
 		// because the merge output is ascending too, which retires the sort below.
@@ -1206,7 +1236,15 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 			candidates = store.SortDedupeIDs(candidates)
 			sortedAsc = true
 		}
-		candidates = store.IntersectSortedIDs(candidates, matched)
+		if store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
+			// Every filter's own set contains the answer, so the residual pass
+			// can narrow the candidates directly and skip the driving filter
+			// entirely rather than re-deriving a set it was already built from.
+			candidates = s.propIdx.NarrowNodesByFilters(candidates, query.Filters, plan.DriverFilter)
+		} else {
+			matched := s.matchNodeIDsByFilters(query.Filters, store.MatchAny)
+			candidates = store.IntersectSortedIDs(candidates, matched)
+		}
 	}
 
 	order := store.NormalizedQueryOrder(query.Order)
@@ -1229,7 +1267,7 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 }
 
 func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
-	candidates, sortedAsc := s.driveEdgeCandidates(query)
+	candidates, sortedAsc, plan := s.driveEdgeCandidates(query)
 
 	if len(query.Types) > 0 || len(query.SrcIDs) > 0 || len(query.DstIDs) > 0 {
 		typeSet := make(map[store.EdgeType]struct{}, len(query.Types))
@@ -1264,12 +1302,16 @@ func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 	}
 
 	if len(query.Filters) > 0 {
-		matched := s.matchEdgeIDsByFilters(query.Filters, store.NormalizedFilterMode(query.FilterMode))
 		if !sortedAsc {
 			candidates = store.SortDedupeIDs(candidates)
 			sortedAsc = true
 		}
-		candidates = store.IntersectSortedIDs(candidates, matched)
+		if store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
+			candidates = s.propIdx.NarrowEdgesByFilters(candidates, query.Filters, plan.DriverFilter)
+		} else {
+			matched := s.matchEdgeIDsByFilters(query.Filters, store.MatchAny)
+			candidates = store.IntersectSortedIDs(candidates, matched)
+		}
 	}
 
 	order := store.NormalizedQueryOrder(query.Order)
@@ -1516,9 +1558,13 @@ func sortDedupeEdgeIDs(ids []store.EdgeID) []store.EdgeID {
 
 // driveNodeCandidates returns the starting candidate set for a node query and
 // whether it is already in ascending ID order.
-func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool) {
+// driveNodeCandidates picks the cheapest source that is guaranteed to contain
+// the query's answer. It returns the candidates, whether they are ascending, and
+// a plan describing that choice — including the filter it consumed, so the
+// residual pass does not evaluate that filter a second time.
+func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool, store.QueryPlan) {
 	if len(query.IDs) > 0 {
-		return s.collectCandidateNodeIDs(query.IDs), false
+		return s.collectCandidateNodeIDs(query.IDs), false, store.QueryPlan{Driver: store.DriverIDs, DriverFilter: -1}
 	}
 
 	// Most selective equality filter, if any qualifies as a driver. Its
@@ -1534,14 +1580,22 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 		}
 	}
 	if bestFilter != nil {
-		return s.liveNodeIDs(s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)), true
+		return s.liveNodeIDs(s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
+			Driver:       store.DriverEquality,
+			DriverKey:    bestFilter.Key,
+			DriverFilter: store.FilterIndexOf(query.Filters, *bestFilter),
+		}
 	}
 
 	// A range or prefix filter on a key declared ordered bounds the result too,
 	// and resolving it here means the query never enumerates the whole graph.
 	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
 		if ids, served := s.propIdx.NodesMatchingOrdered(nil, f); served {
-			return s.liveNodeIDs(sortDedupeNodeIDs(ids)), true
+			return s.liveNodeIDs(sortDedupeNodeIDs(ids)), true, store.QueryPlan{
+				Driver:       store.DriverOrdered,
+				DriverKey:    f.Key,
+				DriverFilter: store.FilterIndexOf(query.Filters, f),
+			}
 		}
 	}
 
@@ -1564,14 +1618,17 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 				out = append(out, id)
 			}
 		}
-		return out, false
+		return out, false, store.QueryPlan{Driver: store.DriverLabels, DriverFilter: -1}
 	}
 
-	return s.collectCandidateNodeIDs(nil), false
+	return s.collectCandidateNodeIDs(nil), false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
 }
 
 // liveNodeIDs drops IDs that no longer resolve to a live node, preserving order.
 func (s *Store) liveNodeIDs(ids []store.NodeID) []store.NodeID {
+	if len(ids) == 0 {
+		return ids // a miss should not pay for the lock
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := ids[:0]
@@ -1585,6 +1642,9 @@ func (s *Store) liveNodeIDs(ids []store.NodeID) []store.NodeID {
 
 // liveEdgeIDs drops IDs that no longer resolve to a live edge, preserving order.
 func (s *Store) liveEdgeIDs(ids []store.EdgeID) []store.EdgeID {
+	if len(ids) == 0 {
+		return ids // a miss should not pay for the lock
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := ids[:0]
@@ -1598,9 +1658,12 @@ func (s *Store) liveEdgeIDs(ids []store.EdgeID) []store.EdgeID {
 
 // driveEdgeCandidates returns the starting candidate set for an edge query and
 // whether it is already in ascending ID order.
-func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool) {
+// driveEdgeCandidates mirrors driveNodeCandidates: it returns the candidates,
+// whether they are ascending, and a plan naming the source it drove from and the
+// filter it consumed, so the residual pass does not re-evaluate that filter.
+func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool, store.QueryPlan) {
 	if len(query.IDs) > 0 {
-		return s.collectCandidateEdgeIDs(query.IDs), false
+		return s.collectCandidateEdgeIDs(query.IDs), false, store.QueryPlan{Driver: store.DriverIDs, DriverFilter: -1}
 	}
 
 	var bestFilter *store.PropertyFilter
@@ -1637,14 +1700,24 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 
 	switch {
 	case bestFilter != nil && (anchorSize < 0 || bestSize <= anchorSize):
-		return s.liveEdgeIDs(s.propIdx.EdgesByProperty(bestFilter.Key, bestFilter.Value)), true
+		return s.liveEdgeIDs(s.propIdx.EdgesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
+			Driver:       store.DriverEquality,
+			DriverKey:    bestFilter.Key,
+			DriverFilter: store.FilterIndexOf(query.Filters, *bestFilter),
+		}
 	case anchorSize >= 0:
-		return s.incidentEdgeIDs(anchors, anchorDir), false
+		return s.incidentEdgeIDs(anchors, anchorDir), false, store.QueryPlan{
+			Driver: store.DriverAdjacency, DriverFilter: -1,
+		}
 	}
 
 	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
 		if ids, served := s.propIdx.EdgesMatchingOrdered(nil, f); served {
-			return s.liveEdgeIDs(sortDedupeEdgeIDs(ids)), true
+			return s.liveEdgeIDs(sortDedupeEdgeIDs(ids)), true, store.QueryPlan{
+				Driver:       store.DriverOrdered,
+				DriverKey:    f.Key,
+				DriverFilter: store.FilterIndexOf(query.Filters, f),
+			}
 		}
 	}
 
@@ -1664,10 +1737,10 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 				out = append(out, id)
 			}
 		}
-		return out, false
+		return out, false, store.QueryPlan{Driver: store.DriverLabels, DriverFilter: -1}
 	}
 
-	return s.collectCandidateEdgeIDs(nil), false
+	return s.collectCandidateEdgeIDs(nil), false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
 }
 
 // degreeSumLocked totals the live incident-edge counts for ids across the delta
@@ -2198,6 +2271,13 @@ func (s *Store) loadCSR(path string) error {
 	// A pre-v6 file carries no section; its entries come from the WAL as before,
 	// and the next Compact writes them into the CSR.
 	if section != nil {
+		// Deliberately per-entry. Bulk loading was built and measured here — one
+		// lock per shard, parallel fill, presized reverse map, batch-local value
+		// interning — and it cut allocations 9-19% but cost 35-75% more resident
+		// memory, because partitioning copies every entry into per-shard slices
+		// and the presize is keyed on entry count rather than entity count. Index
+		// memory is already the project's largest regression, so spending more of
+		// it to save allocations inverts the priority order. See plan.md.
 		for _, e := range section.NodeProps {
 			s.propIdx.IndexNode(e.ID, e.Key, e.Value)
 		}
@@ -2988,4 +3068,43 @@ func unmarshalEdgeProp(b []byte) (id store.EdgeID, key string, value []byte, err
 	value = make([]byte, vl)
 	copy(value, b[14+kl:])
 	return id, key, value, nil
+}
+
+// ExplainNodeQuery reports how the planner would resolve query, without
+// returning the matching entities.
+//
+// It runs the driving step for real — that is the only way to know how large the
+// candidate set is, and the candidate size is what decides how each residual
+// filter is applied — but stops before applying them. So the cost is the driver,
+// not the query.
+//
+// The plan is diagnostic. Which index the planner picks is free to change as the
+// cost model improves; the results a query returns are not.
+func (s *Store) ExplainNodeQuery(query store.NodeQuery) (store.QueryPlan, error) {
+	candidates, _, plan := s.driveNodeCandidates(query)
+	plan.Candidates = len(candidates)
+	if len(query.Filters) > 0 && store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
+		plan.Residuals = s.propIdx.PlanNodeResiduals(query.Filters, plan.DriverFilter, len(candidates))
+	}
+	ids, err := s.QueryNodeIDs(query)
+	if err != nil {
+		return plan, err
+	}
+	plan.Results = len(ids)
+	return plan, nil
+}
+
+// ExplainEdgeQuery is ExplainNodeQuery for edge queries.
+func (s *Store) ExplainEdgeQuery(query store.EdgeQuery) (store.QueryPlan, error) {
+	candidates, _, plan := s.driveEdgeCandidates(query)
+	plan.Candidates = len(candidates)
+	if len(query.Filters) > 0 && store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
+		plan.Residuals = s.propIdx.PlanEdgeResiduals(query.Filters, plan.DriverFilter, len(candidates))
+	}
+	ids, err := s.QueryEdgeIDs(query)
+	if err != nil {
+		return plan, err
+	}
+	plan.Results = len(ids)
+	return plan, nil
 }

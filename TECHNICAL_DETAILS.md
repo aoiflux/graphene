@@ -245,23 +245,30 @@ The query system is API-first and intentionally function-driven:
 
 Execution behavior is shared across memory and disk backends:
 
-1. Build candidate IDs from explicit ID filters or full keyspace.
+1. Drive: pick the cheapest source guaranteed to contain the answer — explicit
+   IDs, the most selective equality postings, an ordered-key range, the label
+   postings, or a full scan. See §5.6.
 2. Apply type filters (`Types`, `SrcIDs`, `DstIDs`) as pre-filters.
-3. Evaluate property filters:
-   - exact match uses property-index fast path,
-   - range/prefix/contains use post-filter evaluation over indexed entries.
-4. Apply combinator semantics:
-   - `MatchAll` = intersection,
-   - `MatchAny` = union.
-5. Apply deterministic ordering:
+3. Apply the remaining property filters:
+   - `MatchAll` narrows the candidates directly, costing each residual filter
+     against the candidate count and skipping the one that drove the query;
+   - `MatchAny` resolves each filter to its own set and unions them, because no
+     single filter's set contains a union.
+4. Apply deterministic ordering:
    - `QueryOrderAsc` or `QueryOrderDesc`.
-6. Apply pagination window:
+5. Apply pagination window:
    - `Offset`, `Limit`.
 
-Numeric comparison semantics for range operators:
+Comparison semantics for range operators depend on whether the key was declared
+ordered:
 
-- attempts numeric comparison first (`ParseFloat` on both sides),
-- falls back to byte-wise lexicographic comparison when parsing fails.
+- **undeclared** — numeric first (`ParseFloat` on both sides), falling back to
+  byte-wise when either side does not parse;
+- **declared ordered** — byte-wise throughout.
+
+They differ because the fallback rule is not a total order — under it
+`"9" < "10" < "1x" < "9"`, a cycle — so no sorted structure can be built on it.
+Every path that evaluates a filter has to pick the same rule for a given key.
 
 Disk-store parity notes:
 
@@ -280,6 +287,55 @@ Custom type-selector semantics:
 - selector APIs parse built-ins and custom forms (`custom:7`, `custom(7)`,
   `custom-7`),
 - custom labels are treated as first-class types, not unknown labels.
+
+### 5.6 Query planning
+
+Resolving a query has two steps, and they are costed separately.
+
+**Driving.** The planner picks the cheapest source guaranteed to contain the
+answer, in order of preference: an explicit ID list, the most selective equality
+filter's postings, a range or prefix on a key declared ordered, the label
+postings, and failing all of those a full scan. Selectivity is exact for equality
+— the postings length is a map lookup away — so "most selective" is measured, not
+guessed.
+
+Under `MatchAll` every filter's own set contains the result, so any of them may
+drive. Under `MatchAny` the result is a union, which no single filter's set
+contains, so only a one-filter query can be driven this way. `store.SupersetDrivers`
+encodes that rule in one place.
+
+**Residuals.** The filters that did not drive still have to be applied, and the
+cost of applying one depends on what the candidate set looks like by then:
+
+| | cost |
+|---|---|
+| probe the candidates through the reverse map | one lookup per candidate |
+| resolve the filter to its own set and intersect | the size of that set |
+
+The second is where the old planner lost. A filter no index can serve — a
+`Contains`, or a range on a key never declared ordered — costs a scan of every
+entry under its key, so a query driven down to a single candidate was still doing
+work proportional to the graph. Costing both ways and taking the cheaper turned
+one such query from 12.97 ms into 443 ns.
+
+Residuals run most-selective-first, so candidates die as early as possible, and
+the pass stops as soon as none are left. The driving filter is excluded outright
+rather than re-derived — it built the candidate set.
+
+This lives in [index/narrow.go](index/narrow.go). It needs nothing but the
+property index, so both backends share one implementation.
+
+**Comparison is the subtle part.** An undeclared key compares numerically when
+both operands parse as numbers and byte-wise otherwise; a key declared ordered
+compares byte-wise throughout. A probe must pick whichever rule the index would
+have picked for that key, or it silently disagrees with the path it replaced.
+The two operators the ordered index declines to serve, `Equal` and `Contains`,
+are comparator-free on both sides, so the rule holds everywhere.
+
+`Graph.ExplainNodeQuery` reports all of this: driver, candidate count, and each
+residual with its estimated cost and how it was applied. It is what makes planner
+behaviour testable — results alone cannot distinguish an index lookup from a full
+scan that happened to agree with it.
 
 ## 6. Traversal and Pattern Engine
 
@@ -349,6 +405,41 @@ Known limits, stated rather than glossed:
   a single append-only file, so ingest throughput does not grow with cores.
 - **Single-key property traffic caps out around four cores.** Sharding is by key,
   so traffic concentrated on one key contends on that one shard.
+
+### 7.3 Read consistency
+
+The guarantee a read gives is:
+
+> every ID returned named an entity that was live at the moment it was checked,
+> and every record returned is internally coherent.
+
+The moment is inside the call. The entity may be gone by the time the caller acts
+on it, and closing that would need snapshot isolation, which the store does not
+offer.
+
+Holding that line took one fix. Property lookups went straight to the property
+index, which is a separate structure under separate locks from the records:
+`DeleteNode` holds the store lock across its whole cascade, but a lookup
+consulting only the index could read postings the delete had not reached and
+return an entity the records no longer had. Postings are now resolved against the
+records, which makes the records the authority, and covers the related case of an
+index entry with no record behind it — index writes do not verify existence, and
+such an entry is invisible to reads and reported by `VerifyIndexes`.
+
+The label paths never had this problem, for a reason worth stating: memory keeps
+label postings inside the store lock alongside the records, and the disk backend
+re-validates candidates against the authoritative view under a single lock hold.
+The property index was the outlier precisely because it is separate — which
+sharding it by key made more true, not less.
+
+`graphene_consistency_test.go` asserts these properties under concurrent
+mutation. It separates a lookup returning an entity whose deletion had already
+*completed* — a torn read, which fails the suite — from one returning an entity
+deleted after the lookup began, which is the caller's race and is counted and
+logged rather than failed. The deleter publishes progress through an atomic that
+readers sample before each lookup; without that ordering the two are
+indistinguishable, and the suite's first version reported the benign case as
+82 and 99 failures.
 
 ## 8. Benchmark and Stress Evidence
 
@@ -435,10 +526,21 @@ from full graph database platforms intentionally out of scope for now.
 
 ## 13. Current Query Limitations
 
-1. No declarative query planner or cost model.
-2. No regex/fuzzy search operators in the current phase.
-3. Range behavior for non-numeric encodings falls back to lexicographic bytes.
-4. Property indexing remains explicit and key-specific by design.
+1. No declarative query language. There *is* a cost model — driver selection by
+   exact postings cardinality, and residual filters costed per strategy — but it
+   is driven by the `NodeQuery` struct, not by parsed text. See §5.6, and
+   `ExplainNodeQuery` to inspect what it decided.
+2. Cardinality statistics are exact and computed on demand, never persisted. A
+   query pays a handful of map lookups to plan; nothing is remembered between
+   calls, and there are no histograms, so selectivity within a range filter is
+   estimated by the key's entry count rather than by distribution.
+3. No regex or fuzzy search operators.
+4. `Contains` cannot be served by any index and always scans the key.
+5. Range behaviour on an undeclared key falls back to the scan rule, which is not
+   a total order. Declare the key and use `index/encoding` for range queries that
+   need to be both fast and well-defined.
+6. Property indexing remains explicit and key-specific by design.
+7. No snapshot isolation: a sequence of calls is not a transaction. See §7.3.
 
 ---
 
