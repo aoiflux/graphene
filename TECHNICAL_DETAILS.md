@@ -1,548 +1,1088 @@
-# GrapheneDB Technical Details
-
-This document is the deep technical companion to the landing README. It is
-intentionally implementation-heavy, but organized so you can skim architecture
-first and dive into low-level details only when needed.
-
-## Status Note
-
-GrapheneDB is currently pre-production. The material in this document describes
-the current implementation direction and behavior, not a finalized production
-contract.
-
-GrapheneDB is best understood today as an experimental embedded native graph
-engine. It owns its graph-shaped storage layout directly, but it is not yet
-positioned as a production-complete peer to server-oriented graph database
-products.
-
-## 1. System Intent
-
-GrapheneDB is designed for a specific workload shape:
-
-1. Ingest large, connected datasets quickly.
-2. Persist safely with crash recovery.
-3. Run many read-heavy graph queries and traversals.
-
-The storage path and APIs are optimized around this sequence.
-
-## 2. Architecture (LLD View)
-
-```mermaid
-flowchart LR
-    A[Graph API<br/>graphene.go] --> B[GraphStore Interface<br/>store/interface.go]
-    B --> C[In-Memory Store<br/>memory/store.go]
-    B --> D[Disk Store<br/>disk/store.go]
-
-    A --> E[Traversal Layer<br/>traversal/*.go]
-    A --> F[Index Layer<br/>index/*.go]
-    A --> G[Helpers<br/>helpers.go]
-    A --> H[Viz Export<br/>viz/exporter.go]
-
-    D --> I[WAL<br/>disk/wal.go]
-    D --> J[CSR Base Graph<br/>disk/csr.go]
-    D --> K[Delta Overlay<br/>in-memory maps]
-```
-
-### Component Responsibilities
-
-| Component        | Responsibility                          | Main Files                                                                           |
-| ---------------- | --------------------------------------- | ------------------------------------------------------------------------------------ |
-| Public API       | Stable graph operations and wrappers    | `graphene.go`, `helpers.go`                                                          |
-| Type system      | Core graph types and contracts          | `store/types.go`, `store/interface.go`                                               |
-| Memory backend   | Fast, test-focused store                | `memory/store.go`                                                                    |
-| Disk backend     | Durable storage, replay, compaction     | `disk/store.go`, `disk/wal.go`, `disk/csr.go`                                        |
-| Traversal engine | BFS, DFS, pathing, pattern matching     | `traversal/bfs.go`, `traversal/dfs.go`, `traversal/path.go`, `traversal/subgraph.go` |
-| Indexes          | Type, temporal, property lookup support | `index/type_index.go`, `index/temporal_index.go`, `index/property_index.go`          |
-| Visualization    | HTML export for graph inspection        | `viz/exporter.go`                                                                    |
-
-## 3. Storage Design
-
-### 3.1 Core Model
-
-GrapheneDB uses a typed property graph:
-
-- Nodes: unique ID + one or more labels + optional raw property blob.
-- Edges: unique ID + src/dst + one or more labels + optional weight + property
-  blob.
-
-### 3.2 Disk Strategy
-
-Disk mode combines three layers:
-
-1. WAL (append-only) for durability.
-2. Delta overlay for recent writes.
-3. CSR base for compact, read-friendly adjacency and durable node/edge property
-   blobs after compaction.
-
-```mermaid
-flowchart TD
-    W[Write Request] --> WAL[Append WAL record + CRC]
-    WAL --> DELTA[Apply to in-memory delta]
-    DELTA --> READS[Visible to reads immediately]
-
-    C[Compact call] --> SNAP[Merge CSR base + delta]
-    SNAP --> NEWCSR[Build new CSR files]
-    NEWCSR --> SWAP[Atomic rename/swap]
-    SWAP --> TRUNC[Truncate or roll WAL]
-```
-
-### 3.2.1 Mutation: update and delete
-
-Graphene supports in-place update and delete of nodes and edges without breaking
-the append-only WAL:
-
-- **Update** re-appends a normal node/edge record (`0x01`/`0x02`) carrying the
-  same ID. On replay the record is applied as an upsert (last write wins). Edge
-  endpoints (`Src`/`Dst`) are immutable — an update changes labels, weight and
-  properties only.
-- **Delete** appends a *tombstone* record — `0x05` for a node, `0x06` for an edge
-  — whose payload is just the 8-byte ID.
-
-Deleting a node **cascades**: one edge tombstone is written for every incident
-edge before the node tombstone, so a crash mid-delete never leaves an edge
-pointing at a missing node.
-
-In memory the delta overlay may now *shadow* or *mask* a CSR record with the same
-ID. Two masking sets (`deletedNodes` / `deletedEdges`) hide a still-in-CSR record
-from every read until the next compaction. Reads consult the overlay first, honour
-the masks, and re-validate `NodesByType`/`EdgesByType` candidates against the
-authoritative view so a label edit is reflected. Property-index entries for a
-deleted entity are purged immediately.
-
-**Space is reclaimed at `Compact`**: the rebuilt CSR simply omits masked and
-delta-overridden records, and the masks are cleared. Until then, a deleted CSR
-record still occupies its slot on disk (its space is freed by the next compaction).
-
-**IDs are never reused**, even across a delete-then-compact-then-reopen cycle.
-The monotonic node/edge sequence high-water marks are persisted in the CSR header
-(format v5) and restored on `Open`, so an ID whose record was dropped during
-compaction is never handed out again.
-
-WAL record types:
-
-| Byte   | Record                     |
-|--------|----------------------------|
-| `0x01` | Node (add or update)       |
-| `0x02` | Edge (add or update)       |
-| `0x03` | Node property index entry  |
-| `0x04` | Edge property index entry  |
-| `0x05` | Node tombstone (delete)    |
-| `0x06` | Edge tombstone (delete)    |
-| `0xFF` | Checkpoint                 |
-
-### 3.3 Why CSR
-
-CSR gives contiguous adjacency reads for neighborhood operations. After
-compaction, traversal-heavy read phases benefit from cache-friendly sequential
-access. The compacted CSR also stores raw node and edge property blobs inline so
-`GetNode` and `GetEdge` preserve the same property-bearing entity contract
-across restart and compaction.
-
-## 4. Read and Write Paths
-
-### 4.1 Write Path (Detailed)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant API as Graph API
-    participant DS as Disk Store
-    participant WAL as WAL
-    participant DEL as Delta
-
-    API->>DS: AddNode/AddEdge
-    DS->>WAL: Append record (checksummed)
-    WAL-->>DS: fsync policy boundary
-    DS->>DEL: Update mutable state
-    DS-->>API: Return generated ID
-```
-
-Write guarantees are single-operation durability and replay safety, not
-multi-statement ACID transactions.
-
-### 4.2 Read Path (Detailed)
-
-```mermaid
-flowchart LR
-    Q[Query] --> M{Data in delta?}
-    M -- yes --> D[Use delta value]
-    M -- no --> C[Read from CSR base]
-    D --> R[Merge result set]
-    C --> R
-    R --> OUT[Return to caller]
-```
-
-Reads observe merged logical state (base + delta).
-
-The current query surface is intentionally API-first rather than language-first:
-the engine exposes graph operations through Go interfaces and traversal helpers,
-not through a built-in declarative query runtime.
-
-## 5. Indexing Internals
-
-Every index below is consulted by the query planner; none of them is decorative.
-Which operators each one accelerates is the practical question, so that is stated
-per index.
-
-### 5.1 Label (type) index
-
-- Maps node label to node IDs and edge label to edge IDs, indexing multi-label
-  entities under each of their labels.
-- Postings are **sorted by ID**. That makes removal a binary search plus a
-  memmove instead of a full rewrite, and lets a lookup hand the query path an
-  already-ordered result it does not need to sort again.
-- The disk backend builds the same postings over the CSR at load
-  (`buildLabelIndex`), so `NodesByType` is proportional to the number of matches
-  rather than to the size of the graph. They are derived state, rebuilt on open,
-  and deliberately not part of the file format.
-- Duplicate labels on one entity are collapsed at every insertion site, so an
-  entity created with `[Tag, Tag]` appears once.
-
-### 5.2 Property index
-
-- Explicit indexing model: properties are queryable only after an indexing call.
-  This keeps behaviour predictable and the storage layer free of any need to
-  understand your property encoding.
-- Postings per `(key, value)` are sorted and deduplicated; registering the same
-  triple twice is a no-op.
-- A reverse `ID → [(key, value)]` map makes removal proportional to the entity's
-  own entries rather than to the size of the whole index.
-- **Persisted** inside the CSR file (format v6), so a compacted store reopens
-  without replaying anything and the WAL is left empty.
-- **Sharded 16 ways by key hash.** The reverse map is sharded alongside the
-  forward map rather than by ID, so no operation ever holds two shard locks —
-  there is no lock ordering to get wrong.
-- Accelerates: equality (`PropertyOpEqual`).
-
-### 5.3 Ordered (range) index
-
-- Opt-in per key via `Graph.DeclareOrderedProperty`. Keeps that key's distinct
-  values sorted, answering range and prefix predicates with two binary searches.
-- Accelerates: `>`, `>=`, `<`, `<=`, `Between`, and `Prefix`.
-- **Declaring a key changes how it compares.** Undeclared keys use the scan rule —
-  numeric when both sides parse, byte order otherwise — which is fine value by
-  value but is *not a valid sort order*: under it `"9" < "10" < "1x" < "9"`, a
-  cycle, so no sorted structure can be built on it. A declared key is compared
-  byte-wise throughout. Encode values with `index/encoding`, which supplies
-  order-preserving encoders for int64, uint64, float64, string and time.
-- Not persisted: a declaration is a runtime choice about how to index, like an
-  index definition elsewhere, and must be re-issued after reopening.
-
-### 5.4 What is not indexed
-
-- `PropertyOpContains` is a scan and will remain one — no ordering can bound a
-  substring match. A trigram index is the only route and is out of scope.
-- A range or prefix filter on an *undeclared* key scans that key's buckets. That
-  is bounded by the key, not by the whole index, but it is still linear.
-
-### 5.5 Query Execution Model (Typed APIs)
-
-The query system is API-first and intentionally function-driven:
-
-- `QueryNodeIDs` / `QueryNodes`
-- `QueryEdgeIDs` / `QueryEdges`
-- `QueryRelationIDs` / `QueryRelations`
-
-Execution behavior is shared across memory and disk backends:
-
-1. Drive: pick the cheapest source guaranteed to contain the answer — explicit
-   IDs, the most selective equality postings, an ordered-key range, the label
-   postings, or a full scan. See §5.6.
-2. Apply type filters (`Types`, `SrcIDs`, `DstIDs`) as pre-filters.
-3. Apply the remaining property filters:
-   - `MatchAll` narrows the candidates directly, costing each residual filter
-     against the candidate count and skipping the one that drove the query;
-   - `MatchAny` resolves each filter to its own set and unions them, because no
-     single filter's set contains a union.
-4. Apply deterministic ordering:
-   - `QueryOrderAsc` or `QueryOrderDesc`.
-5. Apply pagination window:
-   - `Offset`, `Limit`.
-
-Comparison semantics for range operators depend on whether the key was declared
-ordered:
-
-- **undeclared** — numeric first (`ParseFloat` on both sides), falling back to
-  byte-wise when either side does not parse;
-- **declared ordered** — byte-wise throughout.
-
-They differ because the fallback rule is not a total order — under it
-`"9" < "10" < "1x" < "9"`, a cycle — so no sorted structure can be built on it.
-Every path that evaluates a filter has to pick the same rule for a given key.
-
-Disk-store parity notes:
-
-- query candidates merge delta + CSR data,
-- dedupe and ordering are applied after merge,
-- property index state is replayed from WAL and re-emitted across compaction.
-
-Relation-query semantics:
-
-- `QueryRelationIDs` is ID-first for service/pagination workflows,
-- `QueryRelations` hydrates IDs into edge entities,
-- `DirectionBoth` performs global dedupe, then global ordering and pagination.
-
-Custom type-selector semantics:
-
-- selector APIs parse built-ins and custom forms (`custom:7`, `custom(7)`,
-  `custom-7`),
-- custom labels are treated as first-class types, not unknown labels.
-
-### 5.6 Query planning
-
-Resolving a query has two steps, and they are costed separately.
-
-**Driving.** The planner picks the cheapest source guaranteed to contain the
-answer, in order of preference: an explicit ID list, the most selective equality
-filter's postings, a range or prefix on a key declared ordered, the label
-postings, and failing all of those a full scan. Selectivity is exact for equality
-— the postings length is a map lookup away — so "most selective" is measured, not
-guessed.
-
-Under `MatchAll` every filter's own set contains the result, so any of them may
-drive. Under `MatchAny` the result is a union, which no single filter's set
-contains, so only a one-filter query can be driven this way. `store.SupersetDrivers`
-encodes that rule in one place.
-
-**Residuals.** The filters that did not drive still have to be applied, and the
-cost of applying one depends on what the candidate set looks like by then:
-
-| | cost |
-|---|---|
-| probe the candidates through the reverse map | one lookup per candidate |
-| resolve the filter to its own set and intersect | the size of that set |
-
-The second is where the old planner lost. A filter no index can serve — a
-`Contains`, or a range on a key never declared ordered — costs a scan of every
-entry under its key, so a query driven down to a single candidate was still doing
-work proportional to the graph. Costing both ways and taking the cheaper turned
-one such query from 12.97 ms into 443 ns.
-
-Residuals run most-selective-first, so candidates die as early as possible, and
-the pass stops as soon as none are left. The driving filter is excluded outright
-rather than re-derived — it built the candidate set.
-
-This lives in [index/narrow.go](index/narrow.go). It needs nothing but the
-property index, so both backends share one implementation.
-
-**Comparison is the subtle part.** An undeclared key compares numerically when
-both operands parse as numbers and byte-wise otherwise; a key declared ordered
-compares byte-wise throughout. A probe must pick whichever rule the index would
-have picked for that key, or it silently disagrees with the path it replaced.
-The two operators the ordered index declines to serve, `Equal` and `Contains`,
-are comparator-free on both sides, so the rule holds everywhere.
-
-`Graph.ExplainNodeQuery` reports all of this: driver, candidate count, and each
-residual with its estimated cost and how it was applied. It is what makes planner
-behaviour testable — results alone cannot distinguish an index lookup from a full
-scan that happened to agree with it.
-
-## 6. Traversal and Pattern Engine
-
-### 6.1 Traversal Coverage
-
-- BFS for k-hop neighborhoods.
-- DFS for directional exploration.
-- Bidirectional BFS for shortest path.
-- Provenance chains for ancestry-style analysis.
-
-### 6.2 Pattern Matching
-
-Pattern queries use a VF2-inspired backtracking strategy with label pruning and
-optional scope restriction.
-
-Practical recommendation:
-
-1. Run BFS to compute a local scope.
-2. Run `FindPatterns` on that scope.
-3. Keep match limits explicit.
-
-## 7. Concurrency and Safety
-
-- WAL replay restores disk-backed state after unclean exits.
-- Compaction rebuilds and atomically swaps the base snapshot, so readers never
-  observe a torn one.
-
-### 7.1 Lock-free reads on the disk backend
-
-A published `CSRGraph` is immutable, so a reader that obtains the pointer
-atomically can read a record from it without taking the store lock at all.
-
-The delta maps and delete masks still need the lock — they are ordinary Go maps —
-but they only ever *shadow* CSR records, never rewrite them. The store therefore
-keeps a count of CSR records superseded by an update or tombstone in the current
-epoch. While that count is zero, every CSR record is still authoritative and a
-point read that finds its answer there needs no lock.
-
-Counting shadows rather than asking "is the delta empty" is what makes this
-useful under concurrent writes: **appending new entities shadows nothing**, so
-ongoing ingest does not disable the fast path for pre-existing records.
-
-Two invariants make it sound. The counter is only incremented within an epoch, so
-observing zero *after* a lookup proves it was zero throughout. And the epoch is
-sampled *before* the CSR pointer and re-checked afterwards, so a compaction that
-swaps the CSR and resets the counter mid-read cannot make a stale answer look
-valid.
-
-### 7.2 Scaling characteristics
-
-`b.RunParallel` reports wall-time per operation, so lower is better and perfect
-scaling would divide by the core count.
-
-| Path | 1 core | 16 cores | Scaling |
-|---|---:|---:|---|
-| Point lookup (disk) | 59.61 ns | 12.46 ns | 4.8× |
-| 3-hop BFS (disk) | 5 706 ns | 1 056 ns | 5.4× |
-| Property registration, 16 distinct keys | 1 127 ns | 402 ns | 2.8× |
-
-Known limits, stated rather than glossed:
-
-- **The in-memory backend does not scale on reads.** It has no CSR, so it gets
-  none of the above and still serialises on one `RWMutex`. It is the reference
-  implementation for development and testing; the disk backend is the one to
-  measure.
-- **Writes serialise.** The store takes an exclusive lock, and on disk the WAL is
-  a single append-only file, so ingest throughput does not grow with cores.
-- **Single-key property traffic caps out around four cores.** Sharding is by key,
-  so traffic concentrated on one key contends on that one shard.
-
-### 7.3 Read consistency
-
-The guarantee a read gives is:
-
-> every ID returned named an entity that was live at the moment it was checked,
-> and every record returned is internally coherent.
-
-The moment is inside the call. The entity may be gone by the time the caller acts
-on it, and closing that would need snapshot isolation, which the store does not
-offer.
-
-Holding that line took one fix. Property lookups went straight to the property
-index, which is a separate structure under separate locks from the records:
-`DeleteNode` holds the store lock across its whole cascade, but a lookup
-consulting only the index could read postings the delete had not reached and
-return an entity the records no longer had. Postings are now resolved against the
-records, which makes the records the authority, and covers the related case of an
-index entry with no record behind it — index writes do not verify existence, and
-such an entry is invisible to reads and reported by `VerifyIndexes`.
-
-The label paths never had this problem, for a reason worth stating: memory keeps
-label postings inside the store lock alongside the records, and the disk backend
-re-validates candidates against the authoritative view under a single lock hold.
-The property index was the outlier precisely because it is separate — which
-sharding it by key made more true, not less.
-
-`graphene_consistency_test.go` asserts these properties under concurrent
-mutation. It separates a lookup returning an entity whose deletion had already
-*completed* — a torn read, which fails the suite — from one returning an entity
-deleted after the lookup began, which is the caller's race and is counted and
-logged rather than failed. The deleter publishes progress through an atomic that
-readers sample before each lookup; without that ordering the two are
-indistinguishable, and the suite's first version reported the benign case as
-82 and 99 failures.
-
-## 8. Benchmark and Stress Evidence
-
-### 8.1 Current Benchmark Sample
-
-The suite runs 68+ benchmarks covering reads, writes, concurrency, a 10k→100k
-scale sweep, and resident memory footprint. Full methodology and results are in
-[benchmarks.md](benchmarks.md); a representative slice:
-
-| Benchmark | Result | Allocation |
-|---|---:|---:|
-| GetNode | 5.8 ns/op | 0 B, 0 allocs |
-| Point lookup, disk | 50.2 ns/op | 64 B, 1 alloc |
-| Equality property query, disk | 290.7 ns/op | 184 B, 5 allocs |
-| Typed degree on a 1000-edge hub, disk | 8.21 µs/op | 0 B, 0 allocs |
-| `NodesByType`, selective label, disk | 4.90 µs/op | 4.0 KiB, 5 allocs |
-| BFS over a 1000-node chain | 353 µs/op | 229 KiB, 77 allocs |
-| Reopen a compacted 50k store | 60.6 ms/op | — |
-
-**Numbers here are comparative, not absolute.** They come from a warm laptop, and
-measuring the same commit in two different sessions has shown 10–23% drift. Any
-performance claim in this repository is produced by running baseline and current
-**interleaved** — alternating rounds against a `git worktree` at the comparison
-commit — with untouched code paths included as controls. If those controls do not
-read "no significant change", the measurement is discarded.
-
-### 8.2 Stress Scenarios Covered
-
-- Large insert path: 100k nodes, 500k edges.
-- Concurrent write pressure: 50 goroutines.
-- Concurrent read pressure: 50 goroutines.
-- Property index scale test: 50k entities.
-- Opt-in persistent limit test: up to 1M nodes.
-
-## 9. Failure Recovery Model
-
-```mermaid
-stateDiagram-v2
-    [*] --> Running
-    Running --> Crash: power loss / process exit
-    Crash --> Restart
-    Restart --> ReplayWAL: open store
-    ReplayWAL --> Restored: delta rebuilt
-    Restored --> Running
-```
-
-Recovery objective: never lose acknowledged WAL-backed writes.
-
-Recovery also preserves compacted node and edge property blobs because CSR
-serialization now carries them inline rather than treating them as transient
-delta-only state.
-
-## 10. Package-Level LLD Map
-
-| Package      | Role                 | Notes                                         |
-| ------------ | -------------------- | --------------------------------------------- |
-| `disk/`      | Durable backend      | WAL, CSR serialization, compaction pipeline   |
-| `memory/`    | Volatile backend     | Fast unit and stress execution                |
-| `index/`     | Query acceleration   | Type/property/temporal lookup structures      |
-| `traversal/` | Query algorithms     | BFS/DFS/path/provenance/pattern matching      |
-| `store/`     | Contracts + entities | Shared types and graph interface              |
-| `viz/`       | Visual output        | Interactive HTML rendering for sampled graphs |
-
-## 11. Trade-Off Summary
-
-| Decision                   | Benefit                                  | Trade-Off                          |
-| -------------------------- | ---------------------------------------- | ---------------------------------- |
-| Explicit compaction        | Predictable ingest speed and read layout | Caller must schedule compaction    |
-| Explicit property indexing | Stable query costs                       | Requires up-front key planning     |
-| Typed labels               | Clear domain APIs                        | Less dynamic than free-form labels |
-| Embedded architecture      | No external infra dependency             | No built-in query language server  |
-| API-first query model      | Type-safe integration in Go              | No declarative language optimizer  |
-
-Positioning note: these trade-offs make Graphene a strong fit for embedded,
-controlled graph workloads, while leaving some of the product surface expected
-from full graph database platforms intentionally out of scope for now.
-
-## 12. Practical Ops Guidance
-
-1. Batch ingest first, compact once, then run heavy read/traversal phases.
-2. Index only keys that appear in recurring query paths.
-3. Use scoped traversal before expensive pattern matching.
-4. Keep stress data directories isolated per run for reproducibility.
-
-## 13. Current Query Limitations
-
-1. No declarative query language. There *is* a cost model — driver selection by
-   exact postings cardinality, and residual filters costed per strategy — but it
-   is driven by the `NodeQuery` struct, not by parsed text. See §5.6, and
-   `ExplainNodeQuery` to inspect what it decided.
-2. Cardinality statistics are exact and computed on demand, never persisted. A
-   query pays a handful of map lookups to plan; nothing is remembered between
-   calls, and there are no histograms, so selectivity within a range filter is
-   estimated by the key's entry count rather than by distribution.
-3. No regex or fuzzy search operators.
-4. `Contains` cannot be served by any index and always scans the key.
-5. Range behaviour on an undeclared key falls back to the scan rule, which is not
-   a total order. Declare the key and use `index/encoding` for range queries that
-   need to be both fast and well-defined.
-6. Property indexing remains explicit and key-specific by design.
-7. No snapshot isolation: a sequence of calls is not a transaction. See §7.3.
+# GrapheneDB — Technical Details
+
+The low-level design. This is the document to read **before modifying the
+engine**: it describes every on-disk structure to the byte, every non-obvious
+algorithm, the concurrency protocol, and — importantly — the alternatives that
+were tried and rejected, so they are not re-attempted.
+
+For *using* the engine, read [API_REFERENCE.md](API_REFERENCE.md) and
+[USER_GUIDE.md](USER_GUIDE.md). For numbers, read [benchmarks.md](benchmarks.md);
+figures here are illustrative and that document is authoritative.
+
+**Status.** Pre-production. This describes the current implementation, not a
+frozen contract. It is an embedded native graph engine — it owns its graph-shaped
+storage layout directly — not yet a production-complete peer to server-oriented
+graph databases.
 
 ---
 
-If you only need usage patterns, start with [USER_GUIDE.md](USER_GUIDE.md). If
-you need competitive context, see [comparison.md](comparison.md).
+## Contents
+
+1. [System intent](#1-system-intent)
+2. [Architecture](#2-architecture)
+3. [Storage model](#3-storage-model)
+4. [On-disk formats](#4-on-disk-formats)
+5. [Read and write paths](#5-read-and-write-paths)
+6. [Indexing internals](#6-indexing-internals)
+7. [Query planning and execution](#7-query-planning-and-execution)
+8. [Traversal and pattern matching](#8-traversal-and-pattern-matching)
+9. [Concurrency and safety](#9-concurrency-and-safety)
+10. [Consistency model](#10-consistency-model)
+11. [Failure and recovery](#11-failure-and-recovery)
+12. [Worked examples](#12-worked-examples)
+13. [Extension points](#13-extension-points)
+14. [Trade-offs and rejected alternatives](#14-trade-offs-and-rejected-alternatives)
+15. [Invariants](#15-invariants)
+16. [Known limitations](#16-known-limitations)
+
+---
+
+## 1. System intent
+
+One workload shape drives every decision here:
+
+1. Ingest large, connected datasets quickly.
+2. Persist safely, with crash recovery.
+3. Run many read-heavy graph queries and traversals against a long-lived process.
+
+Point three is why several trade-offs land where they do. Opens are counted per
+process; lookups are counted per query. Anything that makes startup cheaper by
+taxing every read is the wrong direction — see §14.
+
+---
+
+## 2. Architecture
+
+```mermaid
+flowchart TD
+    A["graphene.Graph<br/><i>public API, backend-agnostic</i>"] --> B["store.GraphStore<br/><i>interface</i>"]
+    B --> C["memory.Store<br/><i>reference impl</i>"]
+    B --> D["disk.Store<br/><i>production path</i>"]
+    C --> E["index.PropertyIndex"]
+    D --> E
+    C --> F["traversal.*"]
+    D --> F
+    D --> G["disk.CSRGraph<br/><i>immutable base</i>"]
+    D --> H["disk.WAL<br/><i>durability</i>"]
+```
+
+### 2.1 Component responsibilities
+
+| Component | Responsibility |
+|---|---|
+| `graphene.Graph` | Façade: batch helpers, result utilities, visualisation hand-off |
+| `store.GraphStore` | The contract both backends satisfy |
+| `store` (types) | IDs, records, queries, filters, sorted-ID helpers, plan types |
+| `memory.Store` | In-memory reference implementation |
+| `disk.Store` | CSR + delta + WAL; the production path |
+| `disk.CSRGraph` | Immutable compacted base, addressed by ID |
+| `disk.WAL` | Append-only durability log with a lock-free ring buffer |
+| `index.PropertyIndex` | Sharded secondary index, forward and reverse |
+| `index.orderedIndex` | Sorted values per declared key |
+| `index/encoding` | Order-preserving encoders |
+| `traversal` | BFS, DFS, shortest path, subgraph matching |
+| `viz` | Standalone HTML export |
+
+### 2.2 Why a façade
+
+`Graph` delegates almost everything, which is why most of its methods are
+one-liners. The intent is that **the interface is the contract** and the façade
+never becomes a second place where behaviour lives. When a method here contains
+logic, that is a smell worth checking.
+
+### 2.3 Capability interfaces, not one fat interface
+
+`GraphStore` carries only what every backend must have. Everything optional is a
+small separate interface a backend may satisfy, which callers type-assert:
+
+| Interface | Purpose |
+|---|---|
+| `AdjacencyReader` | `IncidentEdges` into a caller buffer; `NodeExists` without materialising |
+| `DegreeCounter` | Degree from CSR offsets without building records |
+| `Reindexer` | `UpdateNodeIndexed`, reindex policy |
+| `IndexVerifier` | `VerifyIndexes` |
+| `IndexRebuilder` | `RebuildIndexes` |
+| `OrderedIndexDeclarer` | `DeclareOrderedProperty` |
+| `NodeQueryExplainer` / `EdgeQueryExplainer` | Query plans |
+
+This is what lets the disk backend expose a zero-allocation degree count from CSR
+offsets without forcing the memory backend into the same shape, and lets callers
+degrade gracefully rather than crash on a backend that lacks a capability.
+
+---
+
+## 3. Storage model
+
+### 3.1 Core model
+
+Property graph. Nodes and edges both carry:
+
+- a monotonic ID (`NodeID` / `EdgeID`, `uint64`, never reused — §15),
+- zero or more `uint16` labels,
+- an opaque property blob (msgpack by convention; the storage layer never parses
+  it).
+
+Edges additionally carry `Src`, `Dst` and a `float32` weight.
+
+**The blob is opaque on purpose.** The engine never decodes it, which is why
+property *indexing* is explicit: the caller supplies `(key, value)` pairs in its
+own encoding. That keeps the storage layer schema-agnostic at the cost of making
+index maintenance the caller's responsibility on update (§6.5).
+
+### 3.2 The disk store is a two-layer read
+
+```mermaid
+flowchart LR
+    Q["Read(id)"] --> T{"tombstoned?"}
+    T -->|yes| N["not found"]
+    T -->|no| D{"in delta?"}
+    D -->|yes| DR["delta record<br/><i>most recent</i>"]
+    D -->|no| C{"in CSR?"}
+    C -->|yes| CR["CSR record"]
+    C -->|no| N
+```
+
+| Layer | Contents | Mutability |
+|---|---|---|
+| Delta | records written since the last compaction, plus tombstones | mutable Go maps |
+| CSR | the compacted base | **immutable once published** |
+
+That asymmetry is the whole basis of the lock-free read path (§9.2): the delta
+needs a lock because it is a map, but the CSR does not because it never changes.
+
+`Compact()` folds the delta into a fresh CSR, publishes it atomically, and
+empties the WAL.
+
+### 3.3 Why CSR
+
+Compressed Sparse Row, addressed **by ID directly**:
+
+```
+                    ┌────────────────────────────────────────┐
+ nodes[]            │ n₀ │ n₁ │ n₂ │ n₃ │ ...  len = maxID+1 │
+                    └────────────────────────────────────────┘
+                             ▲
+                    GetNode(1) = nodes[1]   ← bounds check + pointer, ~6 ns
+
+ outOffset[]        │ 0 │ 2 │ 5 │ 5 │ 7 │      len = maxID+2
+                       └───┬───┘
+ outEdges[]         │ e₃ │ e₇ │ e₁ │ e₄ │ e₉ │ e₂ │ e₅ │
+
+ neighbours(1) = outEdges[outOffset[1] : outOffset[2]] = [e₁, e₄, e₉]
+```
+
+Three properties follow, and they are the reason for the layout:
+
+1. **A point lookup is an array index**, not a hash — no hashing, no probe chain.
+2. **Adjacency is contiguous**, so a traversal walks memory linearly rather than
+   chasing pointers.
+3. **Degree is `outOffset[n+1] - outOffset[n]`** — O(1), zero allocation, no
+   record materialised.
+
+**The cost:** arrays follow the highest ID ever issued, not the live count, so
+deletions leave holes until `Compact()`. Measured at 715 B per live node
+half-deleted-uncompacted against 158 B compacted — **4.5×**. §14 explains why
+this is accepted rather than fixed.
+
+---
+
+## 4. On-disk formats
+
+Two files per store directory: `graphene.csr` and `graphene.wal`.
+**Everything is little-endian.**
+
+### 4.1 CSR file layout
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ HEADER (46 bytes, v6)                                   │
+├─────────────────────────────────────────────────────────┤
+│ NODE RECORDS      × nodeCount     (variable length)     │
+├─────────────────────────────────────────────────────────┤
+│ EDGE RECORDS      × edgeCount     (variable length)     │
+├─────────────────────────────────────────────────────────┤
+│ outOffset[] │ outEdges[] │ inOffset[] │ inEdges[]       │  ← fixed width
+├─────────────────────────────────────────────────────────┤
+│ PROPERTY INDEX SECTION  ("GIDX")   ← at header.indexOffset│
+└─────────────────────────────────────────────────────────┘
+```
+
+**Header, v6 — 46 bytes:**
+
+| Offset | Size | Field | Since |
+|---:|---:|---|---|
+| 0 | 4 | magic `GCSR` | v2 |
+| 4 | 2 | version | v2 |
+| 6 | 8 | node count | v2 |
+| 14 | 8 | edge count | v2 |
+| 22 | 8 | node sequence high-water mark | v5 |
+| 30 | 8 | edge sequence high-water mark | v5 |
+| 38 | 8 | property-index section offset | v6 |
+
+**Node record** (variable length):
+
+| Size | Field |
+|---:|---|
+| 8 | node ID |
+| 1 | label count |
+| 2 × count | labels (`uint16` each; **1 byte each before v4**) |
+| 4 | property blob length (`uint32`) |
+| n | property blob |
+
+**Edge record** (variable length):
+
+| Size | Field |
+|---:|---|
+| 8 | edge ID |
+| 8 | source node ID |
+| 8 | destination node ID |
+| 1 | label count |
+| 2 × count | labels (`uint16` each; 1 byte before v4) |
+| 4 | weight (`float32`) |
+| 4 | property blob length (`uint32`) |
+| n | property blob |
+
+**v2 carried no property blob** — it reserved 8 bytes there and the reader skips
+them, which is why a v2 file loses nothing by upgrading but cannot round-trip
+properties until it does.
+
+**Version history:**
+
+| Version | Change |
+|---|---|
+| v2 | baseline readable format |
+| v3 | — |
+| v4 | labels widened from `uint8` to `uint16` |
+| v5 | sequence high-water marks added |
+| v6 | property-index section + `indexOffset` |
+
+All of v2–v6 are readable; v6 is written. Older files upgrade on the next
+`Compact()`.
+
+**Two header fields worth explaining:**
+
+*Sequence high-water marks* exist because IDs must never be reused (§15). Without
+them, a store whose highest-ID record was deleted before the CSR was written
+would, on reopen, derive its next ID from the surviving records and **reissue a
+live ID**. The marks persist the true watermark independently of what survives.
+
+*`indexOffset`* makes the property-index section directly addressable. Without
+it, a reader would have to walk every variable-length record to find where the
+section begins.
+
+### 4.2 Property-index section
+
+```
+┌──────┬────────────┬───────────────┬────────────┬───────────────┐
+│ GIDX │ nodeCount8 │ node entries… │ edgeCount8 │ edge entries… │
+└──────┴────────────┴───────────────┴────────────┴───────────────┘
+
+entry:  [id:8][keyLen:2][key][valueLen:4][value]
+        └ uint64 ┘└ uint16 ┘      └ uint32 ┘
+```
+
+Note the asymmetry: key length is `uint16` (keys are short identifiers) while
+value length is `uint32` (values are caller-encoded and may be arbitrary bytes).
+Minimum entry size is 14 bytes, which is the bound checked before each read.
+
+Magic, per-list counts, and strict bounds checks on every length — which is why
+`Open` does not need to verify the index separately (§11.3).
+
+Only the **property** index is persisted. Label postings and adjacency are
+derivable from the records in one pass at load, so persisting them would add file
+size and a consistency risk for nothing. Property entries are caller-supplied and
+recoverable from nothing else — hence the asymmetry.
+
+### 4.3 WAL format
+
+```
+record:  [type:1][length:4][payload:length][crc32:4]
+```
+
+| Type | Meaning |
+|---|---|
+| `0x01` | node upsert |
+| `0x02` | edge upsert |
+| `0x03` | node property index entry |
+| `0x04` | edge property index entry |
+| `0x05` | node delete (tombstone) |
+| `0x06` | edge delete (tombstone) |
+| `0x07` | node property purge |
+| `0x08` | edge property purge |
+
+**The purge types exist for a specific bug.** With `ReindexPurge`, an update drops
+an entity's index entries. If that were not journalled, replay would re-apply the
+original `0x03` records and **resurrect entries the purge had dropped**.
+
+### 4.4 WAL write path — the ring buffer
+
+```mermaid
+sequenceDiagram
+    participant W as Writer goroutine
+    participant R as Ring buffer
+    participant D as Drain (holds writeMu)
+    participant F as File
+    W->>R: tryReserve() — atomic seq bump
+    alt slot acquired
+        W->>R: fill payload, mark ready
+    else ring full
+        W->>D: take writeMu, drain until space
+    end
+    D->>R: read ready slots in seq order
+    D->>F: write framed records
+    D->>F: Sync()
+```
+
+A writer reserves a slot with an atomic sequence bump, fills it, and marks it
+ready — no lock on the common path. A drain pass writes ready slots to the file
+**in sequence order**, so WAL order matches logical order. Overflow takes
+`writeMu` and drains until space appears.
+
+A `barrier` flag lets maintenance (compaction) exclude new writers without
+holding a lock across the whole operation: writers observing the barrier yield
+rather than reserving.
+
+**The limit, stated plainly:** the file is still a single append point. The ring
+removes lock contention between writers, not the serialisation of the write
+itself, so write scaling is bounded by the file regardless.
+
+---
+
+## 5. Read and write paths
+
+### 5.1 Write path
+
+```mermaid
+flowchart TD
+    A["AddNode / AddEdge / Update / Delete"] --> B["validate<br/><i>endpoints must exist</i>"]
+    B --> C["append to WAL<br/><i>durable once this returns</i>"]
+    C --> D["apply to delta maps"]
+    D --> E["update label postings"]
+    E --> F["update property index"]
+    F --> G["shadow CSR record if superseded"]
+```
+
+**Validation, WAL append and apply happen under a single lock hold.** That is
+what makes `AddEdge` racing `DeleteNode` on the same node resolve cleanly: either
+the edge is created before the node is gone and is then cascaded, or it is
+rejected with `ErrInvalidEdge`. There is no window where a committed edge points
+at a missing node.
+
+**Cascade ordering matters for crash safety.** `DeleteNode` journals tombstones
+for every incident edge *before* the node's own tombstone. A crash midway leaves
+edges deleted and the node alive — recoverable and consistent. The reverse order
+would leave edges pointing at a missing node.
+
+### 5.2 Read path
+
+```mermaid
+flowchart TD
+    A["GetNode(id)"] --> B{"lock-free path<br/>available?"}
+    B -->|"csrShadowed == 0<br/>and record in CSR"| C["read from CSR<br/><i>no lock</i>"]
+    C --> D{"re-check:<br/>shadowed still 0<br/>AND pointer unchanged?"}
+    D -->|yes| E["return"]
+    D -->|no| F["fall back to locked path"]
+    B -->|no| F
+    F --> G["RLock → tombstone? → delta? → CSR"]
+```
+
+The fast path is described in full in §9.2.
+
+---
+
+## 6. Indexing internals
+
+### 6.1 Catalogue
+
+| # | Index | Structure | Complexity | Persisted |
+|---|---|---|---|---|
+| 1 | Primary (memory) | hash map | O(1) | no |
+| 2 | Primary (CSR) | direct array offset | O(1) | yes |
+| 3 | Primary (delta) | hash-map overlay | O(1) | via WAL |
+| 4 | Adjacency (CSR) | prefix-sum arrays | O(degree) | yes |
+| 5 | Adjacency (delta/memory) | `map[NodeID]{out,in}` | O(degree) | via WAL |
+| 6 | Label postings | sorted `[]ID` per label | O(log n) lookup | rebuilt at load |
+| 7 | Label postings (CSR) | sorted `[]ID` | O(1) lookup | derived at load |
+| 8 | Property index | sorted postings + reverse map | O(1) equality | **yes**, v6 |
+| 9 | Ordered index | sorted values per declared key | O(log n + k) | no — runtime |
+
+### 6.2 Why postings are sorted, not hashed
+
+Three reasons, all load-bearing:
+
+1. **Lookups return an already-ordered slice**, so the query path can merge and
+   window without sorting.
+2. **Removal is a binary search plus a memmove**, not a rehash.
+3. **Intersection is a merge**, not a hash probe — one pass per side, no
+   allocation, and the output is ascending so the final sort is retired.
+
+The trade is that removal remains *linear* in the postings length: the search is
+logarithmic, the shift is not. True O(log n) removal needs a non-contiguous
+structure, which would make `NodesByType` — one contiguous copy today — worse.
+
+### 6.3 Property index structure
+
+```
+PropertyIndex
+ └── shards[16]                        ← chosen by FNV-1a over the KEY
+      └── shard
+           ├── mu  sync.RWMutex
+           ├── nodes postings[NodeID]
+           │    ├── byKey   map[key]map[value][]ID     ← forward, sorted IDs
+           │    ├── ref1    map[ID]propRef             ← reverse, single entry
+           │    ├── refN    map[ID][]propRef           ← reverse, 2+ entries
+           │    └── perKey  map[key]int                ← O(1) scan costing
+           ├── edges postings[EdgeID]                  ← same shape
+           ├── orderedNodeKeys map[key]*orderedIndex
+           └── orderedEdgeKeys map[key]*orderedIndex
+```
+
+**Sharded by key, so unrelated keys never contend.** Registering `sha256` on one
+goroutine does not block a lookup of `bucket` on another.
+
+**The reverse map is sharded alongside the forward map, not by ID.** Each shard
+holds only the pairs for keys it owns, so removing an entity is a pass over all
+16 shards, each taking its own lock. The cost is 16 map lookups instead of one.
+The benefit is decisive: **no operation ever holds two shard locks**, so there is
+no lock ordering to get wrong and no deadlock to reason about. Sharding the
+reverse map by ID would require holding a key-shard lock and an ID-shard lock
+simultaneously for a single removal.
+
+**The reverse map is split by arity.** Sharding by key made "one entry per entity
+per shard" the universal case — each key lives in exactly one shard, and an
+entity normally carries one value per key. A `map[ID][]propRef` therefore
+allocated a one-element backing array per entity, roughly 21.5 B of pure
+overhead on top of the map entry. `ref1` stores that case inline; `refN` carries
+only entities with two or more entries in the same shard, which requires two keys
+hashing together.
+
+An id appears in **exactly one** of the two maps, never both, and `refN` never
+holds an id with fewer than two entries. `VerifyIndexes` checks both directly,
+because a bug in the promotion path would otherwise surface much later as a lost
+or duplicated entry.
+
+### 6.4 Ordered index
+
+```go
+type orderedIndex[T] struct {
+    values []orderedValue[T]   // sorted ascending by bytes.Compare, no duplicates
+}
+type orderedValue[T] struct {
+    value string   // raw encoded bytes
+    ids   []T      // ascending, deduplicated
+}
+```
+
+A range filter resolves to `[lo, hi)` positions by binary search, then walks:
+
+| Operator | Range |
+|---|---|
+| `GreaterThan` | `[upperBound(v), len)` |
+| `GreaterThanOrEqual` | `[lowerBound(v), len)` |
+| `LessThan` | `[0, lowerBound(v))` |
+| `LessThanOrEqual` | `[0, upperBound(v))` |
+| `BetweenInclusive` | `[lowerBound(v), upperBound(upper))` |
+| `Prefix` | `[lowerBound(p), lowerBound(prefixUpperBound(p)))` |
+| `Equal`, `Contains` | **not served** — see below |
+
+`prefixUpperBound` increments the last non-`0xFF` byte and truncates. If the
+prefix is all `0xFF` it reports "unbounded" and the range runs to the end,
+because no successor exists.
+
+**`Equal` and `Contains` are declined deliberately.** Equality is already O(1)
+through the hash postings, and `Contains` cannot be bounded by any ordering.
+Both are comparator-free (`bytes.Equal`, `strings.Contains`), which is what makes
+declining them safe — see §7.4.
+
+### 6.5 Index maintenance on update
+
+The engine cannot re-derive index entries: values are caller-encoded and the
+property blob is opaque. So an update must state what happens to them.
+
+| Policy | Behaviour | Failure mode |
+|---|---|---|
+| `ReindexKeep` (default) | entries untouched | they go **stale** — the old value still matches |
+| `ReindexPurge` | entity's entries dropped | they are **lost**, including untouched keys |
+
+`UpdateNodeIndexed` / `UpdateEdgeIndexed` avoid both by updating the record and
+replacing its entries in one step. Purges are journalled (`0x07`/`0x08`) so
+replay cannot resurrect superseded values.
+
+---
+
+## 7. Query planning and execution
+
+### 7.1 Pipeline
+
+```mermaid
+flowchart TD
+    A["NodeQuery"] --> B["1. DRIVE<br/><i>cheapest superset</i>"]
+    B --> C["2. TYPES<br/><i>pre-filter candidates</i>"]
+    C --> D{"FilterMode"}
+    D -->|MatchAll| E["3a. NARROW<br/><i>residuals, per-step costed</i>"]
+    D -->|MatchAny| F["3b. UNION<br/><i>each filter's set</i>"]
+    E --> G["4. ORDER<br/><i>skip if already ascending</i>"]
+    F --> G
+    G --> H["5. WINDOW<br/><i>Offset / Limit</i>"]
+```
+
+### 7.2 Driver selection
+
+The planner picks the cheapest source **guaranteed to contain the answer**:
+
+| Priority | Source | Cost known? |
+|---:|---|---|
+| 1 | explicit `IDs` | exact |
+| 2 | most selective equality postings | **exact** — postings length is a map lookup |
+| 3 | ordered-key range | bounded by the range |
+| 4 | incident-edge lists (edge queries) | exact — CSR offsets give degree |
+| 5 | label postings | size known on memory; not yet on disk |
+| 6 | full scan | — |
+
+**Why `MatchAny` usually cannot be driven.** Under `MatchAll` the result is the
+intersection of every filter's set, so it is contained in each and any may drive.
+Under `MatchAny` it is the union, which no single filter's set contains.
+`store.SupersetDrivers` encodes this in one place: it returns `nil` for
+`MatchAny` with more than one filter.
+
+### 7.3 Residual evaluation
+
+Filters that did not drive still have to be applied. Each is costed **both ways,
+per step, against the current candidate count**:
+
+| Strategy | Cost |
+|---|---|
+| Probe candidates via the reverse map | one lookup per candidate |
+| Materialise the filter's set and intersect | the size of that set |
+
+Deciding per step matters because each step shrinks the set: a filter not worth
+probing against 1 000 candidates often is against the 5 that survive.
+
+Filters run **most-selective-first** so candidates die early, the pass stops the
+moment none remain, and **the driving filter is excluded outright** rather than
+re-derived from the set it just produced.
+
+The estimate is exact for equality (postings cardinality) and, for anything else,
+the number of entries under the key — which is what a scan of that key would
+visit, and therefore an upper bound.
+
+**Why this matters.** A filter no index can serve — a `Contains`, or a range on
+an undeclared key — costs a scan of *every entry under its key*. Before residual
+costing, a query driven down to a single candidate still did work proportional to
+the graph to eliminate it.
+
+### 7.4 Comparison semantics — the sharpest edge in the system
+
+Two rules coexist, and confusing them produces **wrong answers**, not slow ones:
+
+| Key | Rule |
+|---|---|
+| **Undeclared** | numeric when both operands parse as numbers, byte-wise otherwise |
+| **Declared ordered** | byte-wise throughout |
+
+They differ because the first is **not a valid total order**. Under it:
+
+```
+"9" < "10"     (numeric: 9 < 10)
+"10" < "1x"    (byte-wise: '0' < 'x')
+"1x" < "9"     (byte-wise: '1' < '9')
+∴ "9" < "9"    — a cycle
+```
+
+No sorted structure can be built on a comparator with a cycle, which is why
+declaring a key **must** change its semantics. It is a correctness choice, not a
+performance one.
+
+Every path evaluating a filter must pick the same rule for a given key — the
+index, the scan fallback, and the residual probe.
+`store.PropertyFilterMatches` and `store.PropertyFilterMatchesOrdered` are the
+two implementations. `index/encoding` supplies order-preserving encoders so byte
+order means what the caller intends.
+
+**`Equal` and `Contains` are comparator-free on both sides**, which is why the
+ordered index declining to serve them cannot cause divergence.
+
+### 7.5 Query plans
+
+`ExplainNodeQuery` / `ExplainEdgeQuery` report the driver, candidate count, and
+each residual with its cost estimate and strategy. They exist because **results
+alone cannot distinguish an index lookup from a full scan that happened to agree
+with it** — which also makes them the regression test for planner behaviour.
+
+The `Probe` flag is a forecast: it reports the decision as of the start of the
+pass, while the executor re-decides per step. Order and cost estimates are exact.
+
+---
+
+## 8. Traversal and pattern matching
+
+### 8.1 BFS — two buffers, not a queue
+
+```
+depth 0:   current = [origin]              next = []
+depth 1:   expand current → next           swap
+depth 2:   expand current → next           swap
+```
+
+Two level buffers, reused and swapped at each depth. Memory is bounded by the
+**widest level**, not by the number of nodes visited, and depth becomes the loop
+counter so entries are bare IDs rather than `{id, depth}` pairs.
+
+The original implementation used `queue = queue[1:]`, which slid through the
+backing array so every append past capacity reallocated — one allocation per
+visited node. `BFS_Deep` went from 30 190 allocations to 198.
+
+`BFSIDs` walks without building any record at all: 20 allocations against 394 for
+the record-returning walk on the same traversal.
+
+### 8.2 DFS — `bestRemaining`, not `visited`
+
+A boolean `visited` set is **incorrect under a depth limit**. A node first reached
+by a long path gets marked visited, and is never re-expanded when a shorter path
+later arrives with budget to spare.
+
+```
+A→B→C→E  plus shortcut A→C,  maxDepth 2
+
+  boolean visited:  A B C ✗   (E lost — C consumed the budget via B)
+  bestRemaining:    A B C E ✓
+```
+
+`bestRemaining map[NodeID]int` records the largest remaining budget each node has
+been expanded with, and re-expands when a later path arrives with more. Nodes are
+appended on first arrival only, so there are no duplicates.
+
+**Complexity changed honestly:** a node can be expanded once per distinct
+remaining value, so the bound is O(V × maxDepth) expansions rather than O(V).
+Measured cost ≈6%.
+
+**BFS cannot be replaced by DFS.** They return the same type but different
+results under a depth limit; performance is a wash; and DFS is recursive, so
+stack depth tracks graph depth. DFS is right where it is used —
+`ProvenanceChain` follows a single chain and terminates early.
+
+### 8.3 Pattern matching
+
+`FindSubgraphMatches` matches a small `Pattern` against a scope. It is **the
+worst path in the codebase**: a 2 000-node scope costs ~23.5 ms and ~399 900
+allocations, roughly 200 per scoped node, because it materialises records the
+matcher then discards.
+
+The fix is the one traversal already received — walk adjacency by ID through
+`AdjacencyReader`, reuse candidate buffers, stop building records that are thrown
+away. Not yet done; see [plan.md](plan.md).
+
+---
+
+## 9. Concurrency and safety
+
+### 9.1 Lock inventory
+
+| Lock | Covers | Held during |
+|---|---|---|
+| `memory.Store.mu` | records, adjacency, label postings | every operation |
+| `disk.Store.mu` | delta maps, tombstones, delta postings, CSR pointer swap | locked reads, all writes |
+| `propertyShard.mu` × 16 | one shard's forward and reverse maps | that shard's operations |
+| `WAL.writeMu` | the drain pass | overflow and flush only |
+
+**No operation holds two shard locks.** This is a design constraint, not an
+accident — it is what removes deadlock from the reasoning entirely.
+
+### 9.2 The lock-free CSR read path
+
+A published `CSRGraph` is immutable, so a reader that obtains the pointer
+atomically can read a record from it with **no lock at all**.
+
+```go
+csrPtr      atomic.Pointer[CSRGraph]
+csrShadowed atomic.Int64   // CSR records superseded by an update or tombstone
+```
+
+```mermaid
+sequenceDiagram
+    participant R as Reader
+    participant A as Atomics
+    participant C as Compact()
+    R->>A: csr := csrPtr.Load()
+    R->>A: if csrShadowed != 0 → bail to locked path
+    R->>R: read record from csr
+    Note over C: publishCSR: store pointer FIRST,<br/>then clear shadow count
+    R->>A: re-check csrShadowed == 0 AND csrPtr == csr
+    alt both hold
+        R->>R: answer is valid
+    else either changed
+        R->>R: fall back to locked path
+    end
+```
+
+**Two invariants make it sound:**
+
+1. The shadow counter is only ever incremented within the life of one CSR, so
+   observing zero *after* the read proves it was zero throughout.
+2. The reader re-checks **the pointer it read from**, which catches a `Compact()`
+   that swapped the CSR and cleared the counter underneath it.
+
+Pointer identity is sound because the reader still holds a reference to that CSR,
+so the object cannot be collected and its address cannot be reused mid-check.
+
+**Counting shadows rather than asking "is the delta empty"** is what makes this
+useful. Appending new entities shadows nothing, so ongoing writes do not disable
+the fast path for pre-existing records. An "is the delta empty" flag would switch
+off after the first write and stay off until the next compaction.
+
+#### The version that was wrong
+
+The first implementation used a separate generation counter, with `Compact`
+bumping the generation *before* storing the new pointer. That left a window:
+
+```
+reader: sample generation  → N+1   (already bumped)
+reader: load pointer       → OLD   (not yet stored)
+reader: check shadow count → 0     (already cleared)
+reader: read stale record, re-check, both match → ACCEPTS STALE DATA
+```
+
+Every ordering of two independent atomics has such a window, because the reader
+needs the pointer and its validity to agree and they were separate words. The fix
+**removed the second word** rather than reordering the stores.
+
+**What did not catch this:** neither the race detector — which finds
+unsynchronised access, not stale answers, and the code was perfectly
+synchronised — nor the concurrency tests, whose window is two instructions wide.
+`TestConcurrent_ReadsDuringCompaction` now runs 200 compactions against 8
+readers as defence in depth, but the correctness argument rests on the design.
+
+### 9.3 Scaling characteristics
+
+| Path | Behaviour |
+|---|---|
+| Disk point lookup | **4.8×** across 16 cores (lock-free path) |
+| Disk 3-hop BFS | **5.4×** across 16 cores |
+| Property registration, distinct keys | **2.4×** (16 shards) |
+| Property registration, one key | ~1.2× — sharding cannot help single-key traffic |
+| Memory point lookup | **~0.5× — negative.** `RWMutex` with a very short critical section: `RLock` is an atomic increment on one shared cache line, and the synchronisation costs more than the work it protects |
+| Writes | serialised by the store lock; disk additionally bounded by a single WAL append point |
+
+The memory backend is the reference implementation, not the production path, and
+is deliberately left unsharded — see §14.
+
+---
+
+## 10. Consistency model
+
+### 10.1 What a read guarantees
+
+> **Every ID a read returns named an entity that was live at the moment it was
+> checked, and every record returned is internally coherent** — an edge is
+> incident to the node it was requested for, and a neighbour is that edge's far
+> endpoint.
+
+**The moment is inside the call, not after it.** By the time a caller acts on a
+result the entity may be gone, so `GetNode` on an ID just returned can
+legitimately fail. Measured against a deleter running flat out: **0.7%** of IDs
+from a single-key lookup, **4–11%** from a typed query, which returns more IDs
+over a longer call.
+
+Closing that would require snapshot isolation, which is not offered. A sequence
+of calls is **not** a transaction.
+
+### 10.2 Why property lookups resolve against the records
+
+The index and the records are separate structures under separate locks.
+`DeleteNode` holds the store lock across its whole cascade, but a lookup
+consulting only the index could read postings the delete had not reached yet and
+return an entity the records no longer had — a **torn read of one logical
+operation**.
+
+`NodesByProperty` / `EdgesByProperty` therefore resolve postings against the
+records before returning, making the records the authority. This also covers
+index entries with no record behind them at all, since index writes do not verify
+that the entity exists.
+
+Cost: ~20 ns on a raw single-key lookup, nothing measurable on the typed query
+path, which already resolved candidates that way.
+
+**The label paths never had this problem**, for an instructive reason: the memory
+backend keeps label postings *inside* the store lock alongside the records, and
+the disk backend re-validates candidates under a single lock hold. The property
+index was the outlier precisely because it is separate — which sharding it made
+more true, not less.
+
+---
+
+## 11. Failure and recovery
+
+### 11.1 Durability boundary
+
+A write is recoverable **once its WAL append returns**. Space held by deleted or
+superseded records is reclaimed at the next `Compact()`.
+
+### 11.2 What a crash leaves behind
+
+| Crash point | State on reopen |
+|---|---|
+| Before WAL append | operation never happened |
+| After WAL append, before apply | replay applies it |
+| Mid-cascade in `DeleteNode` | edges deleted, node alive — consistent, because edge tombstones are journalled first |
+| During `Compact`, before publish | old CSR + full WAL; replay reconstructs |
+| After publish, before WAL truncate | new CSR + stale WAL; replay is idempotent (upserts and tombstones) |
+| Abrupt kill (no clean close) | committed data intact; next `Open` replays everything since the last compaction |
+
+### 11.3 Why `Open` does not verify indexes
+
+It did, briefly: ~200 ms on a 100k-node store, an O(V+E) tax on **every** startup,
+catching little that is not already covered.
+
+- A corrupt index section is rejected while parsing — magic, counts and bounds
+  are all checked.
+- Label postings and the property index are rebuilt by insertion through the
+  normal code paths, which sort and deduplicate, so their structure is correct by
+  construction whatever the file contained.
+
+What remains is engine bugs, which belong in tests rather than in a startup scan.
+Recovery is explicit: `VerifyIndexes()` then `RebuildIndexes()`.
+
+### 11.4 What verification can and cannot check
+
+| `VerifyIndexes` checks | It cannot check |
+|---|---|
+| postings ordering and deduplication | that an indexed *value* still matches the entity's properties |
+| forward ↔ reverse agreement, both directions | — because values are caller-encoded and opaque |
+| `ref1`/`refN` arity invariants | |
+| label postings against live labels | |
+| adjacency against edge endpoints | |
+| that no index entry outlives its entity | |
+
+`RebuildIndexes` recomputes what is derivable from the records — label postings,
+adjacency — and drops property entries whose entity is gone. **It repairs
+structure, not content.**
+
+---
+
+## 12. Worked examples
+
+### 12.1 A two-filter query, end to end
+
+```go
+g.QueryNodeIDs(store.NodeQuery{Filters: []store.PropertyFilter{
+    {Key: "sha256", Op: store.PropertyOpEqual,    Value: hash},
+    {Key: "tool",   Op: store.PropertyOpContains, Value: []byte("acquire")},
+}})
+```
+
+| Step | What happens |
+|---|---|
+| Drive | `EqualityDrivers` returns both filters (MatchAll). Only `sha256` is `Equal`; its cardinality is **1**. It drives. |
+| | `candidates = [artID]`, ascending, `DriverFilter = 0` |
+| Types | none in the query — skipped |
+| Residual | one filter left: `tool Contains`. Cost estimate = entries under `tool` = **100 000**. Candidates = 1. `1 < 100 000` → **probe** |
+| | probe reads `refs[artID]` in `tool`'s shard, tests `strings.Contains` |
+| Order | candidates already ascending, `QueryOrderAsc` → no sort |
+| Window | no `Offset`/`Limit` |
+
+```
+driver=equality(sha256) candidates=1 residual=tool:probe~100000 results=1
+```
+
+Before residual costing, that `Contains` resolved to its own set — a scan of all
+100 000 `tool` entries — to eliminate a single candidate. **12.97 ms → 443 ns.**
+
+### 12.2 A delete, end to end
+
+`DeleteNode(N)` where N has 3 incident edges and 2 indexed properties:
+
+```
+ 1. acquire store write lock
+ 2. collect incident edge IDs from adjacency
+ 3. WAL: 0x06 tombstone × 3        ← edges first, for crash safety
+ 4. WAL: 0x05 tombstone for N
+ 5. for each edge: remove from delta/adjacency/label postings,
+                   propIdx.RemoveEdge, shadow CSR edge
+ 6. unindex N's labels
+ 7. delete N from delta records and adjacency
+ 8. mark N tombstoned if it exists in the CSR; shadow it
+ 9. propIdx.RemoveNode(N):
+       for each of 16 shards:            ← never two locks at once
+           lock, look up ref1/refN, remove those (key,value) postings, unlock
+10. release store lock
+```
+
+Step 9 is why the reverse map exists: without it, removing N would require
+scanning every `(key, value)` bucket in the index. With it, the work is
+proportional to N's own entries — **686× faster** on a populated index.
+
+---
+
+## 13. Extension points
+
+### 13.1 Adding a property operator
+
+1. Add the constant to `store.PropertyOp`.
+2. Implement it in **`propertyFilterMatches`** — the shared body — so both the
+   scan rule and the ordered rule get it. If it is comparator-dependent, verify
+   both comparators behave sensibly.
+3. Decide whether the ordered index can serve it, and add a case to
+   `orderedIndex.rangeFor` if so. **If not, ensure it is comparator-free**, or
+   the probe and the scan will disagree (§7.4).
+4. Add cases to the residual semantics tests, checking against expectations
+   computed in the test rather than against the engine's other path.
+
+### 13.2 Adding an index type
+
+1. Decide whether it is derivable from records (like label postings) or
+   caller-supplied (like property entries). Derivable indexes should be rebuilt
+   at load, not persisted.
+2. If persisted, add a section to the CSR with its own magic and bounds checks,
+   and bump the format version.
+3. Add its consistency checks to `VerifyIndexes` and its repair to
+   `RebuildIndexes`.
+4. Teach the planner to drive from it, if it can bound a result set.
+
+### 13.3 Adding a backend
+
+Implement `store.GraphStore`, then opt into whichever capability interfaces make
+sense (§2.3). The parity suite is the acceptance test: it compares the new
+backend against `memory.Store` across queries, traversals and mutations.
+
+### 13.4 Invariants any change must preserve
+
+See §15. The two most easily broken by well-meaning changes are **ID reuse** and
+**the ordering rule for a declared key**.
+
+---
+
+## 14. Trade-offs and rejected alternatives
+
+This section exists so these are not re-attempted. Each was measured.
+
+### 14.1 What was bought, and with what
+
+| Change | Cost | Bought |
+|---|---|---|
+| Reverse `ID → (key,value)` map | +89–96% B/op on register; a large share of index memory | `DeleteNode` **686×** |
+| Property index in the CSR | +63% peak bytes on reopen | reopen **17×** |
+| 16-way key sharding | 16× map header overhead | distinct-key registration **2.4×** |
+| CSR label postings | ~8 B per (node, label) | `NodesByType` **88×** |
+| Ordered index per declared key | ~10.5 B/node (scales with *distinct values*) | range queries 6.8–199× |
+| Postings resolved against records | ~20 ns per raw lookup | **read consistency** — not speed |
+
+**The bill in one number:** property-index memory is **+22–53% per node** against
+the pre-index baseline. That is the honest counterweight to the query speedups.
+
+### 14.2 Rejected: ID-remapping compaction
+
+Would recover the 4.5× memory overhead of max-ID-sized CSR arrays. **Rejected
+because it breaks "IDs are never reused"** (§15), which is documented, relied on
+by callers holding IDs outside the store, and the reason an ID is a stable
+external handle at all. A stored ID that silently means a different node after a
+compaction is a far worse defect than the memory it saves.
+
+Mitigation: `Compact()` recovers the 4.5× outright, and compaction is now ~10×
+cheaper than it was.
+
+### 14.3 Rejected: offset table + decode-on-access
+
+The only design that makes `Open` O(1). **Rejected because it inverts the
+bargain**: today you pay once at open and every `GetNode` is a direct array index
+at ~6 ns; this would spend a decode on every read, forever, to save a one-off
+startup cost. For a long-lived process that is the wrong way round — opens are
+counted per process, lookups per query.
+
+`Open` is ~74 ms on a compacted 50 000-node store, and its cost is attributed:
+~58% CSR record parsing, ~42% property index, with WAL replay contributing
+nothing after a compaction.
+
+**What survives:** mmap'ing the *flat adjacency arrays*, which stay fixed-width
+and directly indexable, so it costs the read path nothing.
+
+### 14.4 Rejected: bulk index loading
+
+Built, tested for equivalence, and **reverted**. One lock per shard, parallel
+fill, presized maps, batch-local value interning. It cut allocations 9–19% but
+cost **35–75% more resident memory**: partitioning copies every entry into
+per-shard slices, and the presize is keyed on entry count where the reverse map
+is keyed on entity.
+
+Spending P1 to buy P2 is the wrong direction, especially on the axis already
+carrying the project's largest regression.
+
+### 14.5 Rejected: compressed postings
+
+Delta+varint or bitmaps over the sorted `[]ID`. The floor is **103.9 B per index
+entry**, of which the sorted `[]ID` is **8 B** — so the ceiling on this work is
+~5%, bought with variable-length decoding on a structure that binary-searches on
+every removal. **The overhead is in the maps, not the lists.**
+
+### 14.6 Rejected: sharding the in-memory store
+
+The memory store is the reference implementation the disk store's parity tests
+compare against; optimising it makes it a worse reference. Sharding it is a large
+change with genuine deadlock risk — an edge insert touches the edge shard, both
+endpoint adjacency shards and the global label postings, and `DeleteNode`'s
+cascade spans arbitrarily many. Poor risk-to-benefit for a backend not on the
+production path, whose disk counterpart already has its read scaling fixed.
+
+### 14.7 Deferred: lazy index construction
+
+Deferring the property index until first use has a **resurrection hazard**:
+`DeleteNode` calls `RemoveNode` on an index that does not exist yet, the removal
+is a no-op, and the later lazy build reloads the deleted entity's entries from
+the section.
+
+Correct only if the trigger is *first touch of any kind*, writes included — which
+narrows the benefit to traversal-only and property-free workloads, and saves a
+write-heavy workload nothing.
+
+---
+
+## 15. Invariants
+
+Any change must preserve these. Each is enforced by tests.
+
+1. **IDs are monotonic and never reused** for the lifetime of a store, across
+   restarts and compactions. Callers may hold an ID externally and rely on it
+   meaning the same entity forever.
+2. **Postings are strictly ascending and duplicate-free**, everywhere.
+3. **The reverse map agrees with the postings in both directions**, and an id
+   lives in exactly one of `ref1`/`refN`, with `refN` holding only ids that have
+   two or more entries in that shard.
+4. **No edge outlives its endpoints.** `DeleteNode` cascades under one lock hold;
+   `AddEdge` validates endpoints under the same hold.
+5. **No index entry outlives its entity.** Checked by `VerifyIndexes`; hidden
+   from reads by the live-filter if it occurs.
+6. **Every ID a read returns named a live entity at the moment it was checked** —
+   and explicitly not stronger (§10.1).
+7. **A reader on the lock-free path never observes a superseded CSR** (§9.2).
+8. **A declared key is compared byte-wise on every path** that evaluates a filter
+   for it (§7.4).
+
+---
+
+## 16. Known limitations
+
+1. **No query language.** The planner is driven by the `NodeQuery` struct, not
+   parsed text. There *is* a cost model — exact equality cardinality, residuals
+   costed per strategy — inspectable via `ExplainNodeQuery`.
+2. **Statistics are exact but ephemeral.** Computed on demand, never persisted,
+   no histograms — so selectivity *within* a range is estimated by the key's
+   entry count rather than by distribution.
+3. **No regex or fuzzy operators.**
+4. **`Contains` always scans** the key's entries. No ordering can bound a
+   substring match.
+5. **Ranges on an undeclared key use the scan rule**, which is not a total order.
+   Declare the key and use `index/encoding` for ranges that must be both fast and
+   well-defined.
+6. **Ordered-key declarations are not persisted.** Re-declare after reopening.
+7. **Property indexing is explicit.** The engine will not infer which fields to
+   index, because it cannot read the blob.
+8. **No snapshot isolation.** A sequence of calls is not a transaction (§10.1).
+9. **Pattern matching is unoptimised** (§8.3).
+10. **Memory-backend read concurrency is negative** past one core (§9.3).
+11. **Write scaling is bounded by a single WAL append point.**
+
+---
+
+For usage patterns start with [USER_GUIDE.md](USER_GUIDE.md); for the API surface
+see [API_REFERENCE.md](API_REFERENCE.md); for measurements and methodology see
+[benchmarks.md](benchmarks.md); for competitive context see
+[comparison.md](comparison.md).

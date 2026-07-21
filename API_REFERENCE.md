@@ -36,7 +36,7 @@ import (
 16. [Concurrency & guarantees](#16-concurrency--guarantees)
 17. [Index maintenance](#17-index-maintenance)
 18. [Query plans](#18-query-plans)
-19. [Choosing indexes: a tuning guide](#19-choosing-indexes-a-tuning-guide)
+19. [Performance guide](#19-performance-guide)
 20. [Process lifecycle](#20-process-lifecycle)
 
 ---
@@ -818,95 +818,313 @@ not the whole query — except for the result count, which requires running it.
 
 ---
 
-## 19. Choosing indexes: a tuning guide
+## 19. Performance guide
 
-Indexing is opt-in here, which means the decision is yours and it is possible to
-get it wrong in both directions. This section is the guidance for making it.
+How to get the most out of Graphene, on both the read and the write path, with
+the specific calls to reach for.
 
-### The one rule
+Figures below are from the benchmark suite on a 100 000-node / 201 000-edge
+fixture. They are **illustrative ratios, not promises** — see
+[benchmarks.md](benchmarks.md) for method and caveats, and note that differences
+under ~25% are not resolvable in that data. The order-of-magnitude gaps are the
+ones worth designing around.
 
-> Index a key when it removes an O(N) scan from a path you have measured, and
-> when you can afford the write cost on every mutation touching that key.
+### 19.1 The fast-path matrix
 
-Everything below is that rule applied to specific situations.
+The single most useful table here: what you want, the call that is slow, and the
+call that is not.
 
-### What each operator costs
-
-| Operator | With the key indexed | Declared ordered | Notes |
+| If you want… | Slower | **Faster** | Difference |
 |---|---|---|---|
-| `Equal` | **O(1)** postings lookup | same | always the fastest path |
-| `Prefix` | scan of that key's entries | **O(log n + k)** | declaring pays here |
-| `GreaterThan` / `LessThan` / `Between` (and `…OrEqual`) | scan of that key's entries | **O(log n + k)** | declaring pays here |
-| `Contains` | scan of that key's entries | **scan** — no benefit | cannot be bounded by any ordering |
+| **Degree of a node** | `EdgesOf(...)` then `len()` | **`Degree` / `InDegree` / `OutDegree` with `nil` types** | ~15 ns vs materialising every edge |
+| **Degree of one edge type** | `Degree(id, []EdgeType{t})` | **`Degree(id, nil)`, filter later if you can** | **~488×** — 15 ns vs 7.4 µs |
+| **Reachable node IDs** | `BFS(...)` then read `.Nodes` | **`BFSIDs(...)`** | 20 allocations vs 394 |
+| **"Are these connected?"** | `ShortestPath(...)` then check error | **`IsConnected(src, dst)`** | no path materialised |
+| **"Is there an edge?"** | `EdgesOf` then scan | **`EdgeExists(src, dst, types)`** | ~280 ns, stops at first hit |
+| **IDs for a follow-up query** | `QueryNodes(...)` | **`QueryNodeIDs(...)`** | skips building every record |
+| **One property lookup** | `QueryNodeIDs` with one filter | **`NodesByProperty(key, val)`** | ~78 ns vs ~320 ns — no planner |
+| **Many nodes** | `AddNode` in a loop | **`AddNodes(batch)`** | one lock hold, one WAL pass |
+| **Many index entries** | `IndexNodeProperty` × N | **`IndexNodeProperties(id, map)`** | one call per entity |
+| **Update an indexed entity** | `UpdateNode` then re-index | **`UpdateNodeIndexed(n, props)`** | atomic; no stale window |
+| **Range / prefix query** | filter on an undeclared key | **`DeclareOrderedProperty(key)` first** | 22.8 ms → 2.3 ms wide; 11.8 ms → 59 µs narrow |
+| **Concurrent reads** | in-memory backend | **disk backend** | 12.3 ns vs 48.0 ns at 16 cores — see §19.5 |
+| **Space after bulk deletes** | leave it | **`Compact()`** | 4.5× less memory per live node |
 
-"Scan of that key's entries" is not a scan of the graph — it visits only what is
-registered under that key. But it is still linear in that, which is why a
-selective driver plus a `Contains` residual now probes candidates instead (§18).
+### 19.2 Reads
 
-### When to index a key
+#### Point lookups are already optimal — don't build around them
 
-**Index it when:**
+`GetNode` on the disk backend resolves through a direct array offset: **~6 ns** at
+the store level. There is nothing to tune. If a profile says point lookups are
+your cost, you are making too many of them — batch with `GetNodes`, or avoid
+materialising records at all (below).
 
-- You filter on it with `Equal` and the value is selective. A `sha256` unique per
-  node is the ideal case: the postings list has one entry, so the query is
-  effectively a hash lookup.
-- You filter on it in most queries, even at moderate selectivity. A `bucket` key
-  with 1 000 distinct values across 100 000 nodes still cuts candidates 100×
-  before any residual work.
-- It is the key you would *drive* from. Only one filter drives a query; the rest
-  are residuals. Indexing a key you always pair with a better one buys less than
-  it looks.
+#### Ask for IDs, not records
 
-**Do not index it when:**
+Every API that returns records has an ID-returning sibling. Records copy property
+blobs; IDs do not.
 
-- You only ever use `Contains` on it. No index helps, and you pay the write and
-  memory cost for nothing.
-- It is low-cardinality *and* unselective — a boolean-ish key where every value
-  matches half the graph. The postings list is enormous and the driver will
-  rightly ignore it.
-- You never filter on it. Storing a value in the property blob does **not**
-  require indexing it; the blob is opaque to the engine and costs nothing extra.
+```go
+// Materialises every node and its property blob.
+nodes, _ := g.QueryNodes(q)
 
-### When to declare a key ordered
+// Returns only IDs — resolve just the ones you actually need.
+ids, _ := g.QueryNodeIDs(q)
+```
 
-`DeclareOrderedProperty` builds a sorted structure over one key's values. It
-turns range and prefix filters from a scan into two binary searches, measured at
-22.8 ms → 2.3 ms on a wide range and 11.8 ms → 59 µs on a narrow one.
+The same applies to traversal. `BFSIDs` walks the graph without constructing a
+single `*store.Node` or `*store.Edge`:
 
-**Declare it when** you run range, `Between`, or prefix queries on that key and
-the values are encoded so byte order matches your intent — use `index/encoding`.
+```go
+ids, _ := g.BFSIDs(origin, 3, store.DirectionBoth, nil)   // 20 allocations
+walk, _ := g.BFS(origin, 3, store.DirectionBoth, nil)     // 394 allocations
+```
 
-**Do not declare it when:**
+The node *set* is identical. Use `BFS` only when you need the edges or the
+records themselves.
 
-- You only use `Equal` on it. Equality is already O(1); the ordered structure is
-  pure overhead.
-- You only use `Contains`. It cannot be served either way.
-- The values are numeric-looking strings you have *not* encoded. Declaring
-  switches the key to byte-wise comparison, so `"9"` sorts after `"10"`, and
-  results will change. This is a semantics change, not just a performance one —
-  see §9a.
+#### Degree: the biggest single trap in the API
 
-Declaring costs **~10.5 B per node** for a key with 1 000 distinct values,
-scaling with *distinct values* rather than entries.
+```go
+g.Degree(id, nil)                             // ~15 ns — reads CSR offsets
+g.Degree(id, []store.EdgeType{someType})      // ~7.4 µs — walks every incident edge
+```
 
-### What indexing costs you
+**~488× apart**, because an unfiltered degree is `outOffset[n+1] - outOffset[n]`
+— one subtraction, no records — while a type filter has to inspect each incident
+edge's labels. Both are far better than they were, but the gap is structural and
+will not close: filtering requires looking.
 
-Be concrete about the bill before adding a key:
+If you can tolerate the unfiltered count, take it. If you genuinely need a typed
+degree on a hot path, consider modelling that edge type as a separate anchored
+query you can cache.
 
-| Axis | Cost |
-|---|---|
-| Memory | **~104–174 B per indexed entry**, depending on cardinality |
-| Write | registration maintains sorted postings and a reverse map; ~2× allocations |
-| Delete | *cheaper*, not dearer — the reverse map makes removal proportional to the entity's own entries |
+#### Let one filter drive, and make it selective
 
-Memory is where indexing hurts most. A store indexing three keys on every node
-carries roughly **777 B per node in memory** against 446 B for topology alone.
+Only **one** filter drives a query; the rest are applied to the candidates it
+produces. So the win comes from one *selective* indexed key, not from indexing
+everything:
+
+```go
+// Good: sha256 is unique, so the driver produces one candidate.
+g.QueryNodeIDs(store.NodeQuery{Filters: []store.PropertyFilter{
+    {Key: "sha256", Op: store.PropertyOpEqual, Value: hash},   // ← drives
+    {Key: "tool",   Op: store.PropertyOpContains, Value: []byte("acq")}, // ← residual, probed
+}})
+```
+
+Verify with `ExplainNodeQuery` (§18) rather than assuming — §19.7.
+
+#### Page with `Limit`, and prefer ascending order
+
+`Offset`/`Limit` are applied after ordering. An ascending query over an already
+ascending candidate set skips sorting entirely; a descending one costs a linear
+reverse. Neither is expensive, but `QueryOrderAsc` is the cheaper default.
+
+#### Scope pattern matching aggressively
+
+`FindPatterns` is the most expensive path in the engine — roughly 200 allocations
+per scoped node. Always pass a `scope`, ideally from `BFSIDs`:
+
+```go
+scope, _ := g.BFSIDs(origin, 2, store.DirectionBoth, nil)
+matches, _ := g.FindPatterns(pattern, scope, 10)   // maxMatches caps the work
+```
+
+### 19.3 Writes
+
+#### Batch, and understand what batching buys
+
+```go
+g.AddNodes(nodes)   // one lock hold, one pass
+g.AddEdges(edges)
+```
+
+Batching amortises lock acquisition and — on disk — the WAL write path. It does
+**not** make the operation atomic: on error the already-added prefix is kept and
+the partial IDs are returned. If you need all-or-nothing, you must implement it
+yourself; there is no transaction.
+
+#### Know what a disk write actually costs
+
+| Operation | Memory | Disk |
+|---|---:|---:|
+| `AddNode` | ~700 ns | **~6.2 µs** |
+
+The ~9× gap is the WAL: a durable write must reach the log before the call
+returns. That is the price of crash safety, and it is not tunable — but it does
+mean **ingest is write-bound on disk, not CPU-bound**, so optimising your own
+property encoding will not help much.
+
+#### Register properties per entity, not per key
+
+```go
+// One call per key — N lock acquisitions across shards.
+g.IndexNodeProperty(id, "sha256", hash)
+g.IndexNodeProperty(id, "bucket", bucket)
+
+// One call — better.
+g.IndexNodeProperties(id, map[string][]byte{"sha256": hash, "bucket": bucket})
+```
+
+Registration costs ~900 ns per entry and maintains sorted postings plus a reverse
+map. That reverse map is why deletes are cheap (§19.6), so the cost is bought,
+not wasted.
+
+#### Use `UpdateNodeIndexed` — the plain update has a failure mode either way
+
+The engine cannot re-derive index entries: your values are caller-encoded and the
+property blob is opaque. So a plain `UpdateNode` must either leave entries stale
+or drop them:
+
+| Policy | Behaviour | Failure mode |
+|---|---|---|
+| `ReindexKeep` (default) | entries untouched | **stale** — the old value still matches |
+| `ReindexPurge` | entity's entries dropped | **lost**, including keys you did not touch |
+
+```go
+// Avoids both: record and entries replaced together.
+g.UpdateNodeIndexed(
+    &store.Node{ID: id, Labels: labels},
+    map[string][]byte{"sha256": newHash},
+)
+```
+
+#### Deleting is cheap, but scales with label size
+
+`DeleteNode` on a populated index costs ~2 µs, because the reverse map makes
+removal proportional to the entity's *own* entries rather than to the index.
+
+Label postings are the part that scales: removing a node from a 50 000-member
+label costs ~4 µs against ~1 µs for a 10 000-member one. If you have a label
+attached to most of the graph, deletes on it will be the slow part.
+
+#### Compact after bulk mutation, not during
+
+```go
+g, _ := graphene.Open(dir)
+// ... bulk ingest / deletion ...
+g.Compact()
+```
+
+`Compact()` reclaims space from deleted and superseded records — **4.5× memory
+per live node** on a half-deleted store — and empties the WAL, which is what
+keeps the next `Open` fast. It costs ~64 ms on a 50 000-node store, so it is a
+periodic operation, not a per-write one.
+
+Compaction takes an exclusive lock. Do it between phases of work, not alongside
+them.
+
+### 19.4 Choosing indexes
+
+Indexing is opt-in, which means the decision is yours and it is possible to get
+it wrong in both directions.
+
+> **The one rule:** index a key when it removes an O(N) scan from a path you have
+> measured, and when you can afford the write cost on every mutation touching it.
+
+#### What each operator costs
+
+| Operator | Key indexed | Key declared ordered |
+|---|---|---|
+| `Equal` | **O(1)** postings lookup | same |
+| `Prefix` | scan of that key's entries | **O(log n + k)** |
+| `GreaterThan` / `LessThan` / `Between` (+ `…OrEqual`) | scan of that key's entries | **O(log n + k)** |
+| `Contains` | scan of that key's entries | **scan** — no ordering can bound a substring |
+
+"Scan of that key's entries" visits only what is registered under that key, not
+the whole graph — but it is still linear in that, which is why a selective driver
+plus a `Contains` residual probes candidates instead (§18).
+
+#### Index a key when
+
+- You filter on it with `Equal` and it is selective. A `sha256` unique per node is
+  ideal: one postings entry, so the query is effectively a hash lookup.
+- You filter on it in most queries, even at moderate selectivity — 1 000 distinct
+  values across 100 000 nodes still cuts candidates 100× before residual work.
+- It is the key you would *drive* from. Indexing a key you always pair with a
+  better one buys less than it looks.
+
+#### Do not index a key when
+
+- You only ever use `Contains` on it. No index helps; you pay write and memory
+  cost for nothing.
+- It is low-cardinality *and* unselective — a boolean-ish key matching half the
+  graph. The postings list is enormous and the planner will rightly ignore it.
+- You never filter on it. **Storing a value in the property blob does not require
+  indexing it** — the blob is opaque and costs nothing extra.
+
+#### Declare a key ordered when
+
+You run range, `Between`, or prefix queries on it *and* the values are encoded so
+byte order matches your intent (`index/encoding`).
+
+**Do not declare** a key you only use with `Equal` (already O(1)), only with
+`Contains` (unservable), or whose values are numeric-looking strings you have not
+encoded — declaring switches that key to byte-wise comparison, so `"9"` sorts
+after `"10"` and **your results change**. That is a semantics change, not a
+performance one (§9a).
+
+Cost: ~10.5 B per node for a key with 1 000 distinct values, scaling with
+*distinct values* rather than entries.
+
+### 19.5 Concurrency
+
+#### Concurrent reads are faster on the disk backend
+
+Counter-intuitive, and worth designing around:
+
+| At 16 cores | Memory | Disk |
+|---|---:|---:|
+| Point lookup | 48.0 ns | **12.3 ns** |
+
+The disk backend has a lock-free fast path over the immutable CSR, so reads scale
+~4.8×. The memory backend holds one `RWMutex`, and `RLock` on a very short
+critical section is an atomic increment on a shared cache line — it scales
+*negatively*. **`NewInMemory()` is the reference implementation and a good
+choice for tests and small graphs; it is not the fast choice under read
+concurrency.**
+
+#### Spread property writes across keys
+
+| Concurrent registration | Time |
+|---|---:|
+| 16 goroutines, **distinct** keys | **427 ns** |
+| 16 goroutines, **same** key | 923 ns |
+
+The property index is sharded 16 ways by key hash, so unrelated keys never
+contend. Traffic concentrated on a single key contends on that one shard and
+sharding cannot help it — ~2.2× apart.
+
+#### Writes serialise; do not expect them to scale
+
+Every write takes the store's exclusive lock, and on disk the WAL is a single
+append point. `Parallel_AddNode` is flat across cores by design. Parallelise your
+*preparation* — encoding, hashing, deriving property values — and keep the actual
+`Add*` calls on one goroutine or accept that they will queue.
+
+### 19.6 Memory
+
+| Configuration | Bytes per node |
+|---|---:|
+| Topology only (memory) | ~446 B |
+| + property index, 3 keys | ~777 B |
+| Topology only (disk) | ~298 B |
+| + property index, 3 keys | ~629 B |
+| Half-deleted, uncompacted | **~715 B per live node** |
+| Same, after `Compact()` | **~158 B** |
+
+Two things follow. **Indexing is where memory goes** — roughly 104–174 B per
+indexed entry depending on cardinality, so a key indexed on every node is a real
+cost. And **compaction is the single biggest memory lever** on a store that
+deletes.
+
 If a workload is memory-bound rather than query-bound, indexing fewer keys is a
 legitimate answer.
 
-### Diagnosing a slow query
+### 19.7 Diagnosing
 
-Use `ExplainNodeQuery` (§18) rather than guessing:
+Do not guess. `ExplainNodeQuery` reports what the planner actually did:
 
 ```go
 plan, _ := g.ExplainNodeQuery(q)
@@ -917,21 +1135,41 @@ fmt.Println(plan)
 | What you see | What it means | What to do |
 |---|---|---|
 | `driver=scan` | nothing bounded the query | index a key you filter on |
-| `driver=labels` with huge `candidates` | the label is unselective | add a selective property filter |
-| `residual=k:set~<big>` where big ≫ candidates | that filter built a large set | usually a range on an undeclared key — declare it |
+| `driver=labels`, huge `candidates` | the label is unselective | add a selective property filter |
+| `residual=k:set~<big>`, big ≫ candidates | that filter built a large set | usually a range on an undeclared key — declare it |
 | `candidates` ≫ `results` | the driver is weak | a different key would drive better |
+| `candidates` ≈ `results` | the driver is doing its job | look elsewhere — record materialisation, or call volume |
 
-### Rules of thumb
+For write-path or memory problems, `VerifyIndexes()` will not help — it checks
+structure, not cost. Measure with the benchmark suite instead.
 
-1. **Measure before indexing.** The planner is exact about equality cardinality;
-   your intuition about selectivity usually is not.
-2. **One good driver beats three mediocre indexes.** Only one filter drives.
-3. **Property blobs are free; indexes are not.** Store everything, index what you
-   query.
-4. **`Compact()` after bulk deletion.** Uncompacted stores cost 4.5× the memory
-   per live node.
-5. **Re-declare ordered keys after reopening.** Declarations are a runtime
-   choice, not stored data.
+### 19.8 Checklist
+
+**Reads**
+
+1. Return IDs, not records, unless you need the records — `QueryNodeIDs`,
+   `BFSIDs`.
+2. `Degree(id, nil)` where you can; the typed form is ~488× dearer.
+3. One selective indexed key to drive each query; verify with `ExplainNodeQuery`.
+4. `DeclareOrderedProperty` for any key you range over, with `index/encoding`
+   values.
+5. `IsConnected` / `EdgeExists` for questions that are not "give me the path".
+6. Scope `FindPatterns` with `BFSIDs`.
+
+**Writes**
+
+7. `AddNodes` / `AddEdges` over loops; `IndexNodeProperties` over per-key calls.
+8. `UpdateNodeIndexed` rather than update-then-reindex.
+9. Spread concurrent property writes across keys; expect no scaling on `Add*`.
+10. `Compact()` between phases of bulk work — never per write.
+11. Re-declare ordered keys after reopening; declarations are runtime state.
+
+**Both**
+
+12. Measure before indexing. The planner is exact about equality cardinality;
+    intuition about selectivity usually is not.
+13. Property blobs are free; indexes are not. Store everything, index what you
+    query.
 
 ---
 
