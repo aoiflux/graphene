@@ -162,7 +162,7 @@ func (p *PropertyIndex) probeNodes(candidates []store.NodeID, f store.PropertyFi
 	ordered := sh.orderedNodeKeys[f.Key] != nil
 	out := candidates[:0]
 	for _, id := range candidates {
-		if refsMatch(sh.nodes.refs[id], f, ordered) {
+		if postingsMatch(&sh.nodes, id, f, ordered) {
 			out = append(out, id)
 		}
 	}
@@ -177,7 +177,7 @@ func (p *PropertyIndex) probeEdges(candidates []store.EdgeID, f store.PropertyFi
 	ordered := sh.orderedEdgeKeys[f.Key] != nil
 	out := candidates[:0]
 	for _, id := range candidates {
-		if refsMatch(sh.edges.refs[id], f, ordered) {
+		if postingsMatch(&sh.edges, id, f, ordered) {
 			out = append(out, id)
 		}
 	}
@@ -193,23 +193,27 @@ func (p *PropertyIndex) probeEdges(candidates []store.EdgeID, f store.PropertyFi
 // ordered selects the comparison rule, and getting it wrong here would make the
 // probe disagree with the index for exactly the keys where a range query is
 // fastest — see store.PropertyFilterMatchesOrdered.
-func refsMatch(refs []propRef, f store.PropertyFilter, ordered bool) bool {
-	for _, ref := range refs {
+func postingsMatch[T entityID](p *postings[T], id T, f store.PropertyFilter, ordered bool) bool {
+	matched := false
+	p.forEachRef(id, func(ref propRef) bool {
 		if ref.key != f.Key {
-			continue
+			return true
 		}
 		v := []byte(ref.value)
 		if ordered {
 			if store.PropertyFilterMatchesOrdered(f, v) {
-				return true
+				matched = true
+				return false
 			}
-			continue
-		}
-		if store.PropertyFilterMatches(f, v) {
 			return true
 		}
-	}
-	return false
+		if store.PropertyFilterMatches(f, v) {
+			matched = true
+			return false
+		}
+		return true
+	})
+	return matched
 }
 
 // matchNodes resolves one filter to its own ascending, deduplicated set.

@@ -236,11 +236,12 @@ func (p *PropertyIndex) RemoveNode(id store.NodeID) {
 		sh := &p.shards[i]
 		sh.mu.Lock()
 		if len(sh.orderedNodeKeys) > 0 {
-			for _, ref := range sh.nodes.refs[id] {
+			sh.nodes.forEachRef(id, func(ref propRef) bool {
 				if idx := sh.orderedNodeKeys[ref.key]; idx != nil {
 					idx.remove(id, ref.value)
 				}
-			}
+				return true
+			})
 		}
 		sh.nodes.remove(id)
 		sh.mu.Unlock()
@@ -254,11 +255,12 @@ func (p *PropertyIndex) RemoveEdge(id store.EdgeID) {
 		sh := &p.shards[i]
 		sh.mu.Lock()
 		if len(sh.orderedEdgeKeys) > 0 {
-			for _, ref := range sh.edges.refs[id] {
+			sh.edges.forEachRef(id, func(ref propRef) bool {
 				if idx := sh.orderedEdgeKeys[ref.key]; idx != nil {
 					idx.remove(id, ref.value)
 				}
-			}
+				return true
+			})
 		}
 		sh.edges.remove(id)
 		sh.mu.Unlock()
@@ -464,13 +466,13 @@ func (p *PropertyIndex) IndexedNodeIDs() []store.NodeID {
 	for i := range p.shards {
 		sh := &p.shards[i]
 		sh.mu.RLock()
-		for id := range sh.nodes.refs {
+		sh.nodes.forEachRefID(func(id store.NodeID) {
 			if _, dup := seen[id]; dup {
-				continue
+				return
 			}
 			seen[id] = struct{}{}
 			out = append(out, id)
-		}
+		})
 		sh.mu.RUnlock()
 	}
 	return out
@@ -483,13 +485,13 @@ func (p *PropertyIndex) IndexedEdgeIDs() []store.EdgeID {
 	for i := range p.shards {
 		sh := &p.shards[i]
 		sh.mu.RLock()
-		for id := range sh.edges.refs {
+		sh.edges.forEachRefID(func(id store.EdgeID) {
 			if _, dup := seen[id]; dup {
-				continue
+				return
 			}
 			seen[id] = struct{}{}
 			out = append(out, id)
-		}
+		})
 		sh.mu.RUnlock()
 	}
 	return out
@@ -513,18 +515,94 @@ type propRef struct {
 // mapping. It is not itself locked; PropertyIndex owns the lock.
 type postings[T entityID] struct {
 	byKey map[string]map[string][]T
-	refs  map[T][]propRef
 	count int // total number of (id, key, value) triples
+
+	// Reverse mapping, split by arity.
+	//
+	// Sharding the index by key made "one entry per entity per shard" the
+	// overwhelmingly common case: each key lives in exactly one shard, and an
+	// entity normally carries one value per key, so it lands in each relevant
+	// shard exactly once. A map[T][]propRef therefore allocated a one-element
+	// backing array per entity — roughly 32 B of pure overhead on top of the map
+	// entry itself, which measured as a meaningful share of the index's memory.
+	//
+	// ref1 holds that case inline. refN carries only entities that genuinely
+	// have several entries in this shard, which needs two keys hashing here.
+	// An id appears in exactly one of the two, never both.
+	ref1 map[T]propRef
+	refN map[T][]propRef
 
 	// Entries per key, so the query planner can cost a scan of a key without
 	// walking that key's buckets to find out how big it is.
 	perKey map[string]int
 }
 
+// forEachRef visits every reverse entry registered for id. Return false from fn
+// to stop early. It allocates nothing in the common single-entry case.
+func (p *postings[T]) forEachRef(id T, fn func(propRef) bool) {
+	if r, ok := p.ref1[id]; ok {
+		fn(r)
+		return
+	}
+	for _, r := range p.refN[id] {
+		if !fn(r) {
+			return
+		}
+	}
+}
+
+// refCount reports how many reverse entries id has.
+func (p *postings[T]) refCount(id T) int {
+	if _, ok := p.ref1[id]; ok {
+		return 1
+	}
+	return len(p.refN[id])
+}
+
+// hasRefs reports whether id has any reverse entry.
+func (p *postings[T]) hasRefs(id T) bool {
+	if _, ok := p.ref1[id]; ok {
+		return true
+	}
+	_, ok := p.refN[id]
+	return ok
+}
+
+// addRef records one reverse entry, promoting to the overflow map on the second.
+func (p *postings[T]) addRef(id T, ref propRef) {
+	if existing, ok := p.ref1[id]; ok {
+		delete(p.ref1, id)
+		p.refN[id] = []propRef{existing, ref}
+		return
+	}
+	if cur, ok := p.refN[id]; ok {
+		p.refN[id] = append(cur, ref)
+		return
+	}
+	p.ref1[id] = ref
+}
+
+// dropRefs removes every reverse entry for id.
+func (p *postings[T]) dropRefs(id T) {
+	delete(p.ref1, id)
+	delete(p.refN, id)
+}
+
+// forEachRefID visits every id holding a reverse entry.
+func (p *postings[T]) forEachRefID(fn func(T)) {
+	for id := range p.ref1 {
+		fn(id)
+	}
+	for id := range p.refN {
+		fn(id)
+	}
+}
+
 func newPostings[T entityID]() postings[T] {
 	return postings[T]{
 		byKey:  make(map[string]map[string][]T),
-		refs:   make(map[T][]propRef),
+		ref1:   make(map[T]propRef),
+		refN:   make(map[T][]propRef),
 		perKey: make(map[string]int),
 	}
 }
@@ -541,21 +619,20 @@ func (p *postings[T]) add(id T, key, value string) {
 		return
 	}
 	bucket[value] = ids
-	p.refs[id] = append(p.refs[id], propRef{key: key, value: value})
+	p.addRef(id, propRef{key: key, value: value})
 	p.perKey[key]++
 	p.count++
 }
 
 // remove drops every entry registered for id.
 func (p *postings[T]) remove(id T) {
-	refs, ok := p.refs[id]
-	if !ok {
+	if !p.hasRefs(id) {
 		return
 	}
-	for _, ref := range refs {
+	p.forEachRef(id, func(ref propRef) bool {
 		bucket := p.byKey[ref.key]
 		if bucket == nil {
-			continue
+			return true
 		}
 		ids, removed := deleteSorted(bucket[ref.value], id)
 		if removed {
@@ -572,8 +649,9 @@ func (p *postings[T]) remove(id T) {
 		if len(bucket) == 0 {
 			delete(p.byKey, ref.key)
 		}
-	}
-	delete(p.refs, id)
+		return true
+	})
+	p.dropRefs(id)
 }
 
 // lookup returns a copy of the sorted postings list for key=value.
@@ -675,25 +753,54 @@ func (p *postings[T]) verify(kind string) error {
 		return fmt.Errorf("%s index: cached count %d != %d actual postings entries", kind, p.count, total)
 	}
 
-	// Reverse map must agree with the postings, in both directions.
-	for id, refs := range p.refs {
-		if len(refs) == 0 {
-			return fmt.Errorf("%s index: id %d has an empty reverse entry", kind, uint64(id))
-		}
-		fromPostings := seen[id]
-		if len(fromPostings) != len(refs) {
-			return fmt.Errorf("%s index: id %d has %d reverse refs but appears in %d postings",
-				kind, uint64(id), len(refs), len(fromPostings))
-		}
-		for _, ref := range refs {
-			if fromPostings[ref] != 1 {
-				return fmt.Errorf("%s index: id %d reverse ref (%q=%q) appears %d times in postings",
-					kind, uint64(id), ref.key, ref.value, fromPostings[ref])
-			}
+	// The reverse map is split by arity, so its own invariants are checked first:
+	// an id lives in exactly one of the two maps, and the overflow map only ever
+	// holds ids that genuinely have two or more entries. A bug in the promotion
+	// path would otherwise show up much later as a lost or duplicated entry.
+	for id := range p.ref1 {
+		if _, both := p.refN[id]; both {
+			return fmt.Errorf("%s index: id %d is in both the inline and overflow reverse maps",
+				kind, uint64(id))
 		}
 	}
+	for id, refs := range p.refN {
+		if len(refs) < 2 {
+			return fmt.Errorf("%s index: id %d is in the overflow reverse map with only %d entries",
+				kind, uint64(id), len(refs))
+		}
+	}
+
+	// Reverse map must agree with the postings, in both directions.
+	var verr error
+	p.forEachRefID(func(id T) {
+		if verr != nil {
+			return
+		}
+		n := p.refCount(id)
+		if n == 0 {
+			verr = fmt.Errorf("%s index: id %d has an empty reverse entry", kind, uint64(id))
+			return
+		}
+		fromPostings := seen[id]
+		if len(fromPostings) != n {
+			verr = fmt.Errorf("%s index: id %d has %d reverse refs but appears in %d postings",
+				kind, uint64(id), n, len(fromPostings))
+			return
+		}
+		p.forEachRef(id, func(ref propRef) bool {
+			if fromPostings[ref] != 1 {
+				verr = fmt.Errorf("%s index: id %d reverse ref (%q=%q) appears %d times in postings",
+					kind, uint64(id), ref.key, ref.value, fromPostings[ref])
+				return false
+			}
+			return true
+		})
+	})
+	if verr != nil {
+		return verr
+	}
 	for id := range seen {
-		if _, ok := p.refs[id]; !ok {
+		if !p.hasRefs(id) {
 			return fmt.Errorf("%s index: id %d appears in postings but has no reverse entry", kind, uint64(id))
 		}
 	}
