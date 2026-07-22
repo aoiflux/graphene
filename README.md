@@ -436,6 +436,7 @@ go run ./examples
 
 ## Docs
 
+- Release notes: [v0.3.0](docs/RELEASE_NOTES_v0.3.0.md) — breaking changes, upgrade path, measured results
 - Easy usage guide: [USER_GUIDE.md](docs/USER_GUIDE.md)
 - Complete API reference: [API_REFERENCE.md](docs/API_REFERENCE.md)
 - Deep technical architecture and LLD:
