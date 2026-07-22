@@ -301,6 +301,33 @@ search that now materialises records only for the final path), `BFS3Hop_Disk`
 20 allocations and 36.3 µs on the disk fixture, against 394 and 113.9 µs for the
 record-returning equivalent.
 
+### Driver selection — a selective label no longer loses to a weak filter
+
+The disk planner took any equality driver unconditionally. A query naming a
+100-node label alongside a 25 000-hit property filter drove from the filter,
+materialised 25 000 candidates, and discarded 24 900. Label posting sizes are
+known in O(1), so the two are now costed on the same scale — as the in-memory
+backend already did.
+
+| `Planner_SelectiveLabelWeakFilter_Disk` | Before | After | Change |
+|---|---:|---:|---:|
+| time | 1 698 µs | **28.9 µs** | **−98.3%** |
+| B/op | 1 963 KiB | **19.0 KiB** | −99.0% |
+| allocs/op | 25 005 | **226** | −99.1% |
+
+The shapes that gain nothing from the change also lose nothing to it —
+`Planner_SelectiveFilterWeakLabel_Disk` (equality was already correct),
+`Planner_LabelOnly_Disk`, `QueryNodes_TypeLimit10_Disk`: all `~`, with identical
+`B/op` and `allocs/op` despite the added cardinality lookup on every typed query.
+
+> Caveat on this run: one control (`QueryNodes_TypeLimit10_Memory`, untouched
+> code) moved −4.34%, with all controls drifting slightly in the new side's
+> favour. Treat anything under ~5% from this run as noise. The 58× headline and
+> the identical allocation counts are unaffected.
+
+This is the worst case for the old planner, not a typical query: the size of the
+win is set by how badly label and filter selectivity are mismatched.
+
 ### Property blobs — reads no longer pay for blob size
 
 The disk backend used to copy a record's property blob on every read. It now

@@ -324,6 +324,35 @@ type BatchReader interface {
 	GetEdgesBatch(ids []EdgeID) (found []*Edge, missing []EdgeID)
 }
 
+// Transactor is implemented by stores that can apply a mixed set of nodes and
+// edges as one atomic unit.
+//
+// This exists because the slice APIs cannot express it. AddNodes followed by
+// AddEdges is two transactions, so a crash between them leaves a graph whose
+// nodes arrived and whose edges did not — the exact shape ingest produces, and
+// the exact shape a transaction is for.
+//
+// IDs are reserved before commit so a transaction can wire an edge to a node it
+// has added but not yet committed. A reserved ID that is never committed is
+// simply never used: IDs are monotonic and never reused, but have never been
+// promised to be dense (see AddNodesBatch, which already burns IDs on WAL
+// failure).
+type Transactor interface {
+	// ReserveNodeID and ReserveEdgeID hand out an ID that no other writer will
+	// receive. They do not create anything.
+	ReserveNodeID() NodeID
+	ReserveEdgeID() EdgeID
+
+	// ApplyTransaction commits nodes and edges together, or neither.
+	//
+	// Every node and edge must already carry an ID from the Reserve methods, and
+	// must be owned by the store (the caller must not retain or mutate them).
+	// Edge endpoints may name either an existing node or a node in nodes.
+	//
+	// On error nothing is applied and the store is unchanged.
+	ApplyTransaction(nodes []*Node, edges []*Edge) error
+}
+
 // Syncer is implemented by stores that can force pending writes to durable
 // storage. Backends without durability (the in-memory store) do not implement
 // it, and Graph.Sync is a no-op for them.

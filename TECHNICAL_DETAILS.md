@@ -405,6 +405,61 @@ for every incident edge *before* the node's own tombstone. A crash midway leaves
 edges deleted and the node alive — recoverable and consistent. The reverse order
 would leave edges pointing at a missing node.
 
+### 5.1a Transactions
+
+`Graph.Begin()` buffers writes and commits them as one unit. It exists for the
+one shape the slice APIs cannot express: nodes and the edges between them.
+`AddNodes` then `AddEdges` is two commits, and a crash between them leaves nodes
+without their edges.
+
+```mermaid
+sequenceDiagram
+    participant C as caller
+    participant T as Tx (caller-side buffer)
+    participant S as Store
+    C->>T: AddNode(n)
+    T->>S: ReserveNodeID()
+    S-->>T: id (atomic bump)
+    T-->>C: id — usable immediately
+    C->>T: AddEdge{Src: id, ...}
+    Note over T: buffered; no lock, no WAL traffic
+    C->>T: Commit()
+    T->>S: ApplyTransaction(nodes, edges)
+    Note over S: lock → validate all edges<br/>→ one framed write → apply
+    S-->>C: nil, or "nothing happened"
+```
+
+**IDs are reserved at buffer time, not assigned at commit.** That is what lets
+`AddEdge` name a node the store has not seen. A transaction that rolls back burns
+the IDs it took — permitted by the standing invariant that IDs are monotonic and
+never reused, but never promised dense. `AddNodesBatch` has burned IDs on WAL
+failure since the batch framing work; the transaction applies an existing rule
+rather than adding one.
+
+`ApplyTransaction` orders its work so atomicity and replayability both fall out:
+
+1. **Validate every edge first**, against live nodes *and* the transaction's own
+   pending nodes. A failure happens before anything is written.
+2. **Frame nodes, then edges**, into one batch. Replay applies records in file
+   order, so a node always precedes any edge that depends on it.
+3. **One `AppendBatch`.** If it fails nothing is applied — the commit marker never
+   reached the file, so replay discards the partial bytes. That absence is the
+   rollback; there is no undo path to get wrong.
+
+The in-memory backend has no WAL, so its atomicity is structural: validate
+everything, then apply, with nothing in between that can fail. It must reject
+exactly what disk rejects, since it is the oracle disk is compared against.
+
+A `Tx` is a caller-side buffer and is not safe for concurrent use; the store lock
+is taken once, at commit. Buffering means a transaction costs memory proportional
+to its size — the same trade the slice APIs make, and the reason the API
+documentation recommends chunking a bulk load rather than opening one transaction
+over it.
+
+*Scope:* creates only. Update and delete inside a transaction is a larger problem
+— deletes cascade, and buffering a cascade against a snapshot that moves under it
+needs a different design.
+
 ### 5.2 Read path
 
 ```mermaid
@@ -610,10 +665,27 @@ The planner picks the cheapest source **guaranteed to contain the answer**:
 |---:|---|---|
 | 1 | explicit `IDs` | exact |
 | 2 | most selective equality postings | **exact** — postings length is a map lookup |
-| 3 | ordered-key range | bounded by the range |
-| 4 | incident-edge lists (edge queries) | exact — CSR offsets give degree |
-| 5 | label postings | size known on memory; not yet on disk |
+| 3 | label postings | **exact** — `NodesByType` aliases CSR memory, so `len` is O(1) |
+| 4 | ordered-key range | bounded by the range |
+| 5 | incident-edge lists (edge queries) | exact — CSR offsets give degree |
 | 6 | full scan | — |
+
+Priority is a starting order, not a decision: where costs are comparable the
+planner **compares them** rather than taking the first available. Equality and
+labels are both exact, so a selective label beats a weak filter — a 100-node
+label against a 25 000-hit filter is 58× faster driven from the label. Ties go to
+equality, which returns candidates already ascending where a label union does
+not, so equal candidate counts are not equal cost.
+
+Label counts are **upper bounds**: they double-count a record present in both the
+delta and the CSR, and ignore tombstones. That is the safe direction — the driver
+must be a superset of the answer, so overestimating makes the planner more
+reluctant to choose labels, never wrong.
+
+> This comparison existed on the in-memory backend before the disk one, which
+> made it a parity bug as well as a performance gap: the same query could be
+> planned differently per backend. `TestLabelDriverParity` now pins the two
+> together.
 
 **Why `MatchAny` usually cannot be driven.** Under `MatchAll` the result is the
 intersection of every filter's set, so it is contained in each and any may drive.

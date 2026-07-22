@@ -100,7 +100,15 @@ func (g *Graph) GetEdges(ids []store.EdgeID) (found []*store.Edge, missing []sto
 // --- Batch writes ---
 
 // AddNodes adds multiple nodes in order, returning their assigned IDs.
-// If any node fails to be added, the already-added nodes are not rolled back.
+//
+// On both bundled backends this is atomic: either every node is added or none
+// is, and a failure returns a nil ID slice rather than a partial one. Third-party
+// stores that do not implement the batch interface fall back to a per-node loop,
+// which is not atomic — it returns the IDs assigned so far alongside the error.
+//
+// For a batch of nodes *and* the edges between them, use Begin: AddNodes
+// followed by AddEdges is two transactions, and a crash between them leaves the
+// nodes without their edges.
 func (g *Graph) AddNodes(nodes []*store.Node) ([]store.NodeID, error) {
 	if b, ok := g.GraphStore.(nodeBatchAdder); ok {
 		return b.AddNodesBatch(nodes)
@@ -118,7 +126,14 @@ func (g *Graph) AddNodes(nodes []*store.Node) ([]store.NodeID, error) {
 }
 
 // AddEdges adds multiple edges in order, returning their assigned IDs.
-// If any edge fails to be added, the already-added edges are not rolled back.
+//
+// On both bundled backends this is atomic, and every endpoint is validated
+// before anything is written — so a batch containing one dangling edge adds
+// nothing and returns ErrInvalidEdge. Third-party stores without the batch
+// interface fall back to a non-atomic per-edge loop.
+//
+// Endpoints must already exist. To create nodes and the edges between them
+// together, use Begin.
 func (g *Graph) AddEdges(edges []*store.Edge) ([]store.EdgeID, error) {
 	if b, ok := g.GraphStore.(edgeBatchAdder); ok {
 		return b.AddEdgesBatch(edges)

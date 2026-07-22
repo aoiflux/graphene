@@ -262,7 +262,9 @@ Cheap checks worth running before committing docs:
 
 ```
 # every exported Graph method is documented
-go doc -all . | grep -E '^func \(g \*Graph\)' | sed 's/.*) //; s/(.*//' \
+# (anchor the receiver: a greedy `.*)` swallows the method name when the method
+# takes no parameters, and reports the return type as undocumented instead)
+go doc -all . | grep -E '^func \(g \*Graph\)' | sed -E 's/^func \([^)]*\) //; s/\(.*//' \
   | while read m; do grep -q "\b$m\b" API_REFERENCE.md || echo "UNDOCUMENTED: $m"; done
 
 # code fences balance

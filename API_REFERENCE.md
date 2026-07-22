@@ -22,6 +22,7 @@ import (
 3. [Core types](#3-core-types)
 4. [Errors](#4-errors)
 5. [Create](#5-create)
+5.1. [Transactions — `Begin`](#51-transactions--begin) ← recommended for ingest
 6. [Read](#6-read)
 7. [Mutation](#7-mutation)  ← update / delete
 8. [Type lookups](#8-type-lookups)
@@ -188,6 +189,81 @@ caseID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}}
 fileID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
 eid, _   := g.AddEdge(&store.Edge{Src: fileID, Dst: caseID, Labels: []store.EdgeType{store.EdgeTypeBelongsTo}})
 ```
+
+### 5.1 Transactions — `Begin` *(recommended for ingest)*
+
+```go
+func (g *Graph) Begin() *Tx
+
+func (tx *Tx) AddNode(n *store.Node) store.NodeID
+func (tx *Tx) AddEdge(e *store.Edge) store.EdgeID
+func (tx *Tx) Commit() error
+func (tx *Tx) Rollback() error
+func (tx *Tx) Len() (nodes, edges int)
+func (tx *Tx) Atomic() bool
+```
+
+`AddNodes` and `AddEdges` are each atomic, but they are **two** transactions. A
+graph is nodes *and* the edges between them, and that pairing is exactly what the
+slice APIs cannot commit together:
+
+```go
+g.AddNodes(nodes)   // commit 1
+// ← a crash here leaves the nodes with none of their edges
+g.AddEdges(edges)   // commit 2
+```
+
+`Begin` makes it one commit, and lets an edge reference a node created in the
+same transaction:
+
+```go
+tx := g.Begin()
+caseID := tx.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}})
+fileID := tx.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
+tx.AddEdge(&store.Edge{Src: fileID, Dst: caseID, Labels: []store.EdgeType{store.EdgeTypeBelongsTo}})
+
+if err := tx.Commit(); err != nil {
+    // nothing was written; the store is exactly as it was
+}
+```
+
+**IDs are returned immediately, before commit.** That is what makes `tx.AddEdge`
+above able to name `fileID`. They are *reserved*, not created — a transaction
+that is rolled back or fails burns the IDs it took, and a later write gets higher
+ones. This is consistent with the standing guarantee: IDs are monotonic and never
+reused, and have never been promised to be contiguous.
+
+`AddNode`/`AddEdge` on a `Tx` return IDs rather than errors. A problem detected
+while buffering (a nil record, use after finish) is latched and returned by
+`Commit`, so checking `Commit` is sufficient.
+
+#### Which should I use?
+
+| Situation | Use | Why |
+|---|---|---|
+| Nodes **and** their edges together | **`Begin`** | The only shape that commits both atomically |
+| Loading a graph from a file / another system | **`Begin`**, chunked | Atomic per chunk, and endpoints can be wired without a second pass |
+| Only nodes, no edges | `AddNodes` | Already atomic; no reason for the extra type |
+| Only edges, endpoints already exist | `AddEdges` | Same |
+| One record | `AddNode` / `AddEdge` | Nothing to batch |
+| Records arriving one at a time, latency-sensitive | `AddNode` / `AddEdge` | A transaction only pays off once it batches |
+
+**Performance is the same** — a `Tx` commits through the same framed single-write
+path as `AddNodes`, so choosing it costs nothing. Pick it for the semantics.
+
+> **Size a transaction deliberately.** Writes are buffered in memory until
+> `Commit`, so a transaction costs memory proportional to its size — the same
+> trade `AddNodes` makes with its slice. For a bulk load that does not need
+> whole-file atomicity, commit in chunks of a few thousand rather than opening one
+> transaction over millions of records.
+
+A `Tx` is **not** safe for concurrent use by multiple goroutines. It is a
+caller-side buffer; the store lock is taken once, at `Commit`. Separate
+goroutines may each hold their own transaction.
+
+`Atomic()` reports false only for third-party backends that do not implement
+`store.Transactor`; both bundled backends return true. Such a backend still
+works, committing via the batch APIs, but without cross-boundary atomicity.
 
 ---
 
@@ -910,6 +986,7 @@ call that is not.
 | **IDs for a follow-up query** | `QueryNodes(...)` | **`QueryNodeIDs(...)`** | skips building every record |
 | **One property lookup** | `QueryNodeIDs` with one filter | **`NodesByProperty(key, val)`** | ~78 ns vs ~320 ns — no planner |
 | **Many nodes** | `AddNode` in a loop | **`AddNodes(batch)`** | **−53 to −64% on disk**, 21–38% in memory |
+| **Nodes *and* their edges** | `AddNodes` then `AddEdges` | **`Begin()` / `Commit()`** | same speed, but one commit instead of two — a crash between them cannot orphan nodes |
 | **Many index entries** | `IndexNodeProperty` × N | **`IndexNodeProperties(id, map)`** | one call per entity |
 | **Update an indexed entity** | `UpdateNode` then re-index | **`UpdateNodeIndexed(n, props)`** | atomic; no stale window |
 | **Range / prefix query** | filter on an undeclared key | **`DeclareOrderedProperty(key)` first** | 22.8 ms → 2.3 ms wide; 11.8 ms → 59 µs narrow |
@@ -1025,12 +1102,11 @@ n=100), since there is no WAL to amortise — only the lock.
 `SetSyncOnCommit(false)` on the disk store only if you sync explicitly via
 `Compact()` or `Close()` and can afford to lose everything since.
 
-`GetNodes` is currently a plain loop over `GetNode` with no batching at all, so
-it is exactly equivalent to writing that loop yourself.
-
-Batching also does **not** make the operation atomic: on error the already-added
-prefix is kept and the partial IDs are returned. If you need all-or-nothing, you
-must implement it yourself; there is no transaction.
+**Batching is also atomic.** On error nothing is applied and no IDs are returned
+— on disk the commit marker never reaches the file, so replay discards the
+partial bytes. What batching cannot do is span the node/edge boundary: `AddNodes`
+then `AddEdges` is two commits. For nodes and their edges together, use
+[`Begin`](#51-transactions--begin), which costs the same and commits once.
 
 #### Know what a disk write actually costs
 
@@ -1246,6 +1322,8 @@ structure, not cost. Measure with the benchmark suite instead.
 **Writes**
 
 7. `AddNodes` / `AddEdges` over loops; `IndexNodeProperties` over per-key calls.
+7a. `Begin()` when a write creates nodes *and* the edges between them — same
+    cost, one commit instead of two. Chunk it; a transaction buffers in memory.
 8. `UpdateNodeIndexed` rather than update-then-reindex.
 9. Spread concurrent property writes across keys; expect no scaling on `Add*`.
 10. `Compact()` between phases of bulk work — never per write.

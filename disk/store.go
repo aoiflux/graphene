@@ -2284,6 +2284,73 @@ func (s *Store) ensureDeltaAdj(id store.NodeID) *deltaAdj {
 
 // commitNodesBatch applies node records to in-memory delta/index state.
 // Caller must hold s.mu.
+// ReserveNodeID implements store.Transactor.
+func (s *Store) ReserveNodeID() store.NodeID {
+	return store.NodeID(s.nodeSeq.Add(1))
+}
+
+// ReserveEdgeID implements store.Transactor.
+func (s *Store) ReserveEdgeID() store.EdgeID {
+	return store.EdgeID(s.edgeSeq.Add(1))
+}
+
+// ApplyTransaction implements store.Transactor: nodes and edges commit together
+// through a single framed WAL write, or not at all.
+//
+// The ordering is what makes this atomic and replayable:
+//
+//  1. validate every edge first, against live nodes *and* the nodes in this
+//     transaction, so a failure happens before anything is written;
+//  2. frame nodes then edges into one batch — replay applies records in file
+//     order, so a node always precedes any edge that depends on it;
+//  3. one AppendBatch. If it fails, nothing is applied: the commit marker never
+//     reached the file, so replay discards whatever partial bytes did. That
+//     absence is the rollback.
+func (s *Store) ApplyTransaction(nodes []*store.Node, edges []*store.Edge) error {
+	if len(nodes) == 0 && len(edges) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Endpoints may name a node this transaction is creating, which is the whole
+	// point of a mixed transaction — those nodes are not in the store yet.
+	pending := make(map[store.NodeID]struct{}, len(nodes))
+	for _, n := range nodes {
+		pending[n.ID] = struct{}{}
+	}
+	for _, e := range edges {
+		if _, ok := pending[e.Src]; !ok && !s.nodeExistsLocked(e.Src) {
+			return &store.ErrInvalidEdge{MissingID: e.Src}
+		}
+		if _, ok := pending[e.Dst]; !ok && !s.nodeExistsLocked(e.Dst) {
+			return &store.ErrInvalidEdge{MissingID: e.Dst}
+		}
+	}
+
+	batch := newWALBatch((len(nodes) + len(edges)) * 64)
+	for _, n := range nodes {
+		node := n
+		batch.addWith(walRecordNode, func(dst []byte) []byte {
+			return appendMarshalledNode(dst, node)
+		})
+	}
+	for _, e := range edges {
+		edge := e
+		batch.addWith(walRecordEdge, func(dst []byte) []byte {
+			return appendMarshalledEdge(dst, edge)
+		})
+	}
+	if err := s.wal.AppendBatch(batch.finish(), s.syncOnCommit); err != nil {
+		return fmt.Errorf("ApplyTransaction: wal: %w", err)
+	}
+
+	s.commitNodesBatch(nodes)
+	s.commitEdgesBatch(edges)
+	return nil
+}
+
 func (s *Store) commitNodesBatch(nodes []*store.Node) {
 	for _, n := range nodes {
 		s.deltaNodes[n.ID] = n
