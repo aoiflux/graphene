@@ -197,9 +197,15 @@ func (g *Graph) Begin() *Tx
 
 func (tx *Tx) AddNode(n *store.Node) store.NodeID
 func (tx *Tx) AddEdge(e *store.Edge) store.EdgeID
+func (tx *Tx) UpdateNode(n *store.Node)
+func (tx *Tx) UpdateEdge(e *store.Edge)
+func (tx *Tx) DeleteNode(id store.NodeID)
+func (tx *Tx) DeleteEdge(id store.EdgeID)
+
 func (tx *Tx) Commit() error
 func (tx *Tx) Rollback() error
-func (tx *Tx) Len() (nodes, edges int)
+func (tx *Tx) Len() (nodes, edges int)   // creations only
+func (tx *Tx) Ops() int                  // total buffered operations
 func (tx *Tx) Atomic() bool
 ```
 
@@ -233,9 +239,59 @@ that is rolled back or fails burns the IDs it took, and a later write gets highe
 ones. This is consistent with the standing guarantee: IDs are monotonic and never
 reused, and have never been promised to be contiguous.
 
-`AddNode`/`AddEdge` on a `Tx` return IDs rather than errors. A problem detected
-while buffering (a nil record, use after finish) is latched and returned by
-`Commit`, so checking `Commit` is sufficient.
+`AddNode`/`AddEdge` on a `Tx` return IDs rather than errors, and the mutation
+methods return nothing. A problem detected while buffering (a nil record, use
+after finish) is latched and returned by `Commit`, so checking `Commit` is
+sufficient.
+
+#### Operations apply in order
+
+A transaction is a **sequence**, not a set. Each operation is evaluated against
+the store as modified by the ones before it:
+
+```go
+tx := g.Begin()
+id := tx.AddNode(&store.Node{Labels: ...})
+tx.DeleteNode(id)     // created and removed before anything is written
+tx.Commit()           // net effect: nothing, but the ID is spent
+```
+
+That ordering cuts both ways — an edge onto a node the same transaction has
+already deleted is rejected, and the whole transaction fails with
+`*store.ErrInvalidEdge`.
+
+#### Deleting a node cascades
+
+`tx.DeleteNode` removes every edge incident to the node, exactly as
+`g.DeleteNode` does — **including edges created earlier in the same
+transaction**:
+
+```go
+tx := g.Begin()
+a := tx.AddNode(&store.Node{Labels: ...})
+b := tx.AddNode(&store.Node{Labels: ...})
+tx.AddEdge(&store.Edge{Src: a, Dst: b, ...})
+tx.DeleteNode(a)      // the edge above goes too
+tx.Commit()           // leaves exactly one node: b, with no dangling adjacency
+```
+
+The cascade is computed at commit under the store lock, not when you call
+`DeleteNode` — buffering it earlier would resolve against a graph that can still
+change before the transaction commits.
+
+`UpdateNode` / `UpdateEdge` replace a record wholesale, the same as their
+`Graph` counterparts, and require the target to exist at commit — either in the
+store or created earlier in this transaction. A missing target fails the whole
+transaction with `*store.ErrNotFound`.
+
+> **Indexing properties is not part of a transaction.** `IndexNodeProperties`
+> and friends are separate calls; a `Tx` does not buffer them. Index properties
+> after the transaction commits.
+>
+> Index *cleanup* is included, because leaving it out would diverge from the
+> non-transactional path: deleting a node inside a transaction removes its
+> property-index entries, and updating one honours `SetReindexPolicy(ReindexPurge)`
+> exactly as `UpdateNode` does.
 
 #### Which should I use?
 
@@ -243,9 +299,12 @@ while buffering (a nil record, use after finish) is latched and returned by
 |---|---|---|
 | Nodes **and** their edges together | **`Begin`** | The only shape that commits both atomically |
 | Loading a graph from a file / another system | **`Begin`**, chunked | Atomic per chunk, and endpoints can be wired without a second pass |
+| A multi-step edit that must not half-apply | **`Begin`** | e.g. delete a node, re-attach its edges elsewhere |
+| Deleting several related entities | **`Begin`** | One commit; cascades resolve against the transaction's own view |
 | Only nodes, no edges | `AddNodes` | Already atomic; no reason for the extra type |
 | Only edges, endpoints already exist | `AddEdges` | Same |
 | One record | `AddNode` / `AddEdge` | Nothing to batch |
+| One update or delete | `UpdateNode` / `DeleteNode` | Already atomic on their own |
 | Records arriving one at a time, latency-sensitive | `AddNode` / `AddEdge` | A transaction only pays off once it batches |
 
 **Performance is the same** — a `Tx` commits through the same framed single-write

@@ -43,11 +43,20 @@ var ErrTxDone = errors.New("graphene: transaction already finished")
 // means a single enormous transaction is not free — for bulk loads that do not
 // need whole-file atomicity, commit in chunks.
 type Tx struct {
-	g     *Graph
-	tr    store.Transactor // nil if the backend cannot do this natively
-	nodes []*store.Node
-	edges []*store.Edge
-	done  bool
+	g  *Graph
+	tr store.Transactor // nil if the backend cannot do this natively
+
+	// ops is the transaction, in issue order. Order is part of the semantics:
+	// each operation is evaluated at commit against the store as modified by the
+	// ones before it, so adding a node and then deleting it is meaningful, and
+	// so is deleting an edge and adding a replacement.
+	ops []store.TxOp
+
+	// nodesAdded/edgesAdded count creations, for Len and for sizing.
+	nodesAdded int
+	edgesAdded int
+
+	done bool
 	// err latches the first buffering error. AddNode/AddEdge return IDs rather
 	// than errors for ergonomics, so a problem detected while buffering has to
 	// surface at Commit.
@@ -101,7 +110,8 @@ func (tx *Tx) AddNode(n *store.Node) store.NodeID {
 		stored.Properties = make([]byte, len(n.Properties))
 		copy(stored.Properties, n.Properties)
 	}
-	tx.nodes = append(tx.nodes, stored)
+	tx.ops = append(tx.ops, store.TxOp{Kind: store.TxOpAddNode, Node: stored})
+	tx.nodesAdded++
 	return id
 }
 
@@ -122,28 +132,83 @@ func (tx *Tx) AddEdge(e *store.Edge) store.EdgeID {
 	}
 
 	id := tx.reserveEdgeID()
-	stored := &store.Edge{
-		ID:     id,
-		Src:    e.Src,
-		Dst:    e.Dst,
-		Weight: e.Weight,
-	}
-	if len(e.Labels) > 0 {
-		stored.Labels = make([]store.EdgeType, len(e.Labels))
-		copy(stored.Labels, e.Labels)
-	}
-	if len(e.Properties) > 0 {
-		stored.Properties = make([]byte, len(e.Properties))
-		copy(stored.Properties, e.Properties)
-	}
-	tx.edges = append(tx.edges, stored)
+	stored := copyEdge(e)
+	stored.ID = id
+	tx.ops = append(tx.ops, store.TxOp{Kind: store.TxOpAddEdge, Edge: stored})
+	tx.edgesAdded++
 	return id
 }
 
-// Len reports how many nodes and edges are buffered.
-func (tx *Tx) Len() (nodes, edges int) { return len(tx.nodes), len(tx.edges) }
+// UpdateNode buffers a replacement for an existing node.
+//
+// The node must exist when the transaction commits — either in the store, or
+// created earlier in this same transaction. Labels must be non-empty. Update
+// replaces the record wholesale, exactly as Graph.UpdateNode does.
+func (tx *Tx) UpdateNode(n *store.Node) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return
+	}
+	if n == nil {
+		tx.setErr(errors.New("Tx.UpdateNode: nil node"))
+		return
+	}
+	if n.ID == store.InvalidNodeID {
+		tx.setErr(errors.New("Tx.UpdateNode: node has no ID"))
+		return
+	}
+	tx.ops = append(tx.ops, store.TxOp{Kind: store.TxOpUpdateNode, Node: copyNode(n)})
+}
 
-// Commit applies every buffered write as one unit.
+// UpdateEdge buffers a replacement for an existing edge. Same rules as
+// UpdateNode; both endpoints must also resolve at commit.
+func (tx *Tx) UpdateEdge(e *store.Edge) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return
+	}
+	if e == nil {
+		tx.setErr(errors.New("Tx.UpdateEdge: nil edge"))
+		return
+	}
+	if e.ID == store.InvalidEdgeID {
+		tx.setErr(errors.New("Tx.UpdateEdge: edge has no ID"))
+		return
+	}
+	tx.ops = append(tx.ops, store.TxOp{Kind: store.TxOpUpdateEdge, Edge: copyEdge(e)})
+}
+
+// DeleteNode buffers a node deletion.
+//
+// Deletion cascades: every edge incident to the node goes too, including edges
+// created earlier in this same transaction. The cascade is computed at commit,
+// under the store lock — computing it at buffer time would resolve against a
+// graph that can still change before the transaction commits.
+func (tx *Tx) DeleteNode(id store.NodeID) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return
+	}
+	tx.ops = append(tx.ops, store.TxOp{Kind: store.TxOpDeleteNode, NodeID: id})
+}
+
+// DeleteEdge buffers an edge deletion.
+func (tx *Tx) DeleteEdge(id store.EdgeID) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return
+	}
+	tx.ops = append(tx.ops, store.TxOp{Kind: store.TxOpDeleteEdge, EdgeID: id})
+}
+
+// Len reports how many nodes and edges this transaction *creates*. It does not
+// count updates or deletes; use Ops for the total.
+func (tx *Tx) Len() (nodes, edges int) { return tx.nodesAdded, tx.edgesAdded }
+
+// Ops reports the total number of buffered operations.
+func (tx *Tx) Ops() int { return len(tx.ops) }
+
+// Commit applies every buffered operation as one unit, in the order issued.
 //
 // On error nothing is applied and the store is unchanged. The transaction is
 // finished either way: a failed Commit does not need, and does not accept, a
@@ -156,12 +221,12 @@ func (tx *Tx) Commit() error {
 	if tx.err != nil {
 		return tx.err
 	}
-	if len(tx.nodes) == 0 && len(tx.edges) == 0 {
+	if len(tx.ops) == 0 {
 		return nil
 	}
 
 	if tx.tr != nil {
-		return tx.tr.ApplyTransaction(tx.nodes, tx.edges)
+		return tx.tr.ApplyTransaction(tx.ops)
 	}
 	return tx.commitFallback()
 }
@@ -179,9 +244,34 @@ func (tx *Tx) Rollback() error {
 		return ErrTxDone
 	}
 	tx.done = true
-	tx.nodes = nil
-	tx.edges = nil
+	tx.ops = nil
 	return nil
+}
+
+func copyNode(n *store.Node) *store.Node {
+	out := &store.Node{ID: n.ID}
+	if len(n.Labels) > 0 {
+		out.Labels = make([]store.NodeType, len(n.Labels))
+		copy(out.Labels, n.Labels)
+	}
+	if len(n.Properties) > 0 {
+		out.Properties = make([]byte, len(n.Properties))
+		copy(out.Properties, n.Properties)
+	}
+	return out
+}
+
+func copyEdge(e *store.Edge) *store.Edge {
+	out := &store.Edge{ID: e.ID, Src: e.Src, Dst: e.Dst, Weight: e.Weight}
+	if len(e.Labels) > 0 {
+		out.Labels = make([]store.EdgeType, len(e.Labels))
+		copy(out.Labels, e.Labels)
+	}
+	if len(e.Properties) > 0 {
+		out.Properties = make([]byte, len(e.Properties))
+		copy(out.Properties, e.Properties)
+	}
+	return out
 }
 
 func (tx *Tx) setErr(err error) {
@@ -205,42 +295,83 @@ func (tx *Tx) reserveNodeID() store.NodeID {
 	if tx.tr != nil {
 		return tx.tr.ReserveNodeID()
 	}
-	return store.NodeID(placeholderNodeBase - uint64(len(tx.nodes)))
+	return store.NodeID(placeholderNodeBase - uint64(tx.nodesAdded))
 }
 
 func (tx *Tx) reserveEdgeID() store.EdgeID {
 	if tx.tr != nil {
 		return tx.tr.ReserveEdgeID()
 	}
-	return store.EdgeID(placeholderEdgeBase - uint64(len(tx.edges)))
+	return store.EdgeID(placeholderEdgeBase - uint64(tx.edgesAdded))
 }
 
-// commitFallback supports stores that do not implement store.Transactor. It is
-// not atomic across the node/edge boundary and does not pretend to be; Atomic
-// reports false for exactly this path.
+// commitFallback supports stores that do not implement store.Transactor.
+//
+// It replays the operations in order through the public API, translating
+// placeholder IDs to the real ones as the store assigns them. Ordering is
+// therefore preserved, but **atomicity is not** — a failure partway through
+// leaves the earlier operations applied. Atomic() reports false for exactly this
+// path, and both bundled backends avoid it.
 func (tx *Tx) commitFallback() error {
-	placeholders := make(map[store.NodeID]store.NodeID, len(tx.nodes))
-	if len(tx.nodes) > 0 {
-		ids, err := tx.g.AddNodes(tx.nodes)
-		if err != nil {
-			return fmt.Errorf("Tx.Commit: nodes: %w", err)
+	nodeIDs := make(map[store.NodeID]store.NodeID)
+	edgeIDs := make(map[store.EdgeID]store.EdgeID)
+
+	realNode := func(id store.NodeID) store.NodeID {
+		if real, ok := nodeIDs[id]; ok {
+			return real
 		}
-		for i, n := range tx.nodes {
-			placeholders[n.ID] = ids[i]
-			n.ID = ids[i]
-		}
+		return id
 	}
-	if len(tx.edges) > 0 {
-		for _, e := range tx.edges {
-			if real, ok := placeholders[e.Src]; ok {
-				e.Src = real
-			}
-			if real, ok := placeholders[e.Dst]; ok {
-				e.Dst = real
-			}
+	realEdge := func(id store.EdgeID) store.EdgeID {
+		if real, ok := edgeIDs[id]; ok {
+			return real
 		}
-		if _, err := tx.g.AddEdges(tx.edges); err != nil {
-			return fmt.Errorf("Tx.Commit: edges: %w", err)
+		return id
+	}
+
+	for i, op := range tx.ops {
+		var err error
+		switch op.Kind {
+		case store.TxOpAddNode:
+			placeholder := op.Node.ID
+			var id store.NodeID
+			id, err = tx.g.AddNode(op.Node)
+			if err == nil {
+				nodeIDs[placeholder] = id
+			}
+
+		case store.TxOpAddEdge:
+			placeholder := op.Edge.ID
+			e := *op.Edge
+			e.Src, e.Dst = realNode(e.Src), realNode(e.Dst)
+			var id store.EdgeID
+			id, err = tx.g.AddEdge(&e)
+			if err == nil {
+				edgeIDs[placeholder] = id
+			}
+
+		case store.TxOpUpdateNode:
+			n := *op.Node
+			n.ID = realNode(n.ID)
+			err = tx.g.UpdateNode(&n)
+
+		case store.TxOpUpdateEdge:
+			e := *op.Edge
+			e.ID = realEdge(e.ID)
+			e.Src, e.Dst = realNode(e.Src), realNode(e.Dst)
+			err = tx.g.UpdateEdge(&e)
+
+		case store.TxOpDeleteNode:
+			err = tx.g.DeleteNode(realNode(op.NodeID))
+
+		case store.TxOpDeleteEdge:
+			err = tx.g.DeleteEdge(realEdge(op.EdgeID))
+
+		default:
+			err = fmt.Errorf("unknown op kind %d", op.Kind)
+		}
+		if err != nil {
+			return fmt.Errorf("Tx.Commit: op %d (%s): %w", i, op.Kind, err)
 		}
 	}
 	return nil

@@ -269,53 +269,6 @@ func (s *Store) ReserveEdgeID() store.EdgeID {
 	return s.nextEdgeID()
 }
 
-// ApplyTransaction implements store.Transactor.
-//
-// There is no WAL here, so atomicity is structural: validate the whole
-// transaction, then apply it. Nothing between those two points can fail.
-//
-// This backend is the oracle the disk backend is compared against, so it has to
-// reject exactly what disk rejects — including accepting an edge whose endpoint
-// is a node created in the same transaction.
-func (s *Store) ApplyTransaction(nodes []*store.Node, edges []*store.Edge) error {
-	if len(nodes) == 0 && len(edges) == 0 {
-		return nil
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	pending := make(map[store.NodeID]struct{}, len(nodes))
-	for _, n := range nodes {
-		pending[n.ID] = struct{}{}
-	}
-	for _, e := range edges {
-		if _, ok := pending[e.Src]; !ok {
-			if _, live := s.nodes[e.Src]; !live {
-				return &store.ErrInvalidEdge{MissingID: e.Src}
-			}
-		}
-		if _, ok := pending[e.Dst]; !ok {
-			if _, live := s.nodes[e.Dst]; !live {
-				return &store.ErrInvalidEdge{MissingID: e.Dst}
-			}
-		}
-	}
-
-	for _, n := range nodes {
-		s.nodes[n.ID] = n
-		s.indexNodeLabels(n.ID, n.Labels)
-		s.ensureAdj(n.ID)
-	}
-	for _, e := range edges {
-		s.edges[e.ID] = e
-		s.indexEdgeLabels(e.ID, e.Labels)
-		s.ensureAdj(e.Src).out = append(s.ensureAdj(e.Src).out, e.ID)
-		s.ensureAdj(e.Dst).in = append(s.ensureAdj(e.Dst).in, e.ID)
-	}
-	return nil
-}
-
 func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	ids := make([]store.EdgeID, len(edges))
 

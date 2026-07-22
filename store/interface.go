@@ -343,14 +343,60 @@ type Transactor interface {
 	ReserveNodeID() NodeID
 	ReserveEdgeID() EdgeID
 
-	// ApplyTransaction commits nodes and edges together, or neither.
+	// ApplyTransaction commits every operation together, or none of them.
 	//
-	// Every node and edge must already carry an ID from the Reserve methods, and
-	// must be owned by the store (the caller must not retain or mutate them).
-	// Edge endpoints may name either an existing node or a node in nodes.
+	// Operations apply **in the order given**. Each is evaluated against the
+	// store as modified by the operations before it, so a transaction may add a
+	// node and then delete it, or delete an edge and add a replacement.
+	//
+	// Records passed in must already carry an ID and must be owned by the store
+	// (the caller must not retain or mutate them).
 	//
 	// On error nothing is applied and the store is unchanged.
-	ApplyTransaction(nodes []*Node, edges []*Edge) error
+	ApplyTransaction(ops []TxOp) error
+}
+
+// TxOpKind identifies which operation a TxOp carries.
+type TxOpKind uint8
+
+const (
+	TxOpAddNode TxOpKind = iota + 1
+	TxOpAddEdge
+	TxOpUpdateNode
+	TxOpUpdateEdge
+	TxOpDeleteNode
+	TxOpDeleteEdge
+)
+
+func (k TxOpKind) String() string {
+	switch k {
+	case TxOpAddNode:
+		return "add-node"
+	case TxOpAddEdge:
+		return "add-edge"
+	case TxOpUpdateNode:
+		return "update-node"
+	case TxOpUpdateEdge:
+		return "update-edge"
+	case TxOpDeleteNode:
+		return "delete-node"
+	case TxOpDeleteEdge:
+		return "delete-edge"
+	default:
+		return "unknown"
+	}
+}
+
+// TxOp is one buffered operation in a transaction.
+//
+// Exactly one of the payload fields is meaningful, selected by Kind: Node for
+// the node operations, Edge for the edge operations, NodeID/EdgeID for deletes.
+type TxOp struct {
+	Kind   TxOpKind
+	Node   *Node
+	Edge   *Edge
+	NodeID NodeID
+	EdgeID EdgeID
 }
 
 // Syncer is implemented by stores that can force pending writes to durable

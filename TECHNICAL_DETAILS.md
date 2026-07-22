@@ -456,9 +456,53 @@ to its size — the same trade the slice APIs make, and the reason the API
 documentation recommends chunking a bulk load rather than opening one transaction
 over it.
 
-*Scope:* creates only. Update and delete inside a transaction is a larger problem
-— deletes cascade, and buffering a cascade against a snapshot that moves under it
-needs a different design.
+#### Ordering and the cascade
+
+A transaction is a **sequence**, not a set. `store.TxOp` carries the six
+operation kinds and each is evaluated against the store as modified by the ones
+before it, so `AddNode` then `DeleteNode` on the same ID nets out to nothing, and
+an edge onto a node the transaction has already deleted is rejected.
+
+Deleting a node cascades to its incident edges — including edges that exist only
+inside the transaction:
+
+```mermaid
+flowchart TD
+    A["DeleteNode(a)"] --> B["cascadeFor(a)"]
+    B --> C["store: incidentEdgeIDsLocked(a)"]
+    B --> D["txView.incident[a]<br/><i>edges this Tx created</i>"]
+    C --> E["filter: still live in this Tx?"]
+    D --> E
+    E --> F["delEdge actions, then delNode"]
+```
+
+The cascade is computed at commit under the lock, never buffered — buffering it
+would resolve against a graph that can still change before the transaction
+commits.
+
+#### resolve → frame → apply
+
+```mermaid
+flowchart LR
+    O["[]TxOp"] --> R["resolve<br/><i>under lock</i>"]
+    R --> L["[]txAction<br/>putNode / putEdge<br/>delNode / delEdge<br/>purge*Index"]
+    L --> W["frame → one WAL batch"]
+    L --> M["apply → delta + indexes"]
+```
+
+Resolution flattens the operations into primitives with no conditionals left in
+them; framing and applying then read **the same list**. An earlier shape
+validated and then re-derived the work while applying — two passes computing the
+same thing from different inputs, which is how a WAL drifts from the state it
+claims to describe.
+
+Index purges are resolved actions too. `Graph.UpdateNode` honours
+`ReindexPolicy == ReindexPurge`; a transaction that skipped it would leave stale
+property-index entries that the non-transactional path removes, so the purge is
+framed and applied with everything else.
+
+*Scope:* property *indexing* is not transactional — `IndexNodeProperties` is a
+separate call and is not buffered. Index *cleanup* is, for the reason above.
 
 ### 5.2 Read path
 
