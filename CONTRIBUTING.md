@@ -206,6 +206,27 @@ rejected.**
 Dead weight in a format hides the bugs that would otherwise surface. That is an
 argument for removing it beyond the space saved.
 
+### Measure the prize before building the thing that wins it
+
+The reverse property-index map was replaced with a sorted array on the strength
+of a *model* saying map machinery was ~62% of index memory. The model was right,
+and the change still failed — but the useful number came from an experiment that
+took two minutes and could have run first:
+
+```
+index with the reverse map disabled → 179.4 B/node
+full index                          → 263.7 B/node   ⇒ reverse map = 84.3 B (90%)
+```
+
+Deliberately breaking a structure to measure its share is cheap, exact, and
+answers "how much is even available here?" before any design work. It also
+decomposes: the same technique showed the array recovered only the map overhead,
+and that **~32 B/entry was value strings pinned by the reverse entries** — a
+component the model had not accounted for at all, and the largest one left.
+
+Do this first for any memory work. A change that recovers 100% of the wrong
+component is worse than no change.
+
 ### Be willing to revert
 
 Bulk index loading was built, tested for equivalence, measured, and **reverted**:

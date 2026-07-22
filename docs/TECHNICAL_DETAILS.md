@@ -855,14 +855,49 @@ stack depth tracks graph depth. DFS is right where it is used —
 
 ### 8.3 Pattern matching
 
-`FindSubgraphMatches` matches a small `Pattern` against a scope. It is **the
-worst path in the codebase**: a 2 000-node scope costs ~23.5 ms and ~399 900
-allocations, roughly 200 per scoped node, because it materialises records the
-matcher then discards.
+`FindSubgraphMatches` matches a small `Pattern` against a scope by backtracking,
+pruned by node- and edge-label constraints. It used to be the worst path in the
+codebase — a 2 000-node scope cost 24.6 ms and 399 950 allocations — and is now
+4.75 ms and 150.
 
-The fix is the one traversal already received — walk adjacency by ID through
-`AdjacencyReader`, reuse candidate buffers, stop building records that are thrown
-away. Not yet done; see [plan.md](plan.md).
+**Candidate building.** For each pattern node, scope members are tested against
+the label postings by binary search. The earlier version loaded each node record
+to read its labels back off it. Scope order is preserved, because candidate order
+decides which matches a `maxMatches`-capped search returns.
+
+**Edge checks — `edgeProbe`.** Backtracking asks "is there an edge from src to
+dst with these labels?" once per candidate pair per pattern edge. That question
+does not need edge records:
+
+```mermaid
+flowchart TD
+    A["probe.exists(src, dst, labels)"] --> B{"memo holds<br/>(src, filter)?"}
+    B -->|yes| D["scan buffered pairs"]
+    B -->|no| C["IncidentEdges → reused buffer<br/><i>(edge ID, far node), no records</i>"]
+    C --> D
+    D --> E{"Neighbour == dst?"}
+    E -->|no| D
+    E -->|yes| F{"more than one<br/>label required?"}
+    F -->|no| G["match — store filter already proved it"]
+    F -->|yes| H["GetEdge — the only record built"]
+```
+
+Two properties hold this together:
+
+- **The store's edge filter is OR; a pattern's labels are AND.** So the filter
+  can prove at most one required label on its own. That is exactly why the
+  no-materialisation fast path is limited to `len(labels) <= 1`.
+- **The memo is keyed on (source, filter).** Backtracking holds the source fixed
+  while iterating every candidate for the next pattern node, so without it the
+  same adjacency is re-walked — and re-locked — once per candidate. This was the
+  *larger* half of the speedup, and invisible to allocation counts: after the
+  record work was removed the path still spent 17 ms doing 150 allocations.
+
+Caching within one search weakens nothing: §10 already states a query is not a
+snapshot, and the previous code offered no cross-call guarantee either.
+
+Correctness rests on `graphene_pattern_test.go`, which compares full match sets
+against a brute-force oracle over five pattern shapes on both backends.
 
 ---
 
@@ -1272,6 +1307,39 @@ the section.
 Correct only if the trigger is *first touch of any kind*, writes included — which
 narrows the benefit to traversal-only and property-free workloads, and saves a
 write-heavy workload nothing.
+
+### 14.8 Rejected: sorted array for the reverse index map
+
+The reverse map (`ref1`/`refN`) is the single largest consumer of memory in this
+engine. Measured directly — by building the index with it disabled — it costs
+**84.3 B/entry, 90% of the property index**, against 9.1 B for the forward
+postings that answer queries.
+
+Replacing it with one array of `{id, propRef}` sorted by id (append fast path for
+monotonic ingest, binary search for lookup, contiguous runs per id so the arity
+split disappears) was built and measured:
+
+| | |
+|---|---:|
+| Index memory | −16.7% |
+| Probe / query path | **no measurable change** — a packed array's locality offsets the extra comparisons |
+| `DeleteNode` with a property index | **+469%** (2.36 µs → 13.42 µs) |
+
+**Rejected on the delete regression.** Deletion memmoves the tail where a map
+delete was O(1), and deleting oldest-first — what expiry and pruning do — is the
+worst case. Speed outranks memory (§ priority order), so 5.7× slower deletes for
+16.7% less memory is the wrong trade. Tombstoning would fix it at the cost of a
+validity check on the probe path and a compaction pass; not worth it for 16.7%.
+
+The experiment's lasting value is the decomposition it forced. Of the 84.3 B, the
+array recovers only the map machinery — **~32 B/entry is value strings pinned by
+the reverse entries**, because a reverse entry keeps the caller's string while the
+forward index keeps only the first one it saw for that value. At cardinality 1
+that is 100k live copies of one distinct string.
+
+That makes value interning the largest remaining lever, and a cardinality-
+dependent one: a clear win on low-cardinality keys, a clear loss on all-distinct
+ones. See plan §5.2.4.
 
 ---
 

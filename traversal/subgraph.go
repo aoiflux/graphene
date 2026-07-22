@@ -58,6 +58,8 @@ func FindSubgraphMatches(
 		return nil, err
 	}
 
+	probe := newEdgeProbe(g)
+
 	var results []SubgraphMatch
 	mapping := make([]store.NodeID, len(pattern.Nodes))
 	for i := range mapping {
@@ -69,7 +71,7 @@ func FindSubgraphMatches(
 	backtrack = func(depth int) error {
 		if depth == len(pattern.Nodes) {
 			// Full mapping found — verify all pattern edges are satisfied.
-			if checkEdges(g, pattern, mapping) {
+			if checkEdges(probe, pattern, mapping) {
 				cp := make([]store.NodeID, len(mapping))
 				copy(cp, mapping)
 				results = append(results, SubgraphMatch{Mapping: cp})
@@ -82,7 +84,7 @@ func FindSubgraphMatches(
 				continue
 			}
 			// Partial edge check: verify edges between already-mapped nodes and this one.
-			if !partialEdgeCheck(g, pattern, mapping, depth, cand) {
+			if !partialEdgeCheck(probe, pattern, mapping, depth, cand) {
 				continue
 			}
 			mapping[depth] = cand
@@ -113,19 +115,57 @@ func FindSubgraphMatches(
 func buildCandidates(g store.GraphStore, pattern *Pattern, scope []store.NodeID) ([][]store.NodeID, error) {
 	candidates := make([][]store.NodeID, len(pattern.Nodes))
 
+	// Label postings, fetched once per distinct label rather than per (scope
+	// node, pattern node) pair. Testing membership against an ascending posting
+	// list is a binary search over IDs; the previous version materialised the
+	// whole node record just to read its labels back off it.
+	//
+	// Scope order is preserved deliberately: candidate order determines which
+	// matches a maxMatches-capped search returns, so reordering here would
+	// silently change results.
+	postings := map[store.NodeType][]store.NodeID{}
+	labelPostings := func(t store.NodeType) ([]store.NodeID, error) {
+		if ids, ok := postings[t]; ok {
+			return ids, nil
+		}
+		ids, err := g.NodesByType(t)
+		if err != nil {
+			return nil, err
+		}
+		postings[t] = ids
+		return ids, nil
+	}
+
 	for i, pn := range pattern.Nodes {
 		if scope != nil {
-			// Filter scope: node must carry all required labels.
-			for _, id := range scope {
-				if len(pn.Labels) == 0 {
-					candidates[i] = append(candidates[i], id)
-					continue
-				}
-				n, err := g.GetNode(id)
+			if len(pn.Labels) == 0 {
+				candidates[i] = append(candidates[i], scope...)
+				continue
+			}
+			lists := make([][]store.NodeID, 0, len(pn.Labels))
+			for _, lbl := range pn.Labels {
+				ids, err := labelPostings(lbl)
 				if err != nil {
-					continue
+					return nil, err
 				}
-				if nodeHasAllLabels(n, pn.Labels) {
+				if len(ids) == 0 {
+					lists = nil
+					break
+				}
+				lists = append(lists, ids)
+			}
+			if lists == nil {
+				continue // some required label has no nodes at all
+			}
+			for _, id := range scope {
+				all := true
+				for _, ids := range lists {
+					if !store.SortedContainsID(ids, id) {
+						all = false
+						break
+					}
+				}
+				if all {
 					candidates[i] = append(candidates[i], id)
 				}
 			}
@@ -160,7 +200,7 @@ func buildCandidates(g store.GraphStore, pattern *Pattern, scope []store.NodeID)
 
 // partialEdgeCheck verifies that all pattern edges between already-committed
 // nodes (indices 0..depth-1) and the candidate at position depth are satisfied.
-func partialEdgeCheck(g store.GraphStore, pattern *Pattern, mapping []store.NodeID, depth int, cand store.NodeID) bool {
+func partialEdgeCheck(probe *edgeProbe, pattern *Pattern, mapping []store.NodeID, depth int, cand store.NodeID) bool {
 	for _, pe := range pattern.Edges {
 		// Only check edges where both endpoints are now committed.
 		srcMapped := pe.SrcPatternID < depth || pe.SrcPatternID == depth
@@ -185,7 +225,7 @@ func partialEdgeCheck(g store.GraphStore, pattern *Pattern, mapping []store.Node
 			continue
 		}
 
-		if !edgeExists(g, srcID, dstID, pe.Labels) {
+		if !probe.exists(srcID, dstID, pe.Labels) {
 			return false
 		}
 	}
@@ -193,28 +233,122 @@ func partialEdgeCheck(g store.GraphStore, pattern *Pattern, mapping []store.Node
 }
 
 // checkEdges verifies all pattern edges against a complete mapping.
-func checkEdges(g store.GraphStore, pattern *Pattern, mapping []store.NodeID) bool {
+func checkEdges(probe *edgeProbe, pattern *Pattern, mapping []store.NodeID) bool {
 	for _, pe := range pattern.Edges {
 		srcID := mapping[pe.SrcPatternID]
 		dstID := mapping[pe.DstPatternID]
-		if !edgeExists(g, srcID, dstID, pe.Labels) {
+		if !probe.exists(srcID, dstID, pe.Labels) {
 			return false
 		}
 	}
 	return true
 }
 
-// edgeExists returns true if there is at least one edge from srcID to dstID
-// whose labels include ALL of the required labels (AND semantics).
-// An empty requiredLabels slice matches any edge.
-func edgeExists(g store.GraphStore, srcID, dstID store.NodeID, requiredLabels []store.EdgeType) bool {
-	// Use the first required label as a filter to narrow candidates, then
-	// check the rest.
+// edgeProbe answers "is there an edge from src to dst with these labels?"
+// without materialising the edges it rejects.
+//
+// This is the hot path of subgraph matching: backtracking asks it once per
+// candidate pair per pattern edge, and the previous version called EdgesOf,
+// which builds a *store.Edge for **every** outbound edge of src just to compare
+// one field on each. On the two-hop benchmark that was ~200 allocations per
+// scoped node.
+//
+// AdjacencyReader.IncidentEdges yields (edge ID, far node) pairs into a caller
+// buffer instead, so the walk allocates nothing and a record is built only for
+// an edge that already matched on endpoint — and only when more than one label
+// has to be checked, which the store's own filter cannot express (it is OR, the
+// pattern's is AND).
+type edgeProbe struct {
+	g   store.GraphStore
+	adj store.AdjacencyReader // nil when the backend does not support it
+	buf []store.IncidentEdge
+
+	// One-entry memo of the last (source, filter) adjacency walk.
+	//
+	// Backtracking holds the source fixed while it iterates every candidate for
+	// the next pattern node, so the same adjacency was being re-walked once per
+	// candidate — an RLock and a filtered scan each time, O(candidates × degree)
+	// where O(degree) suffices. The hit rate on that loop is effectively 100%.
+	//
+	// Caching within a single search does not weaken any guarantee: the
+	// consistency model already states a query is not a snapshot, and the
+	// previous code gave no cross-call guarantee either.
+	memoValid  bool
+	memoSrc    store.NodeID
+	memoFilter store.EdgeType // zero when the walk was unfiltered
+	memoHasFil bool
+}
+
+func newEdgeProbe(g store.GraphStore) *edgeProbe {
+	p := &edgeProbe{g: g}
+	if a, ok := g.(store.AdjacencyReader); ok {
+		p.adj = a
+	}
+	return p
+}
+
+func (p *edgeProbe) exists(srcID, dstID store.NodeID, requiredLabels []store.EdgeType) bool {
+	// The store filter takes OR semantics, so it can only narrow by one label;
+	// the remaining labels are checked against the record.
 	var filter []store.EdgeType
 	if len(requiredLabels) > 0 {
-		filter = []store.EdgeType{requiredLabels[0]}
+		filter = requiredLabels[:1]
 	}
-	edges, err := g.EdgesOf(srcID, store.DirectionOutbound, filter)
+
+	if p.adj == nil {
+		return p.existsFallback(srcID, dstID, filter, requiredLabels)
+	}
+
+	if !p.memoHit(srcID, filter) {
+		var err error
+		p.buf, err = p.adj.IncidentEdges(p.buf[:0], srcID, store.DirectionOutbound, filter)
+		if err != nil {
+			p.memoValid = false
+			return false
+		}
+		p.memoValid = true
+		p.memoSrc = srcID
+		p.memoHasFil = len(filter) > 0
+		if p.memoHasFil {
+			p.memoFilter = filter[0]
+		}
+	}
+
+	for _, ie := range p.buf {
+		if ie.Neighbour != dstID {
+			continue
+		}
+		if len(requiredLabels) <= 1 {
+			// The store's filter already proved the only label required, so the
+			// endpoint match is the whole answer — nothing to materialise.
+			return true
+		}
+		e, err := p.g.GetEdge(ie.Edge)
+		if err != nil {
+			continue
+		}
+		if edgeHasAllLabels(e, requiredLabels) {
+			return true
+		}
+	}
+	return false
+}
+
+// memoHit reports whether buf already holds the adjacency walk for this source
+// and filter.
+func (p *edgeProbe) memoHit(srcID store.NodeID, filter []store.EdgeType) bool {
+	if !p.memoValid || p.memoSrc != srcID {
+		return false
+	}
+	if p.memoHasFil != (len(filter) > 0) {
+		return false
+	}
+	return !p.memoHasFil || p.memoFilter == filter[0]
+}
+
+// existsFallback preserves behaviour for backends without AdjacencyReader.
+func (p *edgeProbe) existsFallback(srcID, dstID store.NodeID, filter, requiredLabels []store.EdgeType) bool {
+	edges, err := p.g.EdgesOf(srcID, store.DirectionOutbound, filter)
 	if err != nil {
 		return false
 	}

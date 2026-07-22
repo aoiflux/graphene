@@ -301,6 +301,32 @@ search that now materialises records only for the final path), `BFS3Hop_Disk`
 20 allocations and 36.3 µs on the disk fixture, against 394 and 113.9 µs for the
 record-returning equivalent.
 
+### Pattern matching — the worst path in the codebase, fixed
+
+`FindPatterns` over a 2 000-node scope was 24.6 ms and **399 950 allocations**,
+roughly 200 per scoped node. Interleaved, 4 rounds, four controls all `~`:
+
+| `Pattern_TwoHop_Scoped` | Before | After | Change |
+|---|---:|---:|---:|
+| time | 24.633 ms | **4.749 ms** | **−80.7%** |
+| B/op | 3 691 KiB | 839 KiB | −77.3% |
+| allocs/op | 399 950 | **150** | **−99.96%** |
+
+Two independent changes, in the order they were found:
+
+1. **Stop materialising discarded records** — the edge check called `EdgesOf`,
+   building a record for every outbound edge just to compare one field. It now
+   walks adjacency IDs and materialises only an edge that already matched on
+   endpoint. Worth −99.96% allocations and −28.8% time.
+2. **Memoise the adjacency walk** — backtracking holds the source fixed while
+   iterating candidates, so the same adjacency was re-walked (and re-locked) once
+   per candidate. A one-entry memo took the remainder: 17.2 ms → 4.75 ms.
+
+The second is the interesting one: after step 1 the benchmark still spent 17 ms
+doing **150 allocations**, so no allocation figure could have pointed at it. The
+larger half of the win was repeated work that allocated nothing, and it only
+became visible once the allocations were gone.
+
 ### Driver selection — a selective label no longer loses to a weak filter
 
 The disk planner took any equality driver unconditionally. A query naming a
@@ -519,23 +545,20 @@ Recorded because they were published as regressions and should not stay that way
 
 ## What is still slow
 
-- **Pattern matching is now the worst path in the codebase.** `FindPatterns` over
-  a 2 000-node scope: **23.5 ms and 399 900 allocations**, unchanged by any of
-  this work — roughly 200 allocations per scoped node. It is the single largest
-  allocation source left.
 - **Cold open on an uncompacted WAL: 727 ms for 10 000 nodes**, against 60.6 ms
   to reopen a *compacted* 50 000-node store. Phase 4 fixed the compacted path;
   replay of an uncompacted log was never optimised and is ~60× worse per node.
+  With pattern matching fixed, this is the largest remaining number.
 - **`Contains` filters are a scan and will stay one.** No ordering can bound a
   substring match; a trigram index is the only route and is out of scope.
 - **Range and prefix are only fast on *declared* keys.** An undeclared key still
   scans its buckets — better than the original full-index materialisation, but
   linear.
-- **Property-index memory, ~107 B/entry.** Three copies of each ID plus the value
-  strings. The largest P1 lead.
-- **Edge property blobs are cloned on every materialisation.** `rawEdgeToStore`
-  copies the blob whenever a CSR edge becomes a `*store.Edge`, and traversal
-  never reads it — costs both time and heap.
+- **Property-index memory.** The reverse map is **84.3 B/entry — 90% of the
+  index**, against 9.1 B for the forward postings. A sorted-array replacement was
+  built and reverted (it made deletes 5.7× slower); the largest remaining
+  component is **value strings pinned by reverse entries, ~32 B/entry**. See
+  [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md) §14.8.
 
 ## Reproducing
 
