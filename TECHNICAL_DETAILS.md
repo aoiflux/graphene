@@ -212,7 +212,7 @@ Two files per store directory: `graphene.csr` and `graphene.wal`.
 | Offset | Size | Field | Since |
 |---:|---:|---|---|
 | 0 | 4 | magic `GCSR` | v2 |
-| 4 | 2 | version | v2 |
+| 4 | 2 | version (2–7 readable, 7 written) | v2 |
 | 6 | 8 | node count | v2 |
 | 14 | 8 | edge count | v2 |
 | 22 | 8 | node sequence high-water mark | v5 |
@@ -256,7 +256,7 @@ properties until it does.
 | v5 | sequence high-water marks added |
 | v6 | property-index section + `indexOffset` |
 
-All of v2–v6 are readable; v6 is written. Older files upgrade on the next
+All of v2–v7 are readable; v7 is written. Older files upgrade on the next
 `Compact()`.
 
 **Two header fields worth explaining:**
@@ -879,10 +879,21 @@ lingers in the ring only when another goroutine holds `writeMu` at that instant.
 page cache for a dead process, but nothing has been forced to the platter since
 the last `Compact()` or `Close()`.
 
-**This is a known gap, not a design choice.** It was found by tracing the write
-path during bulk-write planning, and the previous text here — "recoverable once
-its WAL append returns" — was simply wrong. A durability policy (sync-per-batch,
-caller-controlled, or periodic) is planned; see `plan.md` §5.1.1.
+**The policy, now that one exists:**
+
+| Write | Durable when |
+|---|---|
+| Batch (`AddNodesBatch` / `AddEdgesBatch`) | **at commit** — `AppendBatch` fsyncs by default; `SetSyncOnCommit(false)` opts out |
+| Individual | on `Sync()`, `Compact()`, or `Close()` |
+
+Individual writes are not synced per call by design: an fsync per `AddNode` turns
+a ~6 µs operation into a ~1 ms one. `WAL.Sync` (exposed as `Store.Sync` and
+`Graph.Sync`) drains and fsyncs without rebuilding the CSR, so a caller can
+establish a durability point for ~1 ms instead of the ~64 ms a `Compact()` costs.
+
+The previous text here — "recoverable once its WAL append returns" — was simply
+wrong, and was found by tracing the write path during bulk-write planning rather
+than by any test.
 
 Space held by deleted or superseded records is reclaimed at the next `Compact()`.
 

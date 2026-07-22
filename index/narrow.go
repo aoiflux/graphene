@@ -196,7 +196,7 @@ func (p *PropertyIndex) probeEdges(candidates []store.EdgeID, f store.PropertyFi
 func postingsMatch[T entityID](p *postings[T], id T, f store.PropertyFilter, ordered bool) bool {
 	matched := false
 	p.forEachRef(id, func(ref propRef) bool {
-		if ref.key != f.Key {
+		if p.keyName(ref.keyID) != f.Key {
 			return true
 		}
 		v := []byte(ref.value)

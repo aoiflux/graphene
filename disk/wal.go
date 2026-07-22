@@ -647,3 +647,27 @@ func applyWALRecord(cb ReplayCallbacks, recType byte, payload []byte) error {
 	}
 	return nil
 }
+
+// Sync flushes queued records and forces them to the platter.
+//
+// This is the cheap durability point. Before it existed the only ways to make a
+// write durable were Checkpoint (via Compact, which rebuilds the whole CSR) or
+// Close — so a caller wanting "everything so far is safe" had to pay a full
+// compaction for it.
+func (w *WAL) Sync() error {
+	if w.closed.Load() != 0 {
+		return fmt.Errorf("wal sync: closed")
+	}
+	if !w.enterAppend() {
+		return fmt.Errorf("wal sync: closed")
+	}
+	defer w.inFlight.Add(-1)
+
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+
+	if err := w.drainQueuedLocked(); err != nil {
+		return err
+	}
+	return w.file.Sync()
+}

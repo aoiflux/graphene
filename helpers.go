@@ -730,3 +730,19 @@ func (g *Graph) ExplainEdgeQuery(q store.EdgeQuery) (store.QueryPlan, error) {
 	}
 	return ex.ExplainEdgeQuery(q)
 }
+
+// Sync forces everything written so far to durable storage, returning once it
+// survives power loss.
+//
+// This matters because individual writes are *not* synced as they happen: an
+// fsync per AddNode would turn a ~6 µs operation into a ~1 ms one. Batch commits
+// sync by default; single writes rely on this, on Compact, or on Close.
+//
+// On a backend without durability — the in-memory store — this is a no-op and
+// returns nil.
+func (g *Graph) Sync() error {
+	if s, ok := g.GraphStore.(store.Syncer); ok {
+		return s.Sync()
+	}
+	return nil
+}

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"sort"
 	"testing"
 
 	"github.com/aoiflux/graphene"
@@ -279,6 +280,79 @@ func BenchmarkBulkWrite_AddNodes_Disk_NoSync(b *testing.B) {
 				b.StartTimer()
 			}
 			b.ReportMetric(float64(n), "nodes/op")
+		})
+	}
+}
+
+// --- Step 8 probe: is a sorted walk worth building? ---------------------
+//
+// The disk CSR is a flat array indexed by ID, so ascending IDs walk memory
+// sequentially and shuffled ones thrash cache — measured at up to 3.3× on a 100k
+// batch. The proposed optimisation is to sort internally and permute the results
+// back into request order.
+//
+// That is an *upper bound*, not a result: the sort and the permutation have to be
+// paid out of the win. This prototypes the whole optimisation in the benchmark —
+// allocate pairs, sort, call, permute — so the real cost is measured before any
+// production code is written for it.
+
+type idPos struct {
+	id  store.NodeID
+	pos int
+}
+
+// sortedWalk is what the optimisation would do, cost included.
+func sortedWalk(g *graphene.Graph, ids []store.NodeID) ([]*store.Node, error) {
+	pairs := make([]idPos, len(ids))
+	for i, id := range ids {
+		pairs[i] = idPos{id: id, pos: i}
+	}
+	sort.Slice(pairs, func(a, b int) bool { return pairs[a].id < pairs[b].id })
+
+	sorted := make([]store.NodeID, len(pairs))
+	for i, p := range pairs {
+		sorted[i] = p.id
+	}
+	found, _, err := g.GetNodes(sorted)
+	if err != nil {
+		return nil, err
+	}
+	// Permute back into request order.
+	out := make([]*store.Node, len(found))
+	for i, n := range found {
+		out[pairs[i].pos] = n
+	}
+	return out, nil
+}
+
+func BenchmarkBulkRead_Shuffled_Direct_Disk(b *testing.B) {
+	f := diskGraph()
+	for _, n := range []int{10_000, 100_000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			ids := idsShuffled(f, n)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, _, err := f.g.GetNodes(ids); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkBulkRead_Shuffled_SortedWalk_Disk(b *testing.B) {
+	f := diskGraph()
+	for _, n := range []int{10_000, 100_000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			ids := idsShuffled(f, n)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := sortedWalk(f.g, ids); err != nil {
+					b.Fatal(err)
+				}
+			}
 		})
 	}
 }

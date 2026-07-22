@@ -343,7 +343,7 @@ never before quantified.
 
 Reported in full. Each is a trade, and the axis that won is named.
 
-### The one that matters most: property-index memory, +22–53%
+### The one that matters most: property-index memory, +19–54%
 
 This is a **P1 regression**, it is not noise, and it is the price of the P0 wins
 above.
@@ -352,13 +352,13 @@ above.
 |---|---:|---:|---:|
 | *Topology only, memory* | 446.1 | 446.2 | **+0.02%** |
 | *No property index* | 170.1 | 170.2 | **+0.06%** |
-| Memory store + property index | 563.8 | **777.3** | +37.9% |
-| Disk store + property index | 388.4 | **628.6** | +61.8% |
-| Index at cardinality 1 | 179.0 | **274.1** | +53.1% |
-| Index at cardinality 100 | 180.5 | 275.5 | +52.6% |
-| Index at cardinality 10 000 | 194.0 | 285.9 | +47.4% |
-| Index, all values distinct | 281.1 | 344.2 | +22.4% |
-| On-disk file size | 248.0 | **223.0** | −10.08% |
+| Memory store + property index | 563.8 | **744.6** | +32.1% |
+| Disk store + property index | 388.4 | **597.0** | +53.7% |
+| Index at cardinality 1 | 179.0 | **263.6** | +47.3% |
+| Index at cardinality 100 | 180.5 | 265.1 | +46.9% |
+| Index at cardinality 10 000 | 194.0 | 275.4 | +42.0% |
+| Index, all values distinct | 281.1 | 333.7 | +18.7% |
+| On-disk file size | 248.0 | **175.0** | **−29.4%** ¹ |
 
 The first two rows are controls, and they are what make the rest interpretable:
 both sit at ~0%, so **the entire increase lives in the property index**, not in
@@ -383,7 +383,12 @@ are *shared* (+65% at cardinality 1) and mildest where every value is distinct
 (+30%). At low cardinality the forward map is tiny while the reverse map still
 holds one entry per entity, so the reverse map dominates the ratio.
 
-**Partly recovered: the reverse map is now split by arity.** It was
+**Partly recovered, twice.** Two changes have taken **32 B/node** off the
+three-key fixture between them, both confirmed by the same signature: a constant
+per-entry saving that reproduces across every cardinality and multiplies by the
+key count.
+
+**One — the reverse map is split by arity.** It was
 `map[T][]propRef`, allocating a one-element backing array per entity on top of
 the map entry — and sharding by key had quietly made one entry per shard the
 universal case, since each key lives in exactly one shard. The single case is now
@@ -396,11 +401,20 @@ confirming itself rather than a number that merely moved the right way; the
 no-index control was unchanged, so the saving is attributable. No speed
 regression was detected on the delete, registration, lookup or query paths.
 
-**What is left**, in the order worth trying: the map entry itself and the two
-string headers in `propRef`, which needs value interning — measured at ~5% on its
-own and declined at the time, but the calculus changes now the cheaper win is
-banked. Compressing the postings lists is the obvious idea and the wrong one:
-they are 8 B of a 125 B floor, so the ceiling on that work is ~5%.
+**Two — the key in `propRef` is interned.** A shard sees a handful of keys but
+holds a `propRef` per *(entity, key)*, so a 16-byte string header was describing
+one of a handful of strings, hundreds of thousands of times. Now a `uint32`:
+**−10.5 B per entry**, on every cardinality, with the no-index control unchanged.
+
+**What is left, and why it is not being taken.** Interning the *value* too would
+shrink `propRef` to 8 bytes — roughly −31 B/entry — but the value table costs
+~51 B per *distinct* value, so it breaks even at ~1.65 entities per value: a win
+on low-cardinality keys, a loss on unique ones like `sha256`, ~5–6% on a realistic
+mix. And every value comparison on the residual probe path would gain a table
+indirection. That is P0 spent for 5% of P1.
+
+Compressing the postings lists is the other obvious idea and also wrong: they are
+8 B of a ~93 B floor.
 
 ### Latency and allocation
 

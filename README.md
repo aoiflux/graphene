@@ -151,10 +151,10 @@ regression in the project and it is the direct price of the speed above:
 |---|---:|---:|
 | *Topology only* | 446.1 | 446.2 (+0.02%) |
 | *No property index* | 170.1 | 170.2 (+0.06%) |
-| With property index (memory) | 563.8 | **777.3** (+37.9%) |
-| With property index (disk) | 388.4 | **628.6** (+61.8%) |
-| Index at cardinality 1 | 179.0 | **274.1** (+53.1%) |
-| Index, all values distinct | 281.1 | 344.2 (+22.4%) |
+| With property index (memory) | 563.8 | **744.6** (+32.1%) |
+| With property index (disk) | 388.4 | **597.0** (+53.7%) |
+| Index at cardinality 1 | 179.0 | **263.6** (+47.3%) |
+| Index, all values distinct | 281.1 | 333.7 (+18.7%) |
 
 The first two rows are controls at ~0%, which places the whole increase inside
 the property index rather than the graph itself. It comes from the reverse

@@ -411,10 +411,6 @@ func (g *CSRGraph) EdgeCount() int {
 //	[nodeSeqHW:8][edgeSeqHW:8][indexOffset:8]
 //	[nodeRecord * nodeCount] (each: id:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + propLen:4 + props:N)
 //	[rawEdge * edgeCount]    (each: id:8 + src:8 + dst:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + weight:4 + propLen:4 + props:N)
-//	[outOffset * (maxNodeID+2):8 each]
-//	[outEdges * edgeCount:8 each]
-//	[inOffset * (maxNodeID+2):8 each]
-//	[inEdges * edgeCount:8 each]
 //	--- index section, at byte indexOffset (v6+) ---
 //	[magic:4]["GIDX"]
 //	[nodePropCount:8][entry * nodePropCount] (each: id:8 + keyLen:2 + key + valLen:4 + val)
@@ -430,6 +426,11 @@ func (g *CSRGraph) EdgeCount() int {
 // The label postings are NOT persisted: they are derivable from the node and
 // edge records in a single pass at load time (see buildLabelIndex), so storing
 // them would add file size and a consistency risk to save very little.
+//
+// The adjacency arrays are NOT persisted either, for the same reason — Build()
+// reconstructs them from the records. They *were* written through v6, and never
+// read: the reader has always rebuilt them and then used indexOffset to skip
+// whatever lay between. Roughly a fifth of the file was that skipped region.
 //
 // indexOffset makes the index section directly addressable, so the reader never
 // has to compute its position from the adjacency array sizes.
@@ -503,19 +504,14 @@ func (g *CSRGraph) SerialiseWithIndex(nodeProps []index.NodePropEntry, edgeProps
 		buf.Write(e.Properties)
 	}
 
-	// Adjacency arrays
-	for _, v := range g.outOffset {
-		writeUint64(&buf, v)
-	}
-	for _, v := range g.outEdges {
-		writeUint64(&buf, uint64(v))
-	}
-	for _, v := range g.inOffset {
-		writeUint64(&buf, v)
-	}
-	for _, v := range g.inEdges {
-		writeUint64(&buf, uint64(v))
-	}
+	// No adjacency arrays. They were written here through v6 and never read
+	// back: deserialiseCSR rebuilds them with Build() from the records it has
+	// just parsed, then jumps straight to indexOffset. Proven by
+	// TestAdjacencyArraysAreDeadBytes, which corrupts the region and observes no
+	// difference.
+	//
+	// On a 100k-node fixture that was ~4.8 MB of a ~22 MB file, written on every
+	// Compact and read by nobody.
 
 	// Index section
 	indexOffset := buf.Len()

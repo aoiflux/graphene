@@ -108,7 +108,8 @@ const (
 	csrVersionWithU16Labels  = 4
 	csrVersionWithSeqHW      = 5
 	csrVersionWithPropIndex  = 6
-	csrVersionCurrent        = csrVersionWithPropIndex
+	csrVersionNoAdjacency    = 7 // stopped writing the never-read adjacency arrays
+	csrVersionCurrent        = csrVersionNoAdjacency
 	csrV6HeaderSize          = 46 // magic4 + version2 + counts16 + seqHW16 + indexOffset8
 	csrV5HeaderSize          = 38
 	csrIndexSectionMagic     = "GIDX"
@@ -2626,7 +2627,19 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		if version >= csrVersionWithU16Labels {
 			labelBytes = labelCount * currentLabelBytesPerValue
 		}
-		if pos+labelBytes+8 > len(data) {
+		// Bytes still required after the labels: the property field. v2 reserved
+		// 8 bytes for it; v3+ writes a 4-byte length followed by the blob.
+		//
+		// This used to demand 8 unconditionally, which over-reads by 4 on v3+.
+		// It never fired because the file always carried trailing adjacency
+		// arrays that supplied slack — arrays the reader never actually read. The
+		// moment those stopped being written, a perfectly valid file ending at
+		// its last record started being rejected.
+		nodeTail := nodePayloadPropLenBytes
+		if version == csrVersionV2 {
+			nodeTail = 8
+		}
+		if pos+labelBytes+nodeTail > len(data) {
 			return nil, nil, fmt.Errorf("deserialiseCSR: truncated node labels %d", i)
 		}
 		labels := make([]store.NodeType, labelCount)
@@ -2664,7 +2677,13 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		if version >= csrVersionWithU16Labels {
 			labelBytes = labelCount * currentLabelBytesPerValue
 		}
-		if pos+labelBytes+12 > len(data) {
+		// weight(4) + the property field, which is 8 on v2 and 4 on v3+.
+		// Same over-strict constant as the node case above.
+		edgeTail := 4 + nodePayloadPropLenBytes
+		if version == csrVersionV2 {
+			edgeTail = 4 + 8
+		}
+		if pos+labelBytes+edgeTail > len(data) {
 			return nil, nil, fmt.Errorf("deserialiseCSR: truncated edge labels %d", i)
 		}
 		labels := make([]store.EdgeType, labelCount)
@@ -3347,4 +3366,16 @@ func compactEdges(slots []*store.Edge, ids []store.EdgeID) ([]*store.Edge, []sto
 		found = append(found, e)
 	}
 	return found, missing
+}
+
+// Sync forces everything written so far to durable storage.
+//
+// Single writes are not synced individually — that would cost an fsync per
+// AddNode, turning a ~6 µs operation into a ~1 ms one. Batch commits do sync by
+// default (see SetSyncOnCommit); for individual writes this is how a caller
+// establishes a durability point without paying for a full Compact.
+//
+// After it returns, everything written before the call survives power loss.
+func (s *Store) Sync() error {
+	return s.wal.Sync()
 }

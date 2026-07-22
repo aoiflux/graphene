@@ -237,7 +237,7 @@ func (p *PropertyIndex) RemoveNode(id store.NodeID) {
 		sh.mu.Lock()
 		if len(sh.orderedNodeKeys) > 0 {
 			sh.nodes.forEachRef(id, func(ref propRef) bool {
-				if idx := sh.orderedNodeKeys[ref.key]; idx != nil {
+				if idx := sh.orderedNodeKeys[sh.nodes.keyName(ref.keyID)]; idx != nil {
 					idx.remove(id, ref.value)
 				}
 				return true
@@ -256,7 +256,7 @@ func (p *PropertyIndex) RemoveEdge(id store.EdgeID) {
 		sh.mu.Lock()
 		if len(sh.orderedEdgeKeys) > 0 {
 			sh.edges.forEachRef(id, func(ref propRef) bool {
-				if idx := sh.orderedEdgeKeys[ref.key]; idx != nil {
+				if idx := sh.orderedEdgeKeys[sh.edges.keyName(ref.keyID)]; idx != nil {
 					idx.remove(id, ref.value)
 				}
 				return true
@@ -506,8 +506,14 @@ type entityID interface {
 
 // propRef is one (key, value) pair an entity is registered under, used by the
 // reverse map to make removal proportional to the entity's own entries.
+// propRef is one reverse entry: which key/value an entity was registered under.
+//
+// The key is held as an interned id rather than a string. A shard owns only a
+// handful of distinct keys, but a propRef exists per (entity, key) — so the
+// string header was paid hundreds of thousands of times to describe a handful of
+// strings. Four bytes plus padding replaces sixteen.
 type propRef struct {
-	key   string
+	keyID uint32
 	value string
 }
 
@@ -535,7 +541,27 @@ type postings[T entityID] struct {
 	// Entries per key, so the query planner can cost a scan of a key without
 	// walking that key's buckets to find out how big it is.
 	perKey map[string]int
+
+	// Key interning. A shard sees only the keys that hash to it, so these stay
+	// tiny — which is the whole point: the table is paid once per key, the
+	// saving once per entry.
+	keyNames []string
+	keyIDs   map[string]uint32
 }
+
+// internKey returns a stable id for key within this postings set.
+func (p *postings[T]) internKey(key string) uint32 {
+	if id, ok := p.keyIDs[key]; ok {
+		return id
+	}
+	id := uint32(len(p.keyNames))
+	p.keyNames = append(p.keyNames, key)
+	p.keyIDs[key] = id
+	return id
+}
+
+// keyName resolves an interned id back to its key.
+func (p *postings[T]) keyName(id uint32) string { return p.keyNames[id] }
 
 // forEachRef visits every reverse entry registered for id. Return false from fn
 // to stop early. It allocates nothing in the common single-entry case.
@@ -604,6 +630,7 @@ func newPostings[T entityID]() postings[T] {
 		ref1:   make(map[T]propRef),
 		refN:   make(map[T][]propRef),
 		perKey: make(map[string]int),
+		keyIDs: make(map[string]uint32),
 	}
 }
 
@@ -619,7 +646,7 @@ func (p *postings[T]) add(id T, key, value string) {
 		return
 	}
 	bucket[value] = ids
-	p.addRef(id, propRef{key: key, value: value})
+	p.addRef(id, propRef{keyID: p.internKey(key), value: value})
 	p.perKey[key]++
 	p.count++
 }
@@ -630,15 +657,16 @@ func (p *postings[T]) remove(id T) {
 		return
 	}
 	p.forEachRef(id, func(ref propRef) bool {
-		bucket := p.byKey[ref.key]
+		key := p.keyName(ref.keyID)
+		bucket := p.byKey[key]
 		if bucket == nil {
 			return true
 		}
 		ids, removed := deleteSorted(bucket[ref.value], id)
 		if removed {
 			p.count--
-			if p.perKey[ref.key]--; p.perKey[ref.key] <= 0 {
-				delete(p.perKey, ref.key)
+			if p.perKey[key]--; p.perKey[key] <= 0 {
+				delete(p.perKey, key)
 			}
 		}
 		if len(ids) == 0 {
@@ -647,7 +675,7 @@ func (p *postings[T]) remove(id T) {
 			bucket[ref.value] = ids
 		}
 		if len(bucket) == 0 {
-			delete(p.byKey, ref.key)
+			delete(p.byKey, key)
 		}
 		return true
 	})
@@ -743,7 +771,7 @@ func (p *postings[T]) verify(kind string) error {
 					refs = make(map[propRef]int)
 					seen[id] = refs
 				}
-				refs[propRef{key: key, value: value}]++
+				refs[propRef{keyID: p.internKey(key), value: value}]++
 				total++
 			}
 		}
@@ -790,7 +818,7 @@ func (p *postings[T]) verify(kind string) error {
 		p.forEachRef(id, func(ref propRef) bool {
 			if fromPostings[ref] != 1 {
 				verr = fmt.Errorf("%s index: id %d reverse ref (%q=%q) appears %d times in postings",
-					kind, uint64(id), ref.key, ref.value, fromPostings[ref])
+					kind, uint64(id), p.keyName(ref.keyID), ref.value, fromPostings[ref])
 				return false
 			}
 			return true

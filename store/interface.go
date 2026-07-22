@@ -323,3 +323,10 @@ type BatchReader interface {
 	GetNodesBatch(ids []NodeID) (found []*Node, missing []NodeID)
 	GetEdgesBatch(ids []EdgeID) (found []*Edge, missing []EdgeID)
 }
+
+// Syncer is implemented by stores that can force pending writes to durable
+// storage. Backends without durability (the in-memory store) do not implement
+// it, and Graph.Sync is a no-op for them.
+type Syncer interface {
+	Sync() error
+}

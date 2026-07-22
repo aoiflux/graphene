@@ -728,9 +728,22 @@ readers sample before each lookup, which is what makes the two distinguishable.
   bytes already in the file. So the practical exposure is **power loss, not
   process crash**.
 
-  **If you need durability at a known point, call `Compact()` or `Close()`.**
-  Treat everything since the last one as at risk. This is a known gap and a
-  durability policy is planned; see `plan.md` §5.1.1.
+  **`Sync()` is the cheap durability point:**
+
+  ```go
+  func (g *Graph) Sync() error   // returns once prior writes survive power loss
+  ```
+
+  | Situation | What makes it durable |
+  |---|---|
+  | Batch write (`AddNodes`/`AddEdges`) | **automatic** — fsync at commit, unless disabled |
+  | Individual writes | **`Sync()`**, or `Compact()`, or `Close()` |
+
+  Individual writes are deliberately *not* synced as they happen: an fsync per
+  `AddNode` would turn a ~6 µs operation into a ~1 ms one. `Sync()` exists so a
+  caller can establish a durability point without paying for a full `Compact()`.
+  It is a no-op on the in-memory backend, so callers need not know which backend
+  they hold.
 
   Space held by deleted or superseded records is reclaimed at the next
   `Compact()`.
@@ -1170,13 +1183,13 @@ append point. `Parallel_AddNode` is flat across cores by design. Parallelise you
 | Configuration | Bytes per node |
 |---|---:|
 | Topology only (memory) | ~446 B |
-| + property index, 3 keys | ~777 B |
+| + property index, 3 keys | ~745 B |
 | Topology only (disk) | ~298 B |
-| + property index, 3 keys | ~629 B |
+| + property index, 3 keys | ~597 B |
 | Half-deleted, uncompacted | **~715 B per live node** |
 | Same, after `Compact()` | **~158 B** |
 
-Two things follow. **Indexing is where memory goes** — roughly 104–174 B per
+Two things follow. **Indexing is where memory goes** — roughly 93–163 B per
 indexed entry depending on cardinality, so a key indexed on every node is a real
 cost. And **compaction is the single biggest memory lever** on a store that
 deletes.

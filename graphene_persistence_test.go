@@ -118,8 +118,8 @@ func TestCSRv6_PropertyIndexSurvivesWithoutWAL(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if v := csrVersion(t, dir); v != 6 {
-		t.Fatalf("CSR version = %d, want 6", v)
+	if v := csrVersion(t, dir); v != 7 {
+		t.Fatalf("CSR version = %d, want 7", v)
 	}
 
 	// Compaction used to re-emit every property entry into the fresh WAL. It
@@ -309,8 +309,8 @@ func TestCSRv5_StillReadableAndUpgrades(t *testing.T) {
 	if err := reopened.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if v := csrVersion(t, dir); v != 6 {
-		t.Fatalf("CSR version after upgrade compact = %d, want 6", v)
+	if v := csrVersion(t, dir); v != 7 {
+		t.Fatalf("CSR version after upgrade compact = %d, want 7", v)
 	}
 }
 
