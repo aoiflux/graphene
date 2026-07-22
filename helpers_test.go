@@ -1,7 +1,6 @@
 package graphene_test
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/aoiflux/graphene"
@@ -63,9 +62,12 @@ func TestStats(t *testing.T) {
 func TestGetNodes(t *testing.T) {
 	g, caseID, file1, _, art1, _, _ := newTestGraph(t)
 	ids := []store.NodeID{caseID, file1, art1}
-	nodes, err := g.GetNodes(ids)
+	nodes, missing, err := g.GetNodes(ids)
 	if err != nil {
 		t.Fatalf("GetNodes: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("GetNodes: unexpected missing %v", missing)
 	}
 	if len(nodes) != 3 {
 		t.Fatalf("GetNodes: got %d nodes, want 3", len(nodes))
@@ -78,12 +80,40 @@ func TestGetNodes(t *testing.T) {
 	}
 }
 
-func TestGetNodes_NotFound(t *testing.T) {
+// A missing ID is reported, not returned as an error. Under the read model an ID
+// can be deleted between the call that produced it and the call that resolves it,
+// so this is an expected outcome rather than an exceptional one.
+func TestGetNodes_MissingIsReportedNotAnError(t *testing.T) {
 	g := graphene.NewInMemory()
-	_, err := g.GetNodes([]store.NodeID{999})
-	var nf *store.ErrNotFound
-	if !errors.As(err, &nf) {
-		t.Errorf("expected ErrNotFound, got %v", err)
+	live, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeTag}})
+
+	found, missing, err := g.GetNodes([]store.NodeID{live, 999, live})
+	if err != nil {
+		t.Fatalf("GetNodes: unexpected error %v", err)
+	}
+	if len(found) != 2 || found[0].ID != live || found[1].ID != live {
+		t.Fatalf("found = %v, want the live node twice", found)
+	}
+	if len(missing) != 1 || missing[0] != 999 {
+		t.Fatalf("missing = %v, want [999]", missing)
+	}
+}
+
+// Order is preserved, and duplicates resolve once per occurrence.
+func TestGetNodes_PreservesOrderAroundMisses(t *testing.T) {
+	g := graphene.NewInMemory()
+	a, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeTag}})
+	b, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}})
+
+	found, missing, err := g.GetNodes([]store.NodeID{a, 999, b, 998})
+	if err != nil {
+		t.Fatalf("GetNodes: %v", err)
+	}
+	if len(found) != 2 || found[0].ID != a || found[1].ID != b {
+		t.Fatalf("order not preserved: %v", found)
+	}
+	if len(missing) != 2 || missing[0] != 999 || missing[1] != 998 {
+		t.Fatalf("missing = %v, want [999 998] in request order", missing)
 	}
 }
 
@@ -94,9 +124,12 @@ func TestGetEdges(t *testing.T) {
 	e1, _ := g.AddEdge(&store.Edge{Src: n1, Dst: n2, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
 	e2, _ := g.AddEdge(&store.Edge{Src: n2, Dst: n1, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
 
-	edges, err := g.GetEdges([]store.EdgeID{e1, e2})
+	edges, missing, err := g.GetEdges([]store.EdgeID{e1, e2})
 	if err != nil {
 		t.Fatalf("GetEdges: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("GetEdges: unexpected missing %v", missing)
 	}
 	if len(edges) != 2 {
 		t.Fatalf("GetEdges: got %d, want 2", len(edges))
@@ -106,12 +139,17 @@ func TestGetEdges(t *testing.T) {
 	}
 }
 
-func TestGetEdges_NotFound(t *testing.T) {
+func TestGetEdges_MissingIsReportedNotAnError(t *testing.T) {
 	g := graphene.NewInMemory()
-	_, err := g.GetEdges([]store.EdgeID{999})
-	var nf *store.ErrNotFound
-	if !errors.As(err, &nf) {
-		t.Errorf("expected ErrNotFound, got %v", err)
+	found, missing, err := g.GetEdges([]store.EdgeID{999})
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if len(found) != 0 {
+		t.Errorf("found = %v, want empty", found)
+	}
+	if len(missing) != 1 || missing[0] != 999 {
+		t.Errorf("missing = %v, want [999]", missing)
 	}
 }
 

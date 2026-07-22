@@ -31,7 +31,6 @@
 
     <g font-family="Segoe UI, Tahoma, sans-serif" fill="#F3F9FF">
         <text x="220" y="112" font-size="72" font-weight="700" letter-spacing="1">GrapheneDB</text>
-        <text x="220" y="156" font-size="26" fill="#8EE3F5">Preview build: embeddable graph engine
-            under active validation</text>
+        <text x="220" y="156" font-size="26" fill="#8EE3F5">Preview build: embeddable graph engine</text>
     </g>
 </svg>

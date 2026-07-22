@@ -69,6 +69,9 @@ type Store struct {
 	// Property index (in-memory; rebuilt from WAL on restart).
 	propIdx *index.PropertyIndex
 
+	// syncOnCommit forces an fsync at each batch commit. Guarded by mu.
+	syncOnCommit bool
+
 	// reindexPolicy governs what updates do to propIdx. Guarded by mu.
 	reindexPolicy store.ReindexPolicy
 
@@ -136,6 +139,7 @@ func Open(dir string) (*Store, error) {
 		deltaNodesByType: make(map[store.NodeType][]store.NodeID),
 		deltaEdgesByType: make(map[store.EdgeType][]store.EdgeID),
 		propIdx:          index.NewPropertyIndex(),
+		syncOnCommit:     true,
 	}
 
 	// From here on the WAL file handle is open, so every failure path has to
@@ -237,13 +241,21 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 		stored[i] = node
 	}
 
-	committed := 0
-	for i := range stored {
-		if err := s.wal.AppendNode(marshalNode(stored[i])); err != nil {
-			s.commitNodesBatch(stored[:committed])
-			return ids[:committed], fmt.Errorf("AddNodesBatch: wal: %w", err)
-		}
-		committed++
+	// One framed, transactional write for the whole batch. Previously this was
+	// one WAL append — and one write syscall — per node.
+	batch := newWALBatch(len(stored) * 64)
+	for _, n := range stored {
+		node := n
+		batch.addWith(walRecordNode, func(dst []byte) []byte {
+			return appendMarshalledNode(dst, node)
+		})
+	}
+	if err := s.wal.AppendBatch(batch.finish(), s.syncOnCommit); err != nil {
+		// Apply nothing. The commit marker never reached the file, so replay will
+		// discard whatever partial bytes did — that absence *is* the rollback.
+		// The IDs assigned above are simply never used, which is allowed: IDs are
+		// monotonic and never reused, but were never promised to be dense.
+		return nil, fmt.Errorf("AddNodesBatch: wal: %w", err)
 	}
 
 	s.commitNodesBatch(stored)
@@ -305,11 +317,14 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	defer s.mu.Unlock()
 
 	for i, e := range edges {
+		// Validation happens before anything is written, so a failure here means
+		// the transaction never started. Returning ids[:i] would name IDs for
+		// edges that do not exist — the old non-atomic behaviour, and now wrong.
 		if !s.nodeExistsLocked(e.Src) {
-			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Src}
+			return nil, &store.ErrInvalidEdge{MissingID: e.Src}
 		}
 		if !s.nodeExistsLocked(e.Dst) {
-			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Dst}
+			return nil, &store.ErrInvalidEdge{MissingID: e.Dst}
 		}
 
 		id := store.EdgeID(s.edgeSeq.Add(1))
@@ -332,13 +347,15 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 		stored[i] = edge
 	}
 
-	committed := 0
-	for i := range stored {
-		if err := s.wal.AppendEdge(marshalEdge(stored[i])); err != nil {
-			s.commitEdgesBatch(stored[:committed])
-			return ids[:committed], fmt.Errorf("AddEdgesBatch: wal: %w", err)
-		}
-		committed++
+	batch := newWALBatch(len(stored) * 80)
+	for _, e := range stored {
+		edge := e
+		batch.addWith(walRecordEdge, func(dst []byte) []byte {
+			return appendMarshalledEdge(dst, edge)
+		})
+	}
+	if err := s.wal.AppendBatch(batch.finish(), s.syncOnCommit); err != nil {
+		return nil, fmt.Errorf("AddEdgesBatch: wal: %w", err)
 	}
 
 	s.commitEdgesBatch(stored)
@@ -1164,6 +1181,22 @@ func (s *Store) EdgeCount() (uint64, error) {
 
 func (s *Store) Close() error {
 	return s.wal.Close()
+}
+
+// SetSyncOnCommit controls whether a batch write is flushed to the platter
+// before it returns.
+//
+// Default is true: a transaction whose commit is not fsynced is not a commit,
+// and batching gives the engine its first well-defined durability boundary. The
+// cost is one fsync per batch (~0.1–1 ms depending on device), which a batch of
+// any size amortises well and a batch of one does not.
+//
+// Turn it off only if you sync explicitly — via Compact or Close — and can
+// afford to lose everything since.
+func (s *Store) SetSyncOnCommit(v bool) {
+	s.mu.Lock()
+	s.syncOnCommit = v
+	s.mu.Unlock()
 }
 
 func (s *Store) IndexNodeProperty(id store.NodeID, key string, value []byte) error {
@@ -2316,6 +2349,61 @@ func (s *Store) loadCSR(path string) error {
 // --- serialisation helpers ---
 
 // marshalNode encodes a Node: id(8) labelCount(1) labels(2*N) propLen(4) props(n)
+// appendMarshalledNode writes n's wire encoding onto dst.
+//
+// The allocating marshalNode below is this plus a fresh buffer; batch writes use
+// this form so the payload lands straight in the frame, costing neither a
+// per-record allocation nor a copy.
+func appendMarshalledNode(dst []byte, n *store.Node) []byte {
+	labelCount := len(n.Labels)
+	propLen := len(n.Properties)
+
+	var hdr [nodePayloadLabelStart]byte
+	binary.LittleEndian.PutUint64(hdr[0:nodePayloadIDBytes], uint64(n.ID))
+	hdr[nodePayloadIDBytes] = byte(labelCount)
+	dst = append(dst, hdr[:]...)
+
+	var lbl [currentLabelBytesPerValue]byte
+	for _, l := range n.Labels {
+		binary.LittleEndian.PutUint16(lbl[:], uint16(l))
+		dst = append(dst, lbl[:]...)
+	}
+	var pl [nodePayloadPropLenBytes]byte
+	binary.LittleEndian.PutUint32(pl[:], uint32(propLen))
+	dst = append(dst, pl[:]...)
+	if propLen > 0 {
+		dst = append(dst, n.Properties...)
+	}
+	return dst
+}
+
+// appendMarshalledEdge is appendMarshalledNode for edges.
+func appendMarshalledEdge(dst []byte, e *store.Edge) []byte {
+	labelCount := len(e.Labels)
+	propLen := len(e.Properties)
+
+	var hdr [edgePayloadLabelStart]byte
+	binary.LittleEndian.PutUint64(hdr[0:8], uint64(e.ID))
+	binary.LittleEndian.PutUint64(hdr[8:16], uint64(e.Src))
+	binary.LittleEndian.PutUint64(hdr[16:24], uint64(e.Dst))
+	hdr[edgePayloadIDsBytes] = byte(labelCount)
+	dst = append(dst, hdr[:]...)
+
+	var lbl [currentLabelBytesPerValue]byte
+	for _, l := range e.Labels {
+		binary.LittleEndian.PutUint16(lbl[:], uint16(l))
+		dst = append(dst, lbl[:]...)
+	}
+	var tail [edgePayloadTailFixedSize]byte
+	binary.LittleEndian.PutUint32(tail[0:4], math.Float32bits(e.Weight))
+	binary.LittleEndian.PutUint32(tail[4:8], uint32(propLen))
+	dst = append(dst, tail[:]...)
+	if propLen > 0 {
+		dst = append(dst, e.Properties...)
+	}
+	return dst
+}
+
 func marshalNode(n *store.Node) []byte {
 	labelCount := len(n.Labels)
 	propLen := len(n.Properties)
@@ -3107,4 +3195,156 @@ func (s *Store) ExplainEdgeQuery(query store.EdgeQuery) (store.QueryPlan, error)
 	}
 	plan.Results = len(ids)
 	return plan, nil
+}
+
+// GetNodesBatch resolves many node IDs with one lock-free attempt for the whole
+// batch, falling back to a single locked pass for whatever it could not serve.
+//
+// The per-item path takes the store lock (or performs the lock-free
+// validity dance) once per ID. Batching amortises both: one `csrFastRead`, one
+// validity re-check, and at most one `RLock` for the remainder.
+//
+// **Order is preserved.** Records resolved without the lock and records resolved
+// under it are interleaved back into request order rather than concatenated,
+// because a caller that asked for [a b c] and received [a c b] would have no way
+// to tell without comparing IDs.
+func (s *Store) GetNodesBatch(ids []store.NodeID) ([]*store.Node, []store.NodeID) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	// Positional: slot i holds the record for ids[i], or nil if unresolved.
+	slots := make([]*store.Node, len(ids))
+	pending := make([]int, 0, len(ids)) // indices still needing the locked path
+
+	if csr, ok := s.csrFastRead(); ok {
+		for i, id := range ids {
+			if rec, found := csr.GetNode(id); found {
+				slots[i] = &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: cloneBytes(rec.Properties)}
+				continue
+			}
+			pending = append(pending, i)
+		}
+		if !s.csrFastReadValid(csr) {
+			// The CSR moved under us: discard everything the fast path produced
+			// and redo the whole batch under the lock. Partial trust is not an
+			// option — some slots could be from the superseded CSR.
+			for i := range slots {
+				slots[i] = nil
+			}
+			pending = pending[:0]
+			for i := range ids {
+				pending = append(pending, i)
+			}
+		}
+	} else {
+		for i := range ids {
+			pending = append(pending, i)
+		}
+	}
+
+	if len(pending) > 0 {
+		s.mu.RLock()
+		for _, i := range pending {
+			if n, ok := s.getNodeLocked(ids[i]); ok {
+				slots[i] = n
+			}
+		}
+		s.mu.RUnlock()
+	}
+
+	return compactNodes(slots, ids)
+}
+
+// GetEdgesBatch is GetNodesBatch for edges.
+func (s *Store) GetEdgesBatch(ids []store.EdgeID) ([]*store.Edge, []store.EdgeID) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	slots := make([]*store.Edge, len(ids))
+	pending := make([]int, 0, len(ids))
+
+	if csr, ok := s.csrFastRead(); ok {
+		for i, id := range ids {
+			if rec, found := csr.GetEdge(id); found {
+				slots[i] = rawEdgeToStore(rec)
+				continue
+			}
+			pending = append(pending, i)
+		}
+		if !s.csrFastReadValid(csr) {
+			for i := range slots {
+				slots[i] = nil
+			}
+			pending = pending[:0]
+			for i := range ids {
+				pending = append(pending, i)
+			}
+		}
+	} else {
+		for i := range ids {
+			pending = append(pending, i)
+		}
+	}
+
+	if len(pending) > 0 {
+		s.mu.RLock()
+		for _, i := range pending {
+			// The existing two-value helper is the authority here; duplicating
+			// its delta-then-CSR logic would be a second place to keep correct.
+			if e, ok := s.getEdgeLocked(ids[i]); ok {
+				slots[i] = e
+			}
+		}
+		s.mu.RUnlock()
+	}
+
+	return compactEdges(slots, ids)
+}
+
+// getNodeLocked returns the authoritative live node (delta override or CSR copy)
+// or (nil, false) if it is missing or masked. Caller must hold s.mu.
+//
+// Deliberately mirrors getEdgeLocked's shape, so the two layers are resolved the
+// same way on both paths.
+func (s *Store) getNodeLocked(id store.NodeID) (*store.Node, bool) {
+	if _, del := s.deletedNodes[id]; del {
+		return nil, false
+	}
+	if n, ok := s.deltaNodes[id]; ok {
+		return n, true
+	}
+	if s.csr != nil {
+		if rec, found := s.csr.GetNode(id); found {
+			return &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: cloneBytes(rec.Properties)}, true
+		}
+	}
+	return nil, false
+}
+
+// compactNodes removes the nil slots, preserving order, and reports which ids
+// they corresponded to.
+func compactNodes(slots []*store.Node, ids []store.NodeID) ([]*store.Node, []store.NodeID) {
+	found := slots[:0]
+	var missing []store.NodeID
+	for i, n := range slots {
+		if n == nil {
+			missing = append(missing, ids[i])
+			continue
+		}
+		found = append(found, n)
+	}
+	return found, missing
+}
+
+func compactEdges(slots []*store.Edge, ids []store.EdgeID) ([]*store.Edge, []store.EdgeID) {
+	found := slots[:0]
+	var missing []store.EdgeID
+	for i, e := range slots {
+		if e == nil {
+			missing = append(missing, ids[i])
+			continue
+		}
+		found = append(found, e)
+	}
+	return found, missing
 }

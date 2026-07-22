@@ -309,10 +309,42 @@ record:  [type:1][length:4][payload:length][crc32:4]
 | `0x06` | edge delete (tombstone) |
 | `0x07` | node property purge |
 | `0x08` | edge property purge |
+| `0x09` | batch begin — payload is the record count |
+| `0x0A` | batch commit — payload is count then a CRC over the batch body |
+| `0xFF` | checkpoint |
 
 **The purge types exist for a specific bug.** With `ReindexPurge`, an update drops
 an entity's index entries. If that were not journalled, replay would re-apply the
 original `0x03` records and **resurrect entries the purge had dropped**.
+
+### 4.3.1 Transactional batches
+
+A batch is written as one contiguous run bracketed by markers:
+
+```
+[0x09 begin | count]  [rec 1] [rec 2] … [rec N]  [0x0A commit | count | crc]
+                                                  ▲
+                          replay applies the batch only on reaching this
+```
+
+**Per-record CRCs catch a torn record; they do not catch a torn batch.** If a
+1 000-record write is interrupted after 500, every one of those 500 is
+individually valid, and replay without markers would apply half a transaction.
+
+Replay buffers everything between the markers and applies it only on a commit
+whose count *and* CRC agree with what was read back — "the commit is present" and
+"the batch is intact" being different claims. Reaching EOF with a batch still
+open discards the buffer, and **that discard is the rollback**: it costs nothing
+because none of it had been applied.
+
+**Unknown record types are rejected, not skipped.** Replay previously ignored
+types it did not recognise. That is unsafe once markers exist: a build that does
+not understand them would ignore a begin/commit pair and apply a *rolled back*
+batch as if it had committed.
+
+Aborted batches leave gaps in the ID sequence, since IDs are assigned before the
+write. That is consistent with §15 — IDs are monotonic and never reused, never
+promised to be dense.
 
 ### 4.4 WAL write path — the ring buffer
 
@@ -814,15 +846,52 @@ more true, not less.
 
 ### 11.1 Durability boundary
 
-A write is recoverable **once its WAL append returns**. Space held by deleted or
-superseded records is reclaimed at the next `Compact()`.
+**A returned write is not yet durable.** `fsync` is called in exactly two places —
+`WAL.Checkpoint()` (invoked only from `Compact`) and `WAL.Close()`. The write path
+never syncs.
+
+Worse, the drain is opportunistic:
+
+```go
+w.enqueue(recType, copied)
+if w.writeMu.TryLock() {          // if another goroutine holds it, skip
+    w.drainQueuedLocked()
+    w.writeMu.Unlock()
+}
+return nil                        // returns either way
+```
+
+If that `TryLock` fails, the record is still in the **process-memory ring buffer**
+when the call returns — it has not reached the OS, let alone the platter.
+
+| Failure | Survives? |
+|---|---|
+| Nothing crashes | yes; visible to all readers immediately |
+| Process crash | **usually** — see below |
+| Power loss / kernel panic | **only if `Compact()` or `Close()` has run since** |
+
+Measured, so the risk is not overstated: 200 `AddNode` calls with no `Close()` or
+`Compact()` left all 4 800 bytes already in the file. Single-threaded, the
+`TryLock` always succeeds and every record reaches the OS immediately. A record
+lingers in the ring only when another goroutine holds `writeMu` at that instant.
+
+**So the real exposure is power loss, not process crash** — the OS will flush its
+page cache for a dead process, but nothing has been forced to the platter since
+the last `Compact()` or `Close()`.
+
+**This is a known gap, not a design choice.** It was found by tracing the write
+path during bulk-write planning, and the previous text here — "recoverable once
+its WAL append returns" — was simply wrong. A durability policy (sync-per-batch,
+caller-controlled, or periodic) is planned; see `plan.md` §5.1.1.
+
+Space held by deleted or superseded records is reclaimed at the next `Compact()`.
 
 ### 11.2 What a crash leaves behind
 
 | Crash point | State on reopen |
 |---|---|
 | Before WAL append | operation never happened |
-| After WAL append, before apply | replay applies it |
+| After WAL append, before apply | replay applies it **if the record reached the OS** — see §11.1 |
 | Mid-cascade in `DeleteNode` | edges deleted, node alive — consistent, because edge tombstones are journalled first |
 | During `Compact`, before publish | old CSR + full WAL; replay reconstructs |
 | After publish, before WAL truncate | new CSR + stale WAL; replay is idempotent (upserts and tombstones) |

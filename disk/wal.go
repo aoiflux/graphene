@@ -43,6 +43,15 @@ const (
 	walRecordEdgeDelete    byte = 0x06
 	walRecordNodePropPurge byte = 0x07
 	walRecordEdgePropPurge byte = 0x08
+
+	// Transaction markers. A batch is applied by replay only when its commit
+	// marker is present and valid.
+	//
+	// These exist because per-record CRCs catch a torn *record* but not a torn
+	// *batch*: if a 1 000-record write is interrupted after 500, all 500 are
+	// individually valid and replay would otherwise apply half a transaction.
+	walRecordBatchBegin  byte = 0x09
+	walRecordBatchCommit byte = 0x0A
 	walRecordCheckpoint    byte = 0xFF
 
 	walHeaderSize     = 1 + 4 // type(1) + length(4)
@@ -225,6 +234,11 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 	header := make([]byte, walHeaderSize)
 	footer := make([]byte, walFooterSize)
 
+	// Batch state. pending is non-nil only between a begin marker and its commit;
+	// reaching EOF with it still set discards the batch, which is the rollback.
+	var pending []pendingRecord
+	var body []byte
+
 	for {
 		if _, err := io.ReadFull(w.file, header); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -254,56 +268,65 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 		}
 
 		switch recType {
-		case walRecordNode:
-			if cb.NodeFunc != nil {
-				if err := cb.NodeFunc(payload); err != nil {
+		case walRecordBatchBegin:
+			if pending != nil {
+				return fmt.Errorf("wal replay: nested batch begin")
+			}
+			if len(payload) != walBatchBeginPayload {
+				return fmt.Errorf("wal replay: malformed batch begin")
+			}
+			pending = make([]pendingRecord, 0, binary.LittleEndian.Uint32(payload))
+			body = body[:0]
+			continue
+
+		case walRecordBatchCommit:
+			if pending == nil {
+				return fmt.Errorf("wal replay: batch commit without begin")
+			}
+			if len(payload) != walBatchCommitPayload {
+				return fmt.Errorf("wal replay: malformed batch commit")
+			}
+			wantCount := binary.LittleEndian.Uint32(payload[0:4])
+			wantCRC := binary.LittleEndian.Uint32(payload[4:8])
+			if uint32(len(pending)) != wantCount || computeCRC32(body) != wantCRC {
+				// The commit is present but does not describe what was read back.
+				// Treat it as an incomplete transaction and discard, rather than
+				// applying a batch that does not match its own commit record.
+				pending = nil
+				body = body[:0]
+				continue
+			}
+			for _, rec := range pending {
+				if err := applyWALRecord(cb, rec.recType, rec.payload); err != nil {
 					return err
 				}
 			}
-		case walRecordEdge:
-			if cb.EdgeFunc != nil {
-				if err := cb.EdgeFunc(payload); err != nil {
-					return err
-				}
-			}
-		case walRecordNodeProp:
-			if cb.NodePropFunc != nil {
-				if err := cb.NodePropFunc(payload); err != nil {
-					return err
-				}
-			}
-		case walRecordEdgeProp:
-			if cb.EdgePropFunc != nil {
-				if err := cb.EdgePropFunc(payload); err != nil {
-					return err
-				}
-			}
-		case walRecordNodeDelete:
-			if cb.NodeDeleteFunc != nil {
-				if err := cb.NodeDeleteFunc(payload); err != nil {
-					return err
-				}
-			}
-		case walRecordEdgeDelete:
-			if cb.EdgeDeleteFunc != nil {
-				if err := cb.EdgeDeleteFunc(payload); err != nil {
-					return err
-				}
-			}
-		case walRecordNodePropPurge:
-			if cb.NodePropPurgeFunc != nil {
-				if err := cb.NodePropPurgeFunc(payload); err != nil {
-					return err
-				}
-			}
-		case walRecordEdgePropPurge:
-			if cb.EdgePropPurgeFunc != nil {
-				if err := cb.EdgePropPurgeFunc(payload); err != nil {
-					return err
-				}
-			}
+			pending = nil
+			body = body[:0]
+			continue
+
 		case walRecordCheckpoint:
+			// A checkpoint inside an open batch means the batch never committed.
 			return nil // replay complete up to last checkpoint
+		}
+
+		if !knownWALRecord(recType) {
+			// Deliberately an error, not a skip. Silently ignoring an unknown type
+			// would let an older binary apply a *rolled back* batch by ignoring the
+			// markers that were supposed to suppress it.
+			return fmt.Errorf("wal replay: unknown record type 0x%02X", recType)
+		}
+
+		if pending != nil {
+			// Inside a batch: buffer rather than apply, and accumulate the body
+			// exactly as it was framed so the commit CRC can be checked against it.
+			pending = append(pending, pendingRecord{recType: recType, payload: payload})
+			body = appendRecord(body, recType, payload)
+			continue
+		}
+
+		if err := applyWALRecord(cb, recType, payload); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -527,4 +550,100 @@ func computeCRC32(data []byte) uint32 {
 		}
 	}
 	return ^crc
+}
+
+// AppendBatch writes a pre-framed batch in a single write, optionally syncing.
+//
+// The buffer must come from walBatch.finish(), so it is already bracketed by
+// begin/commit markers. Replay applies it only on reaching a valid commit, which
+// is what makes the batch atomic: a torn write leaves the commit absent and the
+// whole batch is discarded.
+//
+// Queued records are drained first. A batch must not jump ahead of writes
+// already sitting in the ring, because replay order is apply order.
+func (w *WAL) AppendBatch(framed []byte, sync bool) error {
+	if len(framed) == 0 {
+		return nil
+	}
+	if w.closed.Load() != 0 {
+		return fmt.Errorf("wal append batch: closed")
+	}
+	if !w.enterAppend() {
+		return fmt.Errorf("wal append batch: closed")
+	}
+	defer w.inFlight.Add(-1)
+
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+
+	// Preserve ordering against concurrent single-record writers.
+	if err := w.drainQueuedLocked(); err != nil {
+		return err
+	}
+	if _, err := w.file.Write(framed); err != nil {
+		return fmt.Errorf("wal append batch: %w", err)
+	}
+	if sync {
+		if err := w.file.Sync(); err != nil {
+			return fmt.Errorf("wal append batch: sync: %w", err)
+		}
+	}
+	return nil
+}
+
+// pendingRecord is one record buffered inside an uncommitted batch.
+type pendingRecord struct {
+	recType byte
+	payload []byte
+}
+
+// knownWALRecord reports whether recType is one this build understands.
+func knownWALRecord(recType byte) bool {
+	switch recType {
+	case walRecordNode, walRecordEdge,
+		walRecordNodeProp, walRecordEdgeProp,
+		walRecordNodeDelete, walRecordEdgeDelete,
+		walRecordNodePropPurge, walRecordEdgePropPurge:
+		return true
+	}
+	return false
+}
+
+// applyWALRecord dispatches one record to its callback.
+func applyWALRecord(cb ReplayCallbacks, recType byte, payload []byte) error {
+	switch recType {
+	case walRecordNode:
+		if cb.NodeFunc != nil {
+			return cb.NodeFunc(payload)
+		}
+	case walRecordEdge:
+		if cb.EdgeFunc != nil {
+			return cb.EdgeFunc(payload)
+		}
+	case walRecordNodeProp:
+		if cb.NodePropFunc != nil {
+			return cb.NodePropFunc(payload)
+		}
+	case walRecordEdgeProp:
+		if cb.EdgePropFunc != nil {
+			return cb.EdgePropFunc(payload)
+		}
+	case walRecordNodeDelete:
+		if cb.NodeDeleteFunc != nil {
+			return cb.NodeDeleteFunc(payload)
+		}
+	case walRecordEdgeDelete:
+		if cb.EdgeDeleteFunc != nil {
+			return cb.EdgeDeleteFunc(payload)
+		}
+	case walRecordNodePropPurge:
+		if cb.NodePropPurgeFunc != nil {
+			return cb.NodePropPurgeFunc(payload)
+		}
+	case walRecordEdgePropPurge:
+		if cb.EdgePropPurgeFunc != nil {
+			return cb.EdgePropPurgeFunc(payload)
+		}
+	}
+	return nil
 }

@@ -177,8 +177,11 @@ func (g *Graph) AddEdges(edges []*store.Edge) ([]store.EdgeID, error)
 - `AddNode` — assigns and returns a fresh `NodeID`. `n.Labels` must be non-empty.
 - `AddEdge` — `Src` and `Dst` must already exist (and not be deleted), else
   `*store.ErrInvalidEdge`. Returns a fresh `EdgeID`.
-- `AddNodes` / `AddEdges` — ordered batch insert; on error the already-added
-  prefix is **not** rolled back and the partial IDs are returned.
+- `AddNodes` / `AddEdges` — ordered batch insert, and **transactional**: the whole
+  batch is applied or none of it is. On error nothing is created and no IDs are
+  returned. On the disk backend the batch is framed with begin/commit markers and
+  committed with one write plus one `fsync`, so a crash mid-batch leaves the store
+  as if the call never happened.
 
 ```go
 caseID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}})
@@ -193,8 +196,8 @@ eid, _   := g.AddEdge(&store.Edge{Src: fileID, Dst: caseID, Labels: []store.Edge
 ```go
 func (g *Graph) GetNode(id store.NodeID) (*store.Node, error)
 func (g *Graph) GetEdge(id store.EdgeID) (*store.Edge, error)
-func (g *Graph) GetNodes(ids []store.NodeID) ([]*store.Node, error) // first miss errors
-func (g *Graph) GetEdges(ids []store.EdgeID) ([]*store.Edge, error)
+func (g *Graph) GetNodes(ids []store.NodeID) (found []*store.Node, missing []store.NodeID, err error)
+func (g *Graph) GetEdges(ids []store.EdgeID) (found []*store.Edge, missing []store.EdgeID, err error)
 
 func (g *Graph) Neighbours(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]store.NeighbourResult, error)
 func (g *Graph) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]*store.Edge, error)
@@ -203,6 +206,26 @@ func (g *Graph) NodeCount() (uint64, error)
 func (g *Graph) EdgeCount() (uint64, error)
 func (g *Graph) Stats() (*GraphStats, error) // {NodeCount, EdgeCount}
 ```
+
+**A missing ID is not an error.** It is returned in `missing`; `err` is reserved
+for genuine failures. Under the read model (§16) an ID can be deleted between the
+call that produced it and the call that resolves it, so treating that as
+exceptional forced callers back into the per-item loop these methods exist to
+replace.
+
+`found` is compacted — misses leave no `nil` holes — and preserves request order.
+Each record carries its own ID, so correlating results back to requested IDs is
+`node.ID`, not position.
+
+```go
+found, missing, err := g.GetNodes(ids)
+if err != nil { /* a real failure */ }
+if len(missing) > 0 { /* these were deleted concurrently — usually fine */ }
+```
+
+Both backends implement `store.BatchReader`, resolving the whole batch under one
+lock hold. Worth **10–15% on the in-memory backend**; the disk backend already
+resolved reads without a per-item lock, so it gains nothing measurable there.
 
 - Pass `nil` `edgeTypes` to match all edge types; otherwise OR semantics.
 - `Neighbours` deduplicates by neighbour node ID (one entry per neighbour).
@@ -690,7 +713,25 @@ readers sample before each lookup, which is what makes the two distinguishable.
   read-only and mutate exclusively through the API.
 - Type-lookup and property-lookup results are unordered. The typed `Query*` APIs
   apply deterministic ordering and pagination.
-- Durability boundary (disk): a write is recoverable once its WAL append returns.
+- **Durability boundary (disk) — read this carefully.** A returned write is *not*
+  yet on disk. `fsync` happens only in `Compact()` and `Close()`; the write path
+  never calls it, and the WAL's drain is opportunistic, so a returned record may
+  still be in the process's own ring buffer.
+
+  | Failure | Survives? |
+  |---|---|
+  | Nothing crashes | yes — visible to all readers immediately |
+  | Process crash | **usually** — the drain normally succeeds, so the OS has the bytes; a record can linger in the ring only under write contention |
+  | Power loss / kernel panic | **only if `Compact()` or `Close()` has run since** |
+
+  Measured: 200 `AddNode` calls with no `Close()` or `Compact()` left all 4 800
+  bytes already in the file. So the practical exposure is **power loss, not
+  process crash**.
+
+  **If you need durability at a known point, call `Compact()` or `Close()`.**
+  Treat everything since the last one as at risk. This is a known gap and a
+  durability policy is planned; see `plan.md` §5.1.1.
+
   Space held by deleted or superseded records is reclaimed at the next
   `Compact()`.
 - IDs are monotonic and never reused for the lifetime of a store, across restarts
@@ -843,7 +884,7 @@ call that is not.
 | **"Is there an edge?"** | `EdgesOf` then scan | **`EdgeExists(src, dst, types)`** | ~280 ns, stops at first hit |
 | **IDs for a follow-up query** | `QueryNodes(...)` | **`QueryNodeIDs(...)`** | skips building every record |
 | **One property lookup** | `QueryNodeIDs` with one filter | **`NodesByProperty(key, val)`** | ~78 ns vs ~320 ns — no planner |
-| **Many nodes** | `AddNode` in a loop | **`AddNodes(batch)`** | one lock hold, one WAL pass |
+| **Many nodes** | `AddNode` in a loop | **`AddNodes(batch)`** | **−53 to −64% on disk**, 21–38% in memory |
 | **Many index entries** | `IndexNodeProperty` × N | **`IndexNodeProperties(id, map)`** | one call per entity |
 | **Update an indexed entity** | `UpdateNode` then re-index | **`UpdateNodeIndexed(n, props)`** | atomic; no stale window |
 | **Range / prefix query** | filter on an undeclared key | **`DeclareOrderedProperty(key)` first** | 22.8 ms → 2.3 ms wide; 11.8 ms → 59 µs narrow |
@@ -940,10 +981,31 @@ g.AddNodes(nodes)   // one lock hold, one pass
 g.AddEdges(edges)
 ```
 
-Batching amortises lock acquisition and — on disk — the WAL write path. It does
-**not** make the operation atomic: on error the already-added prefix is kept and
-the partial IDs are returned. If you need all-or-nothing, you must implement it
-yourself; there is no transaction.
+**On disk this is now a real bulk path**, not just a lock-amortising wrapper. The
+whole batch is framed into one buffer and committed with a single write:
+
+| Disk batch | per-record | batched | |
+|---:|---:|---:|---|
+| n=1 000 | 5.778 ms | 2.694 ms | **−53%** |
+| n=10 000 | 53.57 ms | 19.42 ms | **−64%** |
+
+That is ~1.94 µs/node against ~5.36 µs — and the batched path is *also* durable,
+where the old one was not. Batching alone is worth ~66%; the `fsync` at commit
+gives back a few points of it.
+
+On the in-memory backend batching is worth **21–38%** (266 vs 365 ns/node at
+n=100), since there is no WAL to amortise — only the lock.
+
+**Durability:** a batch commit `fsync`s by default. Disable with
+`SetSyncOnCommit(false)` on the disk store only if you sync explicitly via
+`Compact()` or `Close()` and can afford to lose everything since.
+
+`GetNodes` is currently a plain loop over `GetNode` with no batching at all, so
+it is exactly equivalent to writing that loop yourself.
+
+Batching also does **not** make the operation atomic: on error the already-added
+prefix is kept and the partial IDs are returned. If you need all-or-nothing, you
+must implement it yourself; there is no transaction.
 
 #### Know what a disk write actually costs
 

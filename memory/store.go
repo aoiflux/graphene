@@ -265,14 +265,23 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for i, e := range edges {
+	// Validate the whole batch before applying any of it.
+	//
+	// The disk backend is transactional — its batch is framed with begin/commit
+	// markers and applied only on a successful write — so this backend must be
+	// too, or the two disagree on what a failed batch leaves behind. Since this
+	// store is the parity oracle, a difference here would be a difference the
+	// tests are supposed to be measuring against.
+	for _, e := range edges {
 		if _, ok := s.nodes[e.Src]; !ok {
-			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Src}
+			return nil, &store.ErrInvalidEdge{MissingID: e.Src}
 		}
 		if _, ok := s.nodes[e.Dst]; !ok {
-			return ids[:i], &store.ErrInvalidEdge{MissingID: e.Dst}
+			return nil, &store.ErrInvalidEdge{MissingID: e.Dst}
 		}
+	}
 
+	for i, e := range edges {
 		id := s.nextEdgeID()
 
 		stored := &store.Edge{
@@ -1613,4 +1622,49 @@ func (s *Store) ExplainEdgeQuery(query store.EdgeQuery) (store.QueryPlan, error)
 	}
 	plan.Results = len(ids)
 	return plan, nil
+}
+
+// GetNodesBatch resolves many node IDs under a single read lock.
+//
+// The per-item alternative takes and releases the store lock once per ID, and
+// an uncontended RLock is an atomic increment on a shared cache line — cheap
+// individually, but paid N times for no reason when the whole batch could be
+// resolved under one hold.
+func (s *Store) GetNodesBatch(ids []store.NodeID) ([]*store.Node, []store.NodeID) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	found := make([]*store.Node, 0, len(ids))
+	var missing []store.NodeID
+
+	s.mu.RLock()
+	for _, id := range ids {
+		if n, ok := s.nodes[id]; ok {
+			found = append(found, n)
+			continue
+		}
+		missing = append(missing, id)
+	}
+	s.mu.RUnlock()
+	return found, missing
+}
+
+// GetEdgesBatch is GetNodesBatch for edges.
+func (s *Store) GetEdgesBatch(ids []store.EdgeID) ([]*store.Edge, []store.EdgeID) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	found := make([]*store.Edge, 0, len(ids))
+	var missing []store.EdgeID
+
+	s.mu.RLock()
+	for _, id := range ids {
+		if e, ok := s.edges[id]; ok {
+			found = append(found, e)
+			continue
+		}
+		missing = append(missing, id)
+	}
+	s.mu.RUnlock()
+	return found, missing
 }

@@ -1241,7 +1241,7 @@ func example18_PersistentExtremeScaleShowcase() {
 	_, inducedEdges, _ := g2.InducedSubgraph(scope)
 	fmt.Printf("  Helpers: Degree=%d EdgeExists(adjacent SimilarTo)=%v IsConnected=%v InducedEdges(scope=%d)=%d\n",
 		deg, exists, connected, len(scope), len(inducedEdges))
-	inducedNodes, err := g2.GetNodes(scope)
+	inducedNodes, _, err := g2.GetNodes(scope)
 	if err != nil {
 		log.Fatalf("  GetNodes for visualization: %v", err)
 	}
@@ -1471,7 +1471,7 @@ func example22_VisualizationExplorationDemo() {
 }
 
 func collectScopeForViz(g *graphene.Graph, scope []store.NodeID) ([]*store.Node, []*store.Edge, error) {
-	nodes, err := g.GetNodes(scope)
+	nodes, _, err := g.GetNodes(scope)
 	if err != nil {
 		return nil, nil, err
 	}

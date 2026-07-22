@@ -308,3 +308,18 @@ type NodeQueryExplainer interface {
 type EdgeQueryExplainer interface {
 	ExplainEdgeQuery(query EdgeQuery) (QueryPlan, error)
 }
+
+// BatchReader is implemented by stores that can resolve many IDs under a single
+// lock hold, rather than one acquisition per ID.
+//
+// Both methods preserve the order of ids in found: a resolved entity appears at
+// the same relative position it was requested in, with missing ids removed
+// rather than left as nil holes. Callers needing to correlate a record back to a
+// requested id can read the record's own ID field.
+//
+// Duplicate ids resolve independently — a duplicate that exists appears once per
+// occurrence, and one that does not appears once per occurrence in missing.
+type BatchReader interface {
+	GetNodesBatch(ids []NodeID) (found []*Node, missing []NodeID)
+	GetEdgesBatch(ids []EdgeID) (found []*Edge, missing []EdgeID)
+}

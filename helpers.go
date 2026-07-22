@@ -40,30 +40,61 @@ func (g *Graph) Stats() (*GraphStats, error) {
 
 // GetNodes fetches multiple nodes by ID in the order given.
 // If any ID is not found the error is returned immediately.
-func (g *Graph) GetNodes(ids []store.NodeID) ([]*store.Node, error) {
-	out := make([]*store.Node, len(ids))
-	for i, id := range ids {
+// GetNodes fetches multiple nodes by ID, preserving request order.
+//
+// **A missing ID is not an error.** It is reported in missing, and err is
+// reserved for genuine failures. That is deliberate: under the read model
+// (API_REFERENCE §16) an ID can be deleted between the call that produced it and
+// the call that resolves it, so treating that as exceptional forced callers back
+// into the per-item loop this method exists to replace.
+//
+// found is compacted — missing IDs leave no nil holes — and each record carries
+// its own ID, so a caller needing to correlate results back to requested IDs can
+// read node.ID rather than relying on position.
+func (g *Graph) GetNodes(ids []store.NodeID) (found []*store.Node, missing []store.NodeID, err error) {
+	if br, ok := g.GraphStore.(store.BatchReader); ok {
+		f, m := br.GetNodesBatch(ids)
+		return f, m, nil
+	}
+	found = make([]*store.Node, 0, len(ids))
+	for _, id := range ids {
 		n, err := g.GetNode(id)
 		if err != nil {
-			return nil, err
+			var nf *store.ErrNotFound
+			if errors.As(err, &nf) {
+				missing = append(missing, id)
+				continue
+			}
+			return nil, nil, err
 		}
-		out[i] = n
+		found = append(found, n)
 	}
-	return out, nil
+	return found, missing, nil
 }
 
 // GetEdges fetches multiple edges by ID in the order given.
 // If any ID is not found the error is returned immediately.
-func (g *Graph) GetEdges(ids []store.EdgeID) ([]*store.Edge, error) {
-	out := make([]*store.Edge, len(ids))
-	for i, id := range ids {
+// GetEdges fetches multiple edges by ID, preserving request order. A missing ID
+// is reported in missing rather than returned as an error — see GetNodes.
+func (g *Graph) GetEdges(ids []store.EdgeID) (found []*store.Edge, missing []store.EdgeID, err error) {
+	if br, ok := g.GraphStore.(store.BatchReader); ok {
+		f, m := br.GetEdgesBatch(ids)
+		return f, m, nil
+	}
+	found = make([]*store.Edge, 0, len(ids))
+	for _, id := range ids {
 		e, err := g.GetEdge(id)
 		if err != nil {
-			return nil, err
+			var nf *store.ErrNotFound
+			if errors.As(err, &nf) {
+				missing = append(missing, id)
+				continue
+			}
+			return nil, nil, err
 		}
-		out[i] = e
+		found = append(found, e)
 	}
-	return out, nil
+	return found, missing, nil
 }
 
 // --- Batch writes ---
@@ -182,7 +213,8 @@ func (g *Graph) NodesWithProperties(props map[string][]byte) ([]*store.Node, err
 	if err != nil {
 		return nil, err
 	}
-	return g.GetNodes(ids)
+	found, _, err := g.GetNodes(ids)
+	return found, err
 }
 
 // EdgesWithProperties returns hydrated edges matching all key-value pairs.
@@ -191,7 +223,8 @@ func (g *Graph) EdgesWithProperties(props map[string][]byte) ([]*store.Edge, err
 	if err != nil {
 		return nil, err
 	}
-	return g.GetEdges(ids)
+	found, _, err := g.GetEdges(ids)
+	return found, err
 }
 
 // QueryNodeIDs returns node IDs that satisfy query constraints.
@@ -205,7 +238,8 @@ func (g *Graph) QueryNodes(query store.NodeQuery) ([]*store.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return g.GetNodes(ids)
+	found, _, err := g.GetNodes(ids)
+	return found, err
 }
 
 // QueryEdgeIDs returns edge IDs that satisfy query constraints.
@@ -219,7 +253,8 @@ func (g *Graph) QueryEdges(query store.EdgeQuery) ([]*store.Edge, error) {
 	if err != nil {
 		return nil, err
 	}
-	return g.GetEdges(ids)
+	found, _, err := g.GetEdges(ids)
+	return found, err
 }
 
 // QueryRelations returns relation edges around anchor nodes using direction-aware matching.
@@ -279,7 +314,8 @@ func (g *Graph) QueryRelations(query store.RelationQuery) ([]*store.Edge, error)
 	if err != nil {
 		return nil, err
 	}
-	return g.GetEdges(ids)
+	found, _, err := g.GetEdges(ids)
+	return found, err
 }
 
 // --- Multi-type queries ---
