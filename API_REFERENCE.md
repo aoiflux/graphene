@@ -230,10 +230,22 @@ resolved reads without a per-item lock, so it gains nothing measurable there.
 - Pass `nil` `edgeTypes` to match all edge types; otherwise OR semantics.
 - `Neighbours` deduplicates by neighbour node ID (one entry per neighbour).
 
-> **Do not mutate returned structs.** For performance, the in-memory and
-> delta-resident reads may hand back pointers into internal state. Treat
-> `*store.Node` / `*store.Edge` as read-only; use `UpdateNode`/`UpdateEdge` to
-> change them.
+> **Do not mutate returned structs.** For performance, reads hand back pointers
+> into internal state — this now includes `Labels` and `Properties` on *every*
+> read path, on both backends, whether the record is delta-resident or in the
+> CSR. Treat `*store.Node` / `*store.Edge` and their slices as read-only; use
+> `UpdateNode`/`UpdateEdge` to change them.
+>
+> If you need to keep or modify a blob, copy it:
+> `p := append([]byte(nil), n.Properties...)`. This is the only case where a copy
+> is your responsibility — the reverse direction is handled for you: the store
+> always copies what you pass to `AddNode`/`AddEdge`/`UpdateNode`, so you may
+> reuse your own buffers freely after a write returns.
+
+Removing the read-side copy made disk reads **flat in property-blob size** rather
+than proportional to it — a 512-byte-blob point lookup went from 151 ns to 45 ns,
+and a 10 000-node bulk read from 2.05 ms to 0.48 ms. See
+[benchmarks.md](benchmarks.md).
 
 ---
 

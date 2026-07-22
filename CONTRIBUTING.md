@@ -77,6 +77,39 @@ Only a benchmark set wide enough to include the unremarkable case caught it. A
 change that is spectacular on the case it was written for and untested elsewhere
 is not measured.
 
+### Check the fixture actually populates what you are optimising
+
+A change to how the disk store handles property blobs measured at +2.57% — and
+the run was meaningless. The giveaway was in the columns nobody reads first:
+
+```
+B/op      96.00 ± ∞     96.00 ± ∞     ~ (p=1.000)
+allocs/op  2.000 ± ∞     2.000 ± ∞     ~ (p=1.000)
+```
+
+**Byte-identical allocation on both sides.** Removing a copy that runs must
+change `B/op`. Identical allocation is not a weak result, it is proof the code
+under test never executed.
+
+It never executed because no benchmark in the repository had ever stored a
+property blob. Every read fixture built `&store.Node{Labels: ...}` and called
+`IndexNodeProperties` — which populates the property *index*, a different
+structure. The record's own `Properties` field stayed nil, so the copy being
+optimised was copying zero bytes everywhere it was measured.
+
+Two habits follow:
+
+- **Read `B/op` and `allocs/op` as a sanity check on the timing column.** If a
+  change adds or removes work and they do not move, distrust the timing.
+- **Assert inside the benchmark that the fixture has the property under test**
+  — `graphene_blob_bench_test.go` fails the benchmark outright if a blob comes
+  back empty. A fixture that silently degenerates to the trivial case turns a
+  benchmark into a random number generator.
+
+Then mutation-test the *benchmark*, the same way you would a test: restore the
+behaviour you are removing and confirm the numbers move. If they do not, the
+benchmark cannot see the thing it exists to measure.
+
 ---
 
 ## 2. Testing

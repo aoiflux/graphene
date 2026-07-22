@@ -420,6 +420,50 @@ flowchart TD
 
 The fast path is described in full in §9.2.
 
+### 5.3 Blob ownership: copy in, alias out
+
+Property blobs and label slices are handled asymmetrically, deliberately.
+
+```mermaid
+flowchart LR
+    subgraph W["write — store COPIES"]
+        W1["caller's []byte"] -->|"make + copy"| W2["record's own blob"]
+    end
+    subgraph R["read — store ALIASES"]
+        R1["record's own blob"] -->|"slice header only"| R2["caller's *store.Node"]
+    end
+    W2 -.->|"same allocation, never mutated"| R1
+```
+
+**Writes copy.** A caller may reuse or overwrite its buffer the moment
+`AddNode`/`AddEdge`/`UpdateNode` returns. Retaining the caller's slice would let
+later caller writes silently rewrite stored data. These copies look redundant and
+are not; `graphene_blob_aliasing_test.go` pins them on both backends.
+
+**Reads alias.** A read returns the record's own slice. Four properties make this
+safe, and each is a real constraint on future changes:
+
+1. **A blob is its own allocation.** `readCSRProperties` does
+   `make([]byte, propLen)` + copy per record while deserialising. Blobs are *not*
+   windows into one large file buffer — so holding one retains `propLen` bytes,
+   not the whole CSR. Were blobs ever changed to slice a shared buffer, aliasing
+   would become a retention hazard and this decision would need revisiting.
+2. **Blobs are never mutated after construction.** The only operations reading a
+   blob are `append`-from; nothing assigns into one.
+3. **Ingest copies**, per above, so a record's blob is never caller-owned.
+4. **The API contract permits it** — and always has.
+
+This was previously inconsistent rather than wrong: delta-resident reads aliased
+while CSR-resident reads copied, so a single `EdgesOf` result could contain
+entries under both policies depending on where each record happened to live.
+`Labels` had always aliased on every path. The copy was removed rather than a
+copy-on-demand view built, because the contract already allowed the cheaper
+behaviour and the code was simply not taking it.
+
+The effect is structural: **disk read cost is now flat in blob size** instead of
+proportional to it. A 512-byte-blob point lookup went 151 ns → 45 ns, a 10 000-node
+bulk read 2.05 ms → 0.48 ms. Figures in [benchmarks.md](benchmarks.md).
+
 ---
 
 ## 6. Indexing internals
@@ -1135,6 +1179,10 @@ Any change must preserve these. Each is enforced by tests.
 7. **A reader on the lock-free path never observes a superseded CSR** (§9.2).
 8. **A declared key is compared byte-wise on every path** that evaluates a filter
    for it (§7.4).
+9. **The store never retains caller memory, and never mutates a blob it has
+   handed out** (§5.3). Writes copy in; reads alias out. Both halves are load-
+   bearing: the first makes it safe for a caller to reuse its buffers, the second
+   is what makes reads independent of blob size.
 
 ---
 

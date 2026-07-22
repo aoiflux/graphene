@@ -60,6 +60,9 @@ func TestMain(m *testing.M) {
 	if orderedDskDir != "" {
 		os.RemoveAll(orderedDskDir)
 	}
+	for _, d := range append(blobDskDirs, plannerDir) {
+		os.RemoveAll(d)
+	}
 	os.Exit(code)
 }
 

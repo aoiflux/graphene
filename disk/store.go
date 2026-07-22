@@ -785,7 +785,7 @@ func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
 	// lock buys nothing — the CSR cannot change under us.
 	if csr, ok := s.csrFastRead(); ok {
 		if rec, found := csr.GetNode(id); found {
-			node := &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: cloneBytes(rec.Properties)}
+			node := &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: csrBytes(rec.Properties)}
 			if s.csrFastReadValid(csr) {
 				return node, nil
 			}
@@ -805,7 +805,7 @@ func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
 	if s.csr != nil {
 		rec, found := s.csr.GetNode(id)
 		if found {
-			return &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: cloneBytes(rec.Properties)}, nil
+			return &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: csrBytes(rec.Properties)}, nil
 		}
 	}
 	return nil, &store.ErrNotFound{Kind: "node", ID: uint64(id)}
@@ -1590,6 +1590,56 @@ func sortDedupeEdgeIDs(ids []store.EdgeID) []store.EdgeID {
 // still a guaranteed superset of the result, leaving the filter stages (and
 // therefore the results) unchanged.
 
+// labelSizeUnknown marks "this query has no labels to drive from". It must lose
+// every comparison against a real cardinality.
+const labelSizeUnknown = -1
+
+// labelDriverWins reports whether driving from label postings beats driving from
+// an equality filter of the given cardinality.
+//
+// Ties go to equality deliberately: the equality path resolves through the
+// property index and returns candidates already in ascending ID order, while the
+// label path has to dedupe across types and reports unsorted. Equal candidate
+// counts therefore are not equal cost.
+func labelDriverWins(labelSize, equalitySize int) bool {
+	return labelSize != labelSizeUnknown && labelSize < equalitySize
+}
+
+// nodeLabelCandidateCount is an upper bound on the number of nodes carrying any
+// of types. It double-counts a node present in both the delta and the CSR, and
+// it ignores tombstones.
+//
+// An upper bound is exactly what costing needs here: the chosen driver must be a
+// superset of the answer, and overestimating can only make the planner more
+// reluctant to pick labels — never wrong, just occasionally conservative.
+func (s *Store) nodeLabelCandidateCount(types []store.NodeType) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	total := 0
+	for _, t := range types {
+		total += len(s.deltaNodesByType[t])
+		if s.csr != nil {
+			// NodesByType aliases CSR memory; len is O(1) and nothing escapes.
+			total += len(s.csr.NodesByType(t))
+		}
+	}
+	return total
+}
+
+// edgeLabelCandidateCount is the edge equivalent of nodeLabelCandidateCount.
+func (s *Store) edgeLabelCandidateCount(types []store.EdgeType) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	total := 0
+	for _, t := range types {
+		total += len(s.deltaEdgesByType[t])
+		if s.csr != nil {
+			total += len(s.csr.EdgesByType(t))
+		}
+	}
+	return total
+}
+
 // driveNodeCandidates returns the starting candidate set for a node query and
 // whether it is already in ascending ID order.
 // driveNodeCandidates picks the cheapest source that is guaranteed to contain
@@ -1613,7 +1663,21 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 			bestSize = size
 		}
 	}
+	// Labels bound the result too, and their posting sizes are known in O(1)
+	// (NodesByType aliases CSR-owned memory, so this counts rather than
+	// materialises). Comparing the two means a highly selective label is no
+	// longer passed over in favour of a weak equality filter: the planner used
+	// to take any equality driver unconditionally, so `Types=[Case]` (100 nodes)
+	// combined with a 14 000-hit filter drove from the filter.
+	labelSize := labelSizeUnknown
+	if len(query.Types) > 0 {
+		labelSize = s.nodeLabelCandidateCount(query.Types)
+	}
+
 	if bestFilter != nil {
+		if labelDriverWins(labelSize, bestSize) {
+			return s.driveNodeLabels(query.Types)
+		}
 		return s.liveNodeIDs(s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
 			Driver:       store.DriverEquality,
 			DriverKey:    bestFilter.Key,
@@ -1633,29 +1697,36 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 		}
 	}
 
-	// Label lookup still scans the CSR (there is no persisted label index yet),
-	// but it filters during the scan and resolves only the matches, which beats
-	// enumerating every node and resolving each one.
 	if len(query.Types) > 0 {
-		seen := make(map[store.NodeID]struct{})
-		var out []store.NodeID
-		for _, t := range query.Types {
-			ids, err := s.NodesByType(t)
-			if err != nil {
-				continue
-			}
-			for _, id := range ids {
-				if _, ok := seen[id]; ok {
-					continue
-				}
-				seen[id] = struct{}{}
-				out = append(out, id)
-			}
-		}
-		return out, false, store.QueryPlan{Driver: store.DriverLabels, DriverFilter: -1}
+		return s.driveNodeLabels(query.Types)
 	}
 
 	return s.collectCandidateNodeIDs(nil), false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
+}
+
+// driveNodeLabels resolves the union of the given labels' postings. It is served
+// by the CSR label index plus the delta, so it costs time proportional to the
+// number of matches rather than to the graph.
+//
+// The result is unsorted: postings are individually ascending, but a union over
+// several labels interleaves them.
+func (s *Store) driveNodeLabels(types []store.NodeType) ([]store.NodeID, bool, store.QueryPlan) {
+	seen := make(map[store.NodeID]struct{})
+	var out []store.NodeID
+	for _, t := range types {
+		ids, err := s.NodesByType(t)
+		if err != nil {
+			continue
+		}
+		for _, id := range ids {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out, false, store.QueryPlan{Driver: store.DriverLabels, DriverFilter: -1}
 }
 
 // liveNodeIDs drops IDs that no longer resolve to a live node, preserving order.
@@ -1732,8 +1803,28 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 		}
 	}
 
+	// Three possible drivers, costed on the same scale. An unavailable driver is
+	// MaxInt so it can never win a comparison, which keeps the cases below free
+	// of sentinel checks.
+	eqCost := math.MaxInt
+	if bestFilter != nil {
+		eqCost = bestSize
+	}
+	anchorCost := math.MaxInt
+	if anchorSize >= 0 {
+		anchorCost = anchorSize
+	}
+	labelCost := math.MaxInt
+	if len(query.Types) > 0 {
+		labelCost = s.edgeLabelCandidateCount(query.Types)
+	}
+
 	switch {
-	case bestFilter != nil && (anchorSize < 0 || bestSize <= anchorSize):
+	// Labels must beat both alternatives strictly: they return unsorted
+	// candidates, where equality and adjacency both return ascending.
+	case labelCost < eqCost && labelCost < anchorCost:
+		return s.driveEdgeLabels(query.Types)
+	case bestFilter != nil && eqCost <= anchorCost:
 		return s.liveEdgeIDs(s.propIdx.EdgesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
 			Driver:       store.DriverEquality,
 			DriverKey:    bestFilter.Key,
@@ -1756,25 +1847,32 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 	}
 
 	if len(query.Types) > 0 {
-		seen := make(map[store.EdgeID]struct{})
-		var out []store.EdgeID
-		for _, t := range query.Types {
-			ids, err := s.EdgesByType(t)
-			if err != nil {
-				continue
-			}
-			for _, id := range ids {
-				if _, ok := seen[id]; ok {
-					continue
-				}
-				seen[id] = struct{}{}
-				out = append(out, id)
-			}
-		}
-		return out, false, store.QueryPlan{Driver: store.DriverLabels, DriverFilter: -1}
+		return s.driveEdgeLabels(query.Types)
 	}
 
 	return s.collectCandidateEdgeIDs(nil), false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
+}
+
+// driveEdgeLabels is the edge counterpart of driveNodeLabels: the union of the
+// given labels' postings, served by the CSR label index plus the delta, and
+// unsorted because a union over several labels interleaves ascending runs.
+func (s *Store) driveEdgeLabels(types []store.EdgeType) ([]store.EdgeID, bool, store.QueryPlan) {
+	seen := make(map[store.EdgeID]struct{})
+	var out []store.EdgeID
+	for _, t := range types {
+		ids, err := s.EdgesByType(t)
+		if err != nil {
+			continue
+		}
+		for _, id := range ids {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out, false, store.QueryPlan{Driver: store.DriverLabels, DriverFilter: -1}
 }
 
 // degreeSumLocked totals the live incident-edge counts for ids across the delta
@@ -2569,7 +2667,7 @@ func rawEdgeToStore(re rawEdge) *store.Edge {
 		Dst:        re.Dst,
 		Labels:     re.Labels,
 		Weight:     re.Weight,
-		Properties: cloneBytes(re.Properties),
+		Properties: csrBytes(re.Properties),
 	}
 }
 
@@ -2848,6 +2946,16 @@ func readCSRProperties(data []byte, pos int, version uint16, kind string, index 
 	props := make([]byte, propLen)
 	copy(props, data[pos:pos+propLen])
 	return props, pos + propLen, nil
+}
+
+// csrBytes returns the property blob for a record that lives in the CSR.
+//
+// The CSR is immutable once published, and the API contract states that reads
+// may hand back pointers into internal state (see API_REFERENCE §"Do not mutate
+// returned structs"). Delta-resident reads already alias; this makes
+// CSR-resident reads consistent with them.
+func csrBytes(src []byte) []byte {
+	return src
 }
 
 func cloneBytes(src []byte) []byte {
@@ -3238,7 +3346,7 @@ func (s *Store) GetNodesBatch(ids []store.NodeID) ([]*store.Node, []store.NodeID
 	if csr, ok := s.csrFastRead(); ok {
 		for i, id := range ids {
 			if rec, found := csr.GetNode(id); found {
-				slots[i] = &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: cloneBytes(rec.Properties)}
+				slots[i] = &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: csrBytes(rec.Properties)}
 				continue
 			}
 			pending = append(pending, i)
@@ -3334,7 +3442,7 @@ func (s *Store) getNodeLocked(id store.NodeID) (*store.Node, bool) {
 	}
 	if s.csr != nil {
 		if rec, found := s.csr.GetNode(id); found {
-			return &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: cloneBytes(rec.Properties)}, true
+			return &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: csrBytes(rec.Properties)}, true
 		}
 	}
 	return nil, false

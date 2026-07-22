@@ -301,6 +301,40 @@ search that now materialises records only for the final path), `BFS3Hop_Disk`
 20 allocations and 36.3 µs on the disk fixture, against 394 and 113.9 µs for the
 record-returning equivalent.
 
+### Property blobs — reads no longer pay for blob size
+
+The disk backend used to copy a record's property blob on every read. It now
+hands back the record's own slice, which the API contract has always permitted
+(`Labels` already did this). Ingest still copies what the caller passes in.
+
+Interleaved, 4 rounds, memory backend as control — every control `~`:
+
+| Disk read (blob size) | 32 B | 128 B | 512 B |
+|---|---:|---:|---:|
+| Point lookup | −30.0% | −42.4% | −70.1% |
+| `EdgesOf`, 4 edges | −16.5% | −22.5% | −40.8% |
+| Bulk `GetNodes`, 10k nodes | −34.4% | −47.8% | −76.8% |
+
+Geomean **−26.6%** sec/op, **−36.9%** B/op, **−25.8%** allocs/op, all at p=0.029.
+
+The absolute figures show the point better than the percentages:
+
+| Disk read | 32 B | 128 B | 512 B | |
+|---|---:|---:|---:|---|
+| Point lookup, before | 68.4 ns | 81.1 ns | 151.0 ns | scales with blob |
+| Point lookup, after | 47.8 ns | 46.7 ns | **45.1 ns** | flat |
+| Bulk 10k, before | 705 µs | 889 µs | 2 047 µs | scales with blob |
+| Bulk 10k, after | 462 µs | 464 µs | **475 µs** | flat |
+
+Blob size stopped being a cost dimension on the read path. The gain therefore
+grows without bound in blob size — at 512 B a bulk read is 4.3× faster, and the
+allocation drops from 5 785 KiB to 785 KiB because the copies are simply gone.
+
+> These are new benchmarks (`graphene_blob_bench_test.go`), not a re-run of
+> existing ones. Until they existed no benchmark had ever stored a property blob,
+> so this copy cost was invisible to the whole suite. That is written up in
+> [CONTRIBUTING.md](CONTRIBUTING.md) §1 as a measurement lesson.
+
 ### Memory footprint (P1)
 
 `B/op` is bytes *allocated during* an operation, which says nothing about what a
