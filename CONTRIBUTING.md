@@ -6,9 +6,9 @@ actually helped.
 Most of what follows is written from failures that happened here. Each one cost
 real time, and each is the kind that repeats.
 
-- For the design, read [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md).
-- For the API, read [API_REFERENCE.md](API_REFERENCE.md).
-- For numbers and method, read [benchmarks.md](benchmarks.md).
+- For the design, read [TECHNICAL_DETAILS.md](docs/TECHNICAL_DETAILS.md).
+- For the API, read [API_REFERENCE.md](docs/API_REFERENCE.md).
+- For numbers and method, read [benchmarks.md](docs/benchmarks.md).
 
 ---
 
@@ -289,11 +289,15 @@ go doc -all . | grep -E '^func \(g \*Graph\)' | sed -E 's/^func \([^)]*\) //; s/
   | while read m; do grep -q "\b$m\b" API_REFERENCE.md || echo "UNDOCUMENTED: $m"; done
 
 # code fences balance
-for f in *.md; do awk -v F="$f" '/^```/{n++} END{if(n%2)print F": UNBALANCED"}' "$f"; done
+for f in *.md docs/*.md; do awk -v F="$f" '/^```/{n++} END{if(n%2)print F": UNBALANCED"}' "$f"; done
 
-# internal links resolve
-grep -ohE '\]\([A-Za-z0-9_/.]+\.(go|md)\)' *.md | tr -d '])(' | sort -u \
-  | while read t; do [ -e "$t" ] || echo "BROKEN LINK: $t"; done
+# internal links resolve — checked *from each file's own directory*, because
+# links are relative and the reference docs live one level down in docs/.
+# Checking only root *.md silently passed 11 broken links when the docs moved.
+for d in . docs; do
+  ( cd "$d" && grep -ohE '\]\([A-Za-z0-9_/.-]+\.(go|md)\)' *.md | tr -d '])(' | sort -u \
+      | while read t; do [ -e "$t" ] || echo "BROKEN LINK in $d/: $t"; done )
+done
 ```
 
 ---

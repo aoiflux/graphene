@@ -53,7 +53,7 @@ results:
 
 The suite now runs **68 benchmarks** covering reads, writes, concurrency, a
 10k→100k scale sweep, and resident memory footprint — up from 5. See
-[benchmarks.md](benchmarks.md) for methodology and the full table.
+[benchmarks.md](docs/benchmarks.md) for methodology and the full table.
 
 **Query operations** — measured on a 100,000-node / 201,000-edge graph with
 300,000 indexed property entries, disk backend compacted to CSR:
@@ -187,13 +187,13 @@ resolvable here**; the order-of-magnitude results are solid and anything in the
 tens of percent is directional. The footprint table above is exempt, being
 deterministic measurement rather than timing.
 
-This is the summary. [benchmarks.md](benchmarks.md) carries the full detail:
+This is the summary. [benchmarks.md](docs/benchmarks.md) carries the full detail:
 methodology, the fixture, per-area breakdowns, the regressions in full, what is
 still slow, and an appendix listing **every benchmark on both sides** across
 time, bytes, allocations and per-node footprint.
 
 Full methodology, per-benchmark detail, and the remaining slow paths are in
-[benchmarks.md](benchmarks.md); the roadmap is in [plan.md](plan.md).
+[benchmarks.md](docs/benchmarks.md); the roadmap is in [plan.md](plan.md).
 
 Scale validation covered by stress tests:
 
@@ -426,13 +426,13 @@ go run ./examples
 
 ## Docs
 
-- Easy usage guide: [USER_GUIDE.md](USER_GUIDE.md)
-- Complete API reference: [API_REFERENCE.md](API_REFERENCE.md)
+- Easy usage guide: [USER_GUIDE.md](docs/USER_GUIDE.md)
+- Complete API reference: [API_REFERENCE.md](docs/API_REFERENCE.md)
 - Deep technical architecture and LLD:
-  [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md)
-- Benchmark methodology and results: [benchmarks.md](benchmarks.md)
+  [TECHNICAL_DETAILS.md](docs/TECHNICAL_DETAILS.md)
+- Benchmark methodology and results: [benchmarks.md](docs/benchmarks.md)
 - Indexing and read-performance roadmap: [plan.md](plan.md)
-- Engine comparison notes: [comparison.md](comparison.md)
+- Engine comparison notes: [comparison.md](docs/comparison.md)
 
 ## Query Migration
 

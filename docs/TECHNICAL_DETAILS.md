@@ -1132,6 +1132,41 @@ Recovery is explicit: `VerifyIndexes()` then `RebuildIndexes()`.
 adjacency — and drops property entries whose entity is gone. **It repairs
 structure, not content.**
 
+### 11.5 Replay cost — buffering and the checksum
+
+Replay is the cost of opening a store that has not been compacted, and it is
+**I/O-bound, not index-bound**. A CPU profile of a cold open put 69% of the time
+in `syscall.readFile`; the index maintenance that replay performs per record did
+not reach the top twenty.
+
+The cause was structural: each record was read with three separate `io.ReadFull`
+calls against the file handle — header, payload, footer — so a 60 000-record log
+issued roughly 180 000 syscalls. Replay now pulls the log through a
+`bufio.Reader`.
+
+> **Why buffering is safe here.** The WAL is opened `O_APPEND`. Writes go to the
+> end of the file regardless of the read offset, so a buffered reader that reads
+> past the last record cannot affect a subsequent append. Without `O_APPEND` this
+> would corrupt the log.
+
+With the syscalls gone, the record checksum became 46% of what remained. It was a
+bit-by-bit CRC-32 — eight iterations per byte — over polynomial `0xEDB88320`,
+which is the reversed IEEE polynomial. `crc32.ChecksumIEEE` produces the
+**identical value** using a hardware-accelerated implementation.
+
+That identity is a **format guarantee**: every WAL already on disk was written by
+the old loop, and a checksum that differed anywhere would fail every record on
+replay. `disk/crc_test.go` pins the values with fixed vectors — including the
+standard `0xCBF43926` check value — rather than comparing against
+`crc32.ChecksumIEEE`, which would now be tautological.
+
+Together: a cold open of a 10 000-node uncompacted store went from 1 263.9 ms to
+**42.7 ms**, with allocation counts unchanged — no allocation figure could have
+located either cost.
+
+The read buffer is capped to the log's own size. A fixed 1 MiB buffer cost a
+megabyte on every open, including compacted stores that replay almost nothing.
+
 ---
 
 ## 12. Worked examples

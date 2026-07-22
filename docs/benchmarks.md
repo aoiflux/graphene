@@ -1,7 +1,7 @@
 # Benchmarks
 
 Measurements for the indexing, durability and traversal work tracked in
-[plan.md](plan.md). Optimisation priority is **P0 speed → P1 memory/space →
+[plan.md](../plan.md). Optimisation priority is **P0 speed → P1 memory/space →
 P2 allocations**.
 
 ## How these were produced
@@ -13,7 +13,7 @@ P2 allocations**.
 | **Go** | go1.26.2 |
 | **Hardware** | AMD Ryzen 9 5980HS, 16 cores |
 | **Baseline** | git `036aac0`, the commit before this work began |
-| **Suites** | [bench](graphene_bench_test.go) · [parallel](graphene_parallel_bench_test.go) · [coverage](graphene_coverage_bench_test.go) · [footprint](graphene_footprint_test.go) |
+| **Suites** | [bench](../graphene_bench_test.go) · [parallel](../graphene_parallel_bench_test.go) · [coverage](../graphene_coverage_bench_test.go) · [footprint](../graphene_footprint_test.go) |
 | **Method** | Baseline and current run **interleaved** — alternating rounds of `-count=2` — then compared with `benchstat`, n=6 per side |
 
 68 benchmarks, up from the 29 this work started with and the 5 the project had
@@ -301,6 +301,38 @@ search that now materialises records only for the final path), `BFS3Hop_Disk`
 20 allocations and 36.3 µs on the disk fixture, against 394 and 113.9 µs for the
 record-returning equivalent.
 
+### Cold open — replay was syscall-bound, not index-bound
+
+`Open` on an uncompacted WAL replayed every record with three separate reads
+straight to the file handle, so a 60 000-record log cost ~180 000 syscalls. A CPU
+profile put **69% of the time in `syscall.readFile`**; index maintenance, which
+the plan had assumed was the cost, did not appear in the top twenty.
+
+Interleaved, 4 rounds, memory-backend controls all `~`:
+
+| `ColdOpen_UncompactedWAL_10k` | Before | After | Change |
+|---|---:|---:|---:|
+| time | 1 263.9 ms | **42.7 ms** | **−96.6%** (~30×) |
+| allocs/op | 285 100 | 285 000 | ~ |
+
+Two fixes, the second only visible after the first:
+
+1. **Buffered replay** — a `bufio.Reader` over the log. Safe because the WAL is
+   `O_APPEND`, so reading past a record cannot disturb a later write.
+   1 263.9 ms → ~220 ms.
+2. **`crc32.ChecksumIEEE`** — the checksum was a bit-by-bit loop, 8 iterations
+   per byte, and became 46% of the time once syscalls were gone. Same polynomial,
+   same values, hardware-accelerated. ~220 ms → 42.7 ms.
+
+Allocations are unchanged, which is the point: no allocation figure could have
+found either of these.
+
+> The buffer is capped to the log's size. A fixed 1 MiB buffer initially showed
+> as +1 MiB on every open, including compacted stores that read almost nothing.
+>
+> Also not claimed: the other reopen benchmarks trended ~25% faster in this run,
+> and so did every untouched control. That is drift. Only the 30× clears it.
+
 ### Pattern matching — the worst path in the codebase, fixed
 
 `FindPatterns` over a 2 000-node scope was 24.6 ms and **399 950 allocations**,
@@ -386,7 +418,7 @@ allocation drops from 5 785 KiB to 785 KiB because the copies are simply gone.
 > These are new benchmarks (`graphene_blob_bench_test.go`), not a re-run of
 > existing ones. Until they existed no benchmark had ever stored a property blob,
 > so this copy cost was invisible to the whole suite. That is written up in
-> [CONTRIBUTING.md](CONTRIBUTING.md) §1 as a measurement lesson.
+> [CONTRIBUTING.md](../CONTRIBUTING.md) §1 as a measurement lesson.
 
 ### Memory footprint (P1)
 
@@ -545,10 +577,6 @@ Recorded because they were published as regressions and should not stay that way
 
 ## What is still slow
 
-- **Cold open on an uncompacted WAL: 727 ms for 10 000 nodes**, against 60.6 ms
-  to reopen a *compacted* 50 000-node store. Phase 4 fixed the compacted path;
-  replay of an uncompacted log was never optimised and is ~60× worse per node.
-  With pattern matching fixed, this is the largest remaining number.
 - **`Contains` filters are a scan and will stay one.** No ordering can bound a
   substring match; a trigram index is the only route and is out of scope.
 - **Range and prefix are only fast on *declared* keys.** An undeclared key still
