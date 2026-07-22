@@ -43,13 +43,13 @@ results:
 
 **Core operations:**
 
-| Benchmark             |       Result |                      Memory |
-| --------------------- | -----------: | --------------------------: |
-| Add node              |  814.0 ns/op |       306 B/op, 3 allocs/op |
-| Get node              |  5.815 ns/op |         0 B/op, 0 allocs/op |
-| BFS traversal         | 353200 ns/op |   234240 B/op, 77 allocs/op |
-| Shortest path         | 188300 ns/op |  100472 B/op, 576 allocs/op |
-| Property index lookup |  42.78 ns/op |          8 B/op, 1 alloc/op |
+| Benchmark             |       Result |                     Memory |
+| --------------------- | -----------: | -------------------------: |
+| Add node              |  814.0 ns/op |      306 B/op, 3 allocs/op |
+| Get node              |  5.815 ns/op |        0 B/op, 0 allocs/op |
+| BFS traversal         | 353200 ns/op |  234240 B/op, 77 allocs/op |
+| Shortest path         | 188300 ns/op | 100472 B/op, 576 allocs/op |
+| Property index lookup |  42.78 ns/op |         8 B/op, 1 alloc/op |
 
 The suite now runs **68 benchmarks** covering reads, writes, concurrency, a
 10k→100k scale sweep, and resident memory footprint — up from 5. See
@@ -58,35 +58,35 @@ The suite now runs **68 benchmarks** covering reads, writes, concurrency, a
 **Query operations** — measured on a 100,000-node / 201,000-edge graph with
 300,000 indexed property entries, disk backend compacted to CSR:
 
-| Benchmark                       |    In-memory |         On-disk |
-| ------------------------------- | -----------: | --------------: |
-| Point lookup by ID              |  26.46 ns/op |     50.09 ns/op |
-| Node in-degree (1000-edge hub)  |  28.79 ns/op |     15.46 ns/op |
-| Equality property query         |  567.8 ns/op |     539.9 ns/op |
-| `NodesByType`, selective label  |  227.1 ns/op |     4.995 µs/op |
-| Typed query with `Limit: 10`    |  12.40 µs/op |     20.47 µs/op |
-| Anchored relation query         |  181.2 µs/op |     206.6 µs/op |
-| 1-hop neighbours                |  179.2 ns/op |     410.1 ns/op |
-| 3-hop BFS                       |  2.799 µs/op |     4.376 µs/op |
+| Benchmark                      |   In-memory |     On-disk |
+| ------------------------------ | ----------: | ----------: |
+| Point lookup by ID             | 26.46 ns/op | 50.09 ns/op |
+| Node in-degree (1000-edge hub) | 28.79 ns/op | 15.46 ns/op |
+| Equality property query        | 567.8 ns/op | 539.9 ns/op |
+| `NodesByType`, selective label | 227.1 ns/op | 4.995 µs/op |
+| Typed query with `Limit: 10`   | 12.40 µs/op | 20.47 µs/op |
+| Anchored relation query        | 181.2 µs/op | 206.6 µs/op |
+| 1-hop neighbours               | 179.2 ns/op | 410.1 ns/op |
+| 3-hop BFS                      | 2.799 µs/op | 4.376 µs/op |
 
 **Traversal** — allocations per walk, the metric that governs GC pressure here:
 
-| Benchmark                        |         Time |   Allocations |
-| -------------------------------- | -----------: | ------------: |
-| BFS, 10,000-node chain           |  6.935 ms/op |           216 |
-| `BFSIDs`, same walk (IDs only)   |  3.819 ms/op |            97 |
-| BFS, 100×100 fan-out             |  5.326 ms/op |           232 |
-| `BFSIDs`, same walk              |  2.612 ms/op |           104 |
-| BFS on disk, 12 hops             |  113.9 µs/op |           394 |
-| `BFSIDs` on disk, same walk      |  36.34 µs/op |            20 |
+| Benchmark                      |        Time | Allocations |
+| ------------------------------ | ----------: | ----------: |
+| BFS, 10,000-node chain         | 6.935 ms/op |         216 |
+| `BFSIDs`, same walk (IDs only) | 3.819 ms/op |          97 |
+| BFS, 100×100 fan-out           | 5.326 ms/op |         232 |
+| `BFSIDs`, same walk            | 2.612 ms/op |         104 |
+| BFS on disk, 12 hops           | 113.9 µs/op |         394 |
+| `BFSIDs` on disk, same walk    | 36.34 µs/op |          20 |
 
 **Durability** — 50,000-node store with 100,000 indexed property entries:
 
-| Benchmark                       |       Result |
-| ------------------------------- | -----------: |
-| Reopen a compacted store        |  62.26 ms/op |
-| Compaction, steady state        |  39.22 ms/op |
-| `VerifyIndexes` (100k nodes)    |  205.8 ms/op |
+| Benchmark                    |      Result |
+| ---------------------------- | ----------: |
+| Reopen a compacted store     | 62.26 ms/op |
+| Compaction, steady state     | 39.22 ms/op |
+| `VerifyIndexes` (100k nodes) | 205.8 ms/op |
 
 ### Indexing & durability upgrade (2026-07-21)
 
@@ -99,21 +99,21 @@ interleaving is not incidental: measuring the two sides back to back produced a
 ~25% shift on benchmarks the changes never touched. See
 [benchmarks.md](docs/benchmarks.md#why-interleaving-demonstrated).
 
-| Operation                              |     Before |       After |          Change |
-| -------------------------------------- | ---------: | ----------: | --------------: |
-| Equality property query (disk)         |   53.55 ms |    277.0 ns | ~193 000× faster |
-| Equality property query (memory)       |   44.00 ms |    320.1 ns | ~137 000× faster |
-| Type + property query (memory)         |   58.71 ms |    7.171 µs |   ~8 200× faster |
-| Node in-degree on a hub (disk)         |   74.33 µs |    15.18 ns |   ~4 900× faster |
-| Typed query with `Limit: 10` (disk)    |   17.72 ms |    22.29 µs |     ~795× faster |
-| `DeleteNode` with a populated index    |   1.423 ms |    2.075 µs |     ~686× faster |
-| Edge query by type (memory)            |   56.35 ms |    155.3 µs |     ~363× faster |
-| Anchored relation query (disk)         |   43.70 ms |    228.7 µs |     ~191× faster |
-| `NodesByType` on a selective label     |  445.7 µs  |    5.059 µs |      ~88× faster |
-| **Reopen a compacted store**           | **1 284 ms** | **73.60 ms** |  **~17× faster** |
-| **Compaction, steady state**           | **648.8 ms** | **64.01 ms** |  **~10× faster** |
-| `UpdateNode` in a 50k-member label     |   49.16 µs |    5.162 µs |     9.5× faster |
-| `DeleteNode` from a 50k-member label   |   31.31 µs |    4.014 µs |     7.8× faster |
+| Operation                            |       Before |        After |           Change |
+| ------------------------------------ | -----------: | -----------: | ---------------: |
+| Equality property query (disk)       |     53.55 ms |     277.0 ns | ~193 000× faster |
+| Equality property query (memory)     |     44.00 ms |     320.1 ns | ~137 000× faster |
+| Type + property query (memory)       |     58.71 ms |     7.171 µs |   ~8 200× faster |
+| Node in-degree on a hub (disk)       |     74.33 µs |     15.18 ns |   ~4 900× faster |
+| Typed query with `Limit: 10` (disk)  |     17.72 ms |     22.29 µs |     ~795× faster |
+| `DeleteNode` with a populated index  |     1.423 ms |     2.075 µs |     ~686× faster |
+| Edge query by type (memory)          |     56.35 ms |     155.3 µs |     ~363× faster |
+| Anchored relation query (disk)       |     43.70 ms |     228.7 µs |     ~191× faster |
+| `NodesByType` on a selective label   |     445.7 µs |     5.059 µs |      ~88× faster |
+| **Reopen a compacted store**         | **1 284 ms** | **73.60 ms** |  **~17× faster** |
+| **Compaction, steady state**         | **648.8 ms** | **64.01 ms** |  **~10× faster** |
+| `UpdateNode` in a 50k-member label   |     49.16 µs |     5.162 µs |      9.5× faster |
+| `DeleteNode` from a 50k-member label |     31.31 µs |     4.014 µs |      7.8× faster |
 
 Cost no longer tracks the graph. A 10× larger graph used to make an equality
 query 14× slower (2.91 ms → 41.38 ms); it is now flat (704 ns → 590 ns).
@@ -121,46 +121,48 @@ query 14× slower (2.91 ms → 41.38 ms); it is now flat (704 ns → 590 ns).
 Traversal was reworked separately, where the metric is **allocations per walk**
 rather than latency — allocation is what the GC turns into tail latency:
 
-| Operation                              |        Before |         After |        Change |
-| -------------------------------------- | ------------: | ------------: | ------------: |
-| BFS over a 10,000-node chain           | 30,190 allocs |   216 allocs  | ~140× fewer |
-| BFS over a 1,000-node chain            |  3,058 allocs |    77 allocs  |  ~40× fewer |
-| BFS over a 100×100 fan-out             |  1,323 allocs |   232 allocs  |  ~5.7× fewer |
-| Shortest path                          |  1,563 allocs |   576 allocs  |  ~2.7× fewer |
-| BFS on the disk backend                |    913 allocs |   394 allocs  |  ~2.3× fewer |
+| Operation                    |        Before |      After |      Change |
+| ---------------------------- | ------------: | ---------: | ----------: |
+| BFS over a 10,000-node chain | 30,190 allocs | 216 allocs | ~140× fewer |
+| BFS over a 1,000-node chain  |  3,058 allocs |  77 allocs |  ~40× fewer |
+| BFS over a 100×100 fan-out   |  1,323 allocs | 232 allocs | ~5.7× fewer |
+| Shortest path                |  1,563 allocs | 576 allocs | ~2.7× fewer |
+| BFS on the disk backend      |    913 allocs | 394 allocs | ~2.3× fewer |
 
-Wall-clock improved alongside it (disk BFS −21%, shortest path −10%), and the new
-`BFSIDs` walks the graph without building a single record: 20 allocations where
-the record-returning walk needs 394.
+Wall-clock improved alongside it (disk BFS −21%, shortest path −10%), and the
+new `BFSIDs` walks the graph without building a single record: 20 allocations
+where the record-returning walk needs 394.
 
 Allocation dropped alongside latency: a filtered query that used to allocate
 **93 MB** now allocates **576 bytes**, and hub degree counting allocates nothing
 at all. Geomean across the shared benchmark set at the time of that comparison:
 **−88.7%** — and several of the worst paths have improved substantially since,
 so treat it as a floor rather than a current figure. Full numbers, and the
-methodology that makes them quotable, are in [benchmarks.md](docs/benchmarks.md).
+methodology that makes them quotable, are in
+[benchmarks.md](docs/benchmarks.md).
 
 Since then: pattern matching **24.6 ms → 4.75 ms** (399 950 → 150 allocations),
-cold open **1 263.9 ms → 42.7 ms**, and unindexed range scans **~32 ms → ~9.4 ms**.
+cold open **1 263.9 ms → 42.7 ms**, and unindexed range scans **~32 ms → ~9.4
+ms**.
 
-Restart and compaction no longer scale with index size. Before, every `Compact()`
-re-emitted the entire property index into the fresh WAL and every restart
-replayed it; now the index lives in the CSR file and the WAL is left empty after
-a compaction.
+Restart and compaction no longer scale with index size. Before, every
+`Compact()` re-emitted the entire property index into the fresh WAL and every
+restart replayed it; now the index lives in the CSR file and the WAL is left
+empty after a compaction.
 
 ### What it cost
 
 **The property index now uses 30–65% more memory per node.** This is the largest
 regression in the project and it is the direct price of the speed above:
 
-| Footprint (B/node) | Before | After |
-|---|---:|---:|
-| *Topology only* | 446.1 | 446.2 (+0.02%) |
-| *No property index* | 170.1 | 170.2 (+0.06%) |
-| With property index (memory) | 563.8 | **744.6** (+32.1%) |
-| With property index (disk) | 388.4 | **597.0** (+53.7%) |
-| Index at cardinality 1 | 179.0 | **263.6** (+47.3%) |
-| Index, all values distinct | 281.1 | 333.7 (+18.7%) |
+| Footprint (B/node)           | Before |              After |
+| ---------------------------- | -----: | -----------------: |
+| _Topology only_              |  446.1 |     446.2 (+0.02%) |
+| _No property index_          |  170.1 |     170.2 (+0.06%) |
+| With property index (memory) |  563.8 | **744.6** (+32.1%) |
+| With property index (disk)   |  388.4 | **597.0** (+53.7%) |
+| Index at cardinality 1       |  179.0 | **263.6** (+47.3%) |
+| Index, all values distinct   |  281.1 |     333.7 (+18.7%) |
 
 The first two rows are controls at ~0%, which places the whole increase inside
 the property index rather than the graph itself. It comes from the reverse
@@ -193,13 +195,13 @@ resolvable here**; the order-of-magnitude results are solid and anything in the
 tens of percent is directional. The footprint table above is exempt, being
 deterministic measurement rather than timing.
 
-This is the summary. [benchmarks.md](docs/benchmarks.md) carries the full detail:
-methodology, the fixture, per-area breakdowns, the regressions in full, what is
-still slow, and an appendix listing **every benchmark on both sides** across
-time, bytes, allocations and per-node footprint.
+This is the summary. [benchmarks.md](docs/benchmarks.md) carries the full
+detail: methodology, the fixture, per-area breakdowns, the regressions in full,
+what is still slow, and an appendix listing **every benchmark on both sides**
+across time, bytes, allocations and per-node footprint.
 
 Full methodology, per-benchmark detail, and the remaining slow paths are in
-[benchmarks.md](docs/benchmarks.md); the roadmap is in [plan.md](plan.md).
+[benchmarks.md](docs/benchmarks.md).
 
 Scale validation covered by stress tests:
 
@@ -274,20 +276,20 @@ ids, _ := g.QueryNodeIDs(store.NodeQuery{
 
 Queries are served from indexes, not from scans. What exists today:
 
-| Index                     | Backing structure                                     | Serves                                       |
-| ------------------------- | ----------------------------------------------------- | -------------------------------------------- |
-| Primary (ID → record)     | Hash map in memory; direct array offset in the CSR     | `GetNode`, `GetEdge`                          |
-| Adjacency                 | CSR prefix-sum arrays, plus a delta overlay            | Neighbours, traversal, anchored relations, degree |
-| Label (type)              | Postings per label, built for both the delta and CSR   | `NodesByType`, `EdgesByType`, `Types` filters  |
-| Property (secondary)      | Sorted postings per `(key, value)` + reverse ID map    | Equality filters, `NodesByProperty`            |
-| Ordered (range)           | Sorted values per *declared* key, ascending postings   | `>`, `>=`, `<`, `<=`, `Between`, `Prefix`      |
+| Index                 | Backing structure                                    | Serves                                            |
+| --------------------- | ---------------------------------------------------- | ------------------------------------------------- |
+| Primary (ID → record) | Hash map in memory; direct array offset in the CSR   | `GetNode`, `GetEdge`                              |
+| Adjacency             | CSR prefix-sum arrays, plus a delta overlay          | Neighbours, traversal, anchored relations, degree |
+| Label (type)          | Postings per label, built for both the delta and CSR | `NodesByType`, `EdgesByType`, `Types` filters     |
+| Property (secondary)  | Sorted postings per `(key, value)` + reverse ID map  | Equality filters, `NodesByProperty`               |
+| Ordered (range)       | Sorted values per _declared_ key, ascending postings | `>`, `>=`, `<`, `<=`, `Between`, `Prefix`         |
 
 The query planner picks whichever of these bounds the result most tightly —
 property postings, a declared ordered key's range, label postings, or the
 anchors' incident-edge lists — and falls back to a full scan only when none
-applies. Property indexing stays explicit and opt-in: you register the fields you want indexed with
-`IndexNodeProperty` / `IndexNodeProperties`, so the storage layer never has to
-understand your property encoding.
+applies. Property indexing stays explicit and opt-in: you register the fields
+you want indexed with `IndexNodeProperty` / `IndexNodeProperties`, so the
+storage layer never has to understand your property encoding.
 
 Index-accelerated operators: `PropertyOpEqual` always; the range operators and
 `Prefix` once the key is declared ordered (below). `Contains` is a scan and will
@@ -308,15 +310,15 @@ fmt.Println(plan)
 // driver=equality(sha256) candidates=1 residual=tool:probe~100000 results=1
 ```
 
-`ExplainNodeQuery` and `ExplainEdgeQuery` exist because results alone cannot tell
-an index lookup from a full scan that happened to agree with it. The plan is
-diagnostic — which index gets picked may change between versions; the results a
-query returns may not.
+`ExplainNodeQuery` and `ExplainEdgeQuery` exist because results alone cannot
+tell an index lookup from a full scan that happened to agree with it. The plan
+is diagnostic — which index gets picked may change between versions; the results
+a query returns may not.
 
 ### Ordered keys for range queries
 
-Declaring a key builds a sorted structure over its values, turning a range filter
-into two binary searches:
+Declaring a key builds a sorted structure over its values, turning a range
+filter into two binary searches:
 
 ```go
 import "github.com/aoiflux/graphene/index/encoding"
@@ -332,10 +334,10 @@ g.QueryNodes(store.NodeQuery{Filters: []store.PropertyFilter{{
 
 **Declaring changes how that key compares.** Undeclared keys use the scan rule —
 numeric when both sides parse, byte order otherwise — which is fine value by
-value but is not a valid sort order: under it `"9" < "10" < "1x" < "9"`, a cycle.
-A declared key is compared byte-wise throughout, so encode values with
-`index/encoding` (or use a naturally ordered form such as zero-padded fixed-width
-digits or hex). Equality lookups are unaffected either way.
+value but is not a valid sort order: under it `"9" < "10" < "1x" < "9"`, a
+cycle. A declared key is compared byte-wise throughout, so encode values with
+`index/encoding` (or use a naturally ordered form such as zero-padded
+fixed-width digits or hex). Equality lookups are unaffected either way.
 
 Measured on 1,000 distinct values: a wide range goes 22.84 ms → 2.310 ms, and a
 narrow one 11.76 ms → 59 µs.
@@ -350,8 +352,8 @@ as before, and are upgraded on the next `Compact()`.
 
 ### What a read guarantees
 
-Every operation is atomic on its own. A completed `DeleteNode` leaves no dangling
-edge and no index entry, in any index, under any key. Reads give you:
+Every operation is atomic on its own. A completed `DeleteNode` leaves no
+dangling edge and no index entry, in any index, under any key. Reads give you:
 
 > every ID returned named an entity that was live at the moment it was checked.
 
@@ -360,9 +362,9 @@ the entity may be gone, so `GetNode` on an ID you were just handed can
 legitimately fail — measured at 0.7% of IDs from a single-key lookup and 4–11%
 from a typed query, against a deleter running flat out. Treat a result set as
 candidates. Closing that gap needs snapshot isolation, which Graphene does not
-offer — `Begin()` gives a multi-write transaction that is atomic and durable, but
-**not isolated**, so read-decide-write across a concurrent writer still needs
-your own serialisation.
+offer — `Begin()` gives a multi-write transaction that is atomic and durable,
+but **not isolated**, so read-decide-write across a concurrent writer still
+needs your own serialisation.
 
 Holding that line needed one fix worth naming: property lookups consulted the
 index without consulting the records, and the two are separate structures under
@@ -374,10 +376,10 @@ two is what made its first version report 82 failures that were not bugs.
 
 ### Keeping the index truthful
 
-The engine cannot re-derive property-index entries on its own: indexed values are
-supplied by you in your own encoding, and the `Properties` blob is opaque to the
-storage layer. So updating an indexed entity needs a choice, and the API makes it
-explicit rather than silent:
+The engine cannot re-derive property-index entries on its own: indexed values
+are supplied by you in your own encoding, and the `Properties` blob is opaque to
+the storage layer. So updating an indexed entity needs a choice, and the API
+makes it explicit rather than silent:
 
 ```go
 // Preferred: update and re-register in one call. No stale entry for the old
@@ -398,9 +400,9 @@ against the records it describes — postings ordering, reverse-map agreement,
 label postings, adjacency endpoints, and orphaned entries — and
 `g.RebuildIndexes()` recomputes everything derivable from the records. Neither
 runs automatically on `Open`: verification is O(V+E) (~200 ms on a 100k-node
-store) and a damaged index section is already rejected while parsing, so the scan
-would be a startup tax for little gain. Run them explicitly in tests, in CI, or
-when recovering a suspect store.
+store) and a damaged index section is already rejected while parsing, so the
+scan would be a startup tax for little gain. Run them explicitly in tests, in
+CI, or when recovering a suspect store.
 
 ## Quick Start
 
@@ -436,13 +438,13 @@ go run ./examples
 
 ## Docs
 
-- Release notes: [v0.3.0](docs/RELEASE_NOTES_v0.3.0.md) — breaking changes, upgrade path, measured results
+- Release notes: [v0.3.0](docs/RELEASE_NOTES_v0.3.0.md) — breaking changes,
+  upgrade path, measured results
 - Easy usage guide: [USER_GUIDE.md](docs/USER_GUIDE.md)
 - Complete API reference: [API_REFERENCE.md](docs/API_REFERENCE.md)
 - Deep technical architecture and LLD:
   [TECHNICAL_DETAILS.md](docs/TECHNICAL_DETAILS.md)
 - Benchmark methodology and results: [benchmarks.md](docs/benchmarks.md)
-- Indexing and read-performance roadmap: [plan.md](plan.md)
 - Engine comparison notes: [comparison.md](docs/comparison.md)
 
 ## Query Migration

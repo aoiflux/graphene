@@ -161,8 +161,6 @@ func BenchmarkBlobPointLookupNode_Disk(b *testing.B) {
 
 // -----------------------------------------------------------------------------
 // Neighbours — blobFanout edge blobs per operation.
-// This is the path plan.md §4.3 names: rawEdgeToStore copies on every
-// materialisation, and a 1-hop expansion materialises several edges.
 // -----------------------------------------------------------------------------
 
 func benchmarkBlobEdgesOf(b *testing.B, f *benchFixture) {

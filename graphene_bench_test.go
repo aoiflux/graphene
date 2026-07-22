@@ -1,7 +1,6 @@
 // Read-path benchmarks for the Graphene engine.
 //
-// These cover the hot paths named in plan.md so that every indexing change can
-// be measured rather than argued about. Run with:
+// Run with:
 //
 //	go test . -tags=stress -bench=. -benchmem -benchtime=1s -run=^$
 //

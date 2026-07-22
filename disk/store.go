@@ -2407,9 +2407,7 @@ func (s *Store) loadCSR(path string) error {
 		// lock per shard, parallel fill, presized reverse map, batch-local value
 		// interning — and it cut allocations 9-19% but cost 35-75% more resident
 		// memory, because partitioning copies every entry into per-shard slices
-		// and the presize is keyed on entry count rather than entity count. Index
-		// memory is already the project's largest regression, so spending more of
-		// it to save allocations inverts the priority order. See plan.md.
+		// and the presize is keyed on entry count rather than entity count
 		for _, e := range section.NodeProps {
 			s.propIdx.IndexNode(e.ID, e.Key, e.Value)
 		}
