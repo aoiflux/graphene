@@ -32,9 +32,13 @@ import (
 // The purge records (0x07/0x08) drop every property-index entry for an ID
 // without deleting the entity, which is what store.ReindexPurge needs: without
 // them, replay would re-apply the superseded 0x03/0x04 entries and resurrect
-// values the entity no longer has. Replay skips unknown record types, so a
-// binary predating these records reads a newer WAL without erroring — it just
-// does not honour the purges.
+// values the entity no longer has.
+//
+// Replay **rejects** unknown record types rather than skipping them. Skipping
+// would let an older binary apply a rolled-back batch by ignoring the very
+// begin/commit markers that were meant to suppress it, so a WAL written by a
+// newer build is not readable by an older one — the log format is
+// forward-compatible only in the direction that is safe.
 
 const (
 	walRecordNode          byte = 0x01
