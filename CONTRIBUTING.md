@@ -227,6 +227,23 @@ component the model had not accounted for at all, and the largest one left.
 Do this first for any memory work. A change that recovers 100% of the wrong
 component is worse than no change.
 
+### Re-profile after a change, not just before
+
+The scan path was found by profiling the whole suite once several other changes
+had landed — the slowest paths were no longer the ones written down, and the two
+worst were not on any list.
+
+It happened twice inside one change. A profile put ~24% of a range query in
+`strconv` float parsing; the fix that shipped never touched parsing, it cut how
+many comparisons ran, and the parsing disappeared with them. Re-profiling then
+showed the new dominant cost was a reflective `sort.Slice`, which had been
+invisible underneath.
+
+Profile → fix → **profile again**. A cost that was 24% is not necessarily worth
+attacking; it may be a symptom of a cost that is 100× more frequent than it needs
+to be. And the thing underneath only becomes measurable once the thing on top is
+gone.
+
 ### Be willing to revert
 
 Bulk index loading was built, tested for equivalence, measured, and **reverted**:

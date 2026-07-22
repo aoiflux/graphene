@@ -224,10 +224,12 @@ func (p *PropertyIndex) matchNodes(f store.PropertyFilter) []store.NodeID {
 	if ids, served := p.NodesMatchingOrdered(nil, f); served {
 		return store.SortDedupeIDs(ids)
 	}
+	// One comparison per distinct value, not per entry: the predicate reads only
+	// the value, so every id sharing it gets the same answer.
 	var out []store.NodeID
-	p.ForEachNodeEntry(f.Key, func(id store.NodeID, value []byte) bool {
+	p.ForEachNodeValue(f.Key, func(value []byte, ids []store.NodeID) bool {
 		if store.PropertyFilterMatches(f, value) {
-			out = append(out, id)
+			out = append(out, ids...)
 		}
 		return true
 	})
@@ -243,9 +245,9 @@ func (p *PropertyIndex) matchEdges(f store.PropertyFilter) []store.EdgeID {
 		return store.SortDedupeIDs(ids)
 	}
 	var out []store.EdgeID
-	p.ForEachEdgeEntry(f.Key, func(id store.EdgeID, value []byte) bool {
+	p.ForEachEdgeValue(f.Key, func(value []byte, ids []store.EdgeID) bool {
 		if store.PropertyFilterMatches(f, value) {
-			out = append(out, id)
+			out = append(out, ids...)
 		}
 		return true
 	})

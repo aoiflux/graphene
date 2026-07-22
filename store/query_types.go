@@ -3,7 +3,7 @@ package store
 import (
 	"bytes"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -231,7 +231,7 @@ func SortDedupeIDs[T EntityID](ids []T) []T {
 	if len(ids) < 2 {
 		return ids
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	out := ids[:1]
 	for _, id := range ids[1:] {
 		if id != out[len(out)-1] {

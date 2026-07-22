@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -1558,7 +1559,7 @@ func sortDedupeNodeIDs(ids []store.NodeID) []store.NodeID {
 	if len(ids) < 2 {
 		return ids
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	out := ids[:1]
 	for _, id := range ids[1:] {
 		if id != out[len(out)-1] {
@@ -1573,7 +1574,7 @@ func sortDedupeEdgeIDs(ids []store.EdgeID) []store.EdgeID {
 	if len(ids) < 2 {
 		return ids
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	out := ids[:1]
 	for _, id := range ids[1:] {
 		if id != out[len(out)-1] {
@@ -3149,10 +3150,11 @@ func (s *Store) matchOneNodeFilter(f store.PropertyFilter) []store.NodeID {
 		return store.SortDedupeIDs(ids)
 	}
 	// Otherwise scan only the buckets belonging to this key, never the whole index.
+	// One comparison per distinct value, not per entry.
 	var out []store.NodeID
-	s.propIdx.ForEachNodeEntry(f.Key, func(id store.NodeID, value []byte) bool {
+	s.propIdx.ForEachNodeValue(f.Key, func(value []byte, ids []store.NodeID) bool {
 		if store.PropertyFilterMatches(f, value) {
-			out = append(out, id)
+			out = append(out, ids...)
 		}
 		return true
 	})
@@ -3191,9 +3193,9 @@ func (s *Store) matchOneEdgeFilter(f store.PropertyFilter) []store.EdgeID {
 		return store.SortDedupeIDs(ids)
 	}
 	var out []store.EdgeID
-	s.propIdx.ForEachEdgeEntry(f.Key, func(id store.EdgeID, value []byte) bool {
+	s.propIdx.ForEachEdgeValue(f.Key, func(value []byte, ids []store.EdgeID) bool {
 		if store.PropertyFilterMatches(f, value) {
-			out = append(out, id)
+			out = append(out, ids...)
 		}
 		return true
 	})

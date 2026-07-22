@@ -301,6 +301,62 @@ search that now materialises records only for the final path), `BFS3Hop_Disk`
 20 allocations and 36.3 µs on the disk fixture, against 394 and 113.9 µs for the
 record-returning equivalent.
 
+### Filter scans — comparing once per value, sorting without reflection
+
+Two independent findings, both from re-profiling rather than from a plan item.
+
+**The predicate ran once per entry, not once per distinct value.** A filter reads
+only the value, so a value shared by a thousand entities was evaluated a thousand
+times for the same answer. Interleaved, nine controls `~`:
+
+| | Before | After | Change |
+|---|---:|---:|---:|
+| `QueryNodes_PropertyRange_Disk` | 27.45 ms | 11.74 ms | **−57.2%** |
+| `QueryNodes_PropertyRange_Memory` | 32.01 ms | 15.24 ms | **−52.4%** |
+| `..._Range_Narrow_Scan_Memory` | 26.16 ms | 13.99 ms | −46.5% |
+| `QueryNodes_PropertyPrefix_Memory` | 17.04 ms | 14.64 ms | −14.0% |
+
+~24% of the range query had been `strconv` float parsing, from the numeric-then-
+bytes scan rule. It vanished without being touched: fewer comparisons, less
+parsing.
+
+**Then the sort dominated, and it was reflective.** `sort.Slice` with a closure
+shows up as `sort.partition_func` + `reflectlite.Swapper`. Switching the five
+ascending-ID sorts to `slices.Sort` (measured with the change above present on
+both sides):
+
+| | Before | After | Change |
+|---|---:|---:|---:|
+| `QueryNodes_PropertyRange_Memory` | 15.33 ms | **9.36 ms** | **−38.9%** |
+| `..._Range_Narrow_Scan_Memory` | 13.82 ms | **8.63 ms** | −37.5% |
+| `QueryNodes_PropertyRange_Disk` | 13.09 ms | 11.70 ms | ~ |
+
+Disk is `~` because its scan is dominated by materialising records rather than
+sorting. The range scan overall moved from ~32 ms to ~9.4 ms; the two figures are
+from separate controlled runs and are not multiplied.
+
+### Property-index memory — interning only where it pays
+
+A reverse index entry kept the caller's own string. The forward index deduplicates
+by content, so a thousand nodes sharing one value left one string on the forward
+side and a thousand copies pinned on the reverse side — ~32 B per entry.
+
+Interning unconditionally would lose on a unique-per-node key like a hash, which
+would pay a table slot per value and save nothing. So a value is interned only on
+its **second** entry, which `insertSorted` has already computed.
+
+Footprint benchmarks (deterministic, ±0%; `NoIndex` control unchanged):
+
+| 100k entries | index B/node before | after | Change |
+|---|---:|---:|---:|
+| cardinality 1 | 93.3 | **61.3** | **−34.3%** |
+| cardinality 100 | 94.8 | **62.9** | −33.6% |
+| cardinality 10 000 | 105.1 | **89.3** | −15.0% |
+| all distinct | 163.4 | **163.4** | **0.0%** |
+
+The last row is the design goal: where interning cannot pay, it costs nothing.
+Whole-graph fixtures move −2.5% to −3.4%, and speed is `~` across read and write.
+
 ### Cold open — replay was syscall-bound, not index-bound
 
 `Open` on an uncompacted WAL replayed every record with three separate reads
@@ -462,7 +518,7 @@ never before quantified.
 
 Reported in full. Each is a trade, and the axis that won is named.
 
-### The one that matters most: property-index memory, +19–54%
+### The one that matters most: property-index memory, +19–48%
 
 This is a **P1 regression**, it is not noise, and it is the price of the P0 wins
 above.
@@ -471,11 +527,11 @@ above.
 |---|---:|---:|---:|
 | *Topology only, memory* | 446.1 | 446.2 | **+0.02%** |
 | *No property index* | 170.1 | 170.2 | **+0.06%** |
-| Memory store + property index | 563.8 | **744.6** | +32.1% |
-| Disk store + property index | 388.4 | **597.0** | +53.7% |
-| Index at cardinality 1 | 179.0 | **263.6** | +47.3% |
-| Index at cardinality 100 | 180.5 | 265.1 | +46.9% |
-| Index at cardinality 10 000 | 194.0 | 275.4 | +42.0% |
+| Memory store + property index | 563.8 | **723.6** | +28.3% |
+| Disk store + property index | 388.4 | **575.7** | +48.2% |
+| Index at cardinality 1 | 179.0 | **231.6** | +29.4% |
+| Index at cardinality 100 | 180.5 | 233.2 | +29.2% |
+| Index at cardinality 10 000 | 194.0 | 259.6 | +33.8% |
 | Index, all values distinct | 281.1 | 333.7 | +18.7% |
 | On-disk file size | 248.0 | **175.0** | **−29.4%** ¹ |
 
@@ -582,10 +638,10 @@ Recorded because they were published as regressions and should not stay that way
 - **Range and prefix are only fast on *declared* keys.** An undeclared key still
   scans its buckets — better than the original full-index materialisation, but
   linear.
-- **Property-index memory.** The reverse map is **84.3 B/entry — 90% of the
-  index**, against 9.1 B for the forward postings. A sorted-array replacement was
-  built and reverted (it made deletes 5.7× slower); the largest remaining
-  component is **value strings pinned by reverse entries, ~32 B/entry**. See
+- **Property-index memory** is now Go map machinery. The reverse map is 90% of
+  the index; the pinned value strings inside it were removed by adaptive
+  interning (below), and the sorted-array replacement that would remove the rest
+  was reverted for making deletes 5.7× slower. See
   [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md) §14.8.
 
 ## Reproducing

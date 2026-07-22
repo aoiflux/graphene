@@ -1276,8 +1276,10 @@ This section exists so these are not re-attempted. Each was measured.
 | Ordered index per declared key | ~10.5 B/node (scales with *distinct values*) | range queries 6.8–199× |
 | Postings resolved against records | ~20 ns per raw lookup | **read consistency** — not speed |
 
-**The bill in one number:** property-index memory is **+22–53% per node** against
+**The bill in one number:** property-index memory is **+19–48% per node** against
 the pre-index baseline. That is the honest counterweight to the query speedups.
+Adaptive value interning (§14.9) took the low-cardinality end of that range down
+by roughly a third; the all-distinct end is unchanged, by design.
 
 ### 14.2 Rejected: ID-remapping compaction
 
@@ -1372,9 +1374,48 @@ the reverse entries**, because a reverse entry keeps the caller's string while t
 forward index keeps only the first one it saw for that value. At cardinality 1
 that is 100k live copies of one distinct string.
 
-That makes value interning the largest remaining lever, and a cardinality-
-dependent one: a clear win on low-cardinality keys, a clear loss on all-distinct
-ones. See plan §5.2.4.
+That made value interning the largest remaining lever — and it has since been
+taken; see §14.9. What is left of the reverse map is Go map machinery.
+
+### 14.9 Taken: value interning, conditional on repetition
+
+A reverse entry stores the value it was registered under. It used to store the
+*caller's* string, and the forward index deduplicates by content — a bucket key
+is written once and never replaced — so a thousand entities sharing one value
+left one string on the forward side and a thousand copies pinned on the reverse
+side. Measured: ~32 B per entry.
+
+Interning unconditionally is the wrong trade. A key whose values are unique per
+entity (a hash, an ID) would pay one table slot per value and save nothing, which
+is why §14.8 recorded this as a design question rather than an optimisation.
+
+**The condition is available for free.** `insertSorted` has just returned the
+value's posting list, so its length says how many entities now share it. A value
+is interned on its second entry and never before:
+
+```go
+func (p *postings[T]) canonical(value string, n int) string {
+    if n < 2 {
+        return value // also the forward bucket's key — shared by construction
+    }
+    if canon, ok := p.shared[value]; ok {
+        return canon
+    }
+    ...
+}
+```
+
+| Key shape | Table slots | Copies saved |
+|---|---|---|
+| unique per entity (`sha256`) | **none** | none — and none available |
+| repeated (`bucket`, `status`) | one per distinct value | one per entry |
+
+Index memory falls **34% at low cardinality and exactly 0% at all-distinct**, and
+the intern entry is released when its bucket empties so churn cannot leak it.
+
+Correctness here is invisible to functional tests — a content-equal string
+changes nothing observable — so `index/interning_test.go` asserts on
+backing-pointer identity instead.
 
 ---
 

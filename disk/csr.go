@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 
 	"github.com/aoiflux/graphene/index"
@@ -581,7 +582,7 @@ func (g *CSRGraph) SortedEdgesByType(t store.EdgeType) []store.EdgeID {
 	ids := g.EdgesByType(t)
 	out := make([]store.EdgeID, len(ids))
 	copy(out, ids)
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 

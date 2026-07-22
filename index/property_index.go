@@ -366,6 +366,27 @@ func (p *PropertyIndex) ForEachNodeEntry(key string, fn func(id store.NodeID, va
 	sh.nodes.forEach(key, fn)
 }
 
+// ForEachNodeValue calls fn once per distinct value under key, with that value's
+// id list. Prefer it over ForEachNodeEntry when the callback depends only on the
+// value — a filter scan does, and this makes it one comparison per value instead
+// of one per entry.
+//
+// The id slice is owned by the index: read it, do not retain or mutate it.
+func (p *PropertyIndex) ForEachNodeValue(key string, fn func(value []byte, ids []store.NodeID) bool) {
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	sh.nodes.forEachValue(key, fn)
+}
+
+// ForEachEdgeValue is ForEachNodeValue for edge properties.
+func (p *PropertyIndex) ForEachEdgeValue(key string, fn func(value []byte, ids []store.EdgeID) bool) {
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	sh.edges.forEachValue(key, fn)
+}
+
 // ForEachEdgeEntry calls fn for every (id, value) registered under key.
 // Return false from fn to stop early.
 func (p *PropertyIndex) ForEachEdgeEntry(key string, fn func(id store.EdgeID, value []byte) bool) {
@@ -538,6 +559,11 @@ type postings[T entityID] struct {
 	ref1 map[T]propRef
 	refN map[T][]propRef
 
+	// shared holds the canonical string for values carrying two or more entries,
+	// so their reverse entries point at one copy instead of one each. Values that
+	// never repeat never enter it — see canonical.
+	shared map[string]string
+
 	// Entries per key, so the query planner can cost a scan of a key without
 	// walking that key's buckets to find out how big it is.
 	perKey map[string]int
@@ -646,9 +672,43 @@ func (p *postings[T]) add(id T, key, value string) {
 		return
 	}
 	bucket[value] = ids
-	p.addRef(id, propRef{keyID: p.internKey(key), value: value})
+	p.addRef(id, propRef{keyID: p.internKey(key), value: p.canonical(value, len(ids))})
 	p.perKey[key]++
 	p.count++
+}
+
+// canonical returns the string to store in a reverse entry for a value that now
+// has n entries under its key.
+//
+// Every reverse entry used to keep the caller's own string. The forward index
+// deduplicates by content — a map key is written once and never replaced — so
+// with a thousand nodes sharing one value, the forward side held one string and
+// the reverse side pinned a thousand copies of it. Measured, that is ~32 B per
+// entry, the largest single component of index memory after the map machinery
+// itself.
+//
+// Interning unconditionally would be the wrong trade: a key like a hash has one
+// entry per distinct value, so a table mapping value → canonical string costs an
+// entry per value and saves nothing at all.
+//
+// The repetition is knowable exactly when it starts to matter. n is the number
+// of entries this value now has, so a value only enters the table on its
+// *second* entry — a key whose values never repeat never allocates a single
+// table slot, and a low-cardinality key pays one slot to save a copy per entry.
+func (p *postings[T]) canonical(value string, n int) string {
+	if n < 2 {
+		// First entry for this value: the forward bucket's key already holds
+		// this exact string, so it is shared by construction.
+		return value
+	}
+	if canon, ok := p.shared[value]; ok {
+		return canon
+	}
+	if p.shared == nil {
+		p.shared = make(map[string]string)
+	}
+	p.shared[value] = value
+	return value
 }
 
 // remove drops every entry registered for id.
@@ -671,6 +731,7 @@ func (p *postings[T]) remove(id T) {
 		}
 		if len(ids) == 0 {
 			delete(bucket, ref.value)
+			delete(p.shared, ref.value)
 		} else {
 			bucket[ref.value] = ids
 		}
@@ -708,6 +769,29 @@ func (p *postings[T]) cardinality(key, value string) int {
 
 // forEach visits every (id, value) under key. The value slice aliases the
 // index's internal string and must not be retained or mutated by fn.
+// forEachValue calls fn once per distinct value under key, with that value's
+// whole id list.
+//
+// forEach below calls its predicate once per *entry*. Every scan caller uses it
+// to evaluate a filter, and a filter reads only the value — so a value shared by
+// a thousand entities was compared a thousand times to reach the same answer.
+// Iterating by value makes the comparison count the number of distinct values
+// rather than the number of entries.
+//
+// ids is the live posting slice: callers must not retain or mutate it, the same
+// contract as unsafeBytes below.
+func (p *postings[T]) forEachValue(key string, fn func(value []byte, ids []T) bool) {
+	bucket := p.byKey[key]
+	if bucket == nil {
+		return
+	}
+	for value, ids := range bucket {
+		if !fn(unsafeBytes(value), ids) {
+			return
+		}
+	}
+}
+
 func (p *postings[T]) forEach(key string, fn func(id T, value []byte) bool) {
 	bucket := p.byKey[key]
 	if bucket == nil {
