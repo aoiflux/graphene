@@ -97,7 +97,7 @@ instead of being rebuilt from the WAL on every restart.
 Measured as an **interleaved** A/B against `036aac0`, 6 samples per side. The
 interleaving is not incidental: measuring the two sides back to back produced a
 ~25% shift on benchmarks the changes never touched. See
-[benchmarks.md](benchmarks.md#why-interleaving-demonstrated).
+[benchmarks.md](docs/benchmarks.md#why-interleaving-demonstrated).
 
 | Operation                              |     Before |       After |          Change |
 | -------------------------------------- | ---------: | ----------: | --------------: |
@@ -135,7 +135,13 @@ the record-returning walk needs 394.
 
 Allocation dropped alongside latency: a filtered query that used to allocate
 **93 MB** now allocates **576 bytes**, and hub degree counting allocates nothing
-at all. Geomean across the whole suite: **−88.7%**.
+at all. Geomean across the shared benchmark set at the time of that comparison:
+**−88.7%** — and several of the worst paths have improved substantially since,
+so treat it as a floor rather than a current figure. Full numbers, and the
+methodology that makes them quotable, are in [benchmarks.md](docs/benchmarks.md).
+
+Since then: pattern matching **24.6 ms → 4.75 ms** (399 950 → 150 allocations),
+cold open **1 263.9 ms → 42.7 ms**, and unindexed range scans **~32 ms → ~9.4 ms**.
 
 Restart and compaction no longer scale with index size. Before, every `Compact()`
 re-emitted the entire property index into the fresh WAL and every restart
@@ -205,6 +211,8 @@ Scale validation covered by stress tests:
 ## Showcased Features
 
 - Full CRUD: add, get, update, and delete nodes and edges (cascade delete).
+- **Transactions**: `Begin()` commits creates, updates and deletes together —
+  atomic and durable, including a delete's edge cascade.
 - Traversal toolkit: BFS, DFS, provenance chain, shortest path.
 - Query primitives: type lookups, property lookups, degree/connectivity checks.
 - Pattern discovery: scoped VF2-inspired subgraph matching.
@@ -228,7 +236,7 @@ _ = g.DeleteNode(artID)
 On the disk backend, updates and deletes are written to the WAL (deletes as
 tombstone records) and take effect immediately for reads; the freed space is
 reclaimed at the next `Compact()`. IDs are monotonic and never reused. See the
-[API reference](API_REFERENCE.md#mutation) for full semantics.
+[API reference](docs/API_REFERENCE.md#mutation) for full semantics.
 
 ## Query Model
 
@@ -352,7 +360,9 @@ the entity may be gone, so `GetNode` on an ID you were just handed can
 legitimately fail — measured at 0.7% of IDs from a single-key lookup and 4–11%
 from a typed query, against a deleter running flat out. Treat a result set as
 candidates. Closing that gap needs snapshot isolation, which Graphene does not
-offer, and a sequence of calls is not a transaction.
+offer — `Begin()` gives a multi-write transaction that is atomic and durable, but
+**not isolated**, so read-decide-write across a concurrent writer still needs
+your own serialisation.
 
 Holding that line needed one fix worth naming: property lookups consulted the
 index without consulting the records, and the two are separate structures under

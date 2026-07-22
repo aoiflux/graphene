@@ -1048,7 +1048,8 @@ call that is not.
 | **Nodes *and* their edges** | `AddNodes` then `AddEdges` | **`Begin()` / `Commit()`** | same speed, but one commit instead of two — a crash between them cannot orphan nodes |
 | **Many index entries** | `IndexNodeProperty` × N | **`IndexNodeProperties(id, map)`** | one call per entity |
 | **Update an indexed entity** | `UpdateNode` then re-index | **`UpdateNodeIndexed(n, props)`** | atomic; no stale window |
-| **Range / prefix query** | filter on an undeclared key | **`DeclareOrderedProperty(key)` first** | 22.8 ms → 2.3 ms wide; 11.8 ms → 59 µs narrow |
+| **Range / prefix query** | filter on an undeclared key | **`DeclareOrderedProperty(key)` first** | 9.4 ms → 1.2 ms wide; 8.6 ms → 17 µs narrow |
+| **Subgraph matching** | `FindPatterns` with `nil` scope | **scope it** — BFS/query IDs first | scope size drives cost directly; the matcher itself is 4.75 ms on a 2 000-node scope |
 | **Concurrent reads** | in-memory backend | **disk backend** | 12.3 ns vs 48.0 ns at 16 cores — see §19.5 |
 | **Space after bulk deletes** | leave it | **`Compact()`** | 4.5× less memory per live node |
 
@@ -1415,11 +1416,20 @@ stop := g.HandleSignals()
 defer stop()
 ```
 
-This matters more than it looks on the disk backend. A write is durable once its
-WAL append returns, so an abrupt kill does not lose committed data — but it does
-leave the WAL unconsolidated, which makes the next `Open` replay every record
-written since the last `Compact()`. Closing cleanly is what keeps restart cost
-proportional to recent work rather than to the whole log.
+This matters more than it looks on the disk backend, though **not** because an
+unclean exit loses committed data outright. The precise guarantee is in §16: a
+single `AddNode`/`AddEdge` reaches the OS but is not `fsync`ed, so it survives a
+process kill and is exposed to power loss until a `Sync()`, batch commit,
+`Compact()` or `Close()`. Batch and transaction commits `fsync` by default.
+
+What an abrupt kill does cost is consolidation: the WAL is left unconsolidated,
+so the next `Open` replays every record written since the last `Compact()`.
+Replay is roughly 30× cheaper than it was — a 10 000-node uncompacted log now
+opens in ~43 ms rather than ~1.3 s — but it is still proportional to the log,
+where a compacted reopen is proportional to nothing you wrote recently.
+
+Closing cleanly is what keeps restart cost proportional to recent work rather
+than to the whole log.
 
 The returned uninstall function exists so tests and embedded uses can avoid
 leaving a global signal handler behind.

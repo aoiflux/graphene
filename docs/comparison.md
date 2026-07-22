@@ -103,12 +103,24 @@ that backend's data layout.
 | Feature                    | Graphene                                                 | Cayley                                                 | Neo4j                                |
 | -------------------------- | -------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------ |
 | Write-ahead log (WAL)      | Yes — per-record CRC32, append-only, replayed on restart | Depends on backend (LevelDB/BoltDB have their own WAL) | Yes — transaction log                |
-| ACID transactions          | No — single-write atomicity only (per node/edge)         | Depends on backend                                     | Full ACID                            |
-| Multi-write transactions   | No                                                       | Depends on backend                                     | Yes                                  |
+| ACID transactions          | Atomic + durable, **not** isolated — see below            | Depends on backend                                     | Full ACID                            |
+| Multi-write transactions   | Yes — `Begin()`; creates, updates and deletes in one commit | Depends on backend                                   | Yes                                  |
+| Transaction isolation      | None — a transaction is not a snapshot; concurrent readers see committed state as it lands | Backend-dependent | Read-committed and above |
 | Crash recovery             | WAL replay into delta layer on Open()                    | Backend-managed                                        | WAL replay + checkpoint              |
 | Compaction / checkpointing | Manual `Compact()` — crash-safe via atomic rename        | Backend-managed                                        | Automatic                            |
 | Concurrent write safety    | Mutex-protected delta writes                             | Backend-dependent                                      | Full concurrent transactional writes |
 | Optimistic locking         | No                                                       | No                                                     | Yes                                  |
+
+**On "ACID" for Graphene.** `Begin()` buffers creates, updates and deletes and
+commits them through one framed WAL write with an `fsync`, so a transaction is
+**atomic** (all or nothing, including a node deletion's edge cascade) and
+**durable** (survives power loss once committed). It is **not isolated**: there
+is no snapshot, no read view, and no conflict detection. Two concurrent
+transactions touching the same entity both apply, last write winning. Consistency
+is enforced structurally — no edge can commit without live endpoints — rather
+than by user-defined constraints.
+
+So: A and D yes, C structurally, I no.
 
 ---
 
@@ -158,7 +170,10 @@ that backend's data layout.
 - Ad-hoc exploratory Cypher queries during investigation.
 - Rich property indexing (arbitrary field queries without explicit
   pre-registration; full B-tree range support).
-- ACID multi-step write transactions (e.g. atomic case ingestion rollback).
+- **Isolated** transactions. Graphene's `Begin()` gives atomicity and durability
+  for a multi-record write, but no isolation or snapshot reads — concurrent
+  readers observe a committed transaction as it lands, and a transaction does not
+  see a stable view of the graph while it is open.
 - Full-text and vector similarity search over properties.
 
 **Cayley is not recommended** for Indicer given its unmaintained state, the RDF

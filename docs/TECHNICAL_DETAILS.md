@@ -98,6 +98,9 @@ small separate interface a backend may satisfy, which callers type-assert:
 | Interface | Purpose |
 |---|---|
 | `AdjacencyReader` | `IncidentEdges` into a caller buffer; `NodeExists` without materialising |
+| `BatchReader` | `GetNodesBatch` / `GetEdgesBatch` — many IDs under one lock hold |
+| `Transactor` | `ReserveNodeID`/`ReserveEdgeID` and `ApplyTransaction([]TxOp)` — the multi-record commit behind `Graph.Begin` (§5.1a) |
+| `Syncer` | `Sync` — force pending writes durable without a full `Compact()` |
 | `DegreeCounter` | Degree from CSR offsets without building records |
 | `Reindexer` | `UpdateNodeIndexed`, reindex policy |
 | `IndexVerifier` | `VerifyIndexes` |
@@ -195,19 +198,23 @@ Two files per store directory: `graphene.csr` and `graphene.wal`.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ HEADER (46 bytes, v6)                                   │
+│ HEADER (46 bytes, v6+)                                  │
 ├─────────────────────────────────────────────────────────┤
 │ NODE RECORDS      × nodeCount     (variable length)     │
 ├─────────────────────────────────────────────────────────┤
 │ EDGE RECORDS      × edgeCount     (variable length)     │
 ├─────────────────────────────────────────────────────────┤
-│ outOffset[] │ outEdges[] │ inOffset[] │ inEdges[]       │  ← fixed width
-├─────────────────────────────────────────────────────────┤
 │ PROPERTY INDEX SECTION  ("GIDX")   ← at header.indexOffset│
 └─────────────────────────────────────────────────────────┘
+
+v2–v6 also carried flat adjacency arrays between the edge records and the index
+section (`outOffset[] │ outEdges[] │ inOffset[] │ inEdges[]`). **v7 does not
+write them**: the reader always rebuilt adjacency from the edge records and
+skipped the arrays entirely, so they were ~21% of the file, written on every
+`Compact()` and read by nobody. A v2–v6 file is still read, arrays and all.
 ```
 
-**Header, v6 — 46 bytes:**
+**Header, v6+ — 46 bytes (unchanged in v7):**
 
 | Offset | Size | Field | Since |
 |---:|---:|---|---|
@@ -255,6 +262,7 @@ properties until it does.
 | v4 | labels widened from `uint8` to `uint16` |
 | v5 | sequence high-water marks added |
 | v6 | property-index section + `indexOffset` |
+| v7 | flat adjacency arrays no longer written (−21% file size) |
 
 All of v2–v7 are readable; v7 is written. Older files upgrade on the next
 `Compact()`.
@@ -1269,12 +1277,15 @@ This section exists so these are not re-attempted. Each was measured.
 
 | Change | Cost | Bought |
 |---|---|---|
-| Reverse `ID → (key,value)` map | +89–96% B/op on register; a large share of index memory | `DeleteNode` **686×** |
+| Reverse `ID → (key,value)` map | +89–96% B/op on register; **90% of index memory** (measured, §14.8) | `DeleteNode` **686×** |
 | Property index in the CSR | +63% peak bytes on reopen | reopen **17×** |
 | 16-way key sharding | 16× map header overhead | distinct-key registration **2.4×** |
 | CSR label postings | ~8 B per (node, label) | `NodesByType` **88×** |
 | Ordered index per declared key | ~10.5 B/node (scales with *distinct values*) | range queries 6.8–199× |
 | Postings resolved against records | ~20 ns per raw lookup | **read consistency** — not speed |
+| Adaptive value interning (§14.9) | one table slot per *repeated* value; none for unique values | index **−34%** at low cardinality, **0%** at all-distinct |
+| Buffered WAL replay + hardware CRC (§11.5) | 1 MiB read buffer, capped to log size | cold open **~30×** |
+| `edgeProbe` + adjacency memo (§8.3) | one buffer and a one-entry memo per search | pattern matching **5.2×**, allocations **−99.96%** |
 
 **The bill in one number:** property-index memory is **+19–48% per node** against
 the pre-index baseline. That is the honest counterweight to the query speedups.

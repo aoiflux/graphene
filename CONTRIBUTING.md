@@ -310,9 +310,12 @@ for f in *.md docs/*.md; do awk -v F="$f" '/^```/{n++} END{if(n%2)print F": UNBA
 
 # internal links resolve — checked *from each file's own directory*, because
 # links are relative and the reference docs live one level down in docs/.
-# Checking only root *.md silently passed 11 broken links when the docs moved.
+# Checking only root *.md silently passed 11 broken links when the docs moved,
+# and a pattern anchored on '.md)' missed two more carrying a #section anchor.
+# Strip the anchor before testing the path.
 for d in . docs; do
-  ( cd "$d" && grep -ohE '\]\([A-Za-z0-9_/.-]+\.(go|md)\)' *.md | tr -d '])(' | sort -u \
+  ( cd "$d" && grep -ohE '\]\([A-Za-z0-9_/.-]+\.(go|md)(#[A-Za-z0-9_-]+)?\)' *.md \
+      | sed -E 's/^\]\(//; s/\)$//; s/#.*//' | sort -u \
       | while read t; do [ -e "$t" ] || echo "BROKEN LINK in $d/: $t"; done )
 done
 ```

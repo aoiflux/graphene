@@ -404,11 +404,15 @@ func (g *CSRGraph) EdgeCount() int {
 	return len(g.outEdges)
 }
 
-// Serialise writes the CSR arrays to binary format v6.
+// Serialise writes the CSR to binary format v7 (csrVersionCurrent).
+//
+// v7 is v6 minus the flat adjacency arrays: the reader never parsed them — it
+// rebuilds adjacency from the edge records — so they were ~21% of the file
+// written on every Compact and read by nobody.
 //
 // Format:
 //
-//	[magic:4]["GCSR"][version:2=0x0006][nodeCount:8][edgeCount:8]
+//	[magic:4]["GCSR"][version:2=0x0007][nodeCount:8][edgeCount:8]
 //	[nodeSeqHW:8][edgeSeqHW:8][indexOffset:8]
 //	[nodeRecord * nodeCount] (each: id:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + propLen:4 + props:N)
 //	[rawEdge * edgeCount]    (each: id:8 + src:8 + dst:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + weight:4 + propLen:4 + props:N)

@@ -482,8 +482,30 @@ of them go stale before you reach them. Closing it would require snapshot
 isolation, which Graphene does not offer, so treat any result set as candidates
 rather than a guarantee.
 
-A *sequence* of calls is not a transaction. If an invariant has to hold across
-several calls — read-decide-write is the usual one — enforce it in your own code.
+A *sequence* of separate calls is not a transaction — but a `Tx` is. Use
+`g.Begin()` when several writes must land together or not at all:
+
+```go
+tx := g.Begin()
+caseID := tx.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}})
+fileID := tx.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
+tx.AddEdge(&store.Edge{Src: fileID, Dst: caseID, Labels: []store.EdgeType{store.EdgeTypeBelongsTo}})
+
+if err := tx.Commit(); err != nil {
+    // nothing was written — the store is exactly as it was
+}
+```
+
+That covers creates, updates and deletes, and a `DeleteNode` inside it cascades
+to the node's edges like the standalone call does. See
+[API_REFERENCE.md](API_REFERENCE.md) §5.1.
+
+**What it does not give you is isolation.** A transaction is not a snapshot: it
+does not see a frozen view of the graph while open, and readers see its effects
+as they land. So *read-decide-write* is still not safe against a concurrent
+writer — reading inside a transaction reads live state, and nothing detects that
+it changed before you commit. Enforce that invariant in your own code, or
+serialise the writers.
 
 ## 6. Traversal and Multi-Hop Analysis
 
@@ -582,11 +604,19 @@ Best practice:
 - use BFS node IDs as scope,
 - then call `FindPatterns` on that subset.
 
+Scoping still matters most, but the matcher itself is no longer the bottleneck it
+was: a two-hop pattern over a 2 000-node scope went from 24.6 ms and ~400 000
+allocations to **4.75 ms and 150**, because edge checks now walk adjacency IDs
+instead of materialising every candidate edge record.
+
 ## 9. Helper APIs and Result Utilities
 
 ### Batch and helper methods
 
-- `GetNodes`, `GetEdges`
+- `AddNodes`, `AddEdges` — atomic ordered batch insert
+- `Begin` → `*Tx` — creates, updates and deletes committing together (§5)
+- `GetNodes`, `GetEdges` — resolve many IDs under one lock hold
+- `Sync` — force pending writes durable without a full `Compact()`
 - `Stats`
 - `NodesByAnyType`, `EdgesByAnyType`
 
@@ -740,12 +770,16 @@ Fix:
 Cause:
 
 - unscoped traversal or pattern matching,
-- no compaction after ingest.
+- no compaction after ingest,
+- a range or prefix filter on a key that was never declared ordered — that is a
+  scan of the key's values, not an index lookup.
 
 Fix:
 
 - scope operations using multi-hop BFS,
-- compact and reopen for read-heavy phase.
+- compact and reopen for read-heavy phase,
+- `DeclareOrderedProperty(key)` before running range or prefix queries against
+  it; on the benchmark fixture that is milliseconds against microseconds.
 
 ## 15. Code Reference Map
 
