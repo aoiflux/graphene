@@ -3,7 +3,6 @@ package memory
 import (
 	"fmt"
 	"slices"
-	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -803,12 +802,7 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 	case sortedAsc:
 		store.ReverseIDs(candidates)
 	default:
-		sort.Slice(candidates, func(i, j int) bool {
-			if order == store.QueryOrderDesc {
-				return candidates[i] > candidates[j]
-			}
-			return candidates[i] < candidates[j]
-		})
+		store.SortIDsForOrder(candidates, order)
 	}
 	return store.ApplyNodeQueryWindow(candidates, query.Offset, query.Limit), nil
 }
@@ -868,12 +862,7 @@ func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 	case sortedAsc:
 		store.ReverseIDs(candidates)
 	default:
-		sort.Slice(candidates, func(i, j int) bool {
-			if order == store.QueryOrderDesc {
-				return candidates[i] > candidates[j]
-			}
-			return candidates[i] < candidates[j]
-		})
+		store.SortIDsForOrder(candidates, order)
 	}
 	return store.ApplyEdgeQueryWindow(candidates, query.Offset, query.Limit), nil
 }

@@ -241,6 +241,23 @@ func SortDedupeIDs[T EntityID](ids []T) []T {
 	return out
 }
 
+// SortIDsForOrder puts ids into the requested order.
+//
+// Sorting ascending and reversing beats sorting with an order-aware comparator:
+// slices.Sort on an ordered type compiles to a direct comparison, where
+// sort.Slice takes a closure and swaps through reflection — which showed up in
+// profiles as sort.partition_func plus reflectlite.Swapper. The reverse is
+// linear and cheap by comparison.
+//
+// Both backends' node and edge query paths had an identical copy of this switch;
+// it lives here so the four cannot drift apart.
+func SortIDsForOrder[T EntityID](ids []T, order QueryOrder) {
+	slices.Sort(ids)
+	if order == QueryOrderDesc {
+		ReverseIDs(ids)
+	}
+}
+
 // ReverseIDs reverses ids in place.
 //
 // Turning an ascending result into a descending one is a linear reverse; sorting
