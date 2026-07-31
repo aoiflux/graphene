@@ -2,6 +2,7 @@ package index
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"unsafe"
@@ -396,37 +397,139 @@ func (p *PropertyIndex) ForEachEdgeEntry(key string, fn func(id store.EdgeID, va
 	sh.edges.forEach(key, fn)
 }
 
-// NodeEntries returns all indexed node property entries.
-// Used by disk.Store.Compact() to re-emit entries to the fresh WAL.
+// NodeEntries returns all indexed node property entries, ordered by
+// (Key, Value, ID).
+//
+// The order is part of the contract, not an accident of enumeration. Entries
+// live in per-shard maps, and Go randomises map iteration order on every range,
+// so an unordered walk enumerates the same index differently on every call.
+// disk.Store.Compact() writes these entries straight into the CSR's index
+// section, which made the serialised image differ byte-for-byte between two
+// compactions of an identical store. That makes the file's digest useless as an
+// identity for its contents: a snapshot hash is not reproducible, and two
+// parties holding the same evidence cannot agree on one. Pinned by
+// TestCompact_IsByteDeterministic.
+//
+// The order follows the index's own nesting — key, then value, then the postings
+// list, which is already ascending by ID — so ordering costs one sort of the
+// keys and one of each key's distinct values, and the entries are then emitted
+// straight into place. Ordering by ID instead would group an entity's entries
+// contiguously, which reads slightly better for a future per-entity digest, but
+// it is a transpose of the layout above: it measured ~2.2x slower on the
+// compaction path even after sorting a packed key and permuting, because every
+// entry lands in a random slot. Determinism is what is actually required here,
+// and this order delivers it for close to nothing.
 //
 // This materialises the whole index; query paths should use ForEachNodeEntry.
 func (p *PropertyIndex) NodeEntries() []NodePropEntry {
-	var out []NodePropEntry
-	for i := range p.shards {
-		sh := &p.shards[i]
+	out := make([]NodePropEntry, 0, p.nodeEntryCount())
+	vals := make([]string, 0, 64)
+	for _, key := range p.nodePropKeys() {
+		sh := p.shardFor(key)
 		sh.mu.RLock()
-		sh.nodes.forEachAll(func(id store.NodeID, key string, value []byte) bool {
-			out = append(out, NodePropEntry{ID: id, Key: key, Value: value})
-			return true
-		})
+		bucket := sh.nodes.byKey[key]
+		vals = sortedBucketValues(bucket, vals)
+		for _, v := range vals {
+			for _, id := range bucket[v] {
+				// Copied per entry, not per value: the callers of this API are
+				// handed ownership of Value, and sharing one backing array
+				// between the entries of a multi-ID posting would alias them.
+				out = append(out, NodePropEntry{ID: id, Key: key, Value: []byte(v)})
+			}
+		}
 		sh.mu.RUnlock()
 	}
 	return out
 }
 
-// EdgeEntries returns all indexed edge property entries.
+// EdgeEntries returns all indexed edge property entries, ordered by
+// (Key, Value, ID). See NodeEntries for why the order is a contract.
 func (p *PropertyIndex) EdgeEntries() []EdgePropEntry {
-	var out []EdgePropEntry
-	for i := range p.shards {
-		sh := &p.shards[i]
+	out := make([]EdgePropEntry, 0, p.edgeEntryCount())
+	vals := make([]string, 0, 64)
+	for _, key := range p.edgePropKeys() {
+		sh := p.shardFor(key)
 		sh.mu.RLock()
-		sh.edges.forEachAll(func(id store.EdgeID, key string, value []byte) bool {
-			out = append(out, EdgePropEntry{ID: id, Key: key, Value: value})
-			return true
-		})
+		bucket := sh.edges.byKey[key]
+		vals = sortedBucketValues(bucket, vals)
+		for _, v := range vals {
+			for _, id := range bucket[v] {
+				out = append(out, EdgePropEntry{ID: id, Key: key, Value: []byte(v)})
+			}
+		}
 		sh.mu.RUnlock()
 	}
 	return out
+}
+
+// sortedBucketValues fills dst with bucket's distinct values in ascending order,
+// reusing dst's capacity across keys.
+func sortedBucketValues[T entityID](bucket map[string][]T, dst []string) []string {
+	dst = dst[:0]
+	for v := range bucket {
+		dst = append(dst, v)
+	}
+	slices.Sort(dst)
+	return dst
+}
+
+// nodePropKeys and edgePropKeys return every indexed key, sorted.
+//
+// Keys are collected across all shards and sorted globally rather than walked
+// shard by shard, so the enumeration order does not depend on which shard a key
+// happens to hash to. There are few keys relative to entries, so this is cheap.
+func (p *PropertyIndex) nodePropKeys() []string {
+	var out []string
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		for k := range sh.nodes.byKey {
+			out = append(out, k)
+		}
+		sh.mu.RUnlock()
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (p *PropertyIndex) edgePropKeys() []string {
+	var out []string
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		for k := range sh.edges.byKey {
+			out = append(out, k)
+		}
+		sh.mu.RUnlock()
+	}
+	slices.Sort(out)
+	return out
+}
+
+// nodeEntryCount and edgeEntryCount total the per-shard entry counts so the
+// caller can size its result exactly. Without this the collection loop grows by
+// append and copies the whole slice ~log2(n) times on the way up — 5 MB of
+// copying for a 100k-entry index, on a path that already runs during compaction.
+func (p *PropertyIndex) nodeEntryCount() int {
+	total := 0
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		total += sh.nodes.count
+		sh.mu.RUnlock()
+	}
+	return total
+}
+
+func (p *PropertyIndex) edgeEntryCount() int {
+	total := 0
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		total += sh.edges.count
+		sh.mu.RUnlock()
+	}
+	return total
 }
 
 // Verify checks the index's internal invariants and returns the first violation

@@ -22,8 +22,19 @@ type GraphStore interface {
 	// one label. The node's ID is never changed.
 	//
 	// UpdateNode does not touch the property index: values registered via
-	// IndexNodeProperty are caller-encoded and decoupled from Properties, so
-	// callers that change indexed fields should re-index explicitly.
+	// IndexNodeProperty are caller-encoded and decoupled from Properties, so the
+	// engine cannot tell that an indexed field changed.
+	//
+	// The consequence is a wrong answer, not a slow one. Index entries are
+	// additive, so a value registered before the update keeps matching after it:
+	// NodesByProperty returns an entity that no longer holds the value it was
+	// found by, and the query planner trusts that result. Registering the new
+	// value does not displace the old one.
+	//
+	// For an entity with indexed properties, prefer graphene.UpdateNodeIndexed,
+	// which updates and re-registers in one step. Reach for plain UpdateNode when
+	// the entity has no index entries, or when you are purging them yourself —
+	// see ReindexPolicy for the two ways to do that and what each costs.
 	UpdateNode(n *Node) error
 
 	// UpdateEdge replaces the Labels, Weight and Properties of the edge
@@ -32,7 +43,9 @@ type GraphStore interface {
 	// requires at least one label. To reconnect an edge, delete it and add a
 	// new one.
 	//
-	// As with UpdateNode, the property index is left untouched.
+	// As with UpdateNode, the property index is left untouched, with the same
+	// stale-entry consequence. Prefer graphene.UpdateEdgeIndexed for an edge that
+	// carries indexed properties.
 	UpdateEdge(e *Edge) error
 
 	// DeleteNode removes the node with the given id and cascades to every edge

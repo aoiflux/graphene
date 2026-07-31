@@ -104,6 +104,8 @@ func ParseNodeType(selector string) (NodeType, error) {
 
 func (t NodeType) String() string {
 	switch t {
+	case NodeTypeUnknown:
+		return "Unknown"
 	case NodeTypeEvidenceFile:
 		return "EvidenceFile"
 	case NodeTypeMicroArtefact:
@@ -116,7 +118,12 @@ func (t NodeType) String() string {
 		if t >= NodeTypeCustomBase {
 			return fmt.Sprintf("Custom(%d)", t-NodeTypeCustomBase)
 		}
-		return "Unknown"
+		// A reserved value that has not been given a name yet. Render the number
+		// rather than "Unknown": ParseNodeType accepts bare numerics, so this
+		// round-trips, and collapsing every unnamed type to one string made two
+		// different types indistinguishable everywhere a label is printed — a
+		// query plan, an error, a visualization legend.
+		return strconv.FormatUint(uint64(t), 10)
 	}
 }
 
@@ -262,6 +269,8 @@ func parseCustomOffset(s string) (uint16, bool, error) {
 
 func (t EdgeType) String() string {
 	switch t {
+	case EdgeTypeUnknown:
+		return "Unknown"
 	case EdgeTypeContains:
 		return "Contains"
 	case EdgeTypeSimilarTo:
@@ -278,7 +287,9 @@ func (t EdgeType) String() string {
 		if t >= EdgeTypeCustomBase {
 			return fmt.Sprintf("Custom(%d)", t-EdgeTypeCustomBase)
 		}
-		return "Unknown"
+		// See NodeType.String: an unnamed reserved value renders as its number so
+		// it round-trips and stays distinguishable from every other unnamed type.
+		return strconv.FormatUint(uint64(t), 10)
 	}
 }
 

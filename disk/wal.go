@@ -58,7 +58,7 @@ const (
 	// individually valid and replay would otherwise apply half a transaction.
 	walRecordBatchBegin  byte = 0x09
 	walRecordBatchCommit byte = 0x0A
-	walRecordCheckpoint    byte = 0xFF
+	walRecordCheckpoint  byte = 0xFF
 
 	// walReplayBufferSize is the read buffer replay pulls the log through. One
 	// MiB turns a multi-megabyte log's per-record reads into a couple of dozen
@@ -261,9 +261,15 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 	// or tiny WAL, and a fixed 1 MiB buffer there is a megabyte allocated to read
 	// a few hundred bytes — measurable as +1 MiB on every reopen benchmark.
 	bufSize := walReplayBufferSize
+	// logSize also bounds each record's declared payload length below. A record
+	// cannot be longer than the file that contains it, and without that check a
+	// corrupt or hostile 5-byte header claiming 0xFFFFFFFF makes replay allocate
+	// 4 GiB before reading a single byte of it.
+	var logSize int64
 	if fi, err := w.file.Stat(); err == nil {
-		if sz := fi.Size(); sz < int64(bufSize) {
-			bufSize = int(sz)
+		logSize = fi.Size()
+		if logSize < int64(bufSize) {
+			bufSize = int(logSize)
 		}
 	}
 	if bufSize < walMinReplayBuffer {
@@ -289,6 +295,15 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 
 		recType := header[0]
 		length := binary.LittleEndian.Uint32(header[1:5])
+
+		// A record longer than the whole log is not a record. Treat it as a torn
+		// tail rather than an error: the same byte pattern arises from a crash
+		// mid-header, and replay's contract is to stop at the first thing it
+		// cannot trust. Checking before the allocation is the point — otherwise
+		// the length field alone decides how much memory replay demands.
+		if logSize > 0 && int64(length) > logSize {
+			break
+		}
 
 		payload := make([]byte, length)
 		if length > 0 {

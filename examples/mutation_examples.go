@@ -134,45 +134,69 @@ func exampleMutation2_DeleteAndCascade() {
 }
 
 // ----------------------------------------------------------------------------
-// Mutation Example 3 — Reclassify a node; understand index vs delete semantics
+// Mutation Example 3 — Reclassify a node without leaving the index lying
 // ----------------------------------------------------------------------------
 //
-// UpdateNode changes labels/properties but does NOT touch the property index
-// (indexed values are caller-encoded and decoupled from Properties). Adding a new
-// indexed value is an explicit IndexNodeProperty call, and the public index API is
-// additive — a stale value keeps matching until the node itself is deleted, which
-// purges all of its index entries.
+// The engine cannot maintain the property index across UpdateNode. Indexed
+// values are caller-encoded and decoupled from Properties, so nothing in the
+// engine knows that "status" changed — and the public index API is additive, so
+// a value registered before an update keeps matching afterwards. The result is
+// not a slow query or a missing row: NodesByProperty returns an entity that no
+// longer holds the value it was found by, and the query planner trusts that
+// answer.
+//
+// UpdateNodeIndexed is the fix. It updates the entity and replaces its index
+// entries in one step, so the index cannot disagree with the entity. Prefer it
+// for any entity with indexed properties; plain UpdateNode is the right call
+// only for entities that carry none.
 func exampleMutation3_ReclassifyAndReindex() {
-	fmt.Println("--- Mutation 3: Reclassify; index vs delete semantics ---")
+	fmt.Println("--- Mutation 3: Reclassify; keeping the index honest ---")
 
-	g := graphene.NewInMemory()
-	defer g.Close()
+	// --- The trap: UpdateNode, then register the new value ---
+	//
+	// This reads as though it works. It does not: the old value is still in the
+	// index, so the node now matches BOTH statuses.
+	bad := graphene.NewInMemory()
+	id, _ := bad.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	_ = bad.IndexNodeProperty(id, "status", []byte("suspect"))
 
-	// A node first classified as an artefact, indexed by a status field.
-	id, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
-	_ = g.IndexNodeProperty(id, "status", []byte("suspect"))
-
-	// Re-classify the node (now also a Tag) and register the new status value.
-	if err := g.UpdateNode(&store.Node{ID: id, Labels: []store.NodeType{store.NodeTypeMicroArtefact, store.NodeTypeTag}}); err != nil {
+	if err := bad.UpdateNode(&store.Node{ID: id, Labels: []store.NodeType{store.NodeTypeMicroArtefact, store.NodeTypeTag}}); err != nil {
 		log.Fatalf("UpdateNode: %v", err)
 	}
-	_ = g.IndexNodeProperty(id, "status", []byte("confirmed"))
+	_ = bad.IndexNodeProperty(id, "status", []byte("confirmed"))
 
-	// The re-classification is reflected in type lookups immediately.
-	tags, _ := g.NodesByType(store.NodeTypeTag)
-	arts, _ := g.NodesByType(store.NodeTypeMicroArtefact)
+	// The re-classification itself is reflected in type lookups immediately.
+	tags, _ := bad.NodesByType(store.NodeTypeTag)
+	arts, _ := bad.NodesByType(store.NodeTypeMicroArtefact)
 	fmt.Printf("  Node appears under Tag(%d) and MicroArtefact(%d) lookups\n", len(tags), len(arts))
 
-	// Both status values still match — the index is additive across UpdateNode.
-	fmt.Printf("  status=suspect: %d  status=confirmed: %d (both linger after update)\n",
-		countHits(g, "status", "suspect"), countHits(g, "status", "confirmed"))
+	fmt.Printf("  UpdateNode        -> suspect:%d confirmed:%d  <- WRONG: 'suspect' is stale and still matches\n",
+		countHits(bad, "status", "suspect"), countHits(bad, "status", "confirmed"))
+	bad.Close()
 
-	// Deleting the node purges every index entry it had.
-	if err := g.DeleteNode(id); err != nil {
+	// --- The fix: state the whole desired index state in one call ---
+	good := graphene.NewInMemory()
+	defer good.Close()
+
+	id2, _ := good.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	_ = good.IndexNodeProperty(id2, "status", []byte("suspect"))
+
+	if err := good.UpdateNodeIndexed(
+		&store.Node{ID: id2, Labels: []store.NodeType{store.NodeTypeMicroArtefact, store.NodeTypeTag}},
+		map[string][]byte{"status": []byte("confirmed")},
+	); err != nil {
+		log.Fatalf("UpdateNodeIndexed: %v", err)
+	}
+
+	fmt.Printf("  UpdateNodeIndexed -> suspect:%d confirmed:%d  <- index agrees with the node\n",
+		countHits(good, "status", "suspect"), countHits(good, "status", "confirmed"))
+
+	// Deleting the node purges every index entry it had, under either approach.
+	if err := good.DeleteNode(id2); err != nil {
 		log.Fatalf("DeleteNode: %v", err)
 	}
-	fmt.Printf("  after DeleteNode -> status=suspect: %d  status=confirmed: %d (purged)\n",
-		countHits(g, "status", "suspect"), countHits(g, "status", "confirmed"))
+	fmt.Printf("  after DeleteNode  -> suspect:%d confirmed:%d  (all entries purged)\n",
+		countHits(good, "status", "suspect"), countHits(good, "status", "confirmed"))
 	fmt.Println()
 }
 

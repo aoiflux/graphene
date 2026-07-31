@@ -486,12 +486,12 @@ func FilterIndexOf(filters []PropertyFilter, f PropertyFilter) int {
 type DriverKind uint8
 
 const (
-	DriverScan     DriverKind = iota // every entity; nothing better was available
-	DriverIDs                        // the query's explicit ID list
-	DriverEquality                   // an equality filter's postings
-	DriverOrdered                    // a range or prefix on a key declared ordered
-	DriverLabels                     // the label postings for the query's types
-	DriverAdjacency                  // incident-edge lists of the anchored endpoints
+	DriverScan      DriverKind = iota // every entity; nothing better was available
+	DriverIDs                         // the query's explicit ID list
+	DriverEquality                    // an equality filter's postings
+	DriverOrdered                     // a range or prefix on a key declared ordered
+	DriverLabels                      // the label postings for the query's types
+	DriverAdjacency                   // incident-edge lists of the anchored endpoints
 )
 
 func (d DriverKind) String() string {

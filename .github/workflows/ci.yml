@@ -1,0 +1,155 @@
+name: CI
+
+# Every correctness guarantee in this repository — the backend parity suites, the
+# index integrity suites, the pinned CRC and CSR format vectors, the race
+# detector — was previously enforced only when a human remembered to run
+# test.ps1, on Windows. This runs them on every push, on both platforms.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 03:17 UTC nightly. Off the hour so it does not queue behind the crowd of
+    # jobs everyone schedules at :00.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Formatting and vet run on Linux only. gofmt -l reports every file on a
+  # Windows checkout that normalises line endings, which would be noise rather
+  # than signal.
+  lint:
+    name: vet and gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests (race)
+        run: go test ./... -race -count=1
+
+      # The stress suite is behind a build tag, so `go test ./...` never compiles
+      # it and it can rot unnoticed. The default path is 100k nodes / 500k edges
+      # and finishes in well under a minute; the 1M-node path is separately gated
+      # behind GRAPHENE_PERSISTENT_STRESS and runs in the scheduled job below.
+      - name: Stress tests (race)
+        run: go test . -tags=stress -race -count=1 -run Test
+
+  # Benchmarks are not a pass/fail gate — benchmark timings are far too sensitive
+  # to runner load to assert on, and CONTRIBUTING.md's method (interleaved A/B
+  # against a control) cannot be run meaningfully on ephemeral CI hardware.
+  # This runs each benchmark exactly once purely to prove they still compile and
+  # do not panic, which is the failure mode that would otherwise go unnoticed.
+  bench-smoke:
+    name: benchmarks compile and run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Benchmark smoke run
+        run: go test . ./index/ -tags=stress -bench=. -benchtime=1x -run='^$'
+
+  # Fuzzing found three parser defects on its first run — two unbounded
+  # allocations and an out-of-range index, all reachable from a file under 110
+  # bytes. Seed corpora and saved crash reproducers already run as ordinary tests
+  # on every push (they live in testdata/fuzz); this job explores for new ones.
+  #
+  # A failure here writes the offending input to testdata/fuzz. That file is the
+  # bug report: commit it, and it becomes a permanent regression test.
+  fuzz:
+    name: fuzz parsers
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pkg: ./disk/
+            target: FuzzDeserialiseCSR
+          - pkg: ./disk/
+            target: FuzzWALReplay
+          - pkg: ./store/
+            target: FuzzParseNodeType
+          - pkg: ./store/
+            target: FuzzParseEdgeType
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Fuzz ${{ matrix.target }}
+        run: go test ${{ matrix.pkg }} -run=XXX -fuzz=${{ matrix.target }} -fuzztime=5m
+
+      - name: Upload any crash reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: "**/testdata/fuzz/**"
+
+  # The 1M-node persistent path is too slow for every push but too valuable to
+  # never run. Nightly, plus on demand.
+  stress-deep:
+    name: deep stress (1M nodes)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Deep stress
+        env:
+          GRAPHENE_PERSISTENT_STRESS: "1"
+        run: go test . -tags=stress -count=1 -run TestStress -timeout 50m

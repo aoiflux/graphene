@@ -114,6 +114,32 @@ const (
 	csrV5HeaderSize          = 38
 	csrIndexSectionMagic     = "GIDX"
 	csrIndexSectionMagicSize = 4
+
+	// Smallest number of bytes a single record can occupy on disk. Used to bound
+	// header-declared counts against the file's actual remaining length before
+	// allocating from them — see deserialiseCSR.
+	//
+	// node:  id8 + labelCount1 + propLen4                       (zero labels, zero-length blob)
+	// edge:  id8 + src8 + dst8 + labelCount1 + weight4 + propLen4
+	// entry: id8 + keyLen2 + valLen4                            (index section)
+	minNodeRecordBytes = 13
+	minEdgeRecordBytes = 33
+	minPropEntryBytes  = 14
+
+	// maxCSREntityID caps the largest entity ID a CSR file may declare.
+	//
+	// Build indexes its arrays by ID, so the in-memory cost of opening a file is
+	// a function of its highest ID rather than its record count. This bounds a
+	// hostile or corrupt file's ability to name an allocation: at 2^28 the node
+	// array tops out around 15 GB, which is far above anything the engine's
+	// stated workload produces and far below the exabyte a raw uint64 permits.
+	//
+	// The value is policy, not a format constant, and it is the loosest of the
+	// checks in checkCSREntityIDs. It is pinned here rather than made
+	// configurable because the right number follows from the maximum graph size
+	// the engine intends to support, which is still an open question (plan §8
+	// Q2). Revisit it there, not here.
+	maxCSREntityID = 1 << 28
 )
 
 // Open opens (or creates) a disk-backed Store rooted at dir.
@@ -2710,6 +2736,20 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		pos = csrV6HeaderSize
 	}
 
+	// Both counts come straight off the header, so a corrupt or hostile file
+	// controls them completely. Allocating from them unchecked lets a 46-byte
+	// file demand terabytes: nodeCount is a uint64 narrowed to int, so a large
+	// value allocates until the process dies and a value above MaxInt64 goes
+	// negative and panics in makeslice before any record is read.
+	//
+	// The bound is the cheapest sound one: every node record occupies at least
+	// minNodeRecordBytes on disk, so a file cannot hold more than its own
+	// remaining length divided by that. This rejects the hostile case without
+	// constraining any legitimate one.
+	if nodeCount < 0 || nodeCount > (len(data)-pos)/minNodeRecordBytes {
+		return nil, nil, fmt.Errorf("deserialiseCSR: node count %d exceeds what %d remaining bytes can hold",
+			nodeCount, len(data)-pos)
+	}
 	nodes := make([]nodeRecord, nodeCount)
 	for i := range nodes {
 		if pos+9 > len(data) {
@@ -2756,6 +2796,10 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		nodes[i] = nodeRecord{ID: nid, Labels: labels, Properties: props}
 	}
 
+	if edgeCount < 0 || edgeCount > (len(data)-pos)/minEdgeRecordBytes {
+		return nil, nil, fmt.Errorf("deserialiseCSR: edge count %d exceeds what %d remaining bytes can hold",
+			edgeCount, len(data)-pos)
+	}
 	edges := make([]rawEdge, edgeCount)
 	for i := range edges {
 		if pos+25 > len(data) {
@@ -2802,6 +2846,16 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		edges[i] = rawEdge{ID: eid, Src: src, Dst: dst, Labels: labels, Weight: weight, Properties: props}
 	}
 
+	// Build indexes its arrays by entity ID, not by record count, so it allocates
+	// maxID+1 slots regardless of how few records there are. Bounding the counts
+	// above is therefore not enough: two records carrying IDs of 0x3030303030303030
+	// make a 105-byte file demand an exabyte-scale slice, which panics in
+	// makeslice rather than returning an error. Validate the IDs before Build
+	// sees them.
+	if err := checkCSREntityIDs(nodes, edges, version, nodeSeqHW, edgeSeqHW); err != nil {
+		return nil, nil, err
+	}
+
 	csr := Build(nodes, edges)
 	csr.nodeSeqHW = nodeSeqHW
 	csr.edgeSeqHW = edgeSeqHW
@@ -2821,6 +2875,77 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 type csrIndexSection struct {
 	NodeProps []index.NodePropEntry
 	EdgeProps []index.EdgePropEntry
+}
+
+// checkCSREntityIDs rejects records whose IDs would make Build allocate an
+// array the file gives no reason to believe in.
+//
+// Two rules, in order of strength:
+//
+//   - For v5+ files the header carries the sequence high-water marks. IDs are
+//     handed out from those monotonic counters and Compact stamps the current
+//     values, so every record's ID is <= its mark by construction. A record
+//     above the mark means the file is inconsistent with itself. This is exact
+//     and costs nothing.
+//
+//   - maxCSREntityID is a backstop, applied to every version. It exists because
+//     the high-water marks live in the same header an attacker controls, so the
+//     first rule alone still permits "seqHW = 2^62, one record with that ID".
+//
+// IDs are deliberately NOT bounded by the record count. They are monotonic and
+// never reused, so a long-lived store that has deleted heavily has a maxID far
+// above its live count, and that file is perfectly valid.
+func checkCSREntityIDs(nodes []nodeRecord, edges []rawEdge, version uint16, nodeSeqHW, edgeSeqHW uint64) error {
+	var maxNID, maxEID uint64
+	for i := range nodes {
+		if uint64(nodes[i].ID) > maxNID {
+			maxNID = uint64(nodes[i].ID)
+		}
+	}
+	for i := range edges {
+		if uint64(edges[i].ID) > maxEID {
+			maxEID = uint64(edges[i].ID)
+		}
+	}
+
+	if maxNID > maxCSREntityID {
+		return fmt.Errorf("deserialiseCSR: node ID %d exceeds the maximum addressable ID %d", maxNID, uint64(maxCSREntityID))
+	}
+	if maxEID > maxCSREntityID {
+		return fmt.Errorf("deserialiseCSR: edge ID %d exceeds the maximum addressable ID %d", maxEID, uint64(maxCSREntityID))
+	}
+
+	// Endpoints are a separate bound from IDs, and the one that actually crashes.
+	// Build sizes the adjacency offset arrays from the highest *node* ID, then
+	// indexes them by each edge's Src and Dst without checking, so an edge naming
+	// a node the file does not contain reads past the end of the array rather
+	// than producing a parse error. Every live edge has both endpoints present —
+	// deletion cascades to incident edges — so this rejects nothing valid.
+	for i := range edges {
+		if uint64(edges[i].Src) > maxNID {
+			return fmt.Errorf("deserialiseCSR: edge %d has source %d, beyond the highest node ID %d",
+				edges[i].ID, edges[i].Src, maxNID)
+		}
+		if uint64(edges[i].Dst) > maxNID {
+			return fmt.Errorf("deserialiseCSR: edge %d has target %d, beyond the highest node ID %d",
+				edges[i].ID, edges[i].Dst, maxNID)
+		}
+	}
+
+	// A zero mark means "not stamped" rather than "the highest ID is zero".
+	// Compact always stamps the live counters, but a CSRGraph serialised straight
+	// out of Build carries zeros, and those files are legitimate. Skipping the
+	// comparison there costs nothing: maxCSREntityID above still bounds the
+	// allocation, so an unstamped file cannot name an unbounded one.
+	if version >= csrVersionWithSeqHW {
+		if nodeSeqHW > 0 && maxNID > nodeSeqHW {
+			return fmt.Errorf("deserialiseCSR: node ID %d exceeds the file's own sequence high-water mark %d", maxNID, nodeSeqHW)
+		}
+		if edgeSeqHW > 0 && maxEID > edgeSeqHW {
+			return fmt.Errorf("deserialiseCSR: edge ID %d exceeds the file's own sequence high-water mark %d", maxEID, edgeSeqHW)
+		}
+	}
+	return nil
 }
 
 // readCSRIndexSection parses the property-index section at the given offset.
@@ -2878,6 +3003,13 @@ func readCSRIndexSection(data []byte, offset int) (*csrIndexSection, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Same reasoning as the record counts in deserialiseCSR: this is a
+	// length-prefix from the file, so it is bounded against what the remaining
+	// bytes could actually encode before it is used to size an allocation.
+	if nodeCount < 0 || nodeCount > (len(data)-pos)/minPropEntryBytes {
+		return nil, fmt.Errorf("readCSRIndexSection: node property count %d exceeds what %d remaining bytes can hold",
+			nodeCount, len(data)-pos)
+	}
 	section.NodeProps = make([]index.NodePropEntry, 0, nodeCount)
 	for i := 0; i < nodeCount; i++ {
 		id, key, val, err := readEntry("node property", i)
@@ -2890,6 +3022,10 @@ func readCSRIndexSection(data []byte, offset int) (*csrIndexSection, error) {
 	edgeCount, err := readCount("edge property")
 	if err != nil {
 		return nil, err
+	}
+	if edgeCount < 0 || edgeCount > (len(data)-pos)/minPropEntryBytes {
+		return nil, fmt.Errorf("readCSRIndexSection: edge property count %d exceeds what %d remaining bytes can hold",
+			edgeCount, len(data)-pos)
 	}
 	section.EdgeProps = make([]index.EdgePropEntry, 0, edgeCount)
 	for i := 0; i < edgeCount; i++ {
