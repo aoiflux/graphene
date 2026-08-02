@@ -15,12 +15,51 @@ import "encoding/binary"
 // The commit carries both the record count and a CRC over the batch body, so a
 // batch truncated mid-record and a batch whose commit marker is itself torn are
 // both detected rather than silently half-applied.
+//
+// # Commit payload layouts
+//
+// The commit marker's payload has grown once. Its length is what distinguishes
+// the versions, which is why replay accepts a set of lengths rather than one:
+//
+//	v1 (8 bytes)   count:4 crc:4
+//	v2 (32 bytes)  count:4 crc:4 commitSeq:8 tsUnixNano:8 actorID:8
+//
+// v2 exists so a committed transaction records when it happened and who made
+// it, not only what changed. All three fields landed together deliberately:
+// each one alone would have been the same format change, and paying for it
+// three times is the mistake worth avoiding.
+//
+// Older readers reject a v2 log, which is intended and is the same rule
+// knownWALRecord applies to unknown record types — a build that cannot see the
+// commit metadata must not silently present the log as if it had. Newer readers
+// accept a v1 log, so an existing store still opens after an upgrade.
 
 // walBatchBeginPayload is the begin marker's payload: the record count.
 const walBatchBeginPayload = 4
 
-// walBatchCommitPayload is the commit marker's payload: count then CRC.
-const walBatchCommitPayload = 8
+const (
+	// walBatchCommitPayloadV1 is the original layout: count then CRC.
+	walBatchCommitPayloadV1 = 8
+
+	// walBatchCommitPayload is the layout written today: V1 plus the commit
+	// sequence number, the wall-clock time of the commit, and the actor.
+	walBatchCommitPayload = walBatchCommitPayloadV1 + 8 + 8 + 8
+)
+
+// batchMeta is the provenance recorded against one commit.
+//
+// CommitSeq is monotonic per store. It is currently only monotonic within a WAL
+// generation: Compact truncates the log, and the CSR header has nowhere to keep
+// a high-water mark, so the counter restarts from whatever the surviving log
+// replays. Persisting it needs a CSR header field, which is deliberately being
+// held for the single v8 format change that also carries the digest and
+// attestation sections rather than being spent on its own bump. Until then,
+// treat CommitSeq as ordering within a generation, not as a durable identity.
+type batchMeta struct {
+	CommitSeq uint64
+	UnixNano  int64
+	ActorID   uint64
+}
 
 // walBatch accumulates framed records for a single atomic append.
 //
@@ -53,9 +92,9 @@ func (b *walBatch) add(recType byte, payload []byte) {
 // empty reports whether any records were added.
 func (b *walBatch) empty() bool { return b.count == 0 }
 
-// finish patches the begin marker's count, appends the commit marker, and
-// returns the complete framed buffer ready for a single write.
-func (b *walBatch) finish() []byte {
+// finish patches the begin marker's count, appends the commit marker carrying
+// meta, and returns the complete framed buffer ready for a single write.
+func (b *walBatch) finish(meta batchMeta) []byte {
 	// Patch the count into the reserved begin payload.
 	binary.LittleEndian.PutUint32(b.buf[walHeaderSize:walHeaderSize+4], b.count)
 	// The begin record's own CRC covers its payload, so it has to be recomputed
@@ -64,10 +103,18 @@ func (b *walBatch) finish() []byte {
 	binary.LittleEndian.PutUint32(b.buf[beginCRCAt:beginCRCAt+4],
 		computeCRC32(b.buf[walHeaderSize:walHeaderSize+walBatchBeginPayload]))
 
+	// The CRC covers the body only, exactly as it did in v1. Extending it over
+	// the metadata would be no stronger — the checksum sits in the same record
+	// as the bytes it describes, so it detects damage and not authorship. Making
+	// the metadata trustworthy is a signature's job, and the layout leaves that
+	// to the record type reserved for it.
 	body := b.buf[b.beginEnd:]
 	commit := make([]byte, walBatchCommitPayload)
 	binary.LittleEndian.PutUint32(commit[0:4], b.count)
 	binary.LittleEndian.PutUint32(commit[4:8], computeCRC32(body))
+	binary.LittleEndian.PutUint64(commit[8:16], meta.CommitSeq)
+	binary.LittleEndian.PutUint64(commit[16:24], uint64(meta.UnixNano))
+	binary.LittleEndian.PutUint64(commit[24:32], meta.ActorID)
 	b.buf = appendRecord(b.buf, walRecordBatchCommit, commit)
 	return b.buf
 }

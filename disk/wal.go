@@ -170,6 +170,21 @@ func (w *WAL) AppendEdgePropPurge(payload []byte) error {
 	return w.append(walRecordEdgePropPurge, payload)
 }
 
+// Size returns the log's current size on disk in bytes, or 0 if it cannot be
+// determined.
+//
+// Reported without taking the maintenance barrier: this is an operational
+// gauge, and blocking writers to read it would make observing the store a
+// reason to slow it down. The figure may therefore lag an in-flight append by
+// one record, which does not matter for anything it is used for.
+func (w *WAL) Size() int64 {
+	fi, err := w.file.Stat()
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
 // Checkpoint writes a checkpoint marker and syncs. After compaction, a
 // checkpoint signals that all records before it are durable in the CSR and
 // the WAL can be safely truncated.
@@ -229,6 +244,16 @@ type ReplayCallbacks struct {
 
 	NodePropPurgeFunc func([]byte) error // called for each 0x07 node property purge
 	EdgePropPurgeFunc func([]byte) error // called for each 0x08 edge property purge
+
+	// CommitFunc is called once per successfully committed batch that carries
+	// provenance, after the commit has been validated against the body it
+	// describes and before the batch's records are applied.
+	//
+	// It is not called for a batch whose commit failed validation — that batch
+	// was never committed — nor for a v1 commit record, which has no metadata to
+	// report. A nil CommitFunc is skipped, so a caller that does not care about
+	// provenance is unaffected.
+	CommitFunc func(batchMeta)
 }
 
 // Replay reads all records from the WAL from the beginning and dispatches each
@@ -366,8 +391,12 @@ func replayRecords(r io.Reader, logSize int64, cb ReplayCallbacks) error {
 			if pending == nil {
 				return fmt.Errorf("wal replay: batch commit without begin")
 			}
-			if len(payload) != walBatchCommitPayload {
-				return fmt.Errorf("wal replay: malformed batch commit")
+			// Two accepted lengths, not one: v1 logs written before the commit
+			// record carried provenance must still replay after an upgrade. The
+			// length is the discriminator — see walbatch.go.
+			if len(payload) != walBatchCommitPayloadV1 && len(payload) != walBatchCommitPayload {
+				return fmt.Errorf("wal replay: malformed batch commit: payload %d bytes, expected %d or %d",
+					len(payload), walBatchCommitPayloadV1, walBatchCommitPayload)
 			}
 			wantCount := binary.LittleEndian.Uint32(payload[0:4])
 			wantCRC := binary.LittleEndian.Uint32(payload[4:8])
@@ -378,6 +407,16 @@ func replayRecords(r io.Reader, logSize int64, cb ReplayCallbacks) error {
 				pending = nil
 				body = body[:0]
 				continue
+			}
+			// Only now, past validation. A batch that failed the check above was
+			// never committed, so reporting its metadata would advance the store's
+			// commit sequence for a transaction that did not happen.
+			if len(payload) == walBatchCommitPayload && cb.CommitFunc != nil {
+				cb.CommitFunc(batchMeta{
+					CommitSeq: binary.LittleEndian.Uint64(payload[8:16]),
+					UnixNano:  int64(binary.LittleEndian.Uint64(payload[16:24])),
+					ActorID:   binary.LittleEndian.Uint64(payload[24:32]),
+				})
 			}
 			for _, rec := range pending {
 				if err := applyWALRecord(cb, rec.recType, rec.payload); err != nil {

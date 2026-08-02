@@ -1,0 +1,21 @@
+# Coverage output (make cover).
+coverage.out
+coverage.html
+
+# Compiled test binaries and profiles.
+*.test
+*.exe
+*.out
+cpu.prof
+mem.prof
+*.pprof
+
+# Note on what is deliberately NOT ignored:
+#
+#   testdata/fuzz/**   Crash reproducers found by fuzzing. Go re-runs these as
+#                      ordinary tests, so committing one turns a fuzz finding
+#                      into a permanent regression test. Keep them.
+#
+#   viz_*.html         Generated visualization samples, currently tracked on
+#                      purpose. Whether they should stay is an open question,
+#                      not an oversight.

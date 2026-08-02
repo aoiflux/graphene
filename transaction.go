@@ -56,6 +56,10 @@ type Tx struct {
 	nodesAdded int
 	edgesAdded int
 
+	// actor is recorded against the commit. Zero means unattributed, which is
+	// what a transaction carries unless As is called.
+	actor store.TxContext
+
 	done bool
 	// err latches the first buffering error. AddNode/AddEdge return IDs rather
 	// than errors for ergonomics, so a problem detected while buffering has to
@@ -81,6 +85,35 @@ func (g *Graph) Begin() *Tx {
 // only for third-party stores that do not implement store.Transactor; both
 // bundled backends return true.
 func (tx *Tx) Atomic() bool { return tx.tr != nil }
+
+// As records who is making this transaction. It returns tx so it can be chained
+// onto Begin.
+//
+// The actor is written into the commit record alongside the commit's sequence
+// number and wall-clock time, which makes the change attributable when the log
+// is read back. It is recorded, not verified — see store.TxContext. Attribution
+// is per-transaction because that is the unit the log can record it against:
+// writes made through the plain APIs outside a transaction produce no commit
+// record and are therefore unattributed.
+//
+// Attributed reports whether the actor will actually be durable, which is false
+// on backends that keep no log.
+func (tx *Tx) As(ctx store.TxContext) *Tx {
+	tx.actor = ctx
+	return tx
+}
+
+// Attributed reports whether this transaction's actor will be recorded durably
+// on commit. It is false when no actor has been set, and false on a backend that
+// does not implement store.ActorTransactor — the in-memory store, for instance,
+// accepts an actor and has nowhere to keep it.
+func (tx *Tx) Attributed() bool {
+	if tx.actor.Unattributed() {
+		return false
+	}
+	_, ok := tx.g.GraphStore.(store.ActorTransactor)
+	return ok
+}
 
 // AddNode buffers a node and returns the ID it will have once committed.
 //
@@ -226,6 +259,12 @@ func (tx *Tx) Commit() error {
 	}
 
 	if tx.tr != nil {
+		// Route through the attributed path only when there is something to
+		// attribute, so a backend that implements both interfaces sees exactly
+		// the call it saw before As existed.
+		if at, ok := tx.tr.(store.ActorTransactor); ok && !tx.actor.Unattributed() {
+			return at.ApplyTransactionAs(tx.ops, tx.actor)
+		}
 		return tx.tr.ApplyTransaction(tx.ops)
 	}
 	return tx.commitFallback()

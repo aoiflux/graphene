@@ -1,5 +1,10 @@
 package store
 
+import (
+	"fmt"
+	"time"
+)
+
 // GraphStore is the core persistence and retrieval interface for the graph engine.
 // All implementations (in-memory, on-disk CSR, etc.) satisfy this interface.
 // Thread safety is implementation-defined; callers should document their assumptions.
@@ -367,6 +372,174 @@ type Transactor interface {
 	//
 	// On error nothing is applied and the store is unchanged.
 	ApplyTransaction(ops []TxOp) error
+}
+
+// TxContext names who is making a change, so a committed transaction records
+// more than what changed.
+//
+// The engine stores these values and binds them to the commit. It does not
+// authenticate them, and it cannot: Graphene is a library linked into the
+// caller's process, so whatever the caller supplies here is asserted rather
+// than proven. Treat the result as attribution and audit, not as a security
+// boundary — a boundary needs a process boundary, which this engine does not
+// have.
+//
+// The zero value means "unattributed", which is what every write made through
+// the plain APIs carries.
+type TxContext struct {
+	// ActorID identifies the principal responsible for the change. Its meaning
+	// is the caller's to define; the engine only records it.
+	ActorID uint64
+
+	// RoleID is the role the actor was acting under. There is no role model in
+	// the engine — nothing is checked against this — so it exists to make a
+	// later RBAC layer's decisions reconstructible from the log.
+	RoleID uint32
+
+	// KeyID names the signing key that should cover this commit. Nothing is
+	// signed yet; the field is carried so that when signing lands it does not
+	// require another change to the commit record's layout.
+	KeyID uint64
+}
+
+// Unattributed reports whether c carries no actor information.
+func (c TxContext) Unattributed() bool {
+	return c.ActorID == 0 && c.RoleID == 0 && c.KeyID == 0
+}
+
+// ActorTransactor is implemented by stores that can record who committed a
+// transaction, alongside when it was committed.
+//
+// Separate from Transactor rather than folded into it, following the same rule
+// as every other optional interface here: a third-party store that already
+// satisfies Transactor keeps working untouched, and Graph degrades to the
+// unattributed path when this is absent.
+type ActorTransactor interface {
+	Transactor
+
+	// ApplyTransactionAs is ApplyTransaction, recording ctx against the commit.
+	// ApplyTransaction is equivalent to passing the zero TxContext.
+	ApplyTransactionAs(ops []TxOp, ctx TxContext) error
+}
+
+// StorageStats reports what a backend is currently holding, so an operator can
+// see when it needs attention.
+//
+// The counts that matter operationally are the delta ones. Everything written
+// since the last compaction lives in memory and is replayed from the log at
+// every open, so unbounded delta growth degrades memory, open time, and read
+// speed together — with no symptom until someone looks. Nothing in the engine
+// triggers a compaction, which makes this the input a caller needs in order to
+// decide.
+type StorageStats struct {
+	// Delta layer: written since the last compaction, resident in memory.
+	DeltaNodes   int
+	DeltaEdges   int
+	DeletedNodes int // tombstones masking CSR records
+	DeletedEdges int
+
+	// The compacted image underneath.
+	CSRNodes int
+	CSREdges int
+
+	// PropertyEntries counts indexed (id, key, value) triples across both.
+	PropertyNodeEntries int
+	PropertyEdgeEntries int
+
+	// WALBytes is the log's size on disk. It is bounded only by compaction, so
+	// it is also the best proxy for how long the next open will take.
+	WALBytes int64
+
+	// CommitSeq is the last commit sequence number issued. See the disk
+	// backend's notes — it is currently per-WAL-generation, not durable across
+	// compaction.
+	CommitSeq uint64
+
+	// LastCompact is when Compact last completed, zero if it has not run in this
+	// process. It is not persisted, so a reopened store reports zero even if the
+	// image on disk was compacted moments earlier.
+	LastCompact time.Time
+}
+
+// DeltaRecords is the total number of records held in memory since the last
+// compaction.
+func (s StorageStats) DeltaRecords() int {
+	return s.DeltaNodes + s.DeltaEdges + s.DeletedNodes + s.DeletedEdges
+}
+
+// CSRRecords is the total number of records in the compacted image.
+func (s StorageStats) CSRRecords() int { return s.CSRNodes + s.CSREdges }
+
+// StorageReporter is implemented by stores that can describe their own storage
+// state. The in-memory backend does not: it has no delta, no log, and no
+// compaction, so there is nothing for it to report.
+type StorageReporter interface {
+	StorageStats() StorageStats
+}
+
+// CompactionPolicy describes when a store is due for compaction.
+//
+// It is advisory. Evaluating it changes nothing — the caller decides whether to
+// act, which is deliberate: compaction rebuilds the whole image and its cost is
+// the caller's to schedule. See Graph.ShouldCompact.
+//
+// A zero field disables that rule. A zero policy therefore never fires.
+type CompactionPolicy struct {
+	// MaxDeltaRecords fires when the in-memory delta exceeds this many records.
+	MaxDeltaRecords int
+
+	// MaxWALBytes fires when the log grows past this size.
+	MaxWALBytes int64
+
+	// MaxDeltaRatio fires when delta records exceed this fraction of the
+	// compacted image — the rule that catches a small store churning heavily,
+	// which MaxDeltaRecords alone would miss.
+	MaxDeltaRatio float64
+}
+
+// DefaultCompactionPolicy returns a starting point, not a tuned
+// recommendation.
+//
+// These numbers are not derived from measurement, and CONTRIBUTING.md is clear
+// about what an unmeasured number is worth. They are set where an operator
+// would probably rather be told too early than too late: a delta of 100k
+// records or a 256 MB log are both well inside what the engine handles, and
+// both are far past the point where a compaction would have been cheap.
+// Callers with a measured workload should replace them.
+func DefaultCompactionPolicy() CompactionPolicy {
+	return CompactionPolicy{
+		MaxDeltaRecords: 100_000,
+		MaxWALBytes:     256 << 20,
+		MaxDeltaRatio:   0.5,
+	}
+}
+
+// Evaluate reports whether stats breach the policy, and which rule fired.
+//
+// The reason is part of the result rather than something the caller reconstructs:
+// "compact now" is not actionable on its own, and the three rules fire for
+// genuinely different reasons.
+func (p CompactionPolicy) Evaluate(s StorageStats) (bool, string) {
+	delta := s.DeltaRecords()
+
+	if p.MaxDeltaRecords > 0 && delta >= p.MaxDeltaRecords {
+		return true, fmt.Sprintf("delta holds %d records, at or past the %d limit",
+			delta, p.MaxDeltaRecords)
+	}
+	if p.MaxWALBytes > 0 && s.WALBytes >= p.MaxWALBytes {
+		return true, fmt.Sprintf("write-ahead log is %d bytes, at or past the %d limit",
+			s.WALBytes, p.MaxWALBytes)
+	}
+	// Ratio is meaningless against an empty image: every first write would breach
+	// it. MaxDeltaRecords is the rule that covers a store with no CSR yet.
+	if p.MaxDeltaRatio > 0 && s.CSRRecords() > 0 {
+		ratio := float64(delta) / float64(s.CSRRecords())
+		if ratio >= p.MaxDeltaRatio {
+			return true, fmt.Sprintf("delta is %.0f%% of the compacted image, at or past the %.0f%% limit",
+				ratio*100, p.MaxDeltaRatio*100)
+		}
+	}
+	return false, ""
 }
 
 // TxOpKind identifies which operation a TxOp carries.

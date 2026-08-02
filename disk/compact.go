@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/aoiflux/graphene/store"
 )
@@ -118,6 +119,8 @@ func (s *Store) Compact() error {
 	s.deletedEdges = make(map[store.EdgeID]struct{})
 	s.deltaNodesByType = make(map[store.NodeType][]store.NodeID)
 	s.deltaEdgesByType = make(map[store.EdgeType][]store.EdgeID)
+
+	s.lastCompact = time.Now()
 
 	return nil
 }

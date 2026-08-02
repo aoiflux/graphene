@@ -41,6 +41,56 @@ done
 benchstat a.txt b.txt
 ```
 
+### Interleaving is not sufficient on its own
+
+Interleaving protects against drift *between* the two arms. It does not protect
+against a control whose own absolute cost is moving underneath the experiment,
+and that is a different failure.
+
+A measured example, from the property-index ordering work: the same control
+binary read **13 ms, then 27 ms, then 30 ms** across one session as the machine
+loaded under back-to-back benchmark runs. Every pair was interleaved and every
+pair had a control. The conclusions survived; the magnitudes did not — "+53%"
+and "+20%" became **+36%** and **+12%** when re-measured on a settled machine.
+Inflated by roughly half, from a procedure that followed both rules above.
+
+Three additions that would have caught it:
+
+- **Discard a warm-up round.** Run both arms once, throw the numbers away, then
+  start measuring. The first round is routinely the outlier.
+- **Report the control's own spread**, and treat a wide one as a failed
+  measurement rather than a noisy result. 6% across rounds is usable; the bad
+  session above was at 76%.
+- **Prebuild the test binaries** so compilation is not inside the first timed
+  round.
+
+### Comparing two implementations? One binary, not two checkouts
+
+A worktree A/B is the right tool for "is my change faster than `HEAD`". It is the
+wrong tool for "which of these two algorithms should I write", because it makes
+the answer hostage to machine drift for no reason.
+
+Write both as sub-benchmarks over one fixture in one process and let the testing
+framework run them back to back:
+
+```go
+func BenchmarkNodeEntriesOrdering(b *testing.B) {
+    p := benchPropertyIndex(50_000)
+    b.Run("structure-order/KeyValueID", func(b *testing.B) { ... })
+    b.Run("sort-entries/IDKeyValue",    func(b *testing.B) { ... })
+}
+```
+
+Keep the losing implementation in the tree as the comparison arm. `NodeEntries`
+is ordered the way it is because that benchmark says the alternative is 1.53x
+slower — and `nodeEntriesByIDReference` is still there so the claim stays
+checkable rather than remembered.
+
+That comparison also surfaced a trade the worktree runs had hidden: the chosen
+ordering is faster **and uses 68% more memory** than the one it beat. Under the
+priority order in §5 that is the right call, but it is a trade, and it was only
+visible with both arms side by side.
+
 ### Always include a control
 
 A control is a benchmark whose code is **byte-identical** on both sides. If it
@@ -321,6 +371,8 @@ done
 
 ## 5. Before opening a change
 
+`make check` on Linux and macOS, `.\test.ps1` on Windows. Both run:
+
 ```
 go build ./...
 go vet ./... && go vet -tags=stress ./...
@@ -328,8 +380,37 @@ go test -race ./...
 go test -tags=stress -race -run 'Test' .
 ```
 
+Neither runner is the authority on what must pass —
+`.github/workflows/ci.yml` calls `go` directly and is the definition. The
+runners exist to reproduce CI locally, so a target that disagrees with the
+workflow is a bug in the target.
+
+If the change touches a parser, also run `make fuzz` (or the equivalent
+`go test <pkg> -run=XXX -fuzz=<Target>`). Fuzzing found six defects in the WAL
+and CSR readers on its first outing, every one reachable from a file under 110
+bytes, and every one sitting behind code that already had a bounds check beside
+it. A failure writes the offending input to `testdata/fuzz` — **commit that
+file**, it becomes a permanent regression test.
+
 And, if the change is meant to be faster: an **interleaved** A/B with a control,
 per §1. If the control moved, you do not have a result yet.
+
+### On Windows, `gofmt -l .` lies
+
+The repository is stored with LF and `core.autocrlf` checks it out as CRLF, so
+`gofmt` objects to every line of every file and reports around thirty of them as
+unformatted. Nearly all of that is noise.
+
+To see the real answer, normalise before checking:
+
+```sh
+cat file.go | tr -d '\r' | gofmt -d
+```
+
+When this was first run against the tree, 31 reported files came down to **2**
+genuinely misformatted ones. CI's `lint` job runs on Linux for exactly this
+reason. Fix real findings by hand rather than with `gofmt -w`, which would
+rewrite every line ending in the file and bury the change.
 
 ### The priority order
 

@@ -46,7 +46,7 @@ func batchOf(payloads ...string) []byte {
 	for _, p := range payloads {
 		b.add(walRecordNode, []byte(p))
 	}
-	return b.finish()
+	return b.finish(batchMeta{})
 }
 
 func TestWALBatch_CommittedBatchIsApplied(t *testing.T) {
@@ -199,7 +199,7 @@ func TestWALBatch_EmptyBatchIsANoOp(t *testing.T) {
 	if !b.empty() {
 		t.Fatal("new batch should be empty")
 	}
-	if err := w.AppendBatch(b.finish(), false); err != nil {
+	if err := w.AppendBatch(b.finish(batchMeta{}), false); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
 	w.Close()

@@ -194,6 +194,20 @@ func (s *Store) resolveTransaction(ops []store.TxOp) ([]txAction, error) {
 	return actions, nil
 }
 
+// This backend deliberately does NOT implement store.ActorTransactor.
+//
+// It could: accepting a TxContext and discarding it compiles and would make the
+// two backends' method sets identical. But the interface means "this store
+// records who committed", and there is nowhere here to record it — everything is
+// in memory and there is no log. Claiming it would make Tx.Attributed report
+// true for an actor that is about to be dropped, which is worse than not
+// offering the feature.
+//
+// Graph falls back to ApplyTransaction, so an attributed transaction against
+// this backend still commits; it commits unattributed, and Tx.Attributed says
+// so. That is the same honesty Tx.Atomic already applies to the non-atomic
+// fallback.
+
 // ApplyTransaction implements store.Transactor.
 func (s *Store) ApplyTransaction(ops []store.TxOp) error {
 	if len(ops) == 0 {

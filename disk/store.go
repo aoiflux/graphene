@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
@@ -75,11 +76,83 @@ type Store struct {
 	// Sequence counters (shared across CSR and delta).
 	nodeSeq atomic.Uint64
 	edgeSeq atomic.Uint64
+
+	// commitSeq numbers batch commits. Unlike nodeSeq and edgeSeq it has no
+	// high-water mark in the CSR header, so it currently resumes from the
+	// highest value the surviving WAL replays and restarts after a compaction
+	// truncates that log. See batchMeta for why persisting it is being held for
+	// the v8 format change rather than spent on a bump of its own.
+	commitSeq atomic.Uint64
+
+	// nowUnixNano supplies the commit timestamp. Indirected so tests can pin it;
+	// production leaves it nil and reads the clock.
+	nowUnixNano func() int64
+
+	// lastCompact is when Compact last completed in this process. Guarded by mu.
+	// Not persisted — a reopened store reports zero even if its image on disk was
+	// compacted a moment earlier. Persisting it needs a CSR header field and is
+	// held for the v8 format change, like the commit sequence high-water mark.
+	lastCompact time.Time
 }
 
 type deltaAdj struct {
 	out []store.EdgeID
 	in  []store.EdgeID
+}
+
+// nextCommitMeta allocates the provenance for one batch commit.
+//
+// Callers hold s.mu, but commitSeq is atomic anyway so the number is unique
+// even for a future writer that does not.
+func (s *Store) nextCommitMeta(ctx store.TxContext) batchMeta {
+	now := time.Now().UnixNano
+	if s.nowUnixNano != nil {
+		now = s.nowUnixNano
+	}
+	return batchMeta{
+		CommitSeq: s.commitSeq.Add(1),
+		UnixNano:  now(),
+		ActorID:   ctx.ActorID,
+	}
+}
+
+// StorageStats implements store.StorageReporter.
+//
+// Taken under a read lock so the delta counts are mutually consistent — a
+// caller comparing DeltaNodes against CSRNodes should not see figures from
+// either side of a compaction. The WAL size is read outside that consistency
+// guarantee (see WAL.Size) and may lag by one record.
+func (s *Store) StorageStats() store.StorageStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	st := store.StorageStats{
+		DeltaNodes:   len(s.deltaNodes),
+		DeltaEdges:   len(s.deltaEdges),
+		DeletedNodes: len(s.deletedNodes),
+		DeletedEdges: len(s.deletedEdges),
+		WALBytes:     s.wal.Size(),
+		CommitSeq:    s.commitSeq.Load(),
+		LastCompact:  s.lastCompact,
+	}
+	if csr := s.csr; csr != nil {
+		st.CSRNodes = csr.NodeCount()
+		st.CSREdges = csr.EdgeCount()
+	}
+	st.PropertyNodeEntries, st.PropertyEdgeEntries = s.propIdx.EntryCounts()
+	return st
+}
+
+// observeCommitMeta advances the commit counter past a value read back from the
+// log, so a reopened store does not reissue sequence numbers the log already
+// used.
+func (s *Store) observeCommitMeta(m batchMeta) {
+	for {
+		cur := s.commitSeq.Load()
+		if m.CommitSeq <= cur || s.commitSeq.CompareAndSwap(cur, m.CommitSeq) {
+			return
+		}
+	}
 }
 
 const (
@@ -282,7 +355,7 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 			return appendMarshalledNode(dst, node)
 		})
 	}
-	if err := s.wal.AppendBatch(batch.finish(), s.syncOnCommit); err != nil {
+	if err := s.wal.AppendBatch(batch.finish(s.nextCommitMeta(store.TxContext{})), s.syncOnCommit); err != nil {
 		// Apply nothing. The commit marker never reached the file, so replay will
 		// discard whatever partial bytes did — that absence *is* the rollback.
 		// The IDs assigned above are simply never used, which is allowed: IDs are
@@ -386,7 +459,7 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 			return appendMarshalledEdge(dst, edge)
 		})
 	}
-	if err := s.wal.AppendBatch(batch.finish(), s.syncOnCommit); err != nil {
+	if err := s.wal.AppendBatch(batch.finish(s.nextCommitMeta(store.TxContext{})), s.syncOnCommit); err != nil {
 		return nil, fmt.Errorf("AddEdgesBatch: wal: %w", err)
 	}
 
@@ -1603,6 +1676,7 @@ func (s *Store) commitEdgesBatch(edges []*store.Edge) {
 
 func (s *Store) replayWAL() error {
 	return s.wal.Replay(ReplayCallbacks{
+		CommitFunc: s.observeCommitMeta,
 		NodeFunc: func(payload []byte) error {
 			n, err := unmarshalNode(payload)
 			if err != nil {

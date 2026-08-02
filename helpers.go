@@ -21,9 +21,16 @@ type edgeBatchAdder interface {
 type GraphStats struct {
 	NodeCount uint64
 	EdgeCount uint64
+
+	// Storage describes what the backend is holding — delta size, log size, and
+	// when it last compacted. Valid only when HasStorage is true; backends
+	// without a delta layer or a log have nothing to report.
+	Storage    store.StorageStats
+	HasStorage bool
 }
 
-// Stats returns high-level counts for the graph.
+// Stats returns high-level counts for the graph, and storage detail where the
+// backend can supply it.
 func (g *Graph) Stats() (*GraphStats, error) {
 	nc, err := g.NodeCount()
 	if err != nil {
@@ -33,7 +40,52 @@ func (g *Graph) Stats() (*GraphStats, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &GraphStats{NodeCount: nc, EdgeCount: ec}, nil
+	out := &GraphStats{NodeCount: nc, EdgeCount: ec}
+	if sr, ok := g.GraphStore.(store.StorageReporter); ok {
+		out.Storage = sr.StorageStats()
+		out.HasStorage = true
+	}
+	return out, nil
+}
+
+// StorageStats reports the backend's storage state, and whether it could.
+//
+// Cheaper than Stats when only the operational figures are wanted: it does not
+// count nodes and edges, which on the disk backend means it does not merge the
+// CSR and delta views.
+func (g *Graph) StorageStats() (store.StorageStats, bool) {
+	sr, ok := g.GraphStore.(store.StorageReporter)
+	if !ok {
+		return store.StorageStats{}, false
+	}
+	return sr.StorageStats(), true
+}
+
+// ShouldCompact reports whether the store has breached policy, and which rule
+// fired.
+//
+// Advisory only. Nothing in the engine acts on it, and calling it changes
+// nothing — compaction rebuilds the entire image, so when to pay that is the
+// caller's decision, not the engine's. A backend that cannot report its storage
+// state returns false.
+//
+// The intended shape is a periodic check in the caller's own loop:
+//
+//	if due, why := g.ShouldCompact(store.DefaultCompactionPolicy()); due {
+//	    log.Printf("compacting: %s", why)
+//	    g.Compact()
+//	}
+//
+// This exists because nothing else bounds delta growth. Everything written since
+// the last compaction stays in memory and is replayed at every open, so a store
+// that is never compacted degrades in memory, open time, and read speed at once
+// — with no error and no warning until someone measures it.
+func (g *Graph) ShouldCompact(p store.CompactionPolicy) (bool, string) {
+	s, ok := g.StorageStats()
+	if !ok {
+		return false, ""
+	}
+	return p.Evaluate(s)
 }
 
 // --- Batch reads ---

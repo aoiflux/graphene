@@ -506,6 +506,13 @@ func (p *PropertyIndex) edgePropKeys() []string {
 	return out
 }
 
+// EntryCounts returns the number of indexed (id, key, value) triples, split by
+// entity kind. Both are exact: each shard keeps a running count, so this does
+// not walk the index.
+func (p *PropertyIndex) EntryCounts() (nodes, edges int) {
+	return p.nodeEntryCount(), p.edgeEntryCount()
+}
+
 // nodeEntryCount and edgeEntryCount total the per-shard entry counts so the
 // caller can size its result exactly. Without this the collection loop grows by
 // append and copies the whole slice ~log2(n) times on the way up — 5 MB of
