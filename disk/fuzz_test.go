@@ -1,10 +1,10 @@
 package disk
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/aoiflux/graphene/index"
@@ -65,6 +65,55 @@ func TestDeserialiseCSR_RejectsCountsLargerThanTheFile(t *testing.T) {
 	}
 }
 
+// An absolute ID ceiling alone is not a bound. Build sizes its arrays from the
+// highest ID, so one small record naming a large ID demands the whole ceiling's
+// worth of memory — which is how a ~60-byte file asked for roughly 15 GB while
+// satisfying every count check. The ID has to be bounded against how many
+// records the file actually carries.
+func TestDeserialiseCSR_RejectsSparseIDsInATinyFile(t *testing.T) {
+	// One node record, ID just under the absolute ceiling.
+	buf := make([]byte, csrV6HeaderSize)
+	copy(buf, "GCSR")
+	binary.LittleEndian.PutUint16(buf[4:6], csrVersionCurrent)
+	binary.LittleEndian.PutUint64(buf[6:14], 1)               // nodeCount
+	binary.LittleEndian.PutUint64(buf[14:22], 0)              // edgeCount
+	binary.LittleEndian.PutUint64(buf[22:30], maxCSREntityID) // nodeSeqHW, so the mark check passes
+
+	rec := make([]byte, 13)
+	binary.LittleEndian.PutUint64(rec[0:8], maxCSREntityID-1) // the ID
+	rec[8] = 0                                                // no labels
+	binary.LittleEndian.PutUint32(rec[9:13], 0)               // no properties
+	buf = append(buf, rec...)
+	binary.LittleEndian.PutUint64(buf[38:46], uint64(len(buf)))
+
+	if _, _, err := deserialiseCSR(buf); err == nil {
+		t.Fatalf("a %d-byte file named ID %d and was accepted; Build would allocate from it",
+			len(buf), maxCSREntityID-1)
+	}
+}
+
+// The sparsity bound must not reject a store that has legitimately burned IDs.
+// IDs are never reused and Compact preserves them, so a long-lived store's
+// highest ID sits well above its live record count — that file has to open.
+func TestDeserialiseCSR_AcceptsLegitimatelySparseIDs(t *testing.T) {
+	const n = 400
+	nodes := make([]nodeRecord, 0, n)
+	for i := 1; i <= n; i++ {
+		// 50x sparsity: the store deleted ~98% of what it ever created.
+		nodes = append(nodes, nodeRecord{
+			ID:     store.NodeID(i * 50),
+			Labels: []store.NodeType{store.NodeTypeMicroArtefact},
+		})
+	}
+	g := Build(nodes, nil)
+	g.nodeSeqHW = uint64(n * 50)
+
+	if _, _, err := deserialiseCSR(g.SerialiseWithIndex(nil, nil)); err != nil {
+		t.Fatalf("rejected a legitimately sparse store (%d records, highest ID %d): %v",
+			n, n*50, err)
+	}
+}
+
 // The same property for the index section's own length prefixes.
 func TestReadCSRIndexSection_RejectsCountsLargerThanTheSection(t *testing.T) {
 	section := make([]byte, csrIndexSectionMagicSize+8)
@@ -106,6 +155,29 @@ func TestWALReplay_RejectsPayloadLongerThanTheLog(t *testing.T) {
 	}
 }
 
+// A batch-begin marker's record count sizes an allocation, so it is bounded by
+// what the log could hold — not by its own CRC, which is computed over the very
+// bytes making the claim.
+//
+// The 13-byte input below claims 2^32-1 records and asked for roughly 137 GB of
+// pendingRecord before reading any of them. Found by FuzzWALReplay once the
+// parser could be driven in memory; the file-backed target never reached it.
+func TestWALReplay_RejectsBatchCountLargerThanTheLog(t *testing.T) {
+	rec := make([]byte, 0, walRecordOverhead+walBatchBeginPayload)
+	rec = appendRecord(rec, walRecordBatchBegin, []byte{0xFF, 0xFF, 0xFF, 0xFF})
+
+	applied := 0
+	err := replayRecords(bytes.NewReader(rec), int64(len(rec)), ReplayCallbacks{
+		NodeFunc: func([]byte) error { applied++; return nil },
+	})
+	if err == nil {
+		t.Fatal("accepted a batch declaring more records than the log can hold")
+	}
+	if applied != 0 {
+		t.Fatalf("applied %d records from a log containing only a begin marker", applied)
+	}
+}
+
 // csrSeed returns a serialised CSR carrying records and index entries, so the
 // fuzzer has a structurally valid image to mutate rather than only noise.
 func csrSeed(t testingTB) []byte {
@@ -136,16 +208,6 @@ type testingTB interface {
 	Helper()
 	Fatalf(string, ...any)
 }
-
-// fuzzWALPath returns one reusable log path per worker process. os.MkdirTemp
-// gives each process its own directory, so concurrent workers cannot collide.
-var fuzzWALPath = sync.OnceValue(func() string {
-	dir, err := os.MkdirTemp("", "graphene-fuzzwal-*")
-	if err != nil {
-		panic("fuzz: cannot create temp dir: " + err.Error())
-	}
-	return filepath.Join(dir, "fuzz.wal")
-})
 
 // walSeedBytes returns a log containing one committed batch and a couple of
 // loose records, so the fuzzer starts from something structurally valid.
@@ -274,33 +336,47 @@ func FuzzWALReplay(f *testing.F) {
 	f.Add(walUncommittedBatchBytes(f))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// One directory and one path for the whole worker process, overwritten per
-		// input. Calling t.TempDir() per iteration means creating and removing a
-		// directory for every candidate, which held this target to ~30 exec/s —
-		// too slow to explore anything. Fuzzing workers run inputs sequentially
-		// within a process, so a shared path is safe.
-		path := fuzzWALPath()
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			t.Skip("could not stage log")
-		}
-		w, err := OpenWAL(path)
-		if err != nil {
-			return
-		}
-		defer w.Close()
-
+		// Driven through replayRecords rather than WAL.Replay so each candidate
+		// costs a bytes.Reader instead of a file write and an open. Going through
+		// the file handle held this target to a few thousand executions a minute,
+		// which is not enough to explore a framed binary format.
 		applied := 0
 		count := func([]byte) error { applied++; return nil }
-		// Replay either succeeds or reports a malformed log. Both are fine; the
-		// test is that it returns at all, without panicking or exhausting memory.
-		_ = w.Replay(ReplayCallbacks{
+		cb := ReplayCallbacks{
 			NodeFunc: count, EdgeFunc: count,
 			NodePropFunc: count, EdgePropFunc: count,
 			NodeDeleteFunc: count, EdgeDeleteFunc: count,
 			NodePropPurgeFunc: count, EdgePropPurgeFunc: count,
-		})
-		if applied < 0 {
-			t.Fatal("unreachable; keeps applied live")
+		}
+
+		// Either outcome is fine — a malformed log should be reported, a torn one
+		// truncated. What must not happen is a panic or an unbounded allocation.
+		if err := replayRecords(bytes.NewReader(data), int64(len(data)), cb); err != nil {
+			return
+		}
+
+		// A clean parse must be deterministic: the same bytes must apply the same
+		// records. Batch buffering makes this worth stating — a batch that commits
+		// applies all of its records, one that does not applies none, and nothing
+		// in between is a legal outcome.
+		second := 0
+		cb2 := ReplayCallbacks{
+			NodeFunc:       func([]byte) error { second++; return nil },
+			EdgeFunc:       func([]byte) error { second++; return nil },
+			NodePropFunc:   func([]byte) error { second++; return nil },
+			EdgePropFunc:   func([]byte) error { second++; return nil },
+			NodeDeleteFunc: func([]byte) error { second++; return nil },
+			EdgeDeleteFunc: func([]byte) error { second++; return nil },
+
+			NodePropPurgeFunc: func([]byte) error { second++; return nil },
+			EdgePropPurgeFunc: func([]byte) error { second++; return nil },
+		}
+		if err := replayRecords(bytes.NewReader(data), int64(len(data)), cb2); err != nil {
+			t.Fatalf("replay succeeded then failed on the same %d bytes: %v", len(data), err)
+		}
+		if second != applied {
+			t.Fatalf("replay is not deterministic: applied %d records then %d from the same bytes",
+				applied, second)
 		}
 	})
 }

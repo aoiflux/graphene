@@ -275,8 +275,21 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 	if bufSize < walMinReplayBuffer {
 		bufSize = walMinReplayBuffer
 	}
-	r := bufio.NewReaderSize(w.file, bufSize)
+	return replayRecords(bufio.NewReaderSize(w.file, bufSize), logSize, cb)
+}
 
+// replayRecords is Replay's parser, separated from the file handling around it.
+//
+// The split exists so the parser can be driven from memory. Replay reads an
+// *os.File, so fuzzing it end-to-end costs a file write and an open per
+// candidate input — which held FuzzWALReplay to a few thousand executions a
+// minute against three million for the in-memory CSR parser, on the log format
+// that carries the higher risk of the two. It is also what a model-checking
+// harness needs, since a generated trace is a byte slice, not a file.
+//
+// logSize bounds each record's declared payload length; pass 0 when the total is
+// not known and the check is skipped.
+func replayRecords(r io.Reader, logSize int64, cb ReplayCallbacks) error {
 	header := make([]byte, walHeaderSize)
 	footer := make([]byte, walFooterSize)
 
@@ -330,7 +343,22 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 			if len(payload) != walBatchBeginPayload {
 				return fmt.Errorf("wal replay: malformed batch begin")
 			}
-			pending = make([]pendingRecord, 0, binary.LittleEndian.Uint32(payload))
+			// The declared count sizes an allocation, so it is bounded by what the
+			// log could actually contain: every batched record costs at least a
+			// header and a footer. Without this a 13-byte log whose begin marker
+			// claims 2^32-1 records asks for ~137 GB before reading the first one,
+			// and the marker's own CRC is no defence — it is computed over the very
+			// bytes that make the claim.
+			//
+			// This is an error rather than a torn tail: the record is intact and
+			// its CRC verified, so what it describes is impossible rather than
+			// truncated, which is the same class as the length check above it.
+			batchCount := binary.LittleEndian.Uint32(payload)
+			if logSize > 0 && int64(batchCount) > logSize/walRecordOverhead {
+				return fmt.Errorf("wal replay: batch begin declares %d records, more than %d bytes can hold",
+					batchCount, logSize)
+			}
+			pending = make([]pendingRecord, 0, batchCount)
 			body = body[:0]
 			continue
 
