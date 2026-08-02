@@ -89,6 +89,42 @@ func assertPropertyIndexIntact(t *testing.T, g *graphene.Graph, ids []store.Node
 	}
 }
 
+// firstSectionOffset reads the v8 section directory and returns the offset of
+// the earliest section, which is where the record region ends.
+//
+// The format knowledge is duplicated here on purpose: these are format tests, and
+// a test that derived the answer from the same code it is checking would pass
+// whatever that code did.
+func firstSectionOffset(t *testing.T, data []byte) int {
+	t.Helper()
+	const sectionTableOffsetPos = 62
+	const entrySize = 24
+
+	if len(data) < 70 {
+		t.Fatalf("file too short for a v8 header: %d bytes", len(data))
+	}
+	tableOff := int(binary.LittleEndian.Uint64(data[sectionTableOffsetPos : sectionTableOffsetPos+8]))
+	if tableOff <= 0 || tableOff+2 > len(data) {
+		t.Fatalf("section directory offset %d is outside a %d-byte file", tableOff, len(data))
+	}
+	count := int(binary.LittleEndian.Uint16(data[tableOff : tableOff+2]))
+	if count == 0 {
+		return tableOff
+	}
+	first := tableOff
+	for i := 0; i < count; i++ {
+		p := tableOff + 2 + i*entrySize
+		if p+entrySize > len(data) {
+			t.Fatalf("truncated section directory entry %d", i)
+		}
+		off := int(binary.LittleEndian.Uint64(data[p+8 : p+16]))
+		if off < first {
+			first = off
+		}
+	}
+	return first
+}
+
 func csrVersion(t *testing.T, dir string) uint16 {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(dir, csrFileName))
@@ -118,8 +154,8 @@ func TestCSRv6_PropertyIndexSurvivesWithoutWAL(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if v := csrVersion(t, dir); v != 7 {
-		t.Fatalf("CSR version = %d, want 7", v)
+	if v := csrVersion(t, dir); v != 8 {
+		t.Fatalf("CSR version = %d, want 8", v)
 	}
 
 	// Compaction used to re-emit every property entry into the fresh WAL. It
@@ -262,17 +298,19 @@ func TestCSRv5_StillReadableAndUpgrades(t *testing.T) {
 		t.Fatalf("read CSR: %v", err)
 	}
 	const (
-		v5Header    = 38
-		v6Header    = 46
-		indexOffPos = 38
+		v5Header = 38
+		v8Header = 102
 	)
-	indexOffset := int(binary.LittleEndian.Uint64(data[indexOffPos : indexOffPos+8]))
-	if indexOffset <= v6Header || indexOffset > len(data) {
-		t.Fatalf("unexpected index offset %d in a %d-byte file", indexOffset, len(data))
+	// v8 addresses its sections through a directory rather than the single
+	// indexOffset field, which it writes as zero. Find where the records end by
+	// reading the first section's offset out of that directory.
+	indexOffset := firstSectionOffset(t, data)
+	if indexOffset <= v8Header || indexOffset > len(data) {
+		t.Fatalf("unexpected first-section offset %d in a %d-byte file", indexOffset, len(data))
 	}
-	v5 := make([]byte, 0, v5Header+(indexOffset-v6Header))
+	v5 := make([]byte, 0, v5Header+(indexOffset-v8Header))
 	v5 = append(v5, data[:v5Header]...)            // header without indexOffset
-	v5 = append(v5, data[v6Header:indexOffset]...) // body without the index section
+	v5 = append(v5, data[v8Header:indexOffset]...) // records only, no sections
 	binary.LittleEndian.PutUint16(v5[csrVersionOff:csrVersionOff+2], 5)
 	if err := os.WriteFile(csrPath, v5, 0600); err != nil {
 		t.Fatalf("write v5 CSR: %v", err)
@@ -309,8 +347,8 @@ func TestCSRv5_StillReadableAndUpgrades(t *testing.T) {
 	if err := reopened.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if v := csrVersion(t, dir); v != 7 {
-		t.Fatalf("CSR version after upgrade compact = %d, want 7", v)
+	if v := csrVersion(t, dir); v != 8 {
+		t.Fatalf("CSR version after upgrade compact = %d, want 8", v)
 	}
 }
 
@@ -365,8 +403,10 @@ func TestCSRv6_CorruptIndexSectionIsDetected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read CSR: %v", err)
 	}
-	// Point the index offset at nonsense; the magic check must catch it.
-	binary.LittleEndian.PutUint64(data[38:46], uint64(len(data)-3))
+	// Point the property-index section at nonsense; the magic check must catch it.
+	// In v8 that offset lives in the section directory, so patch it there.
+	tableOff := int(binary.LittleEndian.Uint64(data[62:70]))
+	binary.LittleEndian.PutUint64(data[tableOff+2+8:tableOff+2+16], uint64(len(data)-3))
 	if err := os.WriteFile(csrPath, data, 0600); err != nil {
 		t.Fatalf("write CSR: %v", err)
 	}

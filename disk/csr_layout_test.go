@@ -31,12 +31,21 @@ func TestCSRLayout_NoGapBeforeIndexSection(t *testing.T) {
 	const n = 200
 	data := layoutFixture(n).SerialiseWithIndex(nil, nil)
 
-	indexOffset := int(binary.LittleEndian.Uint64(data[38:46]))
+	// v8 addresses sections through a directory; the first section begins where
+	// the records end.
+	sections, err := readCSRSectionDirectory(data, binary.LittleEndian.Uint64(data[62:70]))
+	if err != nil {
+		t.Fatalf("section directory: %v", err)
+	}
+	if len(sections) == 0 {
+		t.Fatal("no sections written")
+	}
+	indexOffset := int(sections[0].Offset)
 
 	// node: id(8) + labelCount(1) + label(2) + propLen(4)
 	// edge: ids(24) + labelCount(1) + label(2) + weight(4) + propLen(4)
 	wantRecords := n*(8+1+2+4) + (n-1)*(24+1+2+4+4)
-	if got := indexOffset - csrV6HeaderSize; got != wantRecords {
+	if got := indexOffset - csrV8HeaderSize; got != wantRecords {
 		t.Fatalf("gap between records and index section: body is %d bytes, records need %d (%d bytes unaccounted)",
 			got, wantRecords, got-wantRecords)
 	}

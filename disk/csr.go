@@ -68,6 +68,16 @@ type CSRGraph struct {
 	// max ID physically present.
 	nodeSeqHW uint64
 	edgeSeqHW uint64
+
+	// commitSeqHW is the largest batch-commit sequence number issued at the time
+	// this CSR was built, and lastCompactUnixNano is when that build happened.
+	//
+	// Both exist because the WAL is truncated at compaction: without somewhere
+	// durable to record them, the commit counter restarts and the last
+	// compaction time is forgotten on every reopen. v8 is that somewhere. Zero
+	// means "unknown", which is what every pre-v8 file reports.
+	commitSeqHW         uint64
+	lastCompactUnixNano int64
 }
 
 // nodeRecord is the compact per-node record.
@@ -443,9 +453,33 @@ func (g *CSRGraph) Serialise() []byte {
 	return g.SerialiseWithIndex(nil, nil)
 }
 
+// csrPayload is everything the caller wants carried in the image's sections.
+//
+// A struct rather than a growing parameter list: v8 exists so that sections can
+// be added without a format change, and a signature that has to change for each
+// one would put the friction straight back.
+type csrPayload struct {
+	NodeProps []index.NodePropEntry
+	EdgeProps []index.EdgePropEntry
+
+	// Keys declared ordered. Only the declarations travel — the entries are
+	// already in the property index section, and the ordered structure is
+	// rebuilt from them at load.
+	OrderedNodeKeys []string
+	OrderedEdgeKeys []string
+}
+
 // SerialiseWithIndex writes the CSR plus the given property-index entries.
-// Passing nil for both writes a v6 file with an empty index section.
+//
+// Retained for callers that carry nothing but the property index; everything
+// else goes through SerialiseWithPayload.
 func (g *CSRGraph) SerialiseWithIndex(nodeProps []index.NodePropEntry, edgeProps []index.EdgePropEntry) []byte {
+	return g.SerialiseWithPayload(csrPayload{NodeProps: nodeProps, EdgeProps: edgeProps})
+}
+
+// SerialiseWithPayload writes the CSR and every section the payload asks for.
+func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) []byte {
+	nodeProps, edgeProps := payload.NodeProps, payload.EdgeProps
 	var buf bytes.Buffer
 
 	// Count valid nodes and edges.
@@ -462,7 +496,9 @@ func (g *CSRGraph) SerialiseWithIndex(nodeProps []index.NodePropEntry, edgeProps
 		}
 	}
 
-	// Header
+	// Header. The first 46 bytes keep their v6 meaning and position; v8 appends
+	// to them rather than rearranging, so a reader can identify a file and read
+	// its counts before it understands anything else. See csr_v8.go.
 	buf.Write([]byte("GCSR"))
 	writeUint16(&buf, csrVersionCurrent)
 	writeUint64(&buf, uint64(nodeCount))
@@ -470,9 +506,16 @@ func (g *CSRGraph) SerialiseWithIndex(nodeProps []index.NodePropEntry, edgeProps
 	// Sequence high-water marks (version 5+).
 	writeUint64(&buf, g.nodeSeqHW)
 	writeUint64(&buf, g.edgeSeqHW)
-	// Placeholder for indexOffset (version 6+); patched once the body is written.
-	indexOffsetPos := buf.Len()
+	// indexOffset (v6/v7). Written as 0 in v8: the property index is a section
+	// now. The field stays so the header prefix does not shift.
 	writeUint64(&buf, 0)
+	// v8 additions.
+	writeUint64(&buf, g.commitSeqHW)
+	writeUint64(&buf, uint64(g.lastCompactUnixNano))
+	sectionTableOffsetPos := buf.Len()
+	writeUint64(&buf, 0) // patched once the directory is placed
+	digestPos := buf.Len()
+	buf.Write(make([]byte, csrDigestSize)) // patched last, over a zeroed field
 
 	// Nodes (variable-length labels)
 	for i := 1; i < len(g.nodes); i++ {
@@ -518,7 +561,11 @@ func (g *CSRGraph) SerialiseWithIndex(nodeProps []index.NodePropEntry, edgeProps
 	// On a 100k-node fixture that was ~4.8 MB of a ~22 MB file, written on every
 	// Compact and read by nobody.
 
-	// Index section
+	// Sections, then the directory that addresses them. The property index is a
+	// section now rather than a fixed trailer — see csr_v8.go for why the format
+	// grew a directory instead of another offset field.
+	var sections []csrSection
+
 	indexOffset := buf.Len()
 	buf.WriteString(csrIndexSectionMagic)
 	writeUint64(&buf, uint64(len(nodeProps)))
@@ -529,9 +576,34 @@ func (g *CSRGraph) SerialiseWithIndex(nodeProps []index.NodePropEntry, edgeProps
 	for _, e := range edgeProps {
 		writePropEntry(&buf, uint64(e.ID), e.Key, e.Value)
 	}
+	sections = append(sections, csrSection{
+		// Optional: a reader that skips it answers every query correctly and
+		// only pays for re-registering entries from the WAL.
+		Magic:  csrSectionPropIndex,
+		Offset: uint64(indexOffset),
+		Length: uint64(buf.Len() - indexOffset),
+	})
 
-	out := buf.Bytes()
-	binary.LittleEndian.PutUint64(out[indexOffsetPos:indexOffsetPos+8], uint64(indexOffset))
+	if len(payload.OrderedNodeKeys) > 0 || len(payload.OrderedEdgeKeys) > 0 {
+		ordOffset := buf.Len()
+		buf.Write(appendOrderedKeySection(nil, payload.OrderedNodeKeys, payload.OrderedEdgeKeys))
+		sections = append(sections, csrSection{
+			// Optional for the same reason: losing it costs a scan, not an answer.
+			Magic:  csrSectionOrderedKeys,
+			Offset: uint64(ordOffset),
+			Length: uint64(buf.Len() - ordOffset),
+		})
+	}
+
+	sectionTableOffset := buf.Len()
+	out := appendSectionDirectory(buf.Bytes(), sections)
+
+	binary.LittleEndian.PutUint64(out[sectionTableOffsetPos:sectionTableOffsetPos+8], uint64(sectionTableOffset))
+
+	// Digest last: it covers the finished image with its own field zeroed, so
+	// everything above — header, records, sections, directory — is inside it.
+	digest := computeCSRDigest(out)
+	copy(out[digestPos:digestPos+csrDigestSize], digest[:])
 	return out
 }
 

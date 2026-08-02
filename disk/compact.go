@@ -81,9 +81,27 @@ func (s *Store) Compact() error {
 	newCSR.nodeSeqHW = s.nodeSeq.Load()
 	newCSR.edgeSeqHW = s.edgeSeq.Load()
 
+	// v8 carries two more marks across the truncation that follows.
+	//
+	// Compaction empties the WAL, and until v8 that took the commit sequence and
+	// the last compaction time with it: the counter restarted from zero on the
+	// next open, and nothing could say when the image was built. Both now survive
+	// in the header, which is what makes a commit sequence number a durable
+	// identity rather than an ordering within one log generation.
+	compactedAt := time.Now()
+	newCSR.commitSeqHW = s.commitSeq.Load()
+	newCSR.lastCompactUnixNano = compactedAt.UnixNano()
+
 	// Serialise to temp file, carrying the property index into the CSR so it no
 	// longer has to be reconstructed from the WAL on the next open.
-	data := newCSR.SerialiseWithIndex(s.propIdx.NodeEntries(), s.propIdx.EdgeEntries())
+	// Ordered-key declarations travel with the image. Without this every reopen
+	// silently turned declared range queries back into scans.
+	data := newCSR.SerialiseWithPayload(csrPayload{
+		NodeProps:       s.propIdx.NodeEntries(),
+		EdgeProps:       s.propIdx.EdgeEntries(),
+		OrderedNodeKeys: s.propIdx.OrderedNodeKeys(),
+		OrderedEdgeKeys: s.propIdx.OrderedEdgeKeys(),
+	})
 	tmpPath := filepath.Join(s.dir, csrFileName+".tmp")
 	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
 		return fmt.Errorf("compact: write tmp CSR: %w", err)
@@ -120,7 +138,7 @@ func (s *Store) Compact() error {
 	s.deltaNodesByType = make(map[store.NodeType][]store.NodeID)
 	s.deltaEdgesByType = make(map[store.EdgeType][]store.EdgeID)
 
-	s.lastCompact = time.Now()
+	s.lastCompact = compactedAt
 
 	return nil
 }

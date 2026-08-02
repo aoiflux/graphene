@@ -40,6 +40,20 @@ type CSRInfo struct {
 	// the memory an open costs — the CSR indexes its arrays by ID, not by count.
 	MaxNodeID uint64
 	MaxEdgeID uint64
+
+	// v8 additions. CommitSeqHW and LastCompactUnixNano are zero in older files.
+	CommitSeqHW         uint64
+	LastCompactUnixNano int64
+	Sections            []CSRSectionInfo
+}
+
+// CSRSectionInfo describes one entry in a v8 section directory.
+type CSRSectionInfo struct {
+	Magic    string
+	Critical bool
+	Offset   uint64
+	Length   uint64
+	Known    bool // whether this build understands the section
 }
 
 // InspectCSR parses the CSR image at path.
@@ -64,6 +78,29 @@ func InspectCSR(path string) (CSRInfo, error) {
 	if len(data) >= csrV6HeaderSize {
 		info.Version = binary.LittleEndian.Uint16(data[4:6])
 		info.IndexOffset = binary.LittleEndian.Uint64(data[38:46])
+	}
+	// Header fields are read before the full parse so that a file which fails to
+	// parse still reports what it claims to be. An error with no context cannot
+	// be diagnosed.
+	if info.Version >= csrVersionSectioned && len(data) >= csrV8HeaderSize {
+		info.CommitSeqHW = binary.LittleEndian.Uint64(data[46:54])
+		info.LastCompactUnixNano = int64(binary.LittleEndian.Uint64(data[54:62]))
+		if sections, err := readCSRSectionDirectory(data, binary.LittleEndian.Uint64(data[62:70])); err == nil {
+			for _, s := range sections {
+				known := false
+				switch s.Magic {
+				case csrSectionPropIndex, csrSectionOrderedKeys:
+					known = true
+				}
+				info.Sections = append(info.Sections, CSRSectionInfo{
+					Magic:    s.Magic,
+					Critical: s.Critical(),
+					Offset:   s.Offset,
+					Length:   s.Length,
+					Known:    known,
+				})
+			}
+		}
 	}
 
 	// The full parse is what validates the file, so its bounds checks are the

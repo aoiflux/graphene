@@ -82,7 +82,67 @@ func describeDiff(t *testing.T, a, b []byte) string {
 	return "no byte difference"
 }
 
-// Compacting twice without mutating the store must rewrite the same bytes.
+// stripVolatile blanks the one header field that is not a function of the
+// store's contents, so two images can be compared for content equality.
+//
+// Only the compaction timestamp qualifies. It is a wall-clock reading, so it
+// differs between two compactions of an identical store by design — which is
+// why the digest excludes it too. Everything else in a v8 header is derived from
+// what the file holds.
+func stripVolatile(data []byte) []byte {
+	out := append([]byte(nil), data...)
+	if len(out) >= csrV8HeaderSize {
+		for i := csrLastCompactOffset; i < csrLastCompactOffset+8; i++ {
+			out[i] = 0
+		}
+	}
+	return out
+}
+
+// The digest is the same across two compactions of an unchanged store.
+//
+// This is the property that actually matters, and it is stronger than comparing
+// files: the digest is what a second party checks, so if it is stable then two
+// holders of the same evidence agree even though their files differ in when they
+// were written.
+func TestCompact_DigestIsStableAcrossCompactions(t *testing.T) {
+	s, dir := openFresh(t)
+	defer s.Close()
+
+	determinismFixture(t, s)
+
+	if err := s.Compact(); err != nil {
+		t.Fatalf("first Compact: %v", err)
+	}
+	firstStatus, firstDigest, err := VerifyCSRDigest(dir)
+	if err != nil {
+		t.Fatalf("verify after first compact: %v", err)
+	}
+	if firstStatus != DigestMatch {
+		t.Fatalf("digest status after writing the file: %v", firstStatus)
+	}
+
+	if err := s.Compact(); err != nil {
+		t.Fatalf("second Compact: %v", err)
+	}
+	secondStatus, secondDigest, err := VerifyCSRDigest(dir)
+	if err != nil {
+		t.Fatalf("verify after second compact: %v", err)
+	}
+	if secondStatus != DigestMatch {
+		t.Fatalf("digest status after recompaction: %v", secondStatus)
+	}
+
+	if firstDigest != secondDigest {
+		t.Fatalf("recompacting an unchanged store changed its digest:\n  %x\n  %x\n\n"+
+			"The digest is meant to identify what the file holds, so recompaction "+
+			"must not change it — otherwise a verifier cannot tell 'rebuilt' from 'altered'.",
+			firstDigest, secondDigest)
+	}
+}
+
+// Compacting twice without mutating the store must rewrite the same bytes,
+// ignoring the compaction timestamp.
 //
 // This is the minimal statement of the property and the one that fails first:
 // both compactions run in one process against one property index, so the only
@@ -103,6 +163,7 @@ func TestCompact_IsByteDeterministic(t *testing.T) {
 	}
 	second := readCSR(t, dir)
 
+	first, second = stripVolatile(first), stripVolatile(second)
 	if !bytes.Equal(first, second) {
 		t.Fatalf("two compactions of an unchanged store produced different bytes.\n%s\n\n"+
 			"The CSR image is not a stable identity for its contents, so no digest, "+
@@ -129,6 +190,7 @@ func TestCompact_IdenticalStoresProduceIdenticalBytes(t *testing.T) {
 
 	a, b := build(), build()
 
+	a, b = stripVolatile(a), stripVolatile(b)
 	if !bytes.Equal(a, b) {
 		t.Fatalf("two stores built by identical operations produced different bytes.\n%s\n\n"+
 			"Independent reconstruction of the same evidence does not yield the same "+

@@ -179,7 +179,7 @@ const (
 	csrVersionWithSeqHW      = 5
 	csrVersionWithPropIndex  = 6
 	csrVersionNoAdjacency    = 7 // stopped writing the never-read adjacency arrays
-	csrVersionCurrent        = csrVersionNoAdjacency
+	csrVersionCurrent        = csrVersionSectioned
 	csrV6HeaderSize          = 46 // magic4 + version2 + counts16 + seqHW16 + indexOffset8
 	csrV5HeaderSize          = 38
 	csrIndexSectionMagic     = "GIDX"

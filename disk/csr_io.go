@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"time"
 
 	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
@@ -37,6 +38,21 @@ func (s *Store) loadCSR(path string) error {
 	// A pre-v6 file carries no section; its entries come from the WAL as before,
 	// and the next Compact writes them into the CSR.
 	if section != nil {
+		// Re-declare before the entries land, so the ordered structures are built
+		// by the same incremental path a live declaration uses rather than by a
+		// backfill afterwards. Either order is correct — DeclareOrderedNodeKey
+		// backfills from what is already indexed — but doing it first means there
+		// is one path to reason about.
+		//
+		// This is what stops a reopen silently turning every declared range query
+		// back into a scan.
+		for _, k := range section.OrderedNodeKeys {
+			s.propIdx.DeclareOrderedNodeKey(k)
+		}
+		for _, k := range section.OrderedEdgeKeys {
+			s.propIdx.DeclareOrderedEdgeKey(k)
+		}
+
 		// Deliberately per-entry. Bulk loading was built and measured here — one
 		// lock per shard, parallel fill, presized reverse map, batch-local value
 		// interning — and it cut allocations 9-19% but cost 35-75% more resident
@@ -66,6 +82,16 @@ func (s *Store) loadCSR(path string) error {
 			break
 		}
 	}
+	// Restore the marks that used to be lost at every compaction (v8+). Zero
+	// means the file predates them, in which case the commit counter resumes
+	// from whatever the surviving WAL replays — the pre-v8 behaviour.
+	if csr.commitSeqHW > s.commitSeq.Load() {
+		s.commitSeq.Store(csr.commitSeqHW)
+	}
+	if csr.lastCompactUnixNano != 0 {
+		s.lastCompact = time.Unix(0, csr.lastCompactUnixNano)
+	}
+
 	// Honour the persisted high-water marks so IDs are never reused even when the
 	// record that held the max ID was deleted before this CSR was written.
 	if csr.nodeSeqHW > s.nodeSeq.Load() {
@@ -116,6 +142,36 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		}
 		indexOffset = binary.LittleEndian.Uint64(data[38:46])
 		pos = csrV6HeaderSize
+	}
+
+	// v8 header additions and the section directory.
+	var trailer csrV8Trailer
+	if version >= csrVersionSectioned {
+		if len(data) < csrV8HeaderSize {
+			return nil, nil, fmt.Errorf("deserialiseCSR: truncated v8 header: %d bytes, need %d",
+				len(data), csrV8HeaderSize)
+		}
+		trailer.CommitSeqHW = binary.LittleEndian.Uint64(data[46:54])
+		trailer.LastCompactUnixNano = int64(binary.LittleEndian.Uint64(data[54:62]))
+		sectionTableOffset := binary.LittleEndian.Uint64(data[62:70])
+		copy(trailer.Digest[:], data[csrDigestOffset:csrDigestOffset+csrDigestSize])
+		pos = csrV8HeaderSize
+
+		sections, err := readCSRSectionDirectory(data, sectionTableOffset)
+		if err != nil {
+			return nil, nil, fmt.Errorf("deserialiseCSR: %w", err)
+		}
+		trailer.Sections = sections
+		// Refuse a file whose critical sections this build cannot interpret,
+		// rather than reading it as though they were absent.
+		if err := checkCriticalSections(trailer.Sections); err != nil {
+			return nil, nil, err
+		}
+		// The directory addresses the property index in v8; the v6 offset field
+		// is written as zero.
+		if s, ok := findSection(trailer.Sections, csrSectionPropIndex); ok {
+			indexOffset = s.Offset
+		}
 	}
 
 	// Both counts come straight off the header, so a corrupt or hostile file
@@ -241,6 +297,8 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 	csr := Build(nodes, edges)
 	csr.nodeSeqHW = nodeSeqHW
 	csr.edgeSeqHW = edgeSeqHW
+	csr.commitSeqHW = trailer.CommitSeqHW
+	csr.lastCompactUnixNano = trailer.LastCompactUnixNano
 
 	// Pre-v6 files carry no index section; the caller falls back to the WAL.
 	if version < csrVersionWithPropIndex {
@@ -250,13 +308,33 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Ordered-key declarations (v8+). Optional, so a file without the section
+	// simply carries no declarations — which is what every pre-v8 file reports.
+	if s, ok := findSection(trailer.Sections, csrSectionOrderedKeys); ok {
+		nodeKeys, edgeKeys, err := readOrderedKeySection(data[s.Offset : s.Offset+s.Length])
+		if err != nil {
+			return nil, nil, fmt.Errorf("deserialiseCSR: ordered-key section: %w", err)
+		}
+		section.OrderedNodeKeys = nodeKeys
+		section.OrderedEdgeKeys = edgeKeys
+	}
 	return csr, section, nil
 }
 
-// csrIndexSection holds the property-index entries read out of a v6+ CSR file.
+// csrIndexSection carries everything parsed out of a file's optional sections.
+//
+// It began as the GIDX property index alone, which is where the name comes
+// from; v8 turned sections into a directory and the ordered-key declarations
+// joined it. Any future optional section a loader needs to act on belongs here
+// too.
 type csrIndexSection struct {
 	NodeProps []index.NodePropEntry
 	EdgeProps []index.EdgePropEntry
+
+	// Keys declared ordered when the image was written (GORD, v8+).
+	OrderedNodeKeys []string
+	OrderedEdgeKeys []string
 }
 
 // checkIDCeiling bounds the highest ID of one entity kind both absolutely and

@@ -292,9 +292,14 @@ func TestOrderedIndex_StaysConsistentThroughMutations(t *testing.T) {
 	}
 }
 
-// A declared key must survive a compact/reopen cycle: the CSR carries the
-// entries, and re-declaring rebuilds the ordering over them.
-func TestOrderedIndex_SurvivesReopenAfterRedeclaration(t *testing.T) {
+// A declared key survives a compact/reopen cycle by itself.
+//
+// This test previously asserted the opposite — that declarations were lost and
+// the caller had to re-declare. That was the C3 gap: the reversion was silent,
+// OrderedProperties honestly reported an empty list, and every range query went
+// back to scanning with no error to notice. The declarations are now carried in
+// the image's GORD section, so the reopen restores them.
+func TestOrderedIndex_SurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	g, err := graphene.Open(dir)
 	if err != nil {
@@ -317,15 +322,17 @@ func TestOrderedIndex_SurvivesReopenAfterRedeclaration(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	// The declaration itself is not persisted — it is a runtime choice about how
-	// to index, like an index definition in any other engine. Re-declaring must
-	// reproduce the same answers from the persisted entries.
+	// The declaration is part of the image now, so it is back without the caller
+	// doing anything.
 	nodeKeys, _ := reopened.OrderedProperties()
-	if len(nodeKeys) != 0 {
-		t.Fatalf("expected no declared keys after reopen, got %v", nodeKeys)
+	if len(nodeKeys) != 1 || nodeKeys[0] != "score" {
+		t.Fatalf("declared keys after reopen = %v, want [score]", nodeKeys)
 	}
+
+	// And re-declaring is still harmless, since a caller written against the old
+	// behaviour will do exactly that.
 	if err := reopened.DeclareOrderedProperty("score"); err != nil {
-		t.Fatalf("DeclareOrderedProperty after reopen: %v", err)
+		t.Fatalf("re-declaring an already-declared key: %v", err)
 	}
 
 	f := store.PropertyFilter{Key: "score", Op: store.PropertyOpBetweenInclusive,

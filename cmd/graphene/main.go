@@ -170,12 +170,33 @@ func sparsityNote(c disk.CSRInfo) string {
 
 func cmdCSR(args []string) error {
 	fs := flag.NewFlagSet("csr", flag.ExitOnError)
+	verify := fs.Bool("verify", false, "check the stored digest against the file's contents")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	target := fs.Arg(0)
 	if target == "" {
 		return fmt.Errorf("need a store directory or a graphene.csr path")
+	}
+
+	// Verification first: if the file has been altered, that is the answer, and
+	// the parsed detail below should be read in that light.
+	if *verify {
+		status, computed, err := disk.VerifyCSRDigest(target)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("digest    %v\n", status)
+		if status != disk.DigestAbsent {
+			fmt.Printf("computed  %x\n", computed)
+		}
+		if status == disk.DigestMismatch {
+			fmt.Fprintln(os.Stderr,
+				"\nthe file does not match the digest it carries — it has changed since it was written.\n"+
+					"the digest cannot say whether that was damage or an edit.")
+			os.Exit(1)
+		}
+		fmt.Println()
 	}
 
 	c, err := disk.InspectCSR(target)
@@ -194,8 +215,27 @@ func cmdCSR(args []string) error {
 	fmt.Fprintf(w, "edge seq high-water\t%d\n", c.EdgeSeqHW)
 	fmt.Fprintf(w, "highest node ID\t%d\n", c.MaxNodeID)
 	fmt.Fprintf(w, "highest edge ID\t%d\n", c.MaxEdgeID)
-	fmt.Fprintf(w, "index section at\tbyte %d\n", c.IndexOffset)
 	fmt.Fprintf(w, "property entries\t%d node, %d edge\n", c.PropertyNodeEntries, c.PropertyEdgeEntries)
+	if c.CommitSeqHW > 0 {
+		fmt.Fprintf(w, "commit seq high-water\t%d\n", c.CommitSeqHW)
+	}
+	if c.LastCompactUnixNano != 0 {
+		fmt.Fprintf(w, "last compacted\t%s\n", formatNano(c.LastCompactUnixNano))
+	}
+	if len(c.Sections) > 0 {
+		fmt.Fprintf(w, "sections\t%d\n", len(c.Sections))
+		for _, s := range c.Sections {
+			kind := "optional"
+			if s.Critical {
+				kind = "CRITICAL"
+			}
+			note := ""
+			if !s.Known {
+				note = "  <- not understood by this build"
+			}
+			fmt.Fprintf(w, "  %s\t%s, %d bytes at %d%s\n", s.Magic, kind, s.Length, s.Offset, note)
+		}
+	}
 	return nil
 }
 
