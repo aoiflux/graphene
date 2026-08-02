@@ -42,7 +42,7 @@ func crashFixture(t *testing.T) (log []byte, batchSizes map[string]int) {
 		for i := 0; i < b.count; i++ {
 			wb.add(walRecordNode, []byte(fmt.Sprintf("batch-%s-%d", b.name, i)))
 		}
-		buf = append(buf, wb.finish(batchMeta{CommitSeq: uint64(len(batchSizes) + 1)})...)
+		buf = append(buf, mustFinish(wb, batchMeta{CommitSeq: uint64(len(batchSizes) + 1)})...)
 		batchSizes[b.name] = b.count
 	}
 
@@ -51,8 +51,8 @@ func crashFixture(t *testing.T) (log []byte, batchSizes map[string]int) {
 	// A batch that begins and never commits.
 	open := newWALBatch(64)
 	open.add(walRecordNode, []byte("batch-OPEN-0"))
-	framed := open.finish(batchMeta{CommitSeq: 99})
-	buf = append(buf, framed[:len(framed)-(walRecordOverhead+walBatchCommitPayload)]...)
+	framed := mustFinish(open, batchMeta{CommitSeq: 99})
+	buf = append(buf, framed[:len(framed)-(walRecordOverhead+walBatchCommitPayloadV2)]...)
 
 	return buf, batchSizes
 }

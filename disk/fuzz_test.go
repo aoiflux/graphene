@@ -233,7 +233,7 @@ func walSeedBytes(t testingTB) []byte {
 	b := newWALBatch(64)
 	b.add(walRecordNode, []byte("batched-node"))
 	b.add(walRecordEdge, []byte("batched-edge"))
-	if err := w.AppendBatch(b.finish(batchMeta{}), true); err != nil {
+	if err := w.AppendBatch(mustFinish(b, batchMeta{}), true); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
 	if err := w.Close(); err != nil {
@@ -253,9 +253,9 @@ func walUncommittedBatchBytes(t testingTB) []byte {
 	t.Helper()
 	b := newWALBatch(64)
 	b.add(walRecordNode, []byte("never-committed"))
-	framed := b.finish(batchMeta{})
+	framed := mustFinish(b, batchMeta{})
 	// Drop the commit marker: begin + body, nothing else.
-	return framed[:len(framed)-(walRecordOverhead+walBatchCommitPayload)]
+	return framed[:len(framed)-(walRecordOverhead+walBatchCommitPayloadV2)]
 }
 
 // deserialiseCSR must reject anything it cannot parse, and must do so without

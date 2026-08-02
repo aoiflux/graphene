@@ -17,6 +17,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/aoiflux/graphene/merkle"
 )
 
 // CSRInfo describes a graphene.csr file without loading the graph it holds.
@@ -45,6 +47,23 @@ type CSRInfo struct {
 	CommitSeqHW         uint64
 	LastCompactUnixNano int64
 	Sections            []CSRSectionInfo
+
+	// Signed assertion over the snapshot root, present when the image carries a
+	// GATT section.
+	HasAttestation bool
+	AttestationID  [attestationIDSize]byte
+	AttestActorID  uint64
+	AttestKeyID    uint64
+	AttestUnixNano int64
+	AttestPrev     [attestationIDSize]byte
+
+	// Merkle identity, present when the image carries a GHSH section.
+	HasSnapshotRoots bool
+	SnapshotRoot     merkle.Hash
+	NodeRoot         merkle.Hash
+	EdgeRoot         merkle.Hash
+	IndexRoot        merkle.Hash
+	PrevSnapshotRoot merkle.Hash
 }
 
 // CSRSectionInfo describes one entry in a v8 section directory.
@@ -89,7 +108,7 @@ func InspectCSR(path string) (CSRInfo, error) {
 			for _, s := range sections {
 				known := false
 				switch s.Magic {
-				case csrSectionPropIndex, csrSectionOrderedKeys:
+				case csrSectionPropIndex, csrSectionOrderedKeys, csrSectionEntityHash, csrSectionAttestation:
 					known = true
 				}
 				info.Sections = append(info.Sections, CSRSectionInfo{
@@ -123,6 +142,22 @@ func InspectCSR(path string) (CSRInfo, error) {
 	if section != nil {
 		info.PropertyNodeEntries = len(section.NodeProps)
 		info.PropertyEdgeEntries = len(section.EdgeProps)
+	}
+	if csr.attestation.Signature != nil {
+		info.HasAttestation = true
+		info.AttestationID = csr.attestation.ID
+		info.AttestActorID = csr.attestation.ActorID
+		info.AttestKeyID = csr.attestation.KeyID
+		info.AttestUnixNano = csr.attestation.UnixNano
+		info.AttestPrev = csr.attestation.Prev
+	}
+	if r, ok := csr.Roots(); ok {
+		info.HasSnapshotRoots = true
+		info.SnapshotRoot = r.Snapshot
+		info.NodeRoot = r.NodeRoot
+		info.EdgeRoot = r.EdgeRoot
+		info.IndexRoot = r.IndexRoot
+		info.PrevSnapshotRoot = r.PrevRoot
 	}
 	return info, nil
 }
@@ -247,7 +282,7 @@ func InspectWAL(path string) (WALInfo, error) {
 				c.Validated = binary.LittleEndian.Uint32(payload[0:4]) == uint32(batchRecords) &&
 					binary.LittleEndian.Uint32(payload[4:8]) == computeCRC32(batchBody)
 			}
-			if len(payload) == walBatchCommitPayload {
+			if len(payload) == walBatchCommitPayloadV2 {
 				c.HasDetail = true
 				c.CommitSeq = binary.LittleEndian.Uint64(payload[8:16])
 				c.UnixNano = int64(binary.LittleEndian.Uint64(payload[16:24]))

@@ -42,7 +42,7 @@ func TestCommitMeta_RoundTripsThroughTheLog(t *testing.T) {
 	b.add(walRecordEdge, []byte("two"))
 	want := batchMeta{CommitSeq: 42, UnixNano: 1_750_000_000_000_000_000, ActorID: 7}
 
-	metas, applied := replayMeta(t, b.finish(want))
+	metas, applied := replayMeta(t, mustFinish(b, want))
 
 	if applied != 2 {
 		t.Fatalf("applied %d records, want 2", applied)
@@ -50,8 +50,13 @@ func TestCommitMeta_RoundTripsThroughTheLog(t *testing.T) {
 	if len(metas) != 1 {
 		t.Fatalf("got %d commit records, want 1", len(metas))
 	}
-	if metas[0] != want {
-		t.Fatalf("commit metadata round-tripped as %+v, want %+v", metas[0], want)
+	got := metas[0]
+	if got.CommitSeq != want.CommitSeq || got.UnixNano != want.UnixNano || got.ActorID != want.ActorID {
+		t.Fatalf("commit metadata round-tripped as seq=%d ts=%d actor=%d, want seq=%d ts=%d actor=%d",
+			got.CommitSeq, got.UnixNano, got.ActorID, want.CommitSeq, want.UnixNano, want.ActorID)
+	}
+	if len(got.Signature) != 0 {
+		t.Fatalf("an unsigned commit reported a %d-byte signature", len(got.Signature))
 	}
 }
 
@@ -91,15 +96,15 @@ func TestCommitMeta_LegacyV1LogStillReplays(t *testing.T) {
 func TestCommitMeta_DiscardedBatchReportsNothing(t *testing.T) {
 	b := newWALBatch(64)
 	b.add(walRecordNode, []byte("one"))
-	framed := b.finish(batchMeta{CommitSeq: 99, ActorID: 5})
+	framed := mustFinish(b, batchMeta{CommitSeq: 99, ActorID: 5})
 
 	// Corrupt the commit's body CRC, leaving the record itself intact so it
 	// passes its own checksum and reaches the count/CRC comparison.
-	commitPayloadAt := len(framed) - walFooterSize - walBatchCommitPayload
+	commitPayloadAt := len(framed) - walFooterSize - walBatchCommitPayloadV2
 	binary.LittleEndian.PutUint32(framed[commitPayloadAt+4:commitPayloadAt+8], 0xDEADBEEF)
 	crcAt := len(framed) - walFooterSize
 	binary.LittleEndian.PutUint32(framed[crcAt:],
-		computeCRC32(framed[commitPayloadAt:commitPayloadAt+walBatchCommitPayload]))
+		computeCRC32(framed[commitPayloadAt:commitPayloadAt+walBatchCommitPayloadV2]))
 
 	metas, applied := replayMeta(t, framed)
 

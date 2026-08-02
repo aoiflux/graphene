@@ -2,6 +2,7 @@ package disk
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -10,6 +11,8 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+
+	"github.com/aoiflux/graphene/store"
 )
 
 // WAL is a simple append-only write-ahead log for crash-safe node and edge writes.
@@ -170,6 +173,39 @@ func (w *WAL) AppendEdgePropPurge(payload []byte) error {
 	return w.append(walRecordEdgePropPurge, payload)
 }
 
+// verifyCommitSignature applies the callbacks' signature policy to one commit.
+//
+// Four cases, and the third is the one that matters:
+//
+//   - no verifier: nothing is checked. A signed log replays with its signatures
+//     unexamined, which is what a caller who has not opted in should get.
+//   - signed and verified: the normal path.
+//   - required but absent: rejected. Otherwise stripping a signature downgrades
+//     a commit to an ordinary unsigned one and verification is skipped entirely.
+//   - present but invalid: rejected, loudly and as an error rather than as a
+//     torn tail, because a bad signature is not what a crash produces.
+func verifyCommitSignature(cb ReplayCallbacks, meta batchMeta, body []byte) error {
+	signed := len(meta.Signature) > 0
+
+	if !signed {
+		if cb.RequireSignedCommits {
+			return fmt.Errorf("wal replay: commit %d carries no signature and signed commits are required",
+				meta.CommitSeq)
+		}
+		return nil
+	}
+	if cb.Verifier == nil {
+		return nil
+	}
+
+	data := signedCommitData(meta.CommitSeq, meta.UnixNano, meta.ActorID, meta.KeyID, sha256.Sum256(body))
+	if err := cb.Verifier.Verify(meta.KeyID, data, meta.Signature); err != nil {
+		return fmt.Errorf("wal replay: commit %d failed signature verification under key %d: %w",
+			meta.CommitSeq, meta.KeyID, err)
+	}
+	return nil
+}
+
 // Size returns the log's current size on disk in bytes, or 0 if it cannot be
 // determined.
 //
@@ -244,6 +280,24 @@ type ReplayCallbacks struct {
 
 	NodePropPurgeFunc func([]byte) error // called for each 0x07 node property purge
 	EdgePropPurgeFunc func([]byte) error // called for each 0x08 edge property purge
+
+	// Verifier checks commit signatures. Nil means signatures are not checked —
+	// a signed log still replays, but nothing confirms the signatures, which is
+	// the correct behaviour for a caller who has not opted into verification and
+	// may not hold the public key.
+	Verifier store.Verifier
+
+	// RequireSignedCommits rejects any committed batch that carries no
+	// signature.
+	//
+	// This is the flag that closes the downgrade: without it, stripping the
+	// signature from a commit turns it into a perfectly ordinary v2 record and
+	// verification is simply skipped, so signing would buy nothing against an
+	// attacker with file access. It is separate from Verifier because an
+	// existing store's older commits are genuinely unsigned, and a caller
+	// enabling verification mid-life needs to accept those until a compaction
+	// retires them.
+	RequireSignedCommits bool
 
 	// CommitFunc is called once per successfully committed batch that carries
 	// provenance, after the commit has been validated against the body it
@@ -391,12 +445,13 @@ func replayRecords(r io.Reader, logSize int64, cb ReplayCallbacks) error {
 			if pending == nil {
 				return fmt.Errorf("wal replay: batch commit without begin")
 			}
-			// Two accepted lengths, not one: v1 logs written before the commit
-			// record carried provenance must still replay after an upgrade. The
-			// length is the discriminator — see walbatch.go.
-			if len(payload) != walBatchCommitPayloadV1 && len(payload) != walBatchCommitPayload {
-				return fmt.Errorf("wal replay: malformed batch commit: payload %d bytes, expected %d or %d",
-					len(payload), walBatchCommitPayloadV1, walBatchCommitPayload)
+			// Three accepted lengths: older logs must still replay after an
+			// upgrade, so the length is the discriminator — see walbatch.go.
+			switch len(payload) {
+			case walBatchCommitPayloadV1, walBatchCommitPayloadV2, walBatchCommitPayloadV3:
+			default:
+				return fmt.Errorf("wal replay: malformed batch commit: payload %d bytes, expected %d, %d or %d",
+					len(payload), walBatchCommitPayloadV1, walBatchCommitPayloadV2, walBatchCommitPayloadV3)
 			}
 			wantCount := binary.LittleEndian.Uint32(payload[0:4])
 			wantCRC := binary.LittleEndian.Uint32(payload[4:8])
@@ -411,12 +466,33 @@ func replayRecords(r io.Reader, logSize int64, cb ReplayCallbacks) error {
 			// Only now, past validation. A batch that failed the check above was
 			// never committed, so reporting its metadata would advance the store's
 			// commit sequence for a transaction that did not happen.
-			if len(payload) == walBatchCommitPayload && cb.CommitFunc != nil {
-				cb.CommitFunc(batchMeta{
+			var meta batchMeta
+			if len(payload) >= walBatchCommitPayloadV2 {
+				meta = batchMeta{
 					CommitSeq: binary.LittleEndian.Uint64(payload[8:16]),
 					UnixNano:  int64(binary.LittleEndian.Uint64(payload[16:24])),
 					ActorID:   binary.LittleEndian.Uint64(payload[24:32]),
-				})
+				}
+			}
+			if len(payload) == walBatchCommitPayloadV3 {
+				meta.KeyID = binary.LittleEndian.Uint64(payload[32:40])
+				sigLen := int(binary.LittleEndian.Uint16(payload[40:42]))
+				if sigLen > walSignatureSize {
+					return fmt.Errorf("wal replay: commit %d declares a %d-byte signature, maximum %d",
+						meta.CommitSeq, sigLen, walSignatureSize)
+				}
+				meta.Signature = payload[42 : 42+sigLen]
+			}
+
+			// Signature check, before a single record is applied. This is the
+			// reason the signature sits in the commit payload rather than in a
+			// record after it: a batch must not be applied and then found forged.
+			if err := verifyCommitSignature(cb, meta, body); err != nil {
+				return err
+			}
+
+			if cb.CommitFunc != nil && len(payload) >= walBatchCommitPayloadV2 {
+				cb.CommitFunc(meta)
 			}
 			for _, rec := range pending {
 				if err := applyWALRecord(cb, rec.recType, rec.payload); err != nil {

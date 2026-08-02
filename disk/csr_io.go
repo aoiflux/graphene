@@ -309,6 +309,35 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		return nil, nil, err
 	}
 
+	// Snapshot roots (v8+, GHSH). Critical when present, so an unreadable one is
+	// a hard failure rather than a missing convenience: this section is the
+	// file's integrity evidence.
+	if s, ok := findSection(trailer.Sections, csrSectionEntityHash); ok {
+		roots, err := readSnapshotSection(data[s.Offset : s.Offset+s.Length])
+		if err != nil {
+			return nil, nil, fmt.Errorf("deserialiseCSR: snapshot section: %w", err)
+		}
+		csr.roots = roots
+	}
+
+	// Attestation (v8+, GATT). Also critical: an unreadable one must fail the
+	// open rather than leave the image looking merely unattested.
+	if s, ok := findSection(trailer.Sections, csrSectionAttestation); ok {
+		att, err := readAttestationSection(data[s.Offset : s.Offset+s.Length])
+		if err != nil {
+			return nil, nil, fmt.Errorf("deserialiseCSR: attestation section: %w", err)
+		}
+		// The attestation must be about the snapshot in the same file. One
+		// naming a different subject is either misassembled or lifted from
+		// elsewhere, and either way it does not vouch for this image.
+		if att.Subject != csr.roots.Snapshot {
+			return nil, nil, fmt.Errorf(
+				"deserialiseCSR: attestation names snapshot %x but this image is %x",
+				att.Subject[:8], csr.roots.Snapshot[:8])
+		}
+		csr.attestation = att
+	}
+
 	// Ordered-key declarations (v8+). Optional, so a file without the section
 	// simply carries no declarations — which is what every pre-v8 file reports.
 	if s, ok := findSection(trailer.Sections, csrSectionOrderedKeys); ok {

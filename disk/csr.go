@@ -9,6 +9,7 @@ import (
 	"sort"
 
 	"github.com/aoiflux/graphene/index"
+	"github.com/aoiflux/graphene/merkle"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -78,6 +79,21 @@ type CSRGraph struct {
 	// means "unknown", which is what every pre-v8 file reports.
 	commitSeqHW         uint64
 	lastCompactUnixNano int64
+
+	// roots is the Merkle identity of this image, present when the file carried
+	// a GHSH section or when this graph was just serialised with one. Zero
+	// otherwise, which is what every image written before snapshot roots existed
+	// reports.
+	roots SnapshotRoots
+
+	// attestation is the signed assertion over roots.Snapshot, present when the
+	// file carried a GATT section. Its Signature is nil when absent.
+	attestation Attestation
+}
+
+// Roots returns the Merkle identity of this image, and whether it has one.
+func (g *CSRGraph) Roots() (SnapshotRoots, bool) {
+	return g.roots, !g.roots.Zero()
 }
 
 // nodeRecord is the compact per-node record.
@@ -467,18 +483,43 @@ type csrPayload struct {
 	// rebuilt from them at load.
 	OrderedNodeKeys []string
 	OrderedEdgeKeys []string
+
+	// PrevSnapshotRoot chains this image to the one it replaces. Zero for a
+	// first compaction.
+	PrevSnapshotRoot merkle.Hash
+
+	// WithSnapshotRoots asks for the GHSH section. Off by default so that
+	// serialising for a test or a fixture does not pay for a Merkle pass.
+	WithSnapshotRoots bool
+
+	// Signer, AttestActorID, AttestUnixNano and PrevAttestation produce a GATT
+	// section attesting the snapshot root. Nil Signer writes none.
+	Signer          store.Signer
+	AttestActorID   uint64
+	AttestUnixNano  int64
+	PrevAttestation [attestationIDSize]byte
 }
 
 // SerialiseWithIndex writes the CSR plus the given property-index entries.
 //
 // Retained for callers that carry nothing but the property index; everything
-// else goes through SerialiseWithPayload.
+// else goes through SerialiseWithPayload. Cannot fail, because the only failure
+// SerialiseWithPayload has is a signer erroring and this path configures none.
 func (g *CSRGraph) SerialiseWithIndex(nodeProps []index.NodePropEntry, edgeProps []index.EdgePropEntry) []byte {
-	return g.SerialiseWithPayload(csrPayload{NodeProps: nodeProps, EdgeProps: edgeProps})
+	out, err := g.SerialiseWithPayload(csrPayload{NodeProps: nodeProps, EdgeProps: edgeProps})
+	if err != nil {
+		panic("SerialiseWithIndex: unreachable, no signer configured: " + err.Error())
+	}
+	return out
 }
 
 // SerialiseWithPayload writes the CSR and every section the payload asks for.
-func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) []byte {
+//
+// Errors only when a configured Signer fails. As with a commit, that must abort
+// rather than fall back to writing an unattested image: a store configured to
+// attest that silently stops is indistinguishable downstream from one that never
+// attested at all.
+func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 	nodeProps, edgeProps := payload.NodeProps, payload.EdgeProps
 	var buf bytes.Buffer
 
@@ -595,6 +636,43 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) []byte {
 		})
 	}
 
+	if payload.WithSnapshotRoots {
+		roots := computeSnapshotRoots(g, payload, payload.PrevSnapshotRoot)
+		g.roots = roots
+		rootOffset := buf.Len()
+		buf.Write(appendSnapshotSection(nil, roots))
+		sections = append(sections, csrSection{
+			// CRITICAL. This section is the file's integrity evidence, so a build
+			// that cannot interpret it must refuse rather than open the file and
+			// leave an operator believing verification is available.
+			Magic:  csrSectionEntityHash,
+			Flags:  csrSectionCritial,
+			Offset: uint64(rootOffset),
+			Length: uint64(buf.Len() - rootOffset),
+		})
+	}
+
+	// The attestation signs the snapshot root, so it can only be built after the
+	// roots exist.
+	if payload.WithSnapshotRoots && payload.Signer != nil {
+		att, err := signAttestation(payload.Signer, payload.AttestActorID,
+			payload.AttestUnixNano, g.roots.Snapshot, payload.PrevAttestation)
+		if err != nil {
+			return nil, err
+		}
+		g.attestation = att
+		attOffset := buf.Len()
+		buf.Write(appendAttestationSection(nil, att))
+		sections = append(sections, csrSection{
+			// CRITICAL, like GHSH: a build that cannot check an attestation must
+			// not open the file and leave an operator believing it was checked.
+			Magic:  csrSectionAttestation,
+			Flags:  csrSectionCritial,
+			Offset: uint64(attOffset),
+			Length: uint64(buf.Len() - attOffset),
+		})
+	}
+
 	sectionTableOffset := buf.Len()
 	out := appendSectionDirectory(buf.Bytes(), sections)
 
@@ -604,7 +682,7 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) []byte {
 	// everything above — header, records, sections, directory — is inside it.
 	digest := computeCSRDigest(out)
 	copy(out[digestPos:digestPos+csrDigestSize], digest[:])
-	return out
+	return out, nil
 }
 
 // writePropEntry appends one property-index entry:

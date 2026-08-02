@@ -46,7 +46,7 @@ func batchOf(payloads ...string) []byte {
 	for _, p := range payloads {
 		b.add(walRecordNode, []byte(p))
 	}
-	return b.finish(batchMeta{})
+	return mustFinish(b, batchMeta{})
 }
 
 func TestWALBatch_CommittedBatchIsApplied(t *testing.T) {
@@ -81,7 +81,7 @@ func TestWALBatch_TruncatedBeforeCommit_AppliesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitLen := walRecordOverhead + walBatchCommitPayload
+	commitLen := walRecordOverhead + walBatchCommitPayloadV2
 	if err := os.Truncate(path, fi.Size()-int64(commitLen)-3); err != nil {
 		t.Fatal(err)
 	}
@@ -119,11 +119,11 @@ func TestWALBatch_CommitDisagreeingWithBody_IsRejected(t *testing.T) {
 	// Corrupt one payload byte in the body, leaving that record's own CRC stale
 	// too — replay stops on a bad record CRC, so instead corrupt the *commit* to
 	// claim a different count.
-	framed[len(framed)-walFooterSize-walBatchCommitPayload] = 99 // count := 99
+	framed[len(framed)-walFooterSize-walBatchCommitPayloadV2] = 99 // count := 99
 	// Recompute the commit record's own CRC so it parses cleanly and only the
 	// batch-level check can catch it.
-	commitPayloadAt := len(framed) - walFooterSize - walBatchCommitPayload
-	crc := computeCRC32(framed[commitPayloadAt : commitPayloadAt+walBatchCommitPayload])
+	commitPayloadAt := len(framed) - walFooterSize - walBatchCommitPayloadV2
+	crc := computeCRC32(framed[commitPayloadAt : commitPayloadAt+walBatchCommitPayloadV2])
 	framed[len(framed)-4] = byte(crc)
 	framed[len(framed)-3] = byte(crc >> 8)
 	framed[len(framed)-2] = byte(crc >> 16)
@@ -199,11 +199,21 @@ func TestWALBatch_EmptyBatchIsANoOp(t *testing.T) {
 	if !b.empty() {
 		t.Fatal("new batch should be empty")
 	}
-	if err := w.AppendBatch(b.finish(batchMeta{}), false); err != nil {
+	if err := w.AppendBatch(mustFinish(b, batchMeta{}), false); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
 	w.Close()
 	if got := collect(t, path); len(got) != 0 {
 		t.Fatalf("got %v, want nothing", got)
 	}
+}
+
+// mustFinish is finish for tests that configure no Signer, where the error
+// return is unreachable.
+func mustFinish(b *walBatch, meta batchMeta) []byte {
+	framed, err := b.finish(meta)
+	if err != nil {
+		panic("finish without a signer must not fail: " + err.Error())
+	}
+	return framed
 }

@@ -18,6 +18,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -196,6 +197,19 @@ func cmdCSR(args []string) error {
 					"the digest cannot say whether that was damage or an edit.")
 			os.Exit(1)
 		}
+
+		// A separate question from the digest: do the Merkle roots actually
+		// describe the records sitting next to them?
+		switch err := disk.VerifyCSRRoots(target); {
+		case err == nil:
+			fmt.Println("roots     describe the records")
+		case errors.Is(err, disk.ErrNoSnapshotRoots):
+			fmt.Println("roots     absent (image predates snapshot roots)")
+		default:
+			fmt.Printf("roots     FAILED\n")
+			fmt.Fprintf(os.Stderr, "\n%v\n", err)
+			os.Exit(1)
+		}
 		fmt.Println()
 	}
 
@@ -221,6 +235,31 @@ func cmdCSR(args []string) error {
 	}
 	if c.LastCompactUnixNano != 0 {
 		fmt.Fprintf(w, "last compacted\t%s\n", formatNano(c.LastCompactUnixNano))
+	}
+	if c.HasSnapshotRoots {
+		fmt.Fprintf(w, "\t\n")
+		fmt.Fprintf(w, "snapshot root\t%x\n", c.SnapshotRoot)
+		fmt.Fprintf(w, "  node root\t%x\n", c.NodeRoot)
+		fmt.Fprintf(w, "  edge root\t%x\n", c.EdgeRoot)
+		fmt.Fprintf(w, "  index root\t%x\n", c.IndexRoot)
+		if c.PrevSnapshotRoot != [32]byte{} {
+			fmt.Fprintf(w, "  replaces\t%x\n", c.PrevSnapshotRoot)
+		} else {
+			fmt.Fprintf(w, "  replaces\t(first compaction)\n")
+		}
+		fmt.Fprintf(w, "\t\n")
+	}
+	if c.HasAttestation {
+		fmt.Fprintf(w, "attestation\t%x\n", c.AttestationID)
+		fmt.Fprintf(w, "  actor\t%d\n", c.AttestActorID)
+		fmt.Fprintf(w, "  signed by key\t%d\n", c.AttestKeyID)
+		fmt.Fprintf(w, "  at\t%s\n", formatNano(c.AttestUnixNano))
+		if c.AttestPrev != [16]byte{} {
+			fmt.Fprintf(w, "  follows\t%x\n", c.AttestPrev)
+		} else {
+			fmt.Fprintf(w, "  follows\t(first attestation)\n")
+		}
+		fmt.Fprintf(w, "\t\n")
 	}
 	if len(c.Sections) > 0 {
 		fmt.Fprintf(w, "sections\t%d\n", len(c.Sections))

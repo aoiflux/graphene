@@ -263,7 +263,11 @@ func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error 
 	// One write. If it fails nothing is applied: the commit marker never reached
 	// the file, so replay discards whatever partial bytes did. That absence is
 	// the rollback — there is no undo path that could itself go wrong.
-	if err := s.wal.AppendBatch(batch.finish(s.nextCommitMeta(ctx)), s.syncOnCommit); err != nil {
+	framed, err := batch.finish(s.nextCommitMeta(ctx))
+	if err != nil {
+		return fmt.Errorf("ApplyTransaction: %w", err)
+	}
+	if err := s.wal.AppendBatch(framed, s.syncOnCommit); err != nil {
 		return fmt.Errorf("ApplyTransaction: wal: %w", err)
 	}
 

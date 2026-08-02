@@ -407,6 +407,48 @@ func (c TxContext) Unattributed() bool {
 	return c.ActorID == 0 && c.RoleID == 0 && c.KeyID == 0
 }
 
+// Signer signs commit metadata so a committed transaction carries evidence of
+// who produced it, not merely a claim.
+//
+// The engine never generates, stores, or rotates a key. It signs with what the
+// caller hands it and verifies with what the caller hands it. That is not
+// laziness about key management — it is the only honest arrangement for a
+// library linked into someone else's process. A key the engine held would live
+// in the caller's address space anyway, so custody is the caller's whatever the
+// API pretends, and pretending otherwise would be the more dangerous design.
+//
+// Consequently: a signature proves the holder of a key signed these bytes. It
+// does not prove the process was not compromised, because a compromised process
+// holding the key signs whatever it likes. What signing buys over the digest is
+// that an attacker who edits the log must also possess the key — see the plan's
+// §11.1 for where that boundary sits.
+type Signer interface {
+	// KeyID identifies the key, so a verifier can select the right public key
+	// and so a rotation is reconstructible from the log.
+	KeyID() uint64
+
+	// Sign returns a signature over data. It must be deterministic for a given
+	// key and input — Ed25519 is, which is why it is the recommended scheme;
+	// a non-deterministic scheme still verifies but makes golden-vector tests
+	// impossible.
+	Sign(data []byte) ([]byte, error)
+}
+
+// Verifier checks signatures produced by a Signer.
+//
+// Separate from Signer because the two are held by different parties in every
+// arrangement that matters: the writer signs, and a reader — possibly on another
+// machine, possibly years later — verifies. A verifier that could sign would be
+// a verifier holding the private key.
+type Verifier interface {
+	// Verify reports whether sig is a valid signature over data for keyID.
+	//
+	// Returning an error rather than a bool for the unknown-key case matters:
+	// "this key is not one I know" and "this signature is forged" call for
+	// different responses, and collapsing them loses that.
+	Verify(keyID uint64, data, sig []byte) error
+}
+
 // ActorTransactor is implemented by stores that can record who committed a
 // transaction, alongside when it was committed.
 //

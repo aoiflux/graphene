@@ -99,14 +99,25 @@ func stripVolatile(data []byte) []byte {
 	return out
 }
 
-// The digest is the same across two compactions of an unchanged store.
+// Recompacting an unchanged store leaves its CONTENT identity untouched while
+// advancing its HISTORY.
 //
-// This is the property that actually matters, and it is stronger than comparing
-// files: the digest is what a second party checks, so if it is stable then two
-// holders of the same evidence agree even though their files differ in when they
-// were written.
-func TestCompact_DigestIsStableAcrossCompactions(t *testing.T) {
-	s, dir := openFresh(t)
+// These pull apart deliberately. The component roots — nodes, edges, index — are
+// pure functions of what the store holds, so recompaction must not move them: if
+// it did, a verifier could not tell "rebuilt" from "altered", which is what
+// canonical serialisation was introduced to guarantee (T-17).
+//
+// The snapshot root is different by design. It binds the component roots to the
+// predecessor it replaces, so each compaction produces a new one. That is the
+// chain: a substituted image can be internally perfect and still cannot claim a
+// predecessor it never had.
+//
+// The whole-file digest follows the snapshot root, because the roots live in the
+// file. So the digest identifies "this exact image", and the component roots
+// identify "this content" — two questions that were conflated while there was
+// only one answer available.
+func TestCompact_RecompactionKeepsContentAndAdvancesHistory(t *testing.T) {
+	s, _ := openFresh(t)
 	defer s.Close()
 
 	determinismFixture(t, s)
@@ -114,58 +125,83 @@ func TestCompact_DigestIsStableAcrossCompactions(t *testing.T) {
 	if err := s.Compact(); err != nil {
 		t.Fatalf("first Compact: %v", err)
 	}
-	firstStatus, firstDigest, err := VerifyCSRDigest(dir)
+	first, err := s.SnapshotRoots()
 	if err != nil {
-		t.Fatalf("verify after first compact: %v", err)
-	}
-	if firstStatus != DigestMatch {
-		t.Fatalf("digest status after writing the file: %v", firstStatus)
+		t.Fatal(err)
 	}
 
 	if err := s.Compact(); err != nil {
 		t.Fatalf("second Compact: %v", err)
 	}
-	secondStatus, secondDigest, err := VerifyCSRDigest(dir)
+	second, err := s.SnapshotRoots()
 	if err != nil {
-		t.Fatalf("verify after second compact: %v", err)
-	}
-	if secondStatus != DigestMatch {
-		t.Fatalf("digest status after recompaction: %v", secondStatus)
+		t.Fatal(err)
 	}
 
-	if firstDigest != secondDigest {
-		t.Fatalf("recompacting an unchanged store changed its digest:\n  %x\n  %x\n\n"+
-			"The digest is meant to identify what the file holds, so recompaction "+
-			"must not change it — otherwise a verifier cannot tell 'rebuilt' from 'altered'.",
-			firstDigest, secondDigest)
+	if second.NodeRoot != first.NodeRoot {
+		t.Errorf("recompaction changed the node root; content did not change:\n  %x\n  %x",
+			first.NodeRoot, second.NodeRoot)
+	}
+	if second.EdgeRoot != first.EdgeRoot {
+		t.Errorf("recompaction changed the edge root:\n  %x\n  %x", first.EdgeRoot, second.EdgeRoot)
+	}
+	if second.IndexRoot != first.IndexRoot {
+		t.Errorf("recompaction changed the index root:\n  %x\n  %x", first.IndexRoot, second.IndexRoot)
+	}
+
+	if second.Snapshot == first.Snapshot {
+		t.Fatal("recompaction left the snapshot root unchanged; the chain records no history")
+	}
+	if second.PrevRoot != first.Snapshot {
+		t.Fatalf("the second snapshot names predecessor %x, but the first was %x",
+			second.PrevRoot[:8], first.Snapshot[:8])
+	}
+	if err := VerifyChain(first, second); err != nil {
+		t.Fatalf("consecutive compactions do not form a chain: %v", err)
 	}
 }
 
-// Compacting twice without mutating the store must rewrite the same bytes,
-// ignoring the compaction timestamp.
+// Serialising the same graph twice with the same payload produces the same
+// bytes.
 //
-// This is the minimal statement of the property and the one that fails first:
-// both compactions run in one process against one property index, so the only
-// thing that can differ is the order in which that index was enumerated.
+// This is BL-1's property, stated against serialisation rather than against two
+// sequential compactions — the chain makes consecutive compactions differ on
+// purpose, which would otherwise mask exactly the non-determinism this is here
+// to catch. Map iteration order leaking into the output still fails it.
 func TestCompact_IsByteDeterministic(t *testing.T) {
-	s, dir := openFresh(t)
+	s, _ := openFresh(t)
 	defer s.Close()
 
 	determinismFixture(t, s)
-
 	if err := s.Compact(); err != nil {
-		t.Fatalf("first Compact: %v", err)
+		t.Fatalf("Compact: %v", err)
 	}
-	first := readCSR(t, dir)
 
-	if err := s.Compact(); err != nil {
-		t.Fatalf("second Compact: %v", err)
+	s.mu.RLock()
+	csr := s.csr
+	s.mu.RUnlock()
+
+	payload := func() csrPayload {
+		return csrPayload{
+			NodeProps:         s.propIdx.NodeEntries(),
+			EdgeProps:         s.propIdx.EdgeEntries(),
+			OrderedNodeKeys:   s.propIdx.OrderedNodeKeys(),
+			OrderedEdgeKeys:   s.propIdx.OrderedEdgeKeys(),
+			WithSnapshotRoots: true,
+		}
 	}
-	second := readCSR(t, dir)
 
-	first, second = stripVolatile(first), stripVolatile(second)
+	serialise := func() []byte {
+		out, err := csr.SerialiseWithPayload(payload())
+		if err != nil {
+			t.Fatalf("SerialiseWithPayload: %v", err)
+		}
+		return stripVolatile(out)
+	}
+	first, second := serialise(), serialise()
+
 	if !bytes.Equal(first, second) {
-		t.Fatalf("two compactions of an unchanged store produced different bytes.\n%s\n\n"+
+		t.Fatalf("serialising the same graph twice produced different bytes.\n%s\n\n"+
 			"The CSR image is not a stable identity for its contents, so no digest, "+
 			"Merkle root, or attestation can be computed over it.", describeDiff(t, first, second))
 	}

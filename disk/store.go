@@ -88,6 +88,23 @@ type Store struct {
 	// production leaves it nil and reads the clock.
 	nowUnixNano func() int64
 
+	// signer signs each batch commit; nil leaves commits unsigned. Set through
+	// Open's options and not changed afterwards, so a log never contains a
+	// signing policy that shifted underneath it mid-run.
+	signer store.Signer
+
+	// verifier and requireSigned govern the replay Open performs. Held on the
+	// store so a later Replay — after a Truncate, say — applies the same policy
+	// the store was opened under.
+	verifier      store.Verifier
+	requireSigned bool
+
+	// attestActorID is recorded as the actor in the snapshot attestation written
+	// at compaction. Separate from any transaction's actor because compaction is
+	// not a transaction — it is an operator action, and attributing it to
+	// whoever happened to write last would be wrong.
+	attestActorID uint64
+
 	// lastCompact is when Compact last completed in this process. Guarded by mu.
 	// Not persisted — a reopened store reports zero even if its image on disk was
 	// compacted a moment earlier. Persisting it needs a CSR header field and is
@@ -113,6 +130,7 @@ func (s *Store) nextCommitMeta(ctx store.TxContext) batchMeta {
 		CommitSeq: s.commitSeq.Add(1),
 		UnixNano:  now(),
 		ActorID:   ctx.ActorID,
+		Signer:    s.signer,
 	}
 }
 
@@ -220,10 +238,48 @@ const (
 	csrIDSparsityFloor  = 1 << 16
 )
 
+// Options configure a store at Open. The zero value is the historical
+// behaviour: unsigned commits, unverified replay.
+type Options struct {
+	// Signer signs every batch commit. Nil leaves commits unsigned.
+	Signer store.Signer
+
+	// Verifier checks commit signatures during the replay that Open performs.
+	// Nil skips the check — a signed log still replays, but nothing confirms it.
+	Verifier store.Verifier
+
+	// RequireSignedCommits rejects a log containing a committed batch with no
+	// signature. This is what closes the downgrade: without it, stripping a
+	// signature turns a commit into an ordinary unsigned one and verification is
+	// simply skipped.
+	//
+	// Not implied by setting Verifier, because an existing store's older commits
+	// are genuinely unsigned and a caller enabling verification mid-life has to
+	// tolerate those until a compaction retires them.
+	RequireSignedCommits bool
+
+	// AttestActorID is recorded as the actor in the snapshot attestation written
+	// at each compaction, when Signer is set. Compaction is an operator action
+	// rather than a transaction, so it carries its own actor rather than
+	// inheriting one from whichever write happened last.
+	AttestActorID uint64
+}
+
 // Open opens (or creates) a disk-backed Store rooted at dir.
 // On first use dir will be created. On restart, the WAL is replayed into the
 // delta layer; the existing CSR (if any) is memory-mapped.
 func Open(dir string) (*Store, error) {
+	return OpenWithOptions(dir, Options{})
+}
+
+// OpenWithOptions is Open with signing and verification configured.
+//
+// Verification happens during the replay Open performs, so a log that fails it
+// fails the Open — the store does not come up holding records it could not
+// authenticate. That is deliberately unlike the CSR digest, which is opt-in and
+// checked separately: the log is replayed on every open regardless, so checking
+// signatures there costs only the verification itself.
+func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("disk.Open: mkdir %s: %w", dir, err)
 	}
@@ -245,6 +301,10 @@ func Open(dir string) (*Store, error) {
 		deltaEdgesByType: make(map[store.EdgeType][]store.EdgeID),
 		propIdx:          index.NewPropertyIndex(),
 		syncOnCommit:     true,
+		signer:           opts.Signer,
+		verifier:         opts.Verifier,
+		requireSigned:    opts.RequireSignedCommits,
+		attestActorID:    opts.AttestActorID,
 	}
 
 	// From here on the WAL file handle is open, so every failure path has to
@@ -355,7 +415,11 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 			return appendMarshalledNode(dst, node)
 		})
 	}
-	if err := s.wal.AppendBatch(batch.finish(s.nextCommitMeta(store.TxContext{})), s.syncOnCommit); err != nil {
+	framed, err := batch.finish(s.nextCommitMeta(store.TxContext{}))
+	if err != nil {
+		return nil, err
+	}
+	if err := s.wal.AppendBatch(framed, s.syncOnCommit); err != nil {
 		// Apply nothing. The commit marker never reached the file, so replay will
 		// discard whatever partial bytes did — that absence *is* the rollback.
 		// The IDs assigned above are simply never used, which is allowed: IDs are
@@ -459,7 +523,11 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 			return appendMarshalledEdge(dst, edge)
 		})
 	}
-	if err := s.wal.AppendBatch(batch.finish(s.nextCommitMeta(store.TxContext{})), s.syncOnCommit); err != nil {
+	framed, err := batch.finish(s.nextCommitMeta(store.TxContext{}))
+	if err != nil {
+		return nil, err
+	}
+	if err := s.wal.AppendBatch(framed, s.syncOnCommit); err != nil {
 		return nil, fmt.Errorf("AddEdgesBatch: wal: %w", err)
 	}
 
@@ -1676,7 +1744,9 @@ func (s *Store) commitEdgesBatch(edges []*store.Edge) {
 
 func (s *Store) replayWAL() error {
 	return s.wal.Replay(ReplayCallbacks{
-		CommitFunc: s.observeCommitMeta,
+		Verifier:             s.verifier,
+		RequireSignedCommits: s.requireSigned,
+		CommitFunc:           s.observeCommitMeta,
 		NodeFunc: func(payload []byte) error {
 			n, err := unmarshalNode(payload)
 			if err != nil {

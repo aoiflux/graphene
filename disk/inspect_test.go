@@ -193,9 +193,9 @@ func TestInspectWAL_ReportsAnOpenBatch(t *testing.T) {
 
 	b := newWALBatch(64)
 	b.add(walRecordNode, []byte("never-committed"))
-	framed := b.finish(batchMeta{CommitSeq: 1})
+	framed := mustFinish(b, batchMeta{CommitSeq: 1})
 	// Drop the commit marker.
-	framed = framed[:len(framed)-(walRecordOverhead+walBatchCommitPayload)]
+	framed = framed[:len(framed)-(walRecordOverhead+walBatchCommitPayloadV2)]
 	if err := os.WriteFile(p, framed, 0600); err != nil {
 		t.Fatal(err)
 	}

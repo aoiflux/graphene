@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/aoiflux/graphene/merkle"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -96,12 +97,38 @@ func (s *Store) Compact() error {
 	// longer has to be reconstructed from the WAL on the next open.
 	// Ordered-key declarations travel with the image. Without this every reopen
 	// silently turned declared range queries back into scans.
-	data := newCSR.SerialiseWithPayload(csrPayload{
-		NodeProps:       s.propIdx.NodeEntries(),
-		EdgeProps:       s.propIdx.EdgeEntries(),
-		OrderedNodeKeys: s.propIdx.OrderedNodeKeys(),
-		OrderedEdgeKeys: s.propIdx.OrderedEdgeKeys(),
+	// Chain this image to the one it replaces, so the sequence of compactions is
+	// itself verifiable. A substituted snapshot breaks the link even when the
+	// substitute is internally consistent.
+	var prevRoot merkle.Hash
+	if s.csr != nil {
+		if r, ok := s.csr.Roots(); ok {
+			prevRoot = r.Snapshot
+		}
+	}
+
+	// The attestation chains to the previous image's, so a removed attestation is
+	// provably missing rather than invisibly absent.
+	var prevAttestation [attestationIDSize]byte
+	if s.csr != nil {
+		prevAttestation = s.csr.attestation.ID
+	}
+
+	data, err := newCSR.SerialiseWithPayload(csrPayload{
+		NodeProps:         s.propIdx.NodeEntries(),
+		EdgeProps:         s.propIdx.EdgeEntries(),
+		OrderedNodeKeys:   s.propIdx.OrderedNodeKeys(),
+		OrderedEdgeKeys:   s.propIdx.OrderedEdgeKeys(),
+		PrevSnapshotRoot:  prevRoot,
+		WithSnapshotRoots: true,
+		Signer:            s.signer,
+		AttestActorID:     s.attestActorID,
+		AttestUnixNano:    compactedAt.UnixNano(),
+		PrevAttestation:   prevAttestation,
 	})
+	if err != nil {
+		return fmt.Errorf("compact: %w", err)
+	}
 	tmpPath := filepath.Join(s.dir, csrFileName+".tmp")
 	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
 		return fmt.Errorf("compact: write tmp CSR: %w", err)
