@@ -61,7 +61,16 @@ const (
 	// individually valid and replay would otherwise apply half a transaction.
 	walRecordBatchBegin  byte = 0x09
 	walRecordBatchCommit byte = 0x0A
-	walRecordCheckpoint  byte = 0xFF
+
+	// walRecordKeyTransition records one signing key replacing another, signed
+	// by the outgoing key. See keyrotation.go for why the outgoing key signs.
+	//
+	// Standalone rather than part of a batch: a rotation is not a graph mutation
+	// and has no records to be atomic with. It also has to survive being the only
+	// thing in the log, which a batch marker would not allow.
+	walRecordKeyTransition byte = 0x0D
+
+	walRecordCheckpoint byte = 0xFF
 
 	// walReplayBufferSize is the read buffer replay pulls the log through. One
 	// MiB turns a multi-megabyte log's per-record reads into a couple of dozen
@@ -84,6 +93,13 @@ type WAL struct {
 	mu      sync.Mutex
 	writeMu sync.Mutex
 	file    *os.File
+
+	// framing selects what a record's CRC covers, and dataStart is where records
+	// begin — after a container header, or at 0 for a headerless file. Both are
+	// fixed when the file is opened and never change for its lifetime, so a
+	// single log never contains two framings.
+	framing   uint16
+	dataStart int64
 
 	ringMask uint64
 	ring     []walSlot
@@ -115,15 +131,41 @@ func openWALWithCapacity(path string, capacity int) (*WAL, error) {
 		return nil, fmt.Errorf("wal open: %w", err)
 	}
 
+	// Framing is a property of the file, decided once here. A log that already
+	// exists without a container header keeps the original framing for records
+	// appended to it — rewriting its earlier records is not on the table — and a
+	// new or freshly truncated file gets a header and the stronger framing. See
+	// walcontainer.go.
+	header, dataStart, err := readWALFileHeader(f)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("wal open: %w", err)
+	}
+	if dataStart == 0 {
+		// Headerless. If the file is empty this is a new log, so write a header
+		// and adopt v2; otherwise leave the existing file as it is.
+		fi, statErr := f.Stat()
+		if statErr == nil && fi.Size() == 0 {
+			if _, werr := f.Write(appendWALFileHeader(walFileHeader{Version: walFramingV2})); werr != nil {
+				f.Close()
+				return nil, fmt.Errorf("wal open: write header: %w", werr)
+			}
+			header = walFileHeader{Version: walFramingV2}
+			dataStart = walFileHeaderSize
+		}
+	}
+
 	capPow2 := nextPowerOfTwo(capacity)
 	if capPow2 < 2 {
 		capPow2 = 2
 	}
 
 	w := &WAL{
-		file:     f,
-		ring:     make([]walSlot, capPow2),
-		ringMask: uint64(capPow2 - 1),
+		file:      f,
+		framing:   header.Version,
+		dataStart: dataStart,
+		ring:      make([]walSlot, capPow2),
+		ringMask:  uint64(capPow2 - 1),
 	}
 	for i := range w.ring {
 		w.ring[i].seq.Store(uint64(i))
@@ -165,6 +207,11 @@ func (w *WAL) AppendEdgeDelete(payload []byte) error {
 // be dropped (payload = nodeID:8).
 func (w *WAL) AppendNodePropPurge(payload []byte) error {
 	return w.append(walRecordNodePropPurge, payload)
+}
+
+// AppendKeyTransition records a signing key rotation.
+func (w *WAL) AppendKeyTransition(payload []byte) error {
+	return w.append(walRecordKeyTransition, payload)
 }
 
 // AppendEdgePropPurge records that every property-index entry for an edge is to
@@ -265,6 +312,19 @@ func (w *WAL) Truncate() error {
 		return fmt.Errorf("wal truncate: reopen: %w", err)
 	}
 	w.file = f
+
+	// The truncation emptied the file, so its container header went with it and
+	// has to be rewritten — otherwise dataStart points past the end and replay
+	// skips the records written after this.
+	//
+	// This is also the migration path: a store whose log predates the container
+	// adopts the stronger framing here, at its first compaction, without an
+	// explicit step and without any file ever holding two framings.
+	if _, err := f.Write(appendWALFileHeader(walFileHeader{Version: walFramingV2})); err != nil {
+		return fmt.Errorf("wal truncate: write header: %w", err)
+	}
+	w.framing = walFramingV2
+	w.dataStart = walFileHeaderSize
 	return nil
 }
 
@@ -280,6 +340,15 @@ type ReplayCallbacks struct {
 
 	NodePropPurgeFunc func([]byte) error // called for each 0x07 node property purge
 	EdgePropPurgeFunc func([]byte) error // called for each 0x08 edge property purge
+
+	// KeyTransitionFunc is called for each 0x0D key rotation record.
+	//
+	// Dispatched like any other record, which means a transition inside a batch
+	// is buffered with it and discarded if the batch never commits. Rotations
+	// are written standalone, so that does not arise in practice — but a log
+	// assembled by hand could contain one, and treating it uniformly is safer
+	// than special-casing it.
+	KeyTransitionFunc func([]byte) error
 
 	// Verifier checks commit signatures. Nil means signatures are not checked —
 	// a signed log still replays, but nothing confirms the signatures, which is
@@ -323,7 +392,8 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 		return err
 	}
 
-	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+	// Records begin past the container header, if there is one.
+	if _, err := w.file.Seek(w.dataStart, io.SeekStart); err != nil {
 		return err
 	}
 
@@ -354,8 +424,12 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 	if bufSize < walMinReplayBuffer {
 		bufSize = walMinReplayBuffer
 	}
-	return replayRecords(bufio.NewReaderSize(w.file, bufSize), logSize, cb)
+	return replayRecords(bufio.NewReaderSize(w.file, bufSize), logSize, w.framing, cb)
 }
+
+// Framing reports which record framing this log uses. Callers building a batch
+// for it must match, or the records they frame will not verify on replay.
+func (w *WAL) Framing() uint16 { return w.framing }
 
 // replayRecords is Replay's parser, separated from the file handling around it.
 //
@@ -368,7 +442,7 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 //
 // logSize bounds each record's declared payload length; pass 0 when the total is
 // not known and the check is skipped.
-func replayRecords(r io.Reader, logSize int64, cb ReplayCallbacks) error {
+func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallbacks) error {
 	header := make([]byte, walHeaderSize)
 	footer := make([]byte, walFooterSize)
 
@@ -410,7 +484,10 @@ func replayRecords(r io.Reader, logSize int64, cb ReplayCallbacks) error {
 
 		// Verify CRC32.
 		storedCRC := binary.LittleEndian.Uint32(footer)
-		if computeCRC32(payload) != storedCRC {
+		// Under v2 this covers the type and length too, so a flipped type byte no
+		// longer verifies — which is what stops a corrupted batch marker from
+		// silently changing a record's meaning.
+		if recordCRC(framing, recType, payload) != storedCRC {
 			break // corrupted tail record
 		}
 
@@ -519,7 +596,11 @@ func replayRecords(r io.Reader, logSize int64, cb ReplayCallbacks) error {
 			// Inside a batch: buffer rather than apply, and accumulate the body
 			// exactly as it was framed so the commit CRC can be checked against it.
 			pending = append(pending, pendingRecord{recType: recType, payload: payload})
-			body = appendRecord(body, recType, payload)
+			// Reframed under the file's own framing, because the commit's body
+			// checksum was taken over the bytes the writer produced. Rebuilding
+			// them under a different framing yields different footers and a
+			// mismatch, which replay would read as a torn batch and discard.
+			body = appendRecordFramed(body, framing, recType, payload)
 			continue
 		}
 
@@ -592,7 +673,7 @@ func (w *WAL) append(recType byte, payload []byte) error {
 // writeRecord serialises and writes one WAL record. Must hold w.mu.
 func (w *WAL) writeRecord(recType byte, payload []byte) error {
 	length := uint32(len(payload))
-	crc := computeCRC32(payload)
+	crc := recordCRC(w.framing, recType, payload)
 
 	buf := make([]byte, walHeaderSize+int(length)+walFooterSize)
 	buf[0] = recType
@@ -802,7 +883,8 @@ func knownWALRecord(recType byte) bool {
 	case walRecordNode, walRecordEdge,
 		walRecordNodeProp, walRecordEdgeProp,
 		walRecordNodeDelete, walRecordEdgeDelete,
-		walRecordNodePropPurge, walRecordEdgePropPurge:
+		walRecordNodePropPurge, walRecordEdgePropPurge,
+		walRecordKeyTransition:
 		return true
 	}
 	return false
@@ -811,6 +893,10 @@ func knownWALRecord(recType byte) bool {
 // applyWALRecord dispatches one record to its callback.
 func applyWALRecord(cb ReplayCallbacks, recType byte, payload []byte) error {
 	switch recType {
+	case walRecordKeyTransition:
+		if cb.KeyTransitionFunc != nil {
+			return cb.KeyTransitionFunc(payload)
+		}
 	case walRecordNode:
 		if cb.NodeFunc != nil {
 			return cb.NodeFunc(payload)

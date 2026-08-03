@@ -191,6 +191,11 @@ type WALInfo struct {
 	Path      string
 	FileBytes int64
 
+	// Framing is the record framing this log uses: 1 for a headerless log
+	// written before the container existed, 2 once its checksums cover the
+	// record header too.
+	Framing uint16
+
 	Records []WALRecordInfo
 	Commits []WALCommitInfo
 
@@ -223,11 +228,24 @@ func InspectWAL(path string) (WALInfo, error) {
 	}
 	defer f.Close()
 
-	info := WALInfo{Path: p, FileBytes: fi.Size()}
+	// The container header, if present, tells us which framing the records use.
+	fileHeader, dataStart, err := readWALFileHeader(f)
+	if err != nil {
+		return WALInfo{Path: p, FileBytes: fi.Size()}, fmt.Errorf("inspect wal: %w", err)
+	}
+	if _, err := f.Seek(dataStart, 0); err != nil {
+		return WALInfo{}, fmt.Errorf("inspect wal: %w", err)
+	}
+
+	info := WALInfo{
+		Path:      p,
+		FileBytes: fi.Size(),
+		Framing:   fileHeader.Version,
+	}
 	header := make([]byte, walHeaderSize)
 	footer := make([]byte, walFooterSize)
 
-	var offset int64
+	offset := dataStart
 	inBatch := false
 	batchRecords := 0
 	var batchBody []byte
@@ -259,7 +277,7 @@ func InspectWAL(path string) (WALInfo, error) {
 			break
 		}
 
-		crcValid := computeCRC32(payload) == binary.LittleEndian.Uint32(footer)
+		crcValid := recordCRC(info.Framing, recType, payload) == binary.LittleEndian.Uint32(footer)
 		info.Records = append(info.Records, WALRecordInfo{
 			Offset:   offset,
 			Type:     recType,
@@ -295,7 +313,7 @@ func InspectWAL(path string) (WALInfo, error) {
 		default:
 			if inBatch {
 				batchRecords++
-				batchBody = appendRecord(batchBody, recType, payload)
+				batchBody = appendRecordFramed(batchBody, info.Framing, recType, payload)
 			}
 		}
 

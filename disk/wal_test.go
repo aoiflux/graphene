@@ -113,8 +113,13 @@ func TestWAL_Truncate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() != 0 {
-		t.Errorf("WAL file should be empty after Truncate, size=%d", info.Size())
+	// "Empty" now means "holds no records", not "zero bytes": Truncate rewrites
+	// the container header so the fresh log declares its framing. A log with no
+	// header would be read as the original framing, which is the one thing a
+	// freshly created log should never be.
+	if info.Size() != walFileHeaderSize {
+		t.Errorf("WAL should hold only its header after Truncate, size=%d want=%d",
+			info.Size(), walFileHeaderSize)
 	}
 }
 

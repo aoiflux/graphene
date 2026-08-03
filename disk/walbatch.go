@@ -124,23 +124,35 @@ func signedCommitData(commitSeq uint64, unixNano int64, actorID, keyID uint64, b
 type walBatch struct {
 	buf   []byte
 	count uint32
+	// framing must match the file this batch will be appended to; a log holding
+	// two framings could not be replayed under either.
+	framing uint16
 	// beginEnd marks where the batch body starts, so the commit CRC can be taken
 	// over exactly the bytes replay will read back.
 	beginEnd int
 }
 
-// newWALBatch returns a batch builder with room reserved for hint bytes.
+// newWALBatch returns a batch builder under the original framing, for tests and
+// hand-assembled fixtures.
 func newWALBatch(hint int) *walBatch {
-	b := &walBatch{buf: make([]byte, 0, hint+walRecordOverhead*2+walBatchBeginPayload+walBatchCommitPayloadV3)}
+	return newWALBatchFramed(hint, walFramingV1)
+}
+
+// newWALBatchFramed returns a batch builder with room reserved for hint bytes.
+func newWALBatchFramed(hint int, framing uint16) *walBatch {
+	b := &walBatch{
+		buf:     make([]byte, 0, hint+walRecordOverhead*2+walBatchBeginPayload+walBatchCommitPayloadV3),
+		framing: framing,
+	}
 	// Reserve the begin marker; count is patched in by finish().
-	b.buf = appendRecord(b.buf, walRecordBatchBegin, make([]byte, walBatchBeginPayload))
+	b.buf = appendRecordFramed(b.buf, framing, walRecordBatchBegin, make([]byte, walBatchBeginPayload))
 	b.beginEnd = len(b.buf)
 	return b
 }
 
 // add frames one record into the batch.
 func (b *walBatch) add(recType byte, payload []byte) {
-	b.buf = appendRecord(b.buf, recType, payload)
+	b.buf = appendRecordFramed(b.buf, b.framing, recType, payload)
 	b.count++
 }
 
@@ -162,7 +174,7 @@ func (b *walBatch) finish(meta batchMeta) ([]byte, error) {
 	// now that the count is no longer zero.
 	beginCRCAt := walHeaderSize + walBatchBeginPayload
 	binary.LittleEndian.PutUint32(b.buf[beginCRCAt:beginCRCAt+4],
-		computeCRC32(b.buf[walHeaderSize:walHeaderSize+walBatchBeginPayload]))
+		recordCRC(b.framing, walRecordBatchBegin, b.buf[walHeaderSize:walHeaderSize+walBatchBeginPayload]))
 
 	// The CRC covers the body only, exactly as it did in v1. Extending it over
 	// the metadata would be no stronger — the checksum sits in the same record
@@ -197,20 +209,33 @@ func (b *walBatch) finish(meta batchMeta) ([]byte, error) {
 		copy(commit[42:], sig)
 	}
 
-	b.buf = appendRecord(b.buf, walRecordBatchCommit, commit)
+	b.buf = appendRecordFramed(b.buf, b.framing, walRecordBatchCommit, commit)
 	return b.buf, nil
 }
 
-// appendRecord frames one record onto dst and returns the extended slice.
-func appendRecord(dst []byte, recType byte, payload []byte) []byte {
+// appendRecord frames one record onto dst under the given framing and returns
+// the extended slice.
+//
+// Framing is a parameter rather than a constant because a batch's records must
+// be checksummed by the same rule as the file they are appended to — a log
+// containing two framings could not be replayed by either.
+func appendRecordFramed(dst []byte, framing uint16, recType byte, payload []byte) []byte {
 	var hdr [walHeaderSize]byte
 	hdr[0] = recType
 	binary.LittleEndian.PutUint32(hdr[1:5], uint32(len(payload)))
 	dst = append(dst, hdr[:]...)
 	dst = append(dst, payload...)
 	var crc [walFooterSize]byte
-	binary.LittleEndian.PutUint32(crc[:], computeCRC32(payload))
+	binary.LittleEndian.PutUint32(crc[:], recordCRC(framing, recType, payload))
 	return append(dst, crc[:]...)
+}
+
+// appendRecord frames a record under the original framing.
+//
+// Retained for tests and for hand-assembled fixtures, which predate the
+// container and are simpler to reason about under v1.
+func appendRecord(dst []byte, recType byte, payload []byte) []byte {
+	return appendRecordFramed(dst, walFramingV1, recType, payload)
 }
 
 // addWith frames a record whose payload is written directly into the batch
@@ -231,7 +256,7 @@ func (b *walBatch) addWith(recType byte, marshal func(dst []byte) []byte) {
 	binary.LittleEndian.PutUint32(b.buf[start+1:start+walHeaderSize], uint32(payloadLen))
 
 	var crc [walFooterSize]byte
-	binary.LittleEndian.PutUint32(crc[:], computeCRC32(b.buf[payloadStart:]))
+	binary.LittleEndian.PutUint32(crc[:], recordCRC(b.framing, recType, b.buf[payloadStart:]))
 	b.buf = append(b.buf, crc[:]...)
 	b.count++
 }

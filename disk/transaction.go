@@ -236,7 +236,7 @@ func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error 
 		return nil
 	}
 
-	batch := newWALBatch(len(actions) * 64)
+	batch := newWALBatchFramed(len(actions)*64, s.wal.Framing())
 	for _, a := range actions {
 		switch a.kind {
 		case txActionPutNode:

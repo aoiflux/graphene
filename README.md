@@ -446,6 +446,10 @@ go run ./examples
   [TECHNICAL_DETAILS.md](docs/TECHNICAL_DETAILS.md)
 - Benchmark methodology and results: [benchmarks.md](docs/benchmarks.md)
 - Engine comparison notes: [comparison.md](docs/comparison.md)
+- **Security model, guarantees, and their limits:** [SECURITY.md](SECURITY.md) —
+  read this before relying on the integrity machinery for anything evidentiary.
+  It states what digests, Merkle roots, signatures, and attestations actually
+  prove, and what they do not.
 
 ## Query Migration
 

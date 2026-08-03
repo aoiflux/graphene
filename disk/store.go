@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -98,6 +99,14 @@ type Store struct {
 	// the store was opened under.
 	verifier      store.Verifier
 	requireSigned bool
+
+	// keyTimeline holds the rotations seen in the current log, in the order they
+	// were recorded. Guarded by mu.
+	//
+	// Bounded by the log's lifetime: a compaction truncates it, so rotations
+	// before the last compaction are gone. Durable key history needs WAL
+	// retention, which is not built — see KeyTimeline's doc.
+	keyTimeline []KeyTransition
 
 	// attestActorID is recorded as the actor in the snapshot attestation written
 	// at compaction. Separate from any transaction's actor because compaction is
@@ -263,6 +272,90 @@ type Options struct {
 	// rather than a transaction, so it carries its own actor rather than
 	// inheriting one from whichever write happened last.
 	AttestActorID uint64
+
+	// VerifyOnOpen checks the compacted image before loading it: the body
+	// digest, the Merkle roots against the records they describe, and — when a
+	// Verifier is set — the snapshot attestation's signature. A failure fails
+	// the Open, so the store never comes up holding records it could not vouch
+	// for.
+	//
+	// Off by default, and the reason is worth stating rather than assuming.
+	// Hashing the whole image costs time proportional to the file on every
+	// startup, which is the same argument that keeps Open from running
+	// VerifyIndexes — a check that makes every startup slower gets switched off,
+	// and a check that is switched off protects nothing. Signature verification
+	// of the *log* is not covered by this flag and always runs when a Verifier
+	// is set, because it rides on the replay Open performs anyway.
+	//
+	// Turn it on where opening is rare relative to querying, which is the
+	// ingest-once/query-many shape this engine is built for. See StrictOptions.
+	VerifyOnOpen bool
+}
+
+// StrictOptions returns the most cautious configuration the engine offers:
+// every commit signed and required to be signed, and the image verified before
+// it is loaded.
+//
+// It exists because the safe posture was previously three separate settings a
+// caller had to know about individually, and a security control nobody can find
+// is a security control nobody uses. The permissive default is kept for
+// compatibility — this is how to opt out of it in one call.
+//
+//	s, err := disk.OpenWithOptions(dir, disk.StrictOptions(key, ring, actorID))
+func StrictOptions(signer store.Signer, verifier store.Verifier, actorID uint64) Options {
+	return Options{
+		Signer:               signer,
+		Verifier:             verifier,
+		RequireSignedCommits: true,
+		AttestActorID:        actorID,
+		VerifyOnOpen:         true,
+	}
+}
+
+// verifyImageOnOpen runs the checks VerifyOnOpen asks for, in increasing order
+// of what they prove: the bytes are unchanged, the roots describe those bytes,
+// and a named key vouched for the result.
+func verifyImageOnOpen(csrPath string, opts Options) error {
+	switch status, _, err := VerifyCSRDigest(csrPath); {
+	case err != nil:
+		return fmt.Errorf("verify image: %w", err)
+	case status == DigestMismatch:
+		return fmt.Errorf("verify image: the compacted image does not match its own digest — " +
+			"it has changed since it was written")
+	case status == DigestAbsent:
+		// A pre-v8 image carries no digest. Not a failure: it is the honest
+		// answer for a file that was never covered, and refusing it would make
+		// enabling verification break every older store.
+		return nil
+	}
+
+	if err := VerifyCSRRoots(csrPath); err != nil {
+		if errors.Is(err, ErrNoSnapshotRoots) {
+			return nil
+		}
+		return fmt.Errorf("verify image: %w", err)
+	}
+
+	// The attestation is only checkable with a verifier; without one there is
+	// nothing to check it against, which is not the same as it being absent.
+	if opts.Verifier == nil {
+		return nil
+	}
+	data, err := os.ReadFile(csrPath)
+	if err != nil {
+		return fmt.Errorf("verify image: %w", err)
+	}
+	csr, _, err := deserialiseCSR(data)
+	if err != nil {
+		return fmt.Errorf("verify image: %w", err)
+	}
+	if csr.attestation.Signature == nil {
+		return nil
+	}
+	if err := VerifyAttestation(opts.Verifier, csr.attestation); err != nil {
+		return fmt.Errorf("verify image: %w", err)
+	}
+	return nil
 }
 
 // Open opens (or creates) a disk-backed Store rooted at dir.
@@ -318,6 +411,13 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	// Try to load existing CSR.
 	csrPath := filepath.Join(dir, csrFileName)
 	if _, err := os.Stat(csrPath); err == nil {
+		// Integrity checks run before the image is loaded, so a store that fails
+		// them never comes up holding records it could not vouch for.
+		if opts.VerifyOnOpen {
+			if err := verifyImageOnOpen(csrPath, opts); err != nil {
+				return fail("disk.Open: %w", err)
+			}
+		}
 		if err := s.loadCSR(csrPath); err != nil {
 			return fail("disk.Open: load CSR: %w", err)
 		}
@@ -408,7 +508,7 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 
 	// One framed, transactional write for the whole batch. Previously this was
 	// one WAL append — and one write syscall — per node.
-	batch := newWALBatch(len(stored) * 64)
+	batch := newWALBatchFramed(len(stored)*64, s.wal.Framing())
 	for _, n := range stored {
 		node := n
 		batch.addWith(walRecordNode, func(dst []byte) []byte {
@@ -516,7 +616,7 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 		stored[i] = edge
 	}
 
-	batch := newWALBatch(len(stored) * 80)
+	batch := newWALBatchFramed(len(stored)*80, s.wal.Framing())
 	for _, e := range stored {
 		edge := e
 		batch.addWith(walRecordEdge, func(dst []byte) []byte {
@@ -1747,6 +1847,14 @@ func (s *Store) replayWAL() error {
 		Verifier:             s.verifier,
 		RequireSignedCommits: s.requireSigned,
 		CommitFunc:           s.observeCommitMeta,
+		KeyTransitionFunc: func(payload []byte) error {
+			t, err := readKeyTransitionPayload(payload)
+			if err != nil {
+				return fmt.Errorf("key transition: %w", err)
+			}
+			s.keyTimeline = append(s.keyTimeline, t)
+			return nil
+		},
 		NodeFunc: func(payload []byte) error {
 			n, err := unmarshalNode(payload)
 			if err != nil {

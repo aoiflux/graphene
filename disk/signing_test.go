@@ -82,8 +82,8 @@ func TestSigning_DetectsAnEditedRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Find a node record's payload and change it. Walk the framing rather than
-	// guessing an offset.
-	off, patched := 0, false
+	// guessing an offset, starting past the container header.
+	off, patched := walFileHeaderSize, false
 	for off+walHeaderSize <= len(data) && !patched {
 		recType := data[off]
 		length := int(data[off+1]) | int(data[off+2])<<8 | int(data[off+3])<<16 | int(data[off+4])<<24
@@ -92,7 +92,7 @@ func TestSigning_DetectsAnEditedRecord(t *testing.T) {
 			data[payloadAt] ^= 0x01
 			// Repair the record's own CRC so replay reaches the batch check
 			// rather than stopping at a torn record.
-			crc := computeCRC32(data[payloadAt : payloadAt+length])
+			crc := recordCRC(walFramingV2, recType, data[payloadAt:payloadAt+length])
 			crcAt := payloadAt + length
 			data[crcAt] = byte(crc)
 			data[crcAt+1] = byte(crc >> 8)
@@ -132,7 +132,7 @@ func TestSigning_RejectsAForgedSignature(t *testing.T) {
 	// record CRC so the forgery reaches the signature check.
 	commitPayloadAt := len(data) - walFooterSize - walBatchCommitPayloadV3
 	data[commitPayloadAt+50] ^= 0x01
-	crc := computeCRC32(data[commitPayloadAt : commitPayloadAt+walBatchCommitPayloadV3])
+	crc := recordCRC(walFramingV2, walRecordBatchCommit, data[commitPayloadAt:commitPayloadAt+walBatchCommitPayloadV3])
 	crcAt := len(data) - walFooterSize
 	data[crcAt] = byte(crc)
 	data[crcAt+1] = byte(crc >> 8)
@@ -171,7 +171,7 @@ func TestSigning_RequireSignedRejectsAStrippedSignature(t *testing.T) {
 	payloadAt := commitStart + walHeaderSize
 	v2 := append([]byte(nil), data[payloadAt:payloadAt+walBatchCommitPayloadV2]...)
 	stripped := append([]byte(nil), data[:commitStart]...)
-	stripped = appendRecord(stripped, walRecordBatchCommit, v2)
+	stripped = appendRecordFramed(stripped, walFramingV2, walRecordBatchCommit, v2)
 	if err := os.WriteFile(p, stripped, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -296,14 +296,15 @@ func TestSigning_SignatureIsBoundToCommitMetadata(t *testing.T) {
 	// signature covers the actor, so it must no longer verify.
 	commitPayloadAt := len(framed) - walFooterSize - walBatchCommitPayloadV3
 	framed[commitPayloadAt+24] ^= 0x01 // actorID
-	crc := computeCRC32(framed[commitPayloadAt : commitPayloadAt+walBatchCommitPayloadV3])
+	// This fixture is hand-built under v1, so its CRCs are too.
+	crc := recordCRC(walFramingV1, walRecordBatchCommit, framed[commitPayloadAt:commitPayloadAt+walBatchCommitPayloadV3])
 	crcAt := len(framed) - walFooterSize
 	framed[crcAt] = byte(crc)
 	framed[crcAt+1] = byte(crc >> 8)
 	framed[crcAt+2] = byte(crc >> 16)
 	framed[crcAt+3] = byte(crc >> 24)
 
-	err = replayRecords(bytesReader(framed), int64(len(framed)), ReplayCallbacks{
+	err = replayRecords(bytesReader(framed), int64(len(framed)), walFramingV1, ReplayCallbacks{
 		Verifier:             ring,
 		RequireSignedCommits: true,
 		NodeFunc:             func([]byte) error { return nil },

@@ -165,8 +165,14 @@ func TestCSRv6_PropertyIndexSurvivesWithoutWAL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat WAL: %v", err)
 	}
-	if info.Size() != 0 {
-		t.Fatalf("WAL is %d bytes after compaction, want 0 (index should live in the CSR)", info.Size())
+	// The log holds no records after compaction — only its container header,
+	// which Truncate rewrites so the fresh log declares its framing. The point
+	// of the assertion is unchanged: no property-index entries were re-emitted,
+	// so restart cost is independent of index size.
+	const walHeaderBytes = 50
+	if info.Size() != walHeaderBytes {
+		t.Fatalf("WAL is %d bytes after compaction, want %d (header only; the index should live in the CSR)",
+			info.Size(), walHeaderBytes)
 	}
 
 	reopened, err := graphene.Open(dir)

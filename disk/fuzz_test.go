@@ -167,7 +167,7 @@ func TestWALReplay_RejectsBatchCountLargerThanTheLog(t *testing.T) {
 	rec = appendRecord(rec, walRecordBatchBegin, []byte{0xFF, 0xFF, 0xFF, 0xFF})
 
 	applied := 0
-	err := replayRecords(bytes.NewReader(rec), int64(len(rec)), ReplayCallbacks{
+	err := replayRecords(bytes.NewReader(rec), int64(len(rec)), walFramingV1, ReplayCallbacks{
 		NodeFunc: func([]byte) error { applied++; return nil },
 	})
 	if err == nil {
@@ -351,7 +351,7 @@ func FuzzWALReplay(f *testing.F) {
 
 		// Either outcome is fine — a malformed log should be reported, a torn one
 		// truncated. What must not happen is a panic or an unbounded allocation.
-		if err := replayRecords(bytes.NewReader(data), int64(len(data)), cb); err != nil {
+		if err := replayRecords(bytes.NewReader(data), int64(len(data)), walFramingV1, cb); err != nil {
 			return
 		}
 
@@ -371,7 +371,7 @@ func FuzzWALReplay(f *testing.F) {
 			NodePropPurgeFunc: func([]byte) error { second++; return nil },
 			EdgePropPurgeFunc: func([]byte) error { second++; return nil },
 		}
-		if err := replayRecords(bytes.NewReader(data), int64(len(data)), cb2); err != nil {
+		if err := replayRecords(bytes.NewReader(data), int64(len(data)), walFramingV1, cb2); err != nil {
 			t.Fatalf("replay succeeded then failed on the same %d bytes: %v", len(data), err)
 		}
 		if second != applied {

@@ -19,7 +19,7 @@ func replayMeta(t *testing.T, data []byte) ([]batchMeta, int) {
 	var metas []batchMeta
 	applied := 0
 	count := func([]byte) error { applied++; return nil }
-	err := replayRecords(newByteReader(data), int64(len(data)), ReplayCallbacks{
+	err := replayRecords(newByteReader(data), int64(len(data)), walFramingV1, ReplayCallbacks{
 		CommitFunc:     func(m batchMeta) { metas = append(metas, m) },
 		NodeFunc:       count,
 		EdgeFunc:       count,

@@ -64,7 +64,7 @@ func replayApplied(data []byte) ([]string, error) {
 		got = append(got, string(p))
 		return nil
 	}
-	err := replayRecords(bytes.NewReader(data), int64(len(data)), ReplayCallbacks{
+	err := replayRecords(bytes.NewReader(data), int64(len(data)), walFramingV1, ReplayCallbacks{
 		NodeFunc: collect, EdgeFunc: collect,
 		NodePropFunc: collect, EdgePropFunc: collect,
 		NodeDeleteFunc: collect, EdgeDeleteFunc: collect,
@@ -256,14 +256,19 @@ func TestReplay_SingleByteCorruptionIsAllOrNothing(t *testing.T) {
 // (keyless, recomputable). It is a real hole in the *accident* story, which is
 // the one these markers are for.
 //
-// The fix is to checksum the header along with the payload. That changes what
-// every record's CRC covers, so every existing log would fail to validate under
-// the new rule — and there is no WAL file header to carry a format version that
-// would let old and new coexist. It therefore needs a versioned WAL container,
-// not a patch.
+// **This is now fixed for new logs.** The container header added in
+// walcontainer.go versions the framing, and v2 checksums the record header along
+// with the payload — see TestWALContainer_V2DetectsATypeByteFlip, which flips a
+// type byte in a real log and confirms the record no longer verifies.
 //
-// This test asserts the CURRENT behaviour. If it starts failing, the gap has
-// been closed and this test should be deleted rather than repaired.
+// The gap remains for a headerless log written before the container existed,
+// because changing what its CRCs cover would invalidate every record already in
+// it. Such a log keeps v1 framing until a compaction replaces it, which is the
+// migration path. This fixture is hand-built under v1, so it still exercises
+// that case — which is the case that still exists.
+//
+// If this starts failing, v1 framing has changed and the test should be deleted
+// rather than repaired.
 func TestReplay_CorruptingABatchMarkerTypeDefeatsBatching(t *testing.T) {
 	full, _ := crashFixture(t)
 

@@ -42,7 +42,9 @@ func collect(t *testing.T, path string) []string {
 }
 
 func batchOf(payloads ...string) []byte {
-	b := newWALBatch(0)
+	// Framed as the real WAL frames: these buffers are written into one, and a
+	// log holding two framings would replay under neither.
+	b := newWALBatchFramed(0, walFramingV2)
 	for _, p := range payloads {
 		b.add(walRecordNode, []byte(p))
 	}
@@ -123,7 +125,7 @@ func TestWALBatch_CommitDisagreeingWithBody_IsRejected(t *testing.T) {
 	// Recompute the commit record's own CRC so it parses cleanly and only the
 	// batch-level check can catch it.
 	commitPayloadAt := len(framed) - walFooterSize - walBatchCommitPayloadV2
-	crc := computeCRC32(framed[commitPayloadAt : commitPayloadAt+walBatchCommitPayloadV2])
+	crc := recordCRC(walFramingV2, walRecordBatchCommit, framed[commitPayloadAt:commitPayloadAt+walBatchCommitPayloadV2])
 	framed[len(framed)-4] = byte(crc)
 	framed[len(framed)-3] = byte(crc >> 8)
 	framed[len(framed)-2] = byte(crc >> 16)
@@ -179,7 +181,7 @@ func TestWALReplay_UnknownRecordTypeIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Write(appendRecord(nil, 0x7E, []byte("mystery")))
+	f.Write(appendRecordFramed(nil, walFramingV2, 0x7E, []byte("mystery")))
 	f.Close()
 
 	w2, err := OpenWAL(path)
