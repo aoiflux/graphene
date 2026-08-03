@@ -190,6 +190,11 @@ func (s *Store) RotateKey(newKey store.Signer, newPublicKey []byte) error {
 
 	s.signer = newKey
 	s.keyTimeline = append(s.keyTimeline, t)
+
+	if aerr := s.recordAudit(AuditKeyRotation, s.attestActorID,
+		fmt.Sprintf("key %d replaced by key %d from commit %d", t.PrevKeyID, t.NewKeyID, t.AtCommitSeq)); aerr != nil {
+		return fmt.Errorf("disk.RotateKey: %w", aerr)
+	}
 	return nil
 }
 

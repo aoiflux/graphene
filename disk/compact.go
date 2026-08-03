@@ -144,10 +144,57 @@ func (s *Store) Compact() error {
 		return fmt.Errorf("compact: rename CSR: %w", err)
 	}
 
-	// Truncate WAL.
-	if err := s.wal.Truncate(); err != nil {
-		return fmt.Errorf("compact: wal truncate: %w", err)
+	// Retire the WAL.
+	//
+	// With retention configured the log is rotated to a numbered segment and
+	// kept; without it, it is truncated as before. The distinction is what a
+	// caller asked for, not what the engine thinks best — how long evidence is
+	// held is not the engine's decision.
+	//
+	// Either way this happens *after* the CSR has been renamed into place, so a
+	// crash between the two leaves a log that still holds everything the new
+	// image already contains. Replaying it again is harmless; losing it would
+	// not be.
+	if s.retention.Keeps() {
+		seg, err := s.wal.Rotate(s.dir, s.segmentSeq)
+		if err != nil {
+			return fmt.Errorf("compact: wal rotate: %w", err)
+		}
+		s.segmentSeq++
+
+		removed, err := applyRetention(s.dir, s.retention)
+		if err != nil {
+			return fmt.Errorf("compact: %w", err)
+		}
+		// Recorded because it is a deletion of evidence, whoever authorised it.
+		// A retention policy quietly discarding history is the thing an audit is
+		// for, even — especially — when the discarding was intended.
+		for _, r := range removed {
+			if aerr := s.recordAudit(AuditRetentionDelete, s.attestActorID,
+				fmt.Sprintf("segment %d (%d bytes, digest %x)", r.Sequence, r.Bytes, r.Digest[:8])); aerr != nil {
+				return fmt.Errorf("compact: %w", aerr)
+			}
+		}
+		if aerr := s.recordAudit(AuditCompact, s.attestActorID,
+			fmt.Sprintf("retired segment %d; %d nodes, %d edges; snapshot %x",
+				seg.Sequence, len(nodes), len(edges), newCSR.roots.Snapshot[:8])); aerr != nil {
+			return fmt.Errorf("compact: %w", aerr)
+		}
+	} else {
+		if err := s.wal.Truncate(); err != nil {
+			return fmt.Errorf("compact: wal truncate: %w", err)
+		}
+		if aerr := s.recordAudit(AuditCompact, s.attestActorID,
+			fmt.Sprintf("log discarded; %d nodes, %d edges; snapshot %x",
+				len(nodes), len(edges), newCSR.roots.Snapshot[:8])); aerr != nil {
+			return fmt.Errorf("compact: %w", aerr)
+		}
 	}
+
+	// Rotation starts a fresh active log, so the rotations recorded in the
+	// retired one are no longer in the live timeline. They remain readable in
+	// the segment, which is the point of keeping it.
+	s.keyTimeline = nil
 
 	// The property index is now inside the CSR file, so the truncated WAL is left
 	// empty. Before v6 every compaction re-emitted the whole index here and every

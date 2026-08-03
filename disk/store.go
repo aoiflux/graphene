@@ -100,6 +100,17 @@ type Store struct {
 	verifier      store.Verifier
 	requireSigned bool
 
+	// audit records operator actions when configured; nil when not. Its own
+	// locking is internal, so it is not guarded by mu — an audit append must not
+	// be able to block on the store's write lock, or recording an action could
+	// deadlock against the action itself.
+	audit *AuditLog
+
+	// retention governs which retired segments survive a compaction, and
+	// segmentSeq numbers the next one. Guarded by mu.
+	retention  RetentionPolicy
+	segmentSeq uint64
+
 	// keyTimeline holds the rotations seen in the current log, in the order they
 	// were recorded. Guarded by mu.
 	//
@@ -273,6 +284,26 @@ type Options struct {
 	// inheriting one from whichever write happened last.
 	AttestActorID uint64
 
+	// Audit enables the hash-chained audit log, recording operator actions —
+	// opens, compactions, key rotations, retention deletions — in
+	// graphene.audit.
+	//
+	// Off by default. It is another file, another sync per recorded action, and
+	// a caller who does not need one should not pay for it. Reads and queries
+	// are never recorded regardless: see audit.go for why that boundary is where
+	// it is.
+	Audit bool
+
+	// Retention decides which retired WAL segments survive a compaction.
+	//
+	// The zero value keeps none, which is the behaviour before segmentation
+	// existed: compaction discards the log along with every commit's actor,
+	// timestamp, signature, and every key rotation it held. Set it to keep that
+	// history. How long evidence should be kept is a legal and operational
+	// question rather than an engineering one, so the engine takes it as a
+	// parameter and has no default opinion.
+	Retention RetentionPolicy
+
 	// VerifyOnOpen checks the compacted image before loading it: the body
 	// digest, the Merkle roots against the records they describe, and — when a
 	// Verifier is set — the snapshot attestation's signature. A failure fails
@@ -292,6 +323,25 @@ type Options struct {
 	VerifyOnOpen bool
 }
 
+// recordAudit appends an entry when auditing is enabled, and does nothing
+// otherwise.
+//
+// Errors are returned rather than swallowed by every caller in turn: an audit
+// log that silently stops recording is worse than none, because it still looks
+// like a record.
+func (s *Store) recordAudit(kind AuditKind, actorID uint64, detail string) error {
+	if s.audit == nil {
+		return nil
+	}
+	_, err := s.audit.Record(kind, actorID, detail)
+	return err
+}
+
+// AuditEntries returns this store's audit log, oldest first.
+func (s *Store) AuditEntries() ([]AuditEntry, error) {
+	return ReadAuditLog(s.dir)
+}
+
 // StrictOptions returns the most cautious configuration the engine offers:
 // every commit signed and required to be signed, and the image verified before
 // it is loaded.
@@ -309,6 +359,7 @@ func StrictOptions(signer store.Signer, verifier store.Verifier, actorID uint64)
 		RequireSignedCommits: true,
 		AttestActorID:        actorID,
 		VerifyOnOpen:         true,
+		Audit:                true,
 	}
 }
 
@@ -398,6 +449,26 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		verifier:         opts.Verifier,
 		requireSigned:    opts.RequireSignedCommits,
 		attestActorID:    opts.AttestActorID,
+		retention:        opts.Retention,
+	}
+
+	if opts.Audit {
+		al, aerr := OpenAuditLog(dir)
+		if aerr != nil {
+			wal.Close()
+			return nil, fmt.Errorf("disk.Open: %w", aerr)
+		}
+		s.audit = al
+	}
+
+	// Resume numbering past whatever segments already exist, so a reopened store
+	// never reuses a sequence number and never overwrites retired history.
+	if existing, lerr := ListSegments(dir); lerr == nil {
+		for _, seg := range existing {
+			if seg.Sequence >= s.segmentSeq {
+				s.segmentSeq = seg.Sequence + 1
+			}
+		}
 	}
 
 	// From here on the WAL file handle is open, so every failure path has to
@@ -405,6 +476,13 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	// leaves the file undeletable.
 	fail := func(format string, args ...any) (*Store, error) {
 		wal.Close()
+		// The audit log is opened above, so every failure path from here has to
+		// release it too. Missing this leaked a handle on exactly the paths that
+		// matter — a store rejected by VerifyOnOpen — and on Windows left the
+		// file undeletable.
+		if s.audit != nil {
+			s.audit.Close()
+		}
 		return nil, fmt.Errorf(format, args...)
 	}
 
@@ -1453,7 +1531,17 @@ func (s *Store) EdgeCount() (uint64, error) {
 }
 
 func (s *Store) Close() error {
-	return s.wal.Close()
+	// The WAL closes even if the audit log fails to, because a WAL left open
+	// leaks a file handle and, on Windows, leaves the file undeletable. The
+	// audit error is still returned — it is not more important than durability,
+	// but it is not nothing either.
+	walErr := s.wal.Close()
+	if s.audit != nil {
+		if err := s.audit.Close(); err != nil && walErr == nil {
+			return err
+		}
+	}
+	return walErr
 }
 
 // SetSyncOnCommit controls whether a batch write is flushed to the platter

@@ -111,9 +111,13 @@ Do not assume any of the following. None of it exists:
 - **No access control.** There is no RBAC, no permissions, no principals. Every
   caller has every capability. `TxContext.RoleID` is *recorded* for later audit
   reconstruction; **nothing checks it**.
-- **No audit log.** Reads, queries, exports, and configuration changes are not
-  recorded. Only mutations reach the WAL, and only batched ones carry
-  provenance.
+- **The audit log records operator actions, not reads.** With `Audit` enabled,
+  compactions, key rotations and retention deletions are hash-chained into
+  `graphene.audit`, and callers can add their own entries. Reads and queries are
+  **not** recorded — that would put a synchronous append on the query path, and
+  a caller needing it should record what matters via the API. Removing an entry
+  from the middle is detectable; deleting the whole file is not, without an
+  external anchor.
 - **No durable key history.** Rotations *are* recorded (see §4), but in the WAL,
   which a compaction truncates. Rotations from before the last compaction are
   gone, so a full key history needs log retention, which is not built.
@@ -151,9 +155,10 @@ s, err := disk.OpenWithOptions(dir, disk.StrictOptions(key, ring, actorID))
 ```
 
 `StrictOptions` sets every protection the engine offers: commits signed,
-**unsigned commits refused**, and the image verified before it is loaded. It
-exists because those were three settings a caller had to discover individually,
-and a security control nobody can find is a security control nobody uses.
+**unsigned commits refused**, the image verified before it is loaded, and
+operator actions recorded in the audit log. It exists because those were
+separate settings a caller had to discover individually, and a security control
+nobody can find is a security control nobody uses.
 
 Spelled out, it is:
 
@@ -163,9 +168,14 @@ disk.Options{
     Verifier:             ring,
     RequireSignedCommits: true,   // see below — this flag is the point
     VerifyOnOpen:         true,
+    Audit:                true,
     AttestActorID:        actorID,
 }
 ```
+
+It does **not** set `Retention`, so compaction still discards the log. How long
+evidence is kept is a decision the engine cannot make for you — see §4's
+retention note.
 
 ### Why the default is permissive
 

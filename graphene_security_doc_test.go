@@ -32,18 +32,19 @@ func TestSecurityDoc_SigningAndVerifyingTheLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The spelled-out form the document says it is equivalent to. Checked before
+	// anything is opened, so a mismatch does not leave a store behind.
+	if want := (disk.Options{
+		Signer: key, Verifier: ring, RequireSignedCommits: true,
+		VerifyOnOpen: true, Audit: true, AttestActorID: 42,
+	}); disk.StrictOptions(key, ring, 42) != want {
+		t.Fatal("StrictOptions no longer matches the expansion SECURITY.md documents")
+	}
+
 	// The documented one-call form.
 	s, err := disk.OpenWithOptions(dir, disk.StrictOptions(key, ring, 42))
 	if err != nil {
 		t.Fatalf("the documented StrictOptions call failed to open: %v", err)
-	}
-
-	// And the spelled-out form the document says it is equivalent to.
-	if want := (disk.Options{
-		Signer: key, Verifier: ring, RequireSignedCommits: true,
-		VerifyOnOpen: true, AttestActorID: 42,
-	}); disk.StrictOptions(key, ring, 42) != want {
-		t.Fatal("StrictOptions no longer matches the expansion SECURITY.md documents")
 	}
 
 	if err := s.ApplyTransactionAs(
