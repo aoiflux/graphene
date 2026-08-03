@@ -2,6 +2,7 @@ package graphene_test
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -368,5 +369,353 @@ func TestSecurityDoc_CRC32IsNotTamperDetection(t *testing.T) {
 	}
 	if w.Truncated {
 		t.Fatal("fixture error: unexpected truncation")
+	}
+}
+
+// --- §5, anchoring ---
+//
+// §5 makes four claims a reader will act on: that a checkpoint binds all four
+// histories, that the check runs in both directions, that a destroyed local
+// record reads as broken rather than unanchored, and that the local anchor
+// refuses to live inside the store. Each is executed below.
+
+// anchoredDocStore is §5's setup: a signed, audited store with retention, plus
+// an anchor kept outside it.
+func anchoredDocStore(t *testing.T) (*disk.Store, disk.Anchor, string) {
+	t.Helper()
+	dir := t.TempDir()
+
+	key, pub, err := signing.GenerateKey(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring := signing.NewKeyring()
+	if err := ring.Add(1, pub); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := disk.StrictOptions(key, ring, 42)
+	opts.Retention = disk.RetentionPolicy{MaxSegments: 10}
+	s, err := disk.OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	if _, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	anchor, err := disk.NewInsecureLocalAnchor(filepath.Join(t.TempDir(), "anchor.bin"), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, anchor, dir
+}
+
+// SECURITY.md §5 "What is published" and "What is checked", the documented flow.
+func TestSecurityDoc_PublishingAndCheckingACheckpoint(t *testing.T) {
+	s, anchor, _ := anchoredDocStore(t)
+
+	// The two calls the document shows.
+	c, rec, err := s.PublishCheckpoint(anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Digest != c.Digest {
+		t.Fatal("the anchor acknowledged a digest other than the checkpoint's")
+	}
+
+	report, err := s.VerifyAgainstAnchor(anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Broken() {
+		t.Fatalf("a freshly published checkpoint reported broken: %v", report.Gaps)
+	}
+	if report.Matched != 1 {
+		t.Fatalf("the anchor confirmed %d checkpoints, want 1", report.Matched)
+	}
+
+	// "A store that moved on is not a store that was tampered with."
+	if _, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeTag}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := s.VerifyAgainstAnchor(anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.Broken() {
+		t.Fatalf("§5 says ordinary progress is a finding, not a break: %v", moved.Gaps)
+	}
+	if moved.CurrentMatchesLast {
+		t.Fatal("the store compacted; it cannot still match the witnessed checkpoint")
+	}
+	if len(moved.Gaps) == 0 {
+		t.Fatal("§5 says the unanchored window is reported rather than left to inference")
+	}
+}
+
+// SECURITY.md §5 "Binding all four matters" — the claim that publishing only the
+// snapshot root would leave the other histories free.
+func TestSecurityDoc_CheckpointBindsAllFourHistories(t *testing.T) {
+	s, _, _ := anchoredDocStore(t)
+
+	before, err := s.Checkpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An audit entry alone: no write, no compaction, so the snapshot cannot move.
+	if err := s.RecordAudit(disk.AuditCustom, 7, "a change the snapshot cannot see"); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := s.Checkpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.SnapshotRoot != before.SnapshotRoot {
+		t.Fatal("the snapshot root moved; this no longer isolates the audit history")
+	}
+	if after.Digest == before.Digest {
+		t.Fatal("§5 claims a checkpoint binds all four histories, but a changed audit log " +
+			"left the digest untouched")
+	}
+}
+
+// SECURITY.md §5: "a scheme where destroying the evidence produces the innocent
+// verdict is not a scheme."
+func TestSecurityDoc_DestroyedLocalRecordReadsAsBroken(t *testing.T) {
+	s, anchor, dir := anchoredDocStore(t)
+	if _, _, err := s.PublishCheckpoint(anchor); err != nil {
+		t.Fatal(err)
+	}
+
+	// Whatever the local record is called, removing it must not soften the
+	// verdict. Found by name so the test breaks loudly if the file is renamed.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := 0
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".checkpoints" || e.Name() == "graphene.checkpoints" {
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+				t.Fatal(err)
+			}
+			removed++
+		}
+	}
+	if removed != 1 {
+		t.Fatalf("expected exactly one local checkpoint record to remove, found %d", removed)
+	}
+
+	report, err := s.VerifyAgainstAnchor(anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Broken() {
+		t.Fatal("§5 says a published digest with no local checkpoint is broken; it was not reported")
+	}
+	if bytes.Contains([]byte(report.Summary()), []byte("unanchored")) {
+		t.Errorf("§5 says this must never read as unanchored, but the summary is %q", report.Summary())
+	}
+}
+
+// SECURITY.md §5 "The one implementation, and why you must not use it" — the
+// constructor refuses a path inside the store.
+func TestSecurityDoc_LocalAnchorRefusesToLiveInsideTheStore(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := disk.NewInsecureLocalAnchor(filepath.Join(dir, "anchor.bin"), dir); err == nil {
+		t.Fatal("§5 says the constructor refuses a path inside the store directory; it did not")
+	}
+	if _, err := disk.NewInsecureLocalAnchor(filepath.Join(t.TempDir(), "anchor.bin"), dir); err != nil {
+		t.Fatalf("a path outside the store was refused: %v", err)
+	}
+}
+
+// --- §6, redaction ---
+//
+// §6 promises that content goes and the record stays, that a reason is
+// mandatory, that the cascade is capped when the caller caps it, that the
+// version hash is the same value as the snapshot leaf, and that the ledger
+// survives compaction. Each is executed below.
+
+func redactableDocStore(t *testing.T) (*disk.Store, string) {
+	t.Helper()
+	dir := t.TempDir()
+
+	key, pub, err := signing.GenerateKey(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring := signing.NewKeyring()
+	if err := ring.Add(1, pub); err != nil {
+		t.Fatal(err)
+	}
+
+	// The configuration §6 spells out.
+	opts := disk.StrictOptions(key, ring, 42)
+	opts.Redaction = true
+	opts.RedactionPolicy = disk.RedactionPolicy{MaxCascade: 50}
+
+	s, err := disk.OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s, dir
+}
+
+// SECURITY.md §6 "What survives", the documented flow end to end.
+func TestSecurityDoc_RedactionKeepsTheRecord(t *testing.T) {
+	s, _ := redactableDocStore(t)
+
+	id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The two calls §6 shows.
+	impact, err := s.RedactionImpactFor(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if impact.ExceedsPolicy {
+		t.Fatal("a single node with no edges exceeded a cascade limit of 50")
+	}
+
+	rec, err := s.RedactNode(id, disk.RedactionRequest{
+		ActorID: 7, RoleID: 3, Reason: "subject access request 41",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The content is gone.
+	if s.NodeExists(id) {
+		t.Fatal("§6 says the content goes; the node is still there")
+	}
+	// Everything in the table is not.
+	if rec.ActorID != 7 || rec.RoleID != 3 || rec.Reason != "subject access request 41" {
+		t.Fatalf("§6's table promises actor, role and reason survive: %+v", rec)
+	}
+	if rec.UnixNano == 0 || rec.VersionHash == (merkle.Hash{}) {
+		t.Fatalf("§6's table promises time and version hash survive: %+v", rec)
+	}
+}
+
+// SECURITY.md §6 "A reason is mandatory."
+func TestSecurityDoc_RedactionRequiresAReason(t *testing.T) {
+	s, _ := redactableDocStore(t)
+
+	id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeTag}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.RedactNode(id, disk.RedactionRequest{ActorID: 1})
+	if !errors.Is(err, disk.ErrRedactionUnexplained) {
+		t.Fatalf("§6 says a reason is mandatory; an unexplained redaction returned %v", err)
+	}
+	if !s.NodeExists(id) {
+		t.Fatal("a refused redaction destroyed the node anyway")
+	}
+}
+
+// SECURITY.md §6: the version hash "is deliberately the same value as that
+// entity's Merkle leaf in a snapshot".
+func TestSecurityDoc_RedactionVersionHashIsTheSnapshotLeaf(t *testing.T) {
+	s, _ := redactableDocStore(t)
+
+	id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	proof, err := s.ProveNode(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.RedactNode(id, disk.RedactionRequest{ActorID: 1, Reason: "hash identity"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if rec.VersionHash != merkle.HashLeaf(proof.LeafData) {
+		t.Fatal("§6 claims the version hash is the snapshot leaf; a holder of the old " +
+			"image cannot match the record against it")
+	}
+}
+
+// SECURITY.md §6: "The ledger is not in the WAL ... compaction never touches
+// it", and its head is bound into §5's checkpoint.
+func TestSecurityDoc_RedactionLedgerSurvivesCompactionAndIsAnchored(t *testing.T) {
+	s, dir := redactableDocStore(t)
+
+	id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeTag}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := s.Checkpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNode(id, disk.RedactionRequest{ActorID: 1, Reason: "outlives the log"}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.Checkpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Digest == before.Digest {
+		t.Fatal("§6 says the ledger head is bound into the checkpoint; the digest did not move")
+	}
+
+	// Compaction must not touch it.
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := disk.ReadRedactions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ledger) != 1 || ledger[0].Reason != "outlives the log" {
+		t.Fatalf("§6 says compaction never touches the ledger; it holds %d records", len(ledger))
+	}
+	if err := disk.VerifyRedactionChain(ledger, nil); err != nil {
+		t.Errorf("the ledger did not survive compaction intact: %v", err)
+	}
+}
+
+// SECURITY.md §6 "It requires Options.Redaction, and refuses rather than quietly
+// falling back to a plain delete."
+func TestSecurityDoc_RedactionRefusesWithoutTheOption(t *testing.T) {
+	dir := t.TempDir()
+	s, err := disk.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeTag}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNode(id, disk.RedactionRequest{ActorID: 1, Reason: "no ledger"}); err == nil {
+		t.Fatal("§6 says it refuses without Options.Redaction; it did not")
+	}
+	if !s.NodeExists(id) {
+		t.Fatal("§6 says it refuses rather than falling back to a plain delete; the node is gone")
 	}
 }

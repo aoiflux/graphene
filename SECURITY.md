@@ -117,13 +117,20 @@ Do not assume any of the following. None of it exists:
   **not** recorded — that would put a synchronous append on the query path, and
   a caller needing it should record what matters via the API. Removing an entry
   from the middle is detectable; deleting the whole file is not, without an
-  external anchor.
-- **No durable key history.** Rotations *are* recorded (see §4), but in the WAL,
-  which a compaction truncates. Rotations from before the last compaction are
-  gone, so a full key history needs log retention, which is not built.
-- **No redaction primitive.** `DeleteNode` cascades and tombstones; after a
-  compaction the entity is unrecoverable and the deletion is unattributed.
-  Lawful redaction and evidence destruction are currently the same operation.
+  external anchor — see §5.
+- **Key history depends on retention being switched on.** Rotations *are*
+  recorded (see §4), but in the WAL, which a compaction truncates. With
+  `Options.Retention` set, retired segments survive and so do the rotations in
+  them; with the zero value — the default — every rotation before the last
+  compaction is gone.
+- **No anchoring transport.** §5's checkpoints define what to publish and how to
+  check it, and the engine ships nowhere to publish *to*. Supplying an anchor is
+  the deployment's job, and until one exists every guarantee in this document is
+  the store vouching for itself.
+- **`DeleteNode` is still unattributed.** It cascades and tombstones, records
+  nothing about who or why, and after a compaction leaves no trace at all. It is
+  unchanged and still the default. `RedactNode` (§6) is the attributed form, and
+  a store that has not set `Options.Redaction` has only the unattributed one.
 - **No history.** The engine stores current state. Superseded versions survive
   only until the next compaction truncates the log.
 - **No network exposure**, and therefore no transport security to configure.
@@ -305,14 +312,160 @@ contents are true, that T is accurate, or that K's holder was uncompromised.
 
 ---
 
-## 5. Residual risks
+## 5. Anchoring: the only check that is not the store's own word
+
+Everything in §4 compares the store against the store. That catches corruption
+and it catches an outsider. It does not catch someone who holds the signing key
+and can rewrite every chain consistently — the result verifies perfectly, because
+there is nothing left to disagree with it.
+
+An **anchor** is somewhere outside the store where a digest is published and
+cannot afterwards be changed by whoever controls the store. That property comes
+entirely from where the anchor lives and who runs it. Nothing in this process can
+establish it, which is why the engine defines the interface and ships no
+transport.
+
+### What is published
+
+A `Checkpoint` binds all four histories at one instant — snapshot root,
+attestation, WAL segment head, audit head, plus the counts of each:
+
+```go
+c, rec, err := s.PublishCheckpoint(anchor)   // captures, publishes, records
+```
+
+Binding all four matters. Publishing only the snapshot root leaves the other
+three free: an adversary who rewrites the audit log alone changes no snapshot
+root and passes that check. A checkpoint does not offer the choice.
+
+A zero head is committed to as a zero head, so "there was no audit log" cannot
+later be retrofitted into "here is the audit log".
+
+### What is checked
+
+```go
+report, err := s.VerifyAgainstAnchor(anchor)
+custody, err := s.CustodyForAnchor(id, verifier, anchor)   // §4's custody, anchored
+```
+
+The check runs in both directions, and both directions are load-bearing:
+
+- **A local checkpoint the anchor never witnessed** means the local chain was
+  rewritten. An adversary can forge a self-consistent chain; they cannot forge a
+  publication that already happened.
+- **A published digest with no local checkpoint** means the local record was
+  destroyed. This is reported as **broken**, never as "unanchored" — deleting a
+  file is easier than forging a chain, and a scheme where destroying the evidence
+  produces the innocent verdict is not a scheme.
+
+`VerifyCheckpointChain` additionally checks that the local chain links up. That
+is a weak check by design: an adversary who recomputes it forward passes. It is
+there for when the anchor is unreachable, not as a substitute for one.
+
+### What an anchor does not prove
+
+Only that a digest existed at a time. Specifically:
+
+- **It says nothing about the unanchored tail.** Everything since the last
+  publication is still freely rewritable. `AnchorAudit` reports that window
+  rather than leaving you to infer it, and the guarantee is bounded by how often
+  you publish — not by anything the engine does.
+- **A store that moved on is not a store that was tampered with.** Ordinary
+  progress makes the live state differ from the last witnessed checkpoint. That
+  is reported as a finding, not a break. History that *shrank* is a break.
+- **It does not make the contents true.** Same limit as every signature here.
+
+### The one implementation, and why you must not use it
+
+`disk.InsecureLocalAnchor` writes digests to a file on the same machine. **It is
+not an anchor** — anyone who can rewrite the store can rewrite it. It exists so
+the verification path can be tested and demonstrated without the engine
+acquiring a network dependency. Its constructor refuses a path inside the store
+directory, which is a tripwire against the most likely misuse and not a security
+property.
+
+A real deployment implements `disk.Anchor` against a timestamp authority, a
+transparency log, another organisation's storage, or a printed sheet in a safe.
+The engine does not care which; it cares that whoever can rewrite the store
+cannot rewrite that.
+
+---
+
+## 6. Redaction: removing content without removing the record
+
+`DeleteNode` destroys an entity and says nothing about it. After a compaction
+there is no trace it ever existed — which means **lawful redaction and evidence
+destruction look identical**. An engine holding evidence has to be able to comply
+with an erasure order without that compliance being indistinguishable from
+tampering.
+
+`RedactNode` is the attributed form. It requires `Options.Redaction`, and refuses
+rather than quietly falling back to a plain delete.
+
+```go
+opts := disk.StrictOptions(key, ring, actorID)
+opts.Redaction = true
+opts.RedactionPolicy = disk.RedactionPolicy{MaxCascade: 50}
+
+impact, err := s.RedactionImpactFor(id)     // what would go, before anything goes
+rec, err := s.RedactNode(id, disk.RedactionRequest{
+    ActorID: 7, RoleID: 3, Reason: "subject access request 41",
+})
+```
+
+### What survives
+
+| Kept | Why it matters |
+| --- | --- |
+| the **fact** | a record exists that a redaction happened |
+| the **actor**, role and time | the removal is attributable |
+| the **reason** | required; an unexplained redaction is indistinguishable from destruction |
+| the **shape** | which entity, and every edge cascaded with it |
+| the **version hash** | the identity of what was destroyed |
+
+The version hash is the load-bearing part, and it is deliberately **the same
+value as that entity's Merkle leaf in a snapshot**. A party holding the redacted
+content can prove it is what was removed; a party holding only the ledger can
+prove something specific was removed without learning what it was.
+
+### The rules the engine enforces
+
+- **A reason is mandatory.** `ErrRedactionUnexplained`.
+- **The cascade is capped if you cap it.** `RedactionPolicy.MaxCascade` bounds how
+  much one redaction may take with it — the hub-node problem. The zero value is
+  unbounded; how much removal is too much is a legal question, not an
+  engineering one.
+- **The record is written before the deletion.** A record with no matching
+  deletion is explicable; a deletion with no record is the exact hole this
+  exists to prevent.
+- **The ledger is not in the WAL.** Compaction truncates the WAL, so a deletion
+  record there would be destroyed by the operation that makes the deletion
+  permanent. `graphene.redactions` is its own append-only, hash-chained file that
+  compaction never touches.
+- **Its head is bound into the checkpoint** (§5), so deleting the ledger wholesale
+  is externally detectable rather than silent.
+
+### What it does not do
+
+- **The graph keeps no tombstone.** After a compaction the CSR image contains
+  nothing about a redacted entity — no record, no proof of absence. Only the
+  ledger knows. Proving a redaction from a snapshot alone would need a tombstone
+  in the image itself, which is a format change that has not been made.
+- **It does not undo.** The content is gone. This is crypto-erasure's *shape*,
+  not key-wrapped reversibility.
+- **`RoleID` is recorded, never checked.** There is still no role model (§3).
+
+---
+
+## 7. Residual risks
 
 Stated plainly, because they do not go away:
 
 | Risk | Status |
 | --- | --- |
-| An attacker with **code execution in your process** | **Unmitigable in-engine.** They hold the key and can call any API. Only external anchoring and organisational controls apply |
-| **Rollback of the entire store** to an earlier valid state | Undetectable without an externally retained root. Every internal value is consistent in the older state |
+| An attacker with **code execution in your process** | **Unmitigable in-engine.** They hold the key and can call any API. Only external anchoring (§5) and organisational controls apply |
+| **Rollback of the entire store** to an earlier valid state | Undetectable without an externally retained root. Every internal value is consistent in the older state. §5 is the control; it is only as good as your publishing interval |
+| **Everything since the last checkpoint** | Freely rewritable even with anchoring configured. The window is set by how often you publish, not by the engine |
 | **Backdated timestamps** | Local clock readings are asserted, not proven. An external time authority (RFC 3161) is what would fix this; none is integrated |
 | **Poisoned ingest** | Signatures prove *who asserted* something, never *whether it is true*. Garbage in, signed garbage out |
 | **Stale property index** | `UpdateNode` leaves index entries pointing at superseded values, and the planner trusts them. Use `UpdateNodeIndexed`. The engine cannot detect this — property blobs are opaque to it |
@@ -320,7 +473,7 @@ Stated plainly, because they do not go away:
 
 ---
 
-## 6. Reporting a vulnerability
+## 8. Reporting a vulnerability
 
 **When in doubt, report privately.** Private is the default this policy assumes,
 and no report is ever criticised for having been sent that way.
@@ -347,7 +500,7 @@ report, requesting a private channel"* and no detail, and wait to be contacted.
 
 ### Two tiers, and why
 
-Treating parser robustness as a security concern (§7) and requiring private
+Treating parser robustness as a security concern (§9) and requiring private
 disclosure pull against each other: applied strictly, every fuzz-found panic
 becomes an embargoed report, which slows fixes for bugs that benefit from public
 corpora and outside eyes. So the routing depends on impact, not on category:
@@ -367,7 +520,7 @@ evidence it was handed is a tool that cannot be used at the moment it is needed.
 
 ---
 
-## 7. Scope
+## 9. Scope
 
 **In scope**
 
@@ -376,9 +529,9 @@ evidence it was handed is a tool that cannot be used at the moment it is needed.
 - Integrity checks that pass when they should fail.
 - Signature, inclusion-proof, or attestation verification flaws.
 - Unbounded resource consumption driven by file contents.
-- Any documented guarantee in this file that does not hold. **If §2 or §4 claims
-  something the code does not do, that is a security issue** — an overstated
-  guarantee is believed exactly when it matters.
+- Any documented guarantee in this file that does not hold. **If §2, §4, §5 or §6
+  claims something the code does not do, that is a security issue** — an
+  overstated guarantee is believed exactly when it matters.
 
 **Out of scope**
 

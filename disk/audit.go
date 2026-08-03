@@ -61,6 +61,8 @@ const (
 	AuditRetentionDelete
 	AuditVerify
 	AuditAttestationExport
+	AuditCheckpoint
+	AuditRedaction
 
 	// AuditCustom is the caller's, whose meaning the engine does not interpret.
 	AuditCustom AuditKind = 1000
@@ -80,6 +82,10 @@ func (k AuditKind) String() string {
 		return "verify"
 	case AuditAttestationExport:
 		return "attestation-export"
+	case AuditCheckpoint:
+		return "checkpoint"
+	case AuditRedaction:
+		return "redaction"
 	case AuditCustom:
 		return "custom"
 	default:
@@ -263,7 +269,14 @@ func (a *AuditLog) Record(kind AuditKind, actorID uint64, detail string) (AuditE
 }
 
 // Close closes the log.
+//
+// Nil-safe, because every caller holds it through a *Store field that is nil
+// whenever auditing is off, and making each of them check was how a handle got
+// leaked on the failure paths that matter most.
 func (a *AuditLog) Close() error {
+	if a == nil {
+		return nil
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.file == nil {

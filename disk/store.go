@@ -111,6 +111,11 @@ type Store struct {
 	retention  RetentionPolicy
 	segmentSeq uint64
 
+	// redactions is the ledger of attested removals, nil when Options.Redaction
+	// is off, and redaction the policy bounding a single cascade.
+	redactions *RedactionLedger
+	redaction  RedactionPolicy
+
 	// keyTimeline holds the rotations seen in the current log, in the order they
 	// were recorded. Guarded by mu.
 	//
@@ -304,6 +309,20 @@ type Options struct {
 	// parameter and has no default opinion.
 	Retention RetentionPolicy
 
+	// Redaction enables the redaction ledger, which records who destroyed what,
+	// when, and why — in its own file that compaction never truncates. See
+	// redact.go for why it cannot live in the WAL.
+	//
+	// Off by default, and the default keeps DeleteNode's existing behaviour: an
+	// unrecorded, unattributed removal. A store that has not opted in has no
+	// ledger and RedactNode refuses rather than silently degrading to a delete.
+	Redaction bool
+
+	// RedactionPolicy bounds a single redaction's cascade. The zero value
+	// permits any size; the engine has no opinion on how much removal is too
+	// much, because that is the caller's legal and operational question.
+	RedactionPolicy RedactionPolicy
+
 	// VerifyOnOpen checks the compacted image before loading it: the body
 	// digest, the Merkle roots against the records they describe, and — when a
 	// Verifier is set — the snapshot attestation's signature. A failure fails
@@ -335,6 +354,31 @@ func (s *Store) recordAudit(kind AuditKind, actorID uint64, detail string) error
 	}
 	_, err := s.audit.Record(kind, actorID, detail)
 	return err
+}
+
+// ErrAuditKindReserved rejects a caller trying to write an engine-owned entry.
+var ErrAuditKindReserved = errors.New("disk: that audit kind is the engine's to write")
+
+// RecordAudit appends a caller's own entry to the audit log, and does nothing
+// when auditing is disabled.
+//
+// This is what makes the engine's audit log usable for events only the caller
+// knows about — an export, an operator sign-off, a case-file reference. The
+// engine never interprets Detail.
+//
+// # Why only AuditCustom and above
+//
+// Kinds below AuditCustom are the engine's. Letting a caller write AuditCompact
+// would let them fabricate compaction records, and CustodyFor compares recorded
+// compactions against retired segments precisely to catch a compaction that was
+// never recorded — a forgeable record defeats the check it exists to support.
+// An audit log a caller can write arbitrary engine history into is not evidence
+// of what the engine did.
+func (s *Store) RecordAudit(kind AuditKind, actorID uint64, detail string) error {
+	if kind < AuditCustom {
+		return fmt.Errorf("%w: %s (use AuditCustom or above)", ErrAuditKindReserved, kind)
+	}
+	return s.recordAudit(kind, actorID, detail)
 }
 
 // AuditEntries returns this store's audit log, oldest first.
@@ -450,6 +494,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		requireSigned:    opts.RequireSignedCommits,
 		attestActorID:    opts.AttestActorID,
 		retention:        opts.Retention,
+		redaction:        opts.RedactionPolicy,
 	}
 
 	if opts.Audit {
@@ -459,6 +504,16 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 			return nil, fmt.Errorf("disk.Open: %w", aerr)
 		}
 		s.audit = al
+	}
+
+	if opts.Redaction {
+		rl, rerr := OpenRedactionLedger(dir)
+		if rerr != nil {
+			wal.Close()
+			s.audit.Close()
+			return nil, fmt.Errorf("disk.Open: %w", rerr)
+		}
+		s.redactions = rl
 	}
 
 	// Resume numbering past whatever segments already exist, so a reopened store
@@ -480,9 +535,8 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		// release it too. Missing this leaked a handle on exactly the paths that
 		// matter — a store rejected by VerifyOnOpen — and on Windows left the
 		// file undeletable.
-		if s.audit != nil {
-			s.audit.Close()
-		}
+		s.audit.Close()
+		s.redactions.Close()
 		return nil, fmt.Errorf(format, args...)
 	}
 
@@ -878,8 +932,16 @@ func (s *Store) DeleteNode(id store.NodeID) error {
 	if !s.nodeExistsLocked(id) {
 		return &store.ErrNotFound{Kind: "node", ID: uint64(id)}
 	}
-	incident := s.incidentEdgeIDsLocked(id)
+	return s.deleteNodeLocked(id, s.incidentEdgeIDsLocked(id))
+}
 
+// deleteNodeLocked tombstones a node and the given incident edges.
+//
+// Split out so RedactNode can compute the cascade, write its ledger record, and
+// then perform exactly the deletion it recorded — rather than recomputing the
+// cascade and risking a record that describes a different set from the one
+// actually removed. Caller must hold s.mu and must have checked the node exists.
+func (s *Store) deleteNodeLocked(id store.NodeID, incident []store.EdgeID) error {
 	// Durably record tombstones for the cascaded edges first, then the node, so
 	// a crash mid-delete never leaves an edge pointing at a missing node.
 	for _, eid := range incident {
@@ -1536,10 +1598,11 @@ func (s *Store) Close() error {
 	// audit error is still returned — it is not more important than durability,
 	// but it is not nothing either.
 	walErr := s.wal.Close()
-	if s.audit != nil {
-		if err := s.audit.Close(); err != nil && walErr == nil {
-			return err
-		}
+	if err := s.audit.Close(); err != nil && walErr == nil {
+		walErr = err
+	}
+	if err := s.redactions.Close(); err != nil && walErr == nil {
+		walErr = err
 	}
 	return walErr
 }

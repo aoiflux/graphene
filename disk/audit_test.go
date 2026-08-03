@@ -331,3 +331,72 @@ func TestAudit_StrictOptionsEnablesIt(t *testing.T) {
 		t.Fatal("StrictOptions leaves auditing off")
 	}
 }
+
+// A caller can record their own events, which is what SECURITY.md §3 promises.
+func TestAudit_CallerCanRecordTheirOwnEvents(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenWithOptions(dir, Options{Audit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.RecordAudit(AuditCustom, 9, "exported to case file 2026-114"); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.AuditEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := entries[len(entries)-1]
+	if last.Kind != AuditCustom || last.ActorID != 9 {
+		t.Fatalf("the caller's entry was not recorded as given: %+v", last)
+	}
+	if last.Detail != "exported to case file 2026-114" {
+		t.Errorf("detail was altered: %q", last.Detail)
+	}
+	if err := VerifyAuditChain(entries); err != nil {
+		t.Errorf("a caller entry broke the chain: %v", err)
+	}
+}
+
+// **A caller must not be able to forge engine history.** CustodyFor compares
+// recorded compactions against retired segments; if a caller could write
+// AuditCompact, that check could be satisfied by lying.
+func TestAudit_CallerCannotForgeEngineKinds(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenWithOptions(dir, Options{Audit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for _, k := range []AuditKind{AuditOpen, AuditCompact, AuditKeyRotation,
+		AuditRetentionDelete, AuditVerify, AuditAttestationExport, AuditCheckpoint} {
+		if err := s.RecordAudit(k, 1, "forged"); !errors.Is(err, ErrAuditKindReserved) {
+			t.Errorf("a caller was allowed to write %s (err=%v)", k, err)
+		}
+	}
+
+	entries, err := s.AuditEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Detail == "forged" {
+			t.Fatal("a rejected entry was written to the log anyway")
+		}
+	}
+}
+
+// Recording with auditing off is a no-op rather than an error: a caller should
+// not have to branch on configuration they may not own.
+func TestAudit_RecordingWithAuditingOffIsSilent(t *testing.T) {
+	s, _ := openFresh(t)
+	defer s.Close()
+
+	if err := s.RecordAudit(AuditCustom, 1, "nowhere to go"); err != nil {
+		t.Fatalf("recording into a store with no audit log errored: %v", err)
+	}
+}

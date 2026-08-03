@@ -1,23 +1,38 @@
 // Command graphene inspects a Graphene store from a shell.
 //
-// Every subcommand except `verify` reads graphene.csr and graphene.wal directly
-// and never opens the store. That is deliberate. Opening replays the log,
-// rebuilds indexes, and takes a handle on the WAL — and the moment you most want
-// to look at a store is the moment something has gone wrong with it and a live
-// process is probably still attached. An inspector that cannot be used then is
-// not much of an inspector.
+// The inspection subcommands read graphene.csr and graphene.wal directly and
+// never open the store. That is deliberate. Opening replays the log, rebuilds
+// indexes, and takes a handle on the WAL — and the moment you most want to look
+// at a store is the moment something has gone wrong with it and a live process
+// is probably still attached. An inspector that cannot be used then is not much
+// of an inspector.
 //
-// Nothing here writes. There is no repair, no truncate, no compact, and adding
-// one should be a deliberate decision rather than a convenience: a tool that is
-// safe to point at production is worth more than one that can also fix things.
+// `verify`, `custody` and `anchor` do open the store, because what they check
+// includes state that only exists once the log has been replayed. Each says so
+// on stderr before it does.
+//
+// There is no repair, no truncate, no compact. A tool that is safe to point at
+// production is worth more than one that can also fix things, and adding a
+// mutation should be a deliberate decision rather than a convenience.
+//
+// `anchor -publish` is the one subcommand that writes, and the exception is
+// argued rather than assumed: it only ever appends — a checkpoint and an audit
+// entry — and it can neither alter nor remove anything already recorded. It is
+// there because publishing a checkpoint is a routine scheduled action, and an
+// anchoring scheme that requires writing a program to use is one that does not
+// get used.
 //
 //	graphene info <dir>          summary of the image and the log
 //	graphene csr  <dir|file>     CSR header detail
 //	graphene wal  <dir|file>     record-by-record log dump
-//	graphene verify <dir>        structural index check (this one opens the store)
+//	graphene verify <dir>        structural index check (opens the store)
+//	graphene custody <dir>       chain-of-custody account for one entity (opens the store)
+//	graphene anchor <dir>        publish or check a checkpoint (opens the store; -publish writes)
+//	graphene redactions <dir>    the ledger of attributed removals
 package main
 
 import (
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,6 +42,8 @@ import (
 
 	"github.com/aoiflux/graphene"
 	"github.com/aoiflux/graphene/disk"
+	"github.com/aoiflux/graphene/merkle"
+	"github.com/aoiflux/graphene/store"
 )
 
 func main() {
@@ -46,6 +63,12 @@ func main() {
 		err = cmdWAL(args)
 	case "verify":
 		err = cmdVerify(args)
+	case "custody":
+		err = cmdCustody(args)
+	case "anchor":
+		err = cmdAnchor(args)
+	case "redactions":
+		err = cmdRedactions(args)
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -62,20 +85,39 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `graphene — read-only inspection of a Graphene store
+	fmt.Fprint(os.Stderr, `graphene — inspection of a Graphene store
 
 Usage:
-  graphene info   <dir>         summary of the image and the log
-  graphene csr    <dir|file>    CSR header detail
-  graphene wal    <dir|file>    record-by-record log dump
-  graphene verify <dir>         structural index check (opens the store)
+  graphene info    <dir>        summary of the image and the log
+  graphene csr     <dir|file>   CSR header detail
+  graphene wal     <dir|file>   record-by-record log dump
+  graphene verify  <dir>        structural index check (opens the store)
+  graphene custody <dir>        account for one entity across every history (opens the store)
+  graphene anchor  <dir>        publish or check a checkpoint (opens the store)
+  graphene redactions <dir>     ledger of attributed removals: who, when, why
 
-Only 'verify' opens the store; everything else reads the files directly and is
-safe to run against a store another process is using. Nothing here writes.
+info, csr, wal and redactions read the files directly and are safe to run
+against a store another process is using. verify, custody and anchor open the store, which
+replays the log and takes a handle on the WAL.
+
+'anchor -publish' is the only subcommand that writes, and it only appends.
 
 Flags:
-  wal  -limit N     stop after N records (0 = all, default 50)
-       -commits     show only batch commits and their provenance
+  wal      -limit N     stop after N records (0 = all, default 50)
+           -commits     show only batch commits and their provenance
+  csr      -verify      check the stored digest and Merkle roots
+  custody  -node ID     the entity to account for (required)
+           -anchor HEX  a snapshot root retained outside this system
+  redactions -node ID   show only records for one entity
+  anchor   -publish     capture and publish a checkpoint instead of checking one
+           -insecure-local-file PATH
+                        a local anchor file, which is NOT an anchor: anyone who
+                        can rewrite the store can rewrite it. The engine ships no
+                        real transport; implement disk.Anchor for one.
+
+Exit status is non-zero only when something is actually broken. An incomplete
+account — a store that was never signed, audited, or set to retain history — is
+reported as findings and exits zero.
 `)
 }
 
@@ -379,6 +421,224 @@ func cmdVerify(args []string) error {
 		fmt.Printf("delta holds %d records; log is %s\n",
 			st.Storage.DeltaRecords(), humanBytes(st.Storage.WALBytes))
 	}
+	return nil
+}
+
+// --- custody ---
+
+func cmdCustody(args []string) error {
+	fs := flag.NewFlagSet("custody", flag.ExitOnError)
+	node := fs.Uint64("node", 0, "node ID to account for")
+	anchor := fs.String("anchor", "", "hex snapshot root retained outside this system")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir := fs.Arg(0)
+	if dir == "" {
+		return fmt.Errorf("need a store directory")
+	}
+	if *node == 0 {
+		return fmt.Errorf("need -node")
+	}
+
+	// Opens the store: the report walks in-memory state as well as the files.
+	fmt.Fprintln(os.Stderr, "custody opens the store; do not run it against one another process is writing")
+
+	s, err := disk.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	// No verifier: this command has no key material, so signature-dependent
+	// layers report as unchecked rather than verified. A caller holding a public
+	// key gets a stronger answer from the API.
+	var report disk.CustodyReport
+	if *anchor != "" {
+		var h merkle.Hash
+		raw, derr := hex.DecodeString(*anchor)
+		if derr != nil || len(raw) != len(h) {
+			return fmt.Errorf("-anchor must be %d hex bytes", len(h))
+		}
+		copy(h[:], raw)
+		report, err = s.CustodyForAnchored(store.NodeID(*node), nil, h)
+	} else {
+		report, err = s.CustodyFor(store.NodeID(*node), nil)
+	}
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "node\t%d\n", report.NodeID)
+	fmt.Fprintf(w, "known to store\t%v\n", report.Live)
+	fmt.Fprintf(w, "in snapshot\t%v\n", report.InSnapshot)
+	if report.InSnapshot {
+		fmt.Fprintf(w, "snapshot root\t%x\n", report.SnapshotRoot)
+	}
+	fmt.Fprintf(w, "attested\t%v (verified: %v)\n", report.Attested, report.AttestationVerified)
+	fmt.Fprintf(w, "segments walked\t%d\n", report.SegmentsChecked)
+	fmt.Fprintf(w, "audit entries\t%d (%d compactions)\n", report.AuditEntriesWalked, report.CompactionsRecorded)
+	w.Flush()
+
+	fmt.Printf("\n%s\n", report.Summary())
+	if len(report.Gaps) > 0 {
+		fmt.Println()
+		for _, g := range report.Gaps {
+			fmt.Printf("  %s\n", g)
+		}
+	}
+
+	// Exit non-zero only for an actual break. An incomplete account is a
+	// finding, not a failure — most stores are legitimately not fully
+	// provisioned, and exiting 1 on that would make the command useless in a
+	// script.
+	if report.Broken() {
+		os.Exit(1)
+	}
+	return nil
+}
+
+// cmdAnchor publishes a checkpoint to an anchor, or checks the store against
+// one.
+//
+// The only anchor this command can offer is disk.InsecureLocalAnchor, which is
+// not an anchor — a file on the same machine is reachable by anyone who can
+// rewrite the store. The flag is named to say so, because a command that made
+// real anchoring look like a one-liner would produce stores that believe they
+// are witnessed and are not. A deployment with a genuine anchor implements the
+// disk.Anchor interface and calls the API.
+func cmdAnchor(args []string) error {
+	fs := flag.NewFlagSet("anchor", flag.ExitOnError)
+	publish := fs.Bool("publish", false, "capture and publish a checkpoint instead of verifying")
+	insecure := fs.String("insecure-local-file", "",
+		"path to a local anchor file, which is NOT an anchor; must be outside the store directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir := fs.Arg(0)
+	if dir == "" {
+		return fmt.Errorf("need a store directory")
+	}
+	if *insecure == "" {
+		return fmt.Errorf("need -insecure-local-file: this command ships no real anchor transport.\n" +
+			"See disk.Anchor — a genuine anchor lives where whoever can rewrite the store cannot reach it")
+	}
+
+	anchor, err := disk.NewInsecureLocalAnchor(*insecure, dir)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stderr, "anchor opens the store; do not run it against one another process is writing")
+	fmt.Fprintln(os.Stderr, "warning: a local file is not an external witness; this proves nothing against "+
+		"an adversary who can write to this machine")
+
+	s, err := disk.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	if *publish {
+		c, rec, perr := s.PublishCheckpoint(anchor)
+		if perr != nil {
+			return perr
+		}
+		fmt.Println(c)
+		fmt.Printf("published as %q at %s\n", rec.Ref,
+			time.Unix(0, rec.UnixNano).UTC().Format(time.RFC3339))
+		return nil
+	}
+
+	audit, err := s.VerifyAgainstAnchor(anchor)
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "checkpoints\t%d local, %d published\n", len(audit.Checkpoints), len(audit.Published))
+	fmt.Fprintf(w, "confirmed\t%d\n", audit.Matched)
+	if audit.LastAnchored != nil {
+		fmt.Fprintf(w, "last witnessed\tcheckpoint %d at %s\n", audit.LastAnchored.Seq,
+			time.Unix(0, audit.LastAnchoredAt).UTC().Format(time.RFC3339))
+		fmt.Fprintf(w, "store unchanged since\t%v\n", audit.CurrentMatchesLast)
+	}
+	w.Flush()
+
+	fmt.Printf("\n%s\n", audit.Summary())
+	if len(audit.Gaps) > 0 {
+		fmt.Println()
+		for _, g := range audit.Gaps {
+			fmt.Printf("  %s\n", g)
+		}
+	}
+
+	// Same rule as custody: non-zero for a break, not for an unanchored window.
+	if audit.Broken() {
+		os.Exit(1)
+	}
+	return nil
+}
+
+// cmdRedactions prints the redaction ledger.
+//
+// Reads the file directly rather than opening the store, like info/csr/wal. The
+// ledger is a standalone hash-chained file with no dependency on replayed state,
+// and the moment you most want to read it is the moment someone is asking what
+// was removed from a store that may well be in use.
+func cmdRedactions(args []string) error {
+	fs := flag.NewFlagSet("redactions", flag.ExitOnError)
+	node := fs.Uint64("node", 0, "show only records for this node ID")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir := fs.Arg(0)
+	if dir == "" {
+		return fmt.Errorf("need a store directory")
+	}
+
+	records, err := disk.ReadRedactions(dir)
+	if err != nil {
+		return err
+	}
+	if len(records) == 0 {
+		fmt.Println("no redactions recorded")
+		return nil
+	}
+
+	// Verified over the whole ledger before anything is filtered: a chain break
+	// anywhere makes every record suspect, including the ones asked for.
+	chainErr := disk.VerifyRedactionChain(records, nil)
+
+	for _, r := range records {
+		if *node != 0 && uint64(r.NodeID) != *node {
+			continue
+		}
+		fmt.Println(r)
+		fmt.Printf("    version hash %x\n", r.VersionHash)
+		if len(r.CascadedEdges) > 0 {
+			fmt.Printf("    edges        %v\n", r.CascadedEdges)
+		}
+		if len(r.Signature) > 0 {
+			fmt.Printf("    signed by    key %d\n", r.KeyID)
+		} else {
+			fmt.Printf("    unsigned\n")
+		}
+	}
+
+	noun := "records"
+	if len(records) == 1 {
+		noun = "record"
+	}
+	fmt.Printf("\n%d %s", len(records), noun)
+	if chainErr != nil {
+		// No key material here, so signatures are unchecked; the hash chain is
+		// not, and a break in it is the loud case.
+		fmt.Printf("\nCHAIN BROKEN: %v\n", chainErr)
+		os.Exit(1)
+	}
+	fmt.Println(", hash chain intact (signatures unchecked: no key supplied)")
 	return nil
 }
 
