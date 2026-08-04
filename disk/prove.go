@@ -166,7 +166,20 @@ func VerifyCSRRoots(path string) error {
 		payload.NodeProps = section.NodeProps
 		payload.EdgeProps = section.EdgeProps
 	}
+	// The tombstones the file carries are part of what its root describes.
+	// deserialiseCSR has already checked they produce the stored TombstoneRoot,
+	// so recomputing from them is not circular — it re-derives the same binding
+	// this function is testing the rest of the image against.
+	payload.Tombstones = csr.tombstones
+
 	recomputed := computeSnapshotRoots(csr, payload, stored.PrevRoot)
+
+	// Recomputation always produces the current body version. Comparing a v2
+	// binding against a v1 image's stored root would fail on the version alone
+	// and report it as a content mismatch, so the recomputed set adopts the
+	// stored version and the components below are what actually get compared.
+	recomputed.BodyVersion = stored.BodyVersion
+	recomputed.Snapshot = bindSnapshotRoot(recomputed)
 
 	switch {
 	case recomputed.NodeRoot != stored.NodeRoot:
@@ -178,6 +191,9 @@ func VerifyCSRRoots(path string) error {
 	case recomputed.IndexRoot != stored.IndexRoot:
 		return fmt.Errorf("verify roots: index root does not describe the property entries (stored %x, computed %x)",
 			stored.IndexRoot[:8], recomputed.IndexRoot[:8])
+	case stored.BodyVersion >= snapshotBodyV2 && recomputed.TombstoneRoot != stored.TombstoneRoot:
+		return fmt.Errorf("verify roots: tombstone root does not describe the recorded removals (stored %x, computed %x)",
+			stored.TombstoneRoot[:8], recomputed.TombstoneRoot[:8])
 	case recomputed.Snapshot != stored.Snapshot:
 		return fmt.Errorf("verify roots: snapshot root does not follow from its components")
 	}

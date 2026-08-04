@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aoiflux/graphene/index"
+	"github.com/aoiflux/graphene/merkle"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -309,6 +310,16 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		return nil, nil, err
 	}
 
+	// Tombstones (v8+, GRDT). Read before the roots, because the roots commit to
+	// them and the check below needs both.
+	if s, ok := findSection(trailer.Sections, csrSectionTombstones); ok {
+		ts, err := readTombstoneSection(data[s.Offset : s.Offset+s.Length])
+		if err != nil {
+			return nil, nil, fmt.Errorf("deserialiseCSR: tombstone section: %w", err)
+		}
+		csr.tombstones = ts
+	}
+
 	// Snapshot roots (v8+, GHSH). Critical when present, so an unreadable one is
 	// a hard failure rather than a missing convenience: this section is the
 	// file's integrity evidence.
@@ -316,6 +327,22 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		roots, err := readSnapshotSection(data[s.Offset : s.Offset+s.Length])
 		if err != nil {
 			return nil, nil, fmt.Errorf("deserialiseCSR: snapshot section: %w", err)
+		}
+
+		// The tombstones in the file must be the ones the root commits to. A
+		// mismatch means the section was added, removed, or edited after the
+		// roots were computed — which is precisely how someone would try to make
+		// a removal disappear, or invent one that never happened.
+		if roots.BodyVersion >= snapshotBodyV2 {
+			if got := merkle.Root(tombstoneLeaves(csr.tombstones)); got != roots.TombstoneRoot {
+				return nil, nil, fmt.Errorf(
+					"deserialiseCSR: the image's tombstones produce root %x but the snapshot names %x",
+					got[:8], roots.TombstoneRoot[:8])
+			}
+		} else if len(csr.tombstones) > 0 {
+			return nil, nil, fmt.Errorf(
+				"deserialiseCSR: the image carries %d tombstones but its snapshot root predates them "+
+					"and does not cover them", len(csr.tombstones))
 		}
 		csr.roots = roots
 	}

@@ -114,6 +114,18 @@ func (s *Store) Compact() error {
 		prevAttestation = s.csr.attestation.ID
 	}
 
+	// Tombstones are rebuilt from the ledger rather than carried forward from the
+	// previous image, so the image and the ledger cannot drift into disagreeing
+	// about what was destroyed. The ledger is the record; this is its projection.
+	//
+	// Read from disk rather than from s.redactions so that a store reopened with
+	// Options.Redaction off still carries forward the removals already recorded —
+	// switching the option off must not quietly drop them out of the image.
+	ledger, err := ReadRedactions(s.dir)
+	if err != nil {
+		return fmt.Errorf("compact: reading the redaction ledger: %w", err)
+	}
+
 	data, err := newCSR.SerialiseWithPayload(csrPayload{
 		NodeProps:         s.propIdx.NodeEntries(),
 		EdgeProps:         s.propIdx.EdgeEntries(),
@@ -121,6 +133,7 @@ func (s *Store) Compact() error {
 		OrderedEdgeKeys:   s.propIdx.OrderedEdgeKeys(),
 		PrevSnapshotRoot:  prevRoot,
 		WithSnapshotRoots: true,
+		Tombstones:        tombstonesFromLedger(ledger),
 		Signer:            s.signer,
 		AttestActorID:     s.attestActorID,
 		AttestUnixNano:    compactedAt.UnixNano(),

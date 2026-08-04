@@ -86,6 +86,11 @@ type CSRGraph struct {
 	// reports.
 	roots SnapshotRoots
 
+	// tombstones are this image's record of deliberate removals, present when
+	// the file carried a GRDT section. Nil otherwise, which for a pre-tombstone
+	// image means "unknown" rather than "none" — see tombstone.go.
+	tombstones []Tombstone
+
 	// attestation is the signed assertion over roots.Snapshot, present when the
 	// file carried a GATT section. Its Signature is nil when absent.
 	attestation Attestation
@@ -492,6 +497,14 @@ type csrPayload struct {
 	// serialising for a test or a fixture does not pay for a Merkle pass.
 	WithSnapshotRoots bool
 
+	// Tombstones are this image's record of deliberate removals, projected from
+	// the redaction ledger by the caller. They produce the GRDT section and the
+	// TombstoneRoot component of the snapshot root.
+	//
+	// Empty is meaningful: it commits to "this image records no removals", which
+	// is a claim rather than the absence of one.
+	Tombstones []Tombstone
+
 	// Signer, AttestActorID, AttestUnixNano and PrevAttestation produce a GATT
 	// section attesting the snapshot root. Nil Signer writes none.
 	Signer          store.Signer
@@ -633,6 +646,23 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 			Magic:  csrSectionOrderedKeys,
 			Offset: uint64(ordOffset),
 			Length: uint64(buf.Len() - ordOffset),
+		})
+	}
+
+	// Tombstones go down before the roots, because the roots commit to them.
+	if payload.WithSnapshotRoots && len(payload.Tombstones) > 0 {
+		g.tombstones = payload.Tombstones
+		tsOffset := buf.Len()
+		buf.Write(appendTombstoneSection(nil, payload.Tombstones))
+		sections = append(sections, csrSection{
+			// CRITICAL. A build that cannot read tombstones would present a
+			// redacted entity as one that never existed, which is the single
+			// confusion this section exists to prevent — so it must refuse the
+			// file rather than answer wrongly.
+			Magic:  csrSectionTombstones,
+			Flags:  csrSectionCritial,
+			Offset: uint64(tsOffset),
+			Length: uint64(buf.Len() - tsOffset),
 		})
 	}
 

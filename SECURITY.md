@@ -445,14 +445,50 @@ prove something specific was removed without learning what it was.
 - **Its head is bound into the checkpoint** (§5), so deleting the ledger wholesale
   is externally detectable rather than silent.
 
+### Proving a removal to someone holding only the image
+
+The ledger persuades whoever holds the store. It does nothing for the party who
+matters most in an evidentiary exchange: **someone handed a single compacted
+image and nothing else.** To them a redacted entity is simply not there,
+indistinguishable from one that never existed.
+
+So the image carries its own record. Each compaction writes a `GRDT` section of
+**tombstones** — entity ID, version hash, and which ledger record it came from —
+Merkle-rooted, with that root bound into the snapshot root:
+
+```go
+proof, err := s.ProveRedaction(id)
+err = disk.VerifyRedactionInclusion(retainedRoot, proof)   // recipient's side
+```
+
+That is the same shape as `ProveNode`, for an absence instead of a presence. A
+snapshot root retained outside the system therefore commits to **what was taken
+out of the image as well as what is in it** — so a removal cannot be erased from
+the record without changing the root someone already wrote down.
+
+Three properties worth stating:
+
+- **A tombstone carries no circumstances.** No content, no reason, no actor —
+  those stay in the ledger. The image is the artefact most likely to be handed to
+  someone who should not also receive an operator's name and a case reference.
+  The tombstone's record hash says *which* ledger entry to ask for, and lets the
+  recipient check they were given the right one.
+- **Tombstones are rebuilt from the ledger at each compaction**, never carried
+  forward. A second copy could drift, and an image and ledger that disagree about
+  what was destroyed while each verifies perfectly is worse than neither.
+- **Adding this changed what a snapshot root is.** Roots now come in two body
+  versions: v1 binds four components, v2 adds the tombstone root. A root retained
+  from a v1 image stays verifiable — it commits to less, which is not the same as
+  being wrong. `VerifyRedactionInclusion` refuses a v1 root outright rather than
+  checking a proof against a value that root never covered.
+
 ### What it does not do
 
-- **The graph keeps no tombstone.** After a compaction the CSR image contains
-  nothing about a redacted entity — no record, no proof of absence. Only the
-  ledger knows. Proving a redaction from a snapshot alone would need a tombstone
-  in the image itself, which is a format change that has not been made.
 - **It does not undo.** The content is gone. This is crypto-erasure's *shape*,
   not key-wrapped reversibility.
+- **A removal is only provable once compacted.** Between `RedactNode` and the
+  next `Compact` the ledger knows and the image does not; `CustodyReport`
+  reports that window as `RemovalProvable: false` rather than leaving it implicit.
 - **`RoleID` is recorded, never checked.** There is still no role model (§3).
 
 ---

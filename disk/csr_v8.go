@@ -91,6 +91,7 @@ const (
 	csrSectionEntityHash  = "GHSH" // per-entity version hashes — CRITICAL when written
 	csrSectionAttestation = "GATT" // signatures and attestations — CRITICAL when written
 	csrSectionComposite   = "GCMP" // composite index declarations — optional
+	csrSectionTombstones  = "GRDT" // records of deliberate removal — CRITICAL when written
 )
 
 // csrSection is one entry in the directory.
@@ -283,7 +284,8 @@ func checkCriticalSections(sections []csrSection) error {
 			continue
 		}
 		switch s.Magic {
-		case csrSectionPropIndex, csrSectionOrderedKeys, csrSectionEntityHash, csrSectionAttestation:
+		case csrSectionPropIndex, csrSectionOrderedKeys, csrSectionEntityHash, csrSectionAttestation,
+			csrSectionTombstones:
 			// Understood.
 		default:
 			return fmt.Errorf("deserialiseCSR: file carries critical section %q, which this build does not understand — "+

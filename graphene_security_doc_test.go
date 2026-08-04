@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aoiflux/graphene/disk"
@@ -717,5 +718,84 @@ func TestSecurityDoc_RedactionRefusesWithoutTheOption(t *testing.T) {
 	}
 	if !s.NodeExists(id) {
 		t.Fatal("§6 says it refuses rather than falling back to a plain delete; the node is gone")
+	}
+}
+
+// SECURITY.md §6 "Proving a removal to someone holding only the image" — the
+// documented flow, from the recipient's side.
+func TestSecurityDoc_RemovalIsProvableFromTheImageAlone(t *testing.T) {
+	s, _ := redactableDocStore(t)
+
+	id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNode(id, disk.RedactionRequest{ActorID: 7, Reason: "erasure order"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	// What the recipient holds: a root retained from outside the system.
+	roots, err := s.SnapshotRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The two calls §6 shows.
+	proof, err := s.ProveRedaction(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := disk.VerifyRedactionInclusion(roots.Snapshot, proof); err != nil {
+		t.Fatalf("§6 says a removal is provable against a retained root: %v", err)
+	}
+
+	// "A tombstone carries no circumstances."
+	if strings.Contains(string(proof.LeafData), "erasure order") {
+		t.Error("§6 says the tombstone carries no reason; the leaf contains it")
+	}
+	if proof.Tombstone.NodeID != id {
+		t.Errorf("the proof names node %d, want %d", proof.Tombstone.NodeID, id)
+	}
+}
+
+// SECURITY.md §6: "A removal is only provable once compacted", reported rather
+// than left implicit.
+func TestSecurityDoc_RemovalIsNotProvableUntilCompacted(t *testing.T) {
+	s, _ := redactableDocStore(t)
+
+	id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeTag}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNode(id, disk.RedactionRequest{ActorID: 1, Reason: "window"}); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := s.CustodyFor(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.RemovalProvable {
+		t.Fatal("§6 says a removal is not provable until compacted; it reported otherwise")
+	}
+
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.CustodyFor(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.RemovalProvable {
+		t.Fatal("§6 says compacting closes the window; it did not")
 	}
 }

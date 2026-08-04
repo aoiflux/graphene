@@ -46,9 +46,22 @@ const (
 	leafTagPropEntry = 0x03
 )
 
-// snapshotBodyVersion versions the GHSH section body, so roots can gain fields
-// later without disturbing the section directory around them.
-const snapshotBodyVersion = 1
+// GHSH section body versions, so roots can gain fields without disturbing the
+// section directory around them.
+//
+// v2 adds TombstoneRoot, and adding it **changes what a snapshot root is**. That
+// is why the version is carried in SnapshotRoots and consulted by
+// bindSnapshotRoot rather than the new component simply being appended: a root
+// retained outside the system is the one value SECURITY.md tells a holder to
+// keep, and silently changing how it is computed would invalidate exactly that.
+// A v1 image binds four components forever.
+const (
+	snapshotBodyV1 = 1
+	snapshotBodyV2 = 2
+
+	// snapshotBodyVersion is what newly written images carry.
+	snapshotBodyVersion = snapshotBodyV2
+)
 
 // SnapshotRoots is the Merkle identity of one compacted image.
 type SnapshotRoots struct {
@@ -64,8 +77,21 @@ type SnapshotRoots struct {
 	// a file is coherent, not that it belongs in this store's history.
 	PrevRoot merkle.Hash
 
-	// Snapshot binds the three roots and the predecessor into one value. This is
-	// the number worth publishing or retaining externally.
+	// TombstoneRoot is the root over this image's record of deliberate removals
+	// (tombstone.go). Zero when nothing has been redacted — and committed to as
+	// zero, so "this image recorded no removals" is a claim the root makes
+	// rather than an absence of one.
+	//
+	// Present only from BodyVersion v2.
+	TombstoneRoot merkle.Hash
+
+	// BodyVersion is the GHSH body version these roots came from, and it decides
+	// how many components bind into Snapshot. Zero is read as v1, which is what
+	// every SnapshotRoots value constructed before tombstones existed meant.
+	BodyVersion uint8
+
+	// Snapshot binds the component roots and the predecessor into one value.
+	// This is the number worth publishing or retaining externally.
 	Snapshot merkle.Hash
 }
 
@@ -183,9 +209,11 @@ func propEntryLeaves(nodeCount, edgeCount int, appendEntry func(i int, node bool
 // computeSnapshotRoots builds the roots for an image about to be written.
 func computeSnapshotRoots(g *CSRGraph, payload csrPayload, prev merkle.Hash) SnapshotRoots {
 	r := SnapshotRoots{
-		NodeRoot: merkle.Root(g.NodeLeaves()),
-		EdgeRoot: merkle.Root(g.EdgeLeaves()),
-		PrevRoot: prev,
+		NodeRoot:      merkle.Root(g.NodeLeaves()),
+		EdgeRoot:      merkle.Root(g.EdgeLeaves()),
+		PrevRoot:      prev,
+		TombstoneRoot: merkle.Root(tombstoneLeaves(payload.Tombstones)),
+		BodyVersion:   snapshotBodyVersion,
 	}
 
 	idxLeaves := propEntryLeaves(len(payload.NodeProps), len(payload.EdgeProps), func(i int, node bool) []byte {
@@ -214,44 +242,99 @@ func computeSnapshotRoots(g *CSRGraph, payload csrPayload, prev merkle.Hash) Sna
 
 // bindSnapshotRoot combines the component roots into the snapshot's identity.
 //
-// Built as a Merkle root over the four rather than a plain concatenation, so the
-// same domain separation applies and no component can be shifted into another's
-// position.
+// Built as a Merkle root over the components rather than a plain concatenation,
+// so the same domain separation applies and no component can be shifted into
+// another's position.
+//
+// **The component count depends on BodyVersion**, which is what keeps a v1
+// image's retained root verifiable by a build that knows about tombstones. The
+// version needs no separate protection: choosing the wrong one produces a
+// different bound value, so a proof claiming v1 for a v2 image simply fails to
+// reproduce the root it is checked against.
 func bindSnapshotRoot(r SnapshotRoots) merkle.Hash {
-	return merkle.Root([]merkle.Hash{
+	leaves := []merkle.Hash{
 		merkle.HashLeaf(r.NodeRoot[:]),
 		merkle.HashLeaf(r.EdgeRoot[:]),
 		merkle.HashLeaf(r.IndexRoot[:]),
 		merkle.HashLeaf(r.PrevRoot[:]),
-	})
+	}
+	if r.bodyVersion() >= snapshotBodyV2 {
+		leaves = append(leaves, merkle.HashLeaf(r.TombstoneRoot[:]))
+	}
+	return merkle.Root(leaves)
+}
+
+// bodyVersion reads a zero BodyVersion as v1.
+//
+// Every SnapshotRoots value constructed before tombstones existed leaves the
+// field at zero and means four components, so that is what zero has to mean.
+// Routed through one helper because binding and encoding must never disagree
+// about it: a value bound as v1 and written as v2 produces a section that fails
+// its own consistency check, which is how this was found.
+func (r SnapshotRoots) bodyVersion() uint8 {
+	if r.BodyVersion == 0 {
+		return snapshotBodyV1
+	}
+	return r.BodyVersion
 }
 
 // --- GHSH section encoding ---
 
-const snapshotSectionSize = 1 + 5*merkle.Size
+const (
+	snapshotSectionSizeV1 = 1 + 5*merkle.Size
+	snapshotSectionSizeV2 = snapshotSectionSizeV1 + merkle.Size
+)
 
+// appendSnapshotSection writes the layout matching r's own body version, not
+// whatever version this build prefers — so what is written is always what was
+// bound.
 func appendSnapshotSection(buf []byte, r SnapshotRoots) []byte {
-	buf = append(buf, snapshotBodyVersion)
+	v := r.bodyVersion()
+	buf = append(buf, v)
 	buf = append(buf, r.NodeRoot[:]...)
 	buf = append(buf, r.EdgeRoot[:]...)
 	buf = append(buf, r.IndexRoot[:]...)
 	buf = append(buf, r.PrevRoot[:]...)
+	if v >= snapshotBodyV2 {
+		buf = append(buf, r.TombstoneRoot[:]...)
+	}
 	return append(buf, r.Snapshot[:]...)
 }
 
+// readSnapshotSection parses a GHSH body of either version.
+//
+// v1 is still accepted rather than rejected as stale: an older image's roots are
+// not wrong, they simply commit to less, and a build that refused them would
+// make every pre-tombstone store unverifiable by the tool that is supposed to
+// verify it.
 func readSnapshotSection(data []byte) (SnapshotRoots, error) {
 	var r SnapshotRoots
 	if len(data) < 1 {
 		return r, fmt.Errorf("empty snapshot section")
 	}
-	if v := data[0]; v != snapshotBodyVersion {
-		return r, fmt.Errorf("snapshot section version %d, this build understands %d", v, snapshotBodyVersion)
+
+	var want int
+	switch v := data[0]; v {
+	case snapshotBodyV1:
+		r.BodyVersion, want = snapshotBodyV1, snapshotSectionSizeV1
+	case snapshotBodyV2:
+		r.BodyVersion, want = snapshotBodyV2, snapshotSectionSizeV2
+	default:
+		return r, fmt.Errorf("snapshot section version %d, this build understands %d and %d",
+			v, snapshotBodyV1, snapshotBodyV2)
 	}
-	if len(data) < snapshotSectionSize {
-		return r, fmt.Errorf("truncated snapshot section: %d bytes, need %d", len(data), snapshotSectionSize)
+	if len(data) < want {
+		return r, fmt.Errorf("truncated snapshot section: %d bytes, need %d", len(data), want)
 	}
+
+	fields := []*merkle.Hash{&r.NodeRoot, &r.EdgeRoot, &r.IndexRoot, &r.PrevRoot}
+	if r.BodyVersion >= snapshotBodyV2 {
+		fields = append(fields, &r.TombstoneRoot)
+	}
+	fields = append(fields, &r.Snapshot)
+
 	pos := 1
-	for _, dst := range []*merkle.Hash{&r.NodeRoot, &r.EdgeRoot, &r.IndexRoot, &r.PrevRoot, &r.Snapshot} {
+	for _, dst := range fields {
 		copy(dst[:], data[pos:pos+merkle.Size])
 		pos += merkle.Size
 	}

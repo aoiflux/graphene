@@ -112,6 +112,14 @@ type CustodyReport struct {
 	// distinction between lawful redaction and evidence destruction.
 	Redacted *RedactionRecord
 
+	// RemovalProvable reports whether the compacted image itself records the
+	// removal, under the snapshot root, rather than only the ledger doing so.
+	//
+	// The distinction is who can be convinced. A ledger entry persuades someone
+	// holding the store; a tombstone under a retained root persuades someone
+	// holding nothing but the image.
+	RemovalProvable bool
+
 	// Gaps is everything that could not be accounted for.
 	Gaps []CustodyGap
 }
@@ -317,6 +325,24 @@ func (s *Store) CustodyFor(id store.NodeID, verifier store.Verifier) (CustodyRep
 				r.Redacted = &rec
 				break
 			}
+		}
+	}
+
+	// Whether the *image* records the removal, or only the ledger does. The
+	// difference matters to anyone who will be handed the image alone: a ledger
+	// entry is the store's word, a tombstone under the snapshot root is evidence.
+	if r.Redacted != nil {
+		if _, perr := s.ProveRedaction(id); perr == nil {
+			r.RemovalProvable = true
+		} else if !errorIs(perr, ErrNoTombstone) && !errorIs(perr, ErrNoSnapshotRoots) {
+			return r, perr
+		} else {
+			r.Gaps = append(r.Gaps, CustodyGap{
+				Layer: LayerRedaction,
+				Detail: "the removal is in the ledger but not in the compacted image; " +
+					"compact to bind it into the snapshot root, or a recipient given only the " +
+					"image cannot tell this entity from one that never existed",
+			})
 		}
 	}
 
