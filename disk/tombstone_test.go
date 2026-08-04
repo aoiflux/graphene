@@ -115,9 +115,15 @@ func TestTombstone_RootCommitsToRemovals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if before.BodyVersion != snapshotBodyV2 {
+	// The intent is that a fresh image binds the tombstone root, not that it
+	// carries any one version — so this tracks the constant and separately
+	// insists the constant is high enough to cover tombstones.
+	if before.BodyVersion != snapshotBodyVersion {
 		t.Fatalf("a newly written image carries body version %d, want %d",
-			before.BodyVersion, snapshotBodyV2)
+			before.BodyVersion, snapshotBodyVersion)
+	}
+	if snapshotBodyVersion < snapshotBodyV2 {
+		t.Fatal("the current body version does not bind the tombstone root")
 	}
 	if before.TombstoneRoot != merkle.EmptyRoot() {
 		t.Error("an image with no removals should carry the empty tombstone root")
@@ -507,5 +513,342 @@ func TestTombstone_CustodyReportsWhetherTheRemovalIsProvable(t *testing.T) {
 		if g.Layer == LayerRedaction && strings.Contains(g.Detail, "not in the compacted image") {
 			t.Error("the gap survived the compaction that closed it")
 		}
+	}
+}
+
+// A property strip is provable from the image, and reads as a strip rather than
+// a removal — the entity is still sitting in front of the reader.
+func TestTombstone_PropertyStripIsProvableAndDistinct(t *testing.T) {
+	_, s, ring := redactableStore(t)
+	id := addNodeD(t, s, store.NodeTypeMicroArtefact)
+	if err := s.UpdateNode(&store.Node{
+		ID: id, Labels: []store.NodeType{store.NodeTypeMicroArtefact},
+		Properties: []byte("name=jane.doe"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNodeProperties(id, RedactionRequest{ActorID: 3, Reason: "erasure"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	roots, err := s.SnapshotRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := s.ProveRedaction(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRedactionInclusion(roots.Snapshot, proof); err != nil {
+		t.Fatalf("a property strip did not verify: %v", err)
+	}
+	if proof.Tombstone.Scope != ScopeProperties {
+		t.Fatalf("the tombstone reads as scope %s, want properties", proof.Tombstone.Scope)
+	}
+
+	// The entity is still present and still provable as present. Both proofs
+	// hold at once, which is the whole point of the narrower scope.
+	if !s.NodeExists(id) {
+		t.Fatal("the entity was removed by a property redaction")
+	}
+	if _, err := s.ProveNode(id); err != nil {
+		t.Fatalf("the surviving entity is not provable in the image: %v", err)
+	}
+
+	r, err := s.CustodyFor(id, ring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Live || !r.InSnapshot {
+		t.Fatal("custody reports a stripped node as gone")
+	}
+	if !strings.Contains(r.Summary(), "properties redacted") {
+		t.Errorf("the summary does not describe a property strip: %q", r.Summary())
+	}
+}
+
+// An edge removal is provable, and its proof is not reachable by node ID —
+// edge and node IDs are different namespaces.
+func TestTombstone_EdgeRemovalIsProvableInItsOwnNamespace(t *testing.T) {
+	_, s, _ := redactableStore(t)
+	hub := hubWithSpokes(t, s, 3)
+	impact, err := s.RedactionImpactFor(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := impact.CascadedEdges[0]
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactEdge(target, RedactionRequest{ActorID: 1, Reason: "withdrawn"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	roots, err := s.SnapshotRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := s.ProveEdgeRedaction(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRedactionInclusion(roots.Snapshot, proof); err != nil {
+		t.Fatalf("an edge removal did not verify: %v", err)
+	}
+	if proof.Tombstone.Scope != ScopeEdge || proof.Tombstone.EdgeID != target {
+		t.Fatalf("the tombstone does not describe edge %d: %+v", target, proof.Tombstone)
+	}
+
+	// The same number must not resolve as a node removal.
+	if _, err := s.ProveRedaction(store.NodeID(target)); !errors.Is(err, ErrNoTombstone) {
+		t.Fatalf("an edge tombstone answered a node query (err=%v)", err)
+	}
+}
+
+// A node stripped and then removed outright has two records; the proof must
+// describe its present state, not the first thing that happened to it.
+func TestTombstone_LatestRecordWins(t *testing.T) {
+	_, s, _ := redactableStore(t)
+	id := addNodeD(t, s, store.NodeTypeMicroArtefact)
+	if err := s.UpdateNode(&store.Node{
+		ID: id, Labels: []store.NodeType{store.NodeTypeMicroArtefact},
+		Properties: []byte("pii"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNodeProperties(id, RedactionRequest{ActorID: 1, Reason: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNode(id, RedactionRequest{ActorID: 1, Reason: "then the whole thing"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	proof, err := s.ProveRedaction(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof.Tombstone.Scope != ScopeNode {
+		t.Fatalf("the proof describes the earlier strip (%s), not the removal that followed",
+			proof.Tombstone.Scope)
+	}
+	if s.NodeExists(id) {
+		t.Fatal("the entity survived a whole-node redaction")
+	}
+}
+
+// --- §11.2's separated property hash ---
+
+// **The property §11.2 was designed for.** A verifier learns that an entity's
+// properties were removed and that nothing else about it changed, without ever
+// being shown what the properties were.
+func TestPropertyHash_RemovalIsProvableWithoutRevealingContent(t *testing.T) {
+	_, s, _ := redactableStore(t)
+	id := addNodeD(t, s, store.NodeTypeMicroArtefact)
+	const secret = "name=jane.doe;dob=1984-02-11;nhs=4457718123"
+	if err := s.UpdateNode(&store.Node{
+		ID: id, Labels: []store.NodeType{store.NodeTypeMicroArtefact, store.NodeTypeTag},
+		Properties: []byte(secret),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNodeProperties(id, RedactionRequest{ActorID: 7, Reason: "erasure request"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	roots, err := s.SnapshotRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := s.ProvePropertyRedaction(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyPropertyRedaction(roots.Snapshot, proof); err != nil {
+		t.Fatalf("a genuine property redaction did not verify: %v", err)
+	}
+
+	// **Nothing in the proof reveals the content.** This is the claim.
+	for _, blob := range [][]byte{
+		proof.PriorLeafData, proof.Surviving.LeafData, proof.Removal.LeafData,
+	} {
+		if strings.Contains(string(blob), "jane.doe") || strings.Contains(string(blob), "4457718123") {
+			t.Fatal("the proof carries the redacted content")
+		}
+	}
+
+	// The two leaves agree everywhere but the final 32 bytes.
+	split := len(proof.PriorLeafData) - merkle.Size
+	if !bytesEqual(proof.PriorLeafData[:split], proof.Surviving.LeafData[:split]) {
+		t.Fatal("the prior and surviving leaves differ outside the property hash")
+	}
+	if bytesEqual(proof.PriorLeafData[split:], proof.Surviving.LeafData[split:]) {
+		t.Fatal("the property hash did not change, so nothing was removed")
+	}
+}
+
+// A verifier holding the removed blob can confirm it is what was destroyed —
+// the other half of the same design.
+func TestPropertyHash_HolderOfTheContentCanConfirmIt(t *testing.T) {
+	_, s, _ := redactableStore(t)
+	id := addNodeD(t, s, store.NodeTypeMicroArtefact)
+	const secret = "the removed blob"
+	if err := s.UpdateNode(&store.Node{
+		ID: id, Labels: []store.NodeType{store.NodeTypeMicroArtefact},
+		Properties: []byte(secret),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.RedactNodeProperties(id, RedactionRequest{ActorID: 1, Reason: "confirmable"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if rec.PriorPropertiesHash != propertiesHash([]byte(secret)) {
+		t.Fatal("the record's property hash is not the hash of what was removed")
+	}
+	if rec.PriorPropertiesHash == propertiesHash([]byte("something else")) {
+		t.Fatal("a different blob hashed the same")
+	}
+}
+
+// **A forged claim must not verify.** Changing the labels as well as the
+// properties is not a property-only redaction, and the proof must say so.
+func TestPropertyHash_RefusesWhenIdentityAlsoChanged(t *testing.T) {
+	_, s, _ := redactableStore(t)
+	id := addNodeD(t, s, store.NodeTypeMicroArtefact)
+	if err := s.UpdateNode(&store.Node{
+		ID: id, Labels: []store.NodeType{store.NodeTypeMicroArtefact},
+		Properties: []byte("pii"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNodeProperties(id, RedactionRequest{ActorID: 1, Reason: "forge me"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := s.SnapshotRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := s.ProvePropertyRedaction(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim the entity previously had a different label.
+	forged := proof
+	forged.PriorLeafData = append([]byte(nil), proof.PriorLeafData...)
+	forged.PriorLeafData[9] ^= 0x01 // inside the label region
+	if err := VerifyPropertyRedaction(roots.Snapshot, forged); err == nil {
+		t.Fatal("a proof claiming the identity also changed was accepted")
+	}
+
+	// Claim a different prior property hash than the ledger recorded.
+	forged2 := proof
+	forged2.PriorLeafData = append([]byte(nil), proof.PriorLeafData...)
+	forged2.PriorLeafData[len(forged2.PriorLeafData)-1] ^= 0x01
+	if err := VerifyPropertyRedaction(roots.Snapshot, forged2); err == nil {
+		t.Fatal("a proof with an invented prior property hash was accepted")
+	}
+}
+
+// The proof is refused for an entity whose properties are still present, and for
+// a whole-entity removal.
+func TestPropertyHash_RefusesTheWrongScope(t *testing.T) {
+	_, s, _ := redactableStore(t)
+	kept := addNodeD(t, s, store.NodeTypeTag)
+	gone := addNodeD(t, s, store.NodeTypeTag)
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactNode(gone, RedactionRequest{ActorID: 1, Reason: "whole thing"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.ProvePropertyRedaction(gone); !errors.Is(err, ErrNoPropertyRedaction) {
+		t.Fatalf("a whole-entity removal produced %v, want ErrNoPropertyRedaction", err)
+	}
+	if _, err := s.ProvePropertyRedaction(kept); !errors.Is(err, ErrNoTombstone) {
+		t.Fatalf("an untouched entity produced %v, want ErrNoTombstone", err)
+	}
+}
+
+// v3 leaves change every root, so a v1 or v2 image must be recomputed under its
+// own encoding rather than this build's.
+func TestPropertyHash_OlderLeafEncodingsStillVerify(t *testing.T) {
+	n := nodeRecord{
+		ID:         7,
+		Labels:     []store.NodeType{store.NodeTypeTag},
+		Properties: []byte("payload"),
+	}
+
+	v1 := nodeLeafFor(snapshotBodyV1, n)
+	v2 := nodeLeafFor(snapshotBodyV2, n)
+	v3 := nodeLeafFor(snapshotBodyV3, n)
+
+	if !bytesEqual(v1, v2) {
+		t.Fatal("v1 and v2 changed the leaf encoding; only v3 was supposed to")
+	}
+	if bytesEqual(v1, v3) {
+		t.Fatal("v3 did not change the leaf encoding")
+	}
+	if v1[0] != leafTagNode || v3[0] != leafTagNodeV2 {
+		t.Fatalf("the encodings are not domain-separated: %x vs %x", v1[0], v3[0])
+	}
+	// The inline form carries the content; the separated one must not.
+	if !strings.Contains(string(v1), "payload") {
+		t.Fatal("the v1 leaf was supposed to carry the blob inline")
+	}
+	if strings.Contains(string(v3), "payload") {
+		t.Fatal("the v3 leaf carries the property blob, so it is not separated")
+	}
+}
+
+// An edge's properties are separated too, so the encoding is consistent across
+// entity kinds even though edges have no property-only redaction yet.
+func TestPropertyHash_EdgeLeavesAreSeparatedToo(t *testing.T) {
+	e := rawEdge{
+		ID: 1, Src: 1, Dst: 2,
+		Labels:     []store.EdgeType{store.EdgeTypeTaggedWith},
+		Properties: []byte("edge-payload"),
+	}
+	v3 := edgeLeafFor(snapshotBodyV3, e)
+	if strings.Contains(string(v3), "edge-payload") {
+		t.Fatal("the v3 edge leaf carries the property blob")
+	}
+	if v3[0] != leafTagEdgeV2 {
+		t.Fatalf("the edge leaf is not domain-separated: %x", v3[0])
 	}
 }

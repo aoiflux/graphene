@@ -428,6 +428,53 @@ value as that entity's Merkle leaf in a snapshot**. A party holding the redacted
 content can prove it is what was removed; a party holding only the ledger can
 prove something specific was removed without learning what it was.
 
+### Three scopes, because they are three different decisions
+
+```go
+s.RedactNode(id, req)               // the entity, and every edge touching it
+s.RedactNodeProperties(id, req)     // the property blob; ID, labels and edges stay
+s.RedactEdge(edgeID, req)           // one relationship, both endpoints kept
+s.RedactEdgeProperties(edgeID, req) // an edge's properties; the relationship stays
+```
+
+**`RedactNodeProperties` is the lawful-erasure case and should usually be the
+one you want.** An erasure request is almost always about personal data, not
+about the existence of the artefact that carried it. Removing the whole node
+destroys evidence that was never in scope — including every relationship that
+made the artefact meaningful — so the narrow form keeps the graph's shape and
+the entity's availability as a subject of provenance.
+
+Its record keeps the version hash the node had *before* and the one it has
+*after*, so a recipient can confirm the entity now in the image is the one the
+record describes rather than taking it on trust.
+
+**A property redaction is provable without revealing what was removed:**
+
+```go
+proof, err := s.ProvePropertyRedaction(id)
+err = disk.VerifyPropertyRedaction(retainedRoot, proof)   // recipient's side
+```
+
+That check establishes something a bare version-hash comparison cannot — that
+the entity's **identity did not change**, only its properties. Entity leaves
+commit to `SHA256(0x07 ‖ Properties)` rather than to the blob itself, so the
+leaf before and the leaf after are byte-identical except in their final 32
+bytes. A verifier sees that equality directly. Nothing in the proof carries the
+removed content; the strongest thing it holds is a digest of it, which a party
+who already has the blob can use to confirm it is what was destroyed and a party
+who does not learns nothing from.
+
+**Property redaction purges the property index unconditionally**, regardless of
+`ReindexPolicy`. The index holds the values themselves; leaving its entries
+behind would keep redacted content queryable, which would defeat the operation
+entirely. This is the one place that policy does not get a say.
+
+**A cascade is tombstoned edge by edge.** `RedactNode` records the version hash
+of every edge it takes with it, and the image gets a tombstone for each — so an
+edge removed as collateral is provable in the same way as one removed
+deliberately. Without that, an auditor asking "why is there no edge between A
+and B" would get nothing.
+
 ### The rules the engine enforces
 
 - **A reason is mandatory.** `ErrRedactionUnexplained`.
@@ -476,11 +523,16 @@ Three properties worth stating:
 - **Tombstones are rebuilt from the ledger at each compaction**, never carried
   forward. A second copy could drift, and an image and ledger that disagree about
   what was destroyed while each verifies perfectly is worse than neither.
-- **Adding this changed what a snapshot root is.** Roots now come in two body
-  versions: v1 binds four components, v2 adds the tombstone root. A root retained
-  from a v1 image stays verifiable — it commits to less, which is not the same as
-  being wrong. `VerifyRedactionInclusion` refuses a v1 root outright rather than
-  checking a proof against a value that root never covered.
+- **Snapshot roots are versioned, because adding to them changes what they are.**
+  v1 binds four components; v2 adds the tombstone root; v3 additionally changes
+  entity leaves to commit to a property *hash* rather than the blob. A root
+  retained from an older image stays verifiable — it commits to less, which is
+  not the same as being wrong — and every proof and recomputation uses the
+  encoding the image was written with, not the one this build prefers.
+  `VerifyRedactionInclusion` refuses a v1 root outright rather than checking a
+  proof against a value that root never covered, and
+  `ProvePropertyRedaction` refuses a pre-v3 image rather than pretending a
+  content-free proof is available where the leaves inline the content.
 
 ### What it does not do
 

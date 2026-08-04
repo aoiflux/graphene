@@ -91,7 +91,10 @@ func (s *Store) ProveNode(id store.NodeID) (NodeInclusionProof, error) {
 		return NodeInclusionProof{}, fmt.Errorf("%w: node %d", ErrNotInSnapshot, id)
 	}
 
-	leaves := csr.NodeLeaves()
+	// The image's own body version, not this build's preference: a proof built
+	// with a different leaf encoding than the root was computed from resolves to
+	// nothing, and the failure would look like tampering rather than a mismatch.
+	leaves := csr.NodeLeaves(roots.bodyVersion())
 	proof, err := merkle.BuildProof(leaves, index)
 	if err != nil {
 		return NodeInclusionProof{}, err
@@ -99,7 +102,7 @@ func (s *Store) ProveNode(id store.NodeID) (NodeInclusionProof, error) {
 
 	return NodeInclusionProof{
 		NodeID:   id,
-		LeafData: nodeLeafData(csr.nodes[id]),
+		LeafData: nodeLeafFor(roots.bodyVersion(), csr.nodes[id]),
 		Proof:    proof,
 		NodeRoot: roots.NodeRoot,
 		Roots:    roots,
@@ -172,14 +175,11 @@ func VerifyCSRRoots(path string) error {
 	// this function is testing the rest of the image against.
 	payload.Tombstones = csr.tombstones
 
-	recomputed := computeSnapshotRoots(csr, payload, stored.PrevRoot)
-
-	// Recomputation always produces the current body version. Comparing a v2
-	// binding against a v1 image's stored root would fail on the version alone
-	// and report it as a content mismatch, so the recomputed set adopts the
-	// stored version and the components below are what actually get compared.
-	recomputed.BodyVersion = stored.BodyVersion
-	recomputed.Snapshot = bindSnapshotRoot(recomputed)
+	// Recompute under the *stored* body version throughout. It decides both how
+	// records are hashed into leaves and how many components bind, so a v1 image
+	// checked with this build's preferences would fail on the version alone and
+	// report it as a content mismatch.
+	recomputed := computeSnapshotRootsAs(stored.bodyVersion(), csr, payload, stored.PrevRoot)
 
 	switch {
 	case recomputed.NodeRoot != stored.NodeRoot:

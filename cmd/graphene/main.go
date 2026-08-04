@@ -109,6 +109,7 @@ Flags:
   custody  -node ID     the entity to account for (required)
            -anchor HEX  a snapshot root retained outside this system
   redactions -node ID   show only records for one entity
+             -edge ID   show only records for one relationship
   anchor   -publish     capture and publish a checkpoint instead of checking one
            -insecure-local-file PATH
                         a local anchor file, which is NOT an anchor: anyone who
@@ -590,6 +591,7 @@ func cmdAnchor(args []string) error {
 func cmdRedactions(args []string) error {
 	fs := flag.NewFlagSet("redactions", flag.ExitOnError)
 	node := fs.Uint64("node", 0, "show only records for this node ID")
+	edge := fs.Uint64("edge", 0, "show only records for this edge ID")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -611,14 +613,33 @@ func cmdRedactions(args []string) error {
 	// anywhere makes every record suspect, including the ones asked for.
 	chainErr := disk.VerifyRedactionChain(records, nil)
 
+	shown := 0
 	for _, r := range records {
-		if *node != 0 && uint64(r.NodeID) != *node {
+		// A node filter must not match an edge record, which leaves NodeID zero.
+		if *node != 0 && (r.EdgeID != 0 || uint64(r.NodeID) != *node) {
 			continue
 		}
+		if *edge != 0 && uint64(r.EdgeID) != *edge {
+			continue
+		}
+		shown++
 		fmt.Println(r)
+		fmt.Printf("    scope        %s\n", r.Scope)
 		fmt.Printf("    version hash %x\n", r.VersionHash)
+		if r.SurvivingHash != (merkle.Hash{}) {
+			fmt.Printf("    survives as  %x\n", r.SurvivingHash)
+		}
+		if r.PriorPropertiesHash != (merkle.Hash{}) {
+			fmt.Printf("    prior props  %x\n", r.PriorPropertiesHash)
+		}
 		if len(r.CascadedEdges) > 0 {
-			fmt.Printf("    edges        %v\n", r.CascadedEdges)
+			fmt.Printf("    edges        %v", r.CascadedEdges)
+			if len(r.CascadedHashes) != len(r.CascadedEdges) {
+				// Worth saying: without hashes these edges are named but not
+				// identified, so the image carries no tombstone for them.
+				fmt.Printf("  (unidentified: no tombstones in the image)")
+			}
+			fmt.Println()
 		}
 		if len(r.Signature) > 0 {
 			fmt.Printf("    signed by    key %d\n", r.KeyID)
@@ -631,7 +652,15 @@ func cmdRedactions(args []string) error {
 	if len(records) == 1 {
 		noun = "record"
 	}
-	fmt.Printf("\n%d %s", len(records), noun)
+	// The chain covers the whole ledger, so the count reported alongside its
+	// verdict has to be the whole ledger too — saying "2 records, chain intact"
+	// after a filter would attach the verdict to the wrong set.
+	if *node != 0 || *edge != 0 {
+		fmt.Printf("\n%d shown of ", shown)
+	} else {
+		fmt.Print("\n")
+	}
+	fmt.Printf("%d %s in the ledger", len(records), noun)
 	if chainErr != nil {
 		// No key material here, so signatures are unchecked; the hash chain is
 		// not, and a break in it is the loud case.

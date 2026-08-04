@@ -799,3 +799,89 @@ func TestSecurityDoc_RemovalIsNotProvableUntilCompacted(t *testing.T) {
 		t.Fatal("§6 says compacting closes the window; it did not")
 	}
 }
+
+// SECURITY.md §6 "Three scopes, because they are three different decisions" —
+// the property form keeps the entity, its labels and its edges.
+func TestSecurityDoc_PropertyRedactionKeepsTheEntity(t *testing.T) {
+	s, _ := redactableDocStore(t)
+
+	id, err := s.AddNode(&store.Node{
+		Labels:     []store.NodeType{store.NodeTypeMicroArtefact},
+		Properties: []byte("name=jane.doe"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeTag}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddEdge(&store.Edge{
+		Src: id, Dst: other, Labels: []store.EdgeType{store.EdgeTypeTaggedWith},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := s.RedactNodeProperties(id, disk.RedactionRequest{ActorID: 7, Reason: "erasure request"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.GetNode(id)
+	if err != nil {
+		t.Fatalf("§6 says the entity stays: %v", err)
+	}
+	if len(n.Properties) != 0 {
+		t.Fatal("§6 says the property blob goes; it is still there")
+	}
+	if len(n.Labels) == 0 {
+		t.Fatal("§6 says labels stay")
+	}
+	impact, err := s.RedactionImpactFor(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impact.CascadedEdges) != 1 {
+		t.Fatalf("§6 says edges stay; %d remain", len(impact.CascadedEdges))
+	}
+
+	// "keeps the version hash the node had before and the one it has after"
+	if rec.VersionHash == (merkle.Hash{}) || rec.SurvivingHash == (merkle.Hash{}) {
+		t.Fatalf("§6 promises both hashes: %+v", rec)
+	}
+	if rec.VersionHash == rec.SurvivingHash {
+		t.Fatal("before and after hash identically; the record describes no change")
+	}
+}
+
+// SECURITY.md §6: "Property redaction purges the property index
+// unconditionally, regardless of ReindexPolicy."
+func TestSecurityDoc_PropertyRedactionPurgesTheIndex(t *testing.T) {
+	s, _ := redactableDocStore(t)
+
+	id, err := s.AddNode(&store.Node{
+		Labels:     []store.NodeType{store.NodeTypeMicroArtefact},
+		Properties: []byte("pii"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexNodeProperty(id, "email", []byte("jane@example.com")); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := s.NodesByProperty("email", []byte("jane@example.com")); err != nil || len(found) == 0 {
+		t.Fatalf("the value was never indexed, so this proves nothing (err=%v)", err)
+	}
+
+	if _, err := s.RedactNodeProperties(id, disk.RedactionRequest{ActorID: 1, Reason: "purge"}); err != nil {
+		t.Fatal(err)
+	}
+
+	still, err := s.NodesByProperty("email", []byte("jane@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(still) != 0 {
+		t.Fatal("§6 says redacted content does not stay queryable; it is still in the index")
+	}
+}

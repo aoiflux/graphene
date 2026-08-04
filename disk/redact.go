@@ -51,6 +51,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -85,6 +86,41 @@ type RedactionPolicy struct {
 	MaxCascade int
 }
 
+// RedactionScope says what a redaction removed.
+//
+// The three are genuinely different operations with different evidentiary
+// consequences, and collapsing them would make the ledger say "something was
+// removed" where it can say which thing.
+type RedactionScope uint8
+
+const (
+	// ScopeNode removes an entity and cascades to its incident edges. Zero so
+	// that a record written before scopes existed reads as what it was.
+	ScopeNode RedactionScope = iota
+
+	// ScopeProperties removes a node's property blob and keeps the node — its ID,
+	// its labels and its edges all survive. This is the lawful-erasure case:
+	// personal data goes, the graph's shape stays, and the entity remains
+	// available as a subject of provenance.
+	ScopeProperties
+
+	// ScopeEdge removes a single relationship, leaving both endpoints.
+	ScopeEdge
+)
+
+func (s RedactionScope) String() string {
+	switch s {
+	case ScopeNode:
+		return "node"
+	case ScopeProperties:
+		return "properties"
+	case ScopeEdge:
+		return "edge"
+	default:
+		return fmt.Sprintf("unknown(%d)", uint8(s))
+	}
+}
+
 // RedactionRequest is what a caller must supply to redact something.
 type RedactionRequest struct {
 	// ActorID and RoleID attribute the decision. RoleID is recorded, never
@@ -104,8 +140,10 @@ type RedactionRequest struct {
 type RedactionImpact struct {
 	NodeID store.NodeID
 
-	// CascadedEdges are the incident edges that would be tombstoned with it.
-	CascadedEdges []store.EdgeID
+	// CascadedEdges are the incident edges that would be tombstoned with it, and
+	// CascadedHashes their version hashes in the same order.
+	CascadedEdges  []store.EdgeID
+	CascadedHashes []merkle.Hash
 
 	// VersionHash identifies the node's current content.
 	VersionHash merkle.Hash
@@ -122,9 +160,41 @@ type RedactionRecord struct {
 	ActorID  uint64
 	RoleID   uint32
 
+	// Scope says what was removed. Zero is ScopeNode, which is what every record
+	// written before scopes existed meant.
+	Scope RedactionScope
+
 	// NodeID is what was redacted, and CascadedEdges what went with it.
+	// For ScopeEdge, EdgeID names the relationship and NodeID is zero.
 	NodeID        store.NodeID
+	EdgeID        store.EdgeID
 	CascadedEdges []store.EdgeID
+
+	// CascadedHashes are the version hashes of CascadedEdges, in the same order.
+	//
+	// Without them a cascaded edge could be named but not identified, so its
+	// removal could not be matched against an earlier image the way the node's
+	// can. An edge taken as collateral deserves the same standing as one removed
+	// deliberately.
+	CascadedHashes []merkle.Hash
+
+	// PriorPropertiesHash is the separated hash of the property blob that was
+	// destroyed — §11.2's `SHA256(0x07 ‖ Properties)`.
+	//
+	// It is what makes a property redaction provable without revealing content:
+	// with it, the entity's ID and labels read from the surviving image, a
+	// verifier can reconstruct the leaf the entity used to have and check it
+	// against VersionHash. Without it they would have to be handed the removed
+	// blob to check anything, which defeats the redaction.
+	PriorPropertiesHash merkle.Hash
+
+	// SurvivingHash is the entity's version hash *after* the redaction, for a
+	// scope that leaves something behind. Zero when nothing survived.
+	//
+	// It is what lets a recipient confirm that the entity now in the image is the
+	// one this record describes, rather than taking on trust that the thing they
+	// were shown is what was left over.
+	SurvivingHash merkle.Hash
 
 	// VersionHash is the identity of the destroyed content. Holding it lets a
 	// party with a copy prove it is what was removed, and a party without one
@@ -161,7 +231,43 @@ func redactionSignedData(r RedactionRecord) []byte {
 	buf = append(buf, r.VersionHash[:]...)
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(r.Reason)))
 	buf = append(buf, r.Reason...)
-	return append(buf, r.PrevHash[:]...)
+	buf = append(buf, r.PrevHash[:]...)
+
+	// Fields added after the original format are hashed *after* PrevHash rather
+	// than in field order, so a record written before they existed produces the
+	// same hash under this code as it did under the code that wrote it. Appending
+	// keeps every ledger already on disk verifiable; inserting would silently
+	// break every chain in existence.
+	//
+	// Each extension is emitted only when it or a later one carries something, so
+	// the old and new encodings coincide exactly rather than agreeing by luck.
+	// **Every extension present must be hashed** — a field the hash skips is a
+	// field an adversary can rewrite, which is why the guards below test the
+	// whole tail and not just their own value.
+	hasCascade := len(r.CascadedHashes) > 0
+	hasProps := r.PriorPropertiesHash != (merkle.Hash{})
+	hasScope := r.Scope != ScopeNode || r.EdgeID != 0 || r.SurvivingHash != (merkle.Hash{})
+
+	if !hasScope && !hasProps && !hasCascade {
+		return buf
+	}
+	buf = append(buf, byte(r.Scope))
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(r.EdgeID))
+	buf = append(buf, r.SurvivingHash[:]...)
+
+	if !hasProps && !hasCascade {
+		return buf
+	}
+	buf = append(buf, r.PriorPropertiesHash[:]...)
+
+	if !hasCascade {
+		return buf
+	}
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(r.CascadedHashes)))
+	for _, h := range r.CascadedHashes {
+		buf = append(buf, h[:]...)
+	}
+	return buf
 }
 
 func computeRedactionHash(r RedactionRecord) [sha256.Size]byte {
@@ -169,9 +275,23 @@ func computeRedactionHash(r RedactionRecord) [sha256.Size]byte {
 }
 
 func (r RedactionRecord) String() string {
-	return fmt.Sprintf("redaction %d at %s: node %d (+%d edges) by actor %d role %d — %q",
+	// The subject has to name the right namespace. An edge redaction leaves
+	// NodeID zero, and printing "node 0" for it would describe a removal that
+	// never happened to an entity that does not exist.
+	var subject string
+	switch {
+	case r.EdgeID != 0 && r.Scope == ScopeProperties:
+		subject = fmt.Sprintf("edge %d properties", r.EdgeID)
+	case r.EdgeID != 0:
+		subject = fmt.Sprintf("edge %d", r.EdgeID)
+	case r.Scope == ScopeProperties:
+		subject = fmt.Sprintf("node %d properties", r.NodeID)
+	default:
+		subject = fmt.Sprintf("node %d (+%d edges)", r.NodeID, len(r.CascadedEdges))
+	}
+	return fmt.Sprintf("redaction %d at %s: %s by actor %d role %d — %q",
 		r.Seq, time.Unix(0, r.UnixNano).UTC().Format(time.RFC3339),
-		r.NodeID, len(r.CascadedEdges), r.ActorID, r.RoleID, r.Reason)
+		subject, r.ActorID, r.RoleID, r.Reason)
 }
 
 // --- the ledger ---
@@ -281,6 +401,18 @@ func appendRedactionRecord(buf []byte, r RedactionRecord) []byte {
 	body = binary.LittleEndian.AppendUint32(body, uint32(len(r.Signature)))
 	body = append(body, r.Signature...)
 
+	// Appended after the signature so a shorter, older record still parses — the
+	// record is length-prefixed, so "these fields are absent" is a readable
+	// state rather than a corrupt one. See parseRedactionRecord.
+	body = append(body, byte(r.Scope))
+	body = binary.LittleEndian.AppendUint64(body, uint64(r.EdgeID))
+	body = append(body, r.SurvivingHash[:]...)
+	body = append(body, r.PriorPropertiesHash[:]...)
+	body = binary.LittleEndian.AppendUint32(body, uint32(len(r.CascadedHashes)))
+	for _, h := range r.CascadedHashes {
+		body = append(body, h[:]...)
+	}
+
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(body)))
 	return append(buf, body...)
 }
@@ -358,11 +490,65 @@ func parseRedactionRecord(b []byte) (RedactionRecord, error) {
 		return RedactionRecord{}, err
 	}
 	var sig string
-	if sig, _, err = readLengthPrefixedString(b, off, "signature"); err != nil {
+	if sig, off, err = readLengthPrefixedString(b, off, "signature"); err != nil {
 		return RedactionRecord{}, err
 	}
 	if sig != "" {
 		r.Signature = []byte(sig)
+	}
+
+	// The scope fields are optional trailing bytes: a record written before they
+	// existed simply ends here, and means a whole-node redaction. Present-but-
+	// truncated is a different matter and is an error, because a record that ran
+	// out mid-field is damaged rather than merely old.
+	const (
+		scopeTail = 1 + 8 + merkle.Size
+		propTail  = merkle.Size
+	)
+	switch rest := len(b) - off; {
+	case rest == 0:
+		return r, nil
+	case rest < scopeTail:
+		return RedactionRecord{}, fmt.Errorf(
+			"disk: redaction record %d has %d trailing bytes, too few for its scope fields", r.Seq, rest)
+	}
+	r.Scope = RedactionScope(b[off])
+	off++
+	r.EdgeID = store.EdgeID(binary.LittleEndian.Uint64(b[off : off+8]))
+	off += 8
+	copy(r.SurvivingHash[:], b[off:off+merkle.Size])
+	off += merkle.Size
+
+	switch rest := len(b) - off; {
+	case rest == 0:
+		return r, nil
+	case rest < propTail:
+		return RedactionRecord{}, fmt.Errorf(
+			"disk: redaction record %d has %d trailing bytes, too few for its property hash", r.Seq, rest)
+	}
+	copy(r.PriorPropertiesHash[:], b[off:off+merkle.Size])
+	off += merkle.Size
+
+	if len(b)-off == 0 {
+		return r, nil
+	}
+	if off+4 > len(b) {
+		return RedactionRecord{}, fmt.Errorf(
+			"disk: redaction record %d is truncated before its cascade-hash count", r.Seq)
+	}
+	cn := int(binary.LittleEndian.Uint32(b[off : off+4]))
+	off += 4
+	if cn < 0 || cn > (len(b)-off)/merkle.Size {
+		return RedactionRecord{}, fmt.Errorf(
+			"disk: redaction record %d claims %d cascade hashes but only %d bytes remain",
+			r.Seq, cn, len(b)-off)
+	}
+	if cn > 0 {
+		r.CascadedHashes = make([]merkle.Hash, cn)
+		for i := 0; i < cn; i++ {
+			copy(r.CascadedHashes[i][:], b[off:off+merkle.Size])
+			off += merkle.Size
+		}
 	}
 	return r, nil
 }
@@ -430,6 +616,15 @@ func (s *Store) redactionImpactLocked(id store.NodeID) (RedactionImpact, error) 
 		NodeID:        id,
 		CascadedEdges: s.incidentEdgeIDsLocked(id),
 	}
+	// Hashed here rather than at deletion time, so the set the record describes
+	// is provably the set the impact report showed and the deletion removed.
+	for _, eid := range impact.CascadedEdges {
+		h, herr := s.edgeVersionHashLocked(eid)
+		if herr != nil {
+			return RedactionImpact{}, herr
+		}
+		impact.CascadedHashes = append(impact.CascadedHashes, h)
+	}
 	h, err := s.nodeVersionHashLocked(id)
 	if err != nil {
 		return RedactionImpact{}, err
@@ -450,11 +645,30 @@ func (s *Store) nodeVersionHashLocked(id store.NodeID) (merkle.Hash, error) {
 	if !ok {
 		return merkle.Hash{}, &store.ErrNotFound{Kind: "node", ID: uint64(id)}
 	}
-	return merkle.HashLeaf(nodeLeafData(nodeRecord{
+	return s.nodeVersionHashOf(nodeRecord{
 		ID:         n.ID,
 		Labels:     n.Labels,
 		Properties: n.Properties,
-	})), nil
+	}), nil
+}
+
+// nodeVersionHashOf hashes a node record under the leaf encoding this store's
+// image uses, so a redaction record's hashes line up with the snapshot's leaves
+// rather than with whatever this build would write next.
+func (s *Store) nodeVersionHashOf(n nodeRecord) merkle.Hash {
+	return merkle.HashLeaf(nodeLeafFor(s.leafVersionLocked(), n))
+}
+
+// leafVersionLocked reports the leaf encoding the current image was built with,
+// defaulting to what a fresh compaction would write when there is no image yet.
+// Caller must hold s.mu.
+func (s *Store) leafVersionLocked() uint8 {
+	if s.csr != nil {
+		if r, ok := s.csr.Roots(); ok {
+			return r.bodyVersion()
+		}
+	}
+	return snapshotBodyVersion
 }
 
 // RedactNode destroys a node's content and records that it did.
@@ -470,8 +684,7 @@ func (s *Store) RedactNode(id store.NodeID, req RedactionRequest) (RedactionReco
 		return RedactionRecord{}, ErrRedactionUnexplained
 	}
 	if s.redactions == nil {
-		return RedactionRecord{}, errors.New("disk: redaction requires Options.Redaction; " +
-			"use DeleteNode for an unrecorded removal")
+		return RedactionRecord{}, errRedactionDisabled
 	}
 
 	s.mu.Lock()
@@ -487,13 +700,14 @@ func (s *Store) RedactNode(id store.NodeID, req RedactionRequest) (RedactionReco
 	}
 
 	rec, err := s.redactions.append(RedactionRecord{
-		UnixNano:      time.Now().UnixNano(),
-		ActorID:       req.ActorID,
-		RoleID:        req.RoleID,
-		NodeID:        id,
-		CascadedEdges: impact.CascadedEdges,
-		VersionHash:   impact.VersionHash,
-		Reason:        req.Reason,
+		UnixNano:       time.Now().UnixNano(),
+		ActorID:        req.ActorID,
+		RoleID:         req.RoleID,
+		NodeID:         id,
+		CascadedEdges:  impact.CascadedEdges,
+		CascadedHashes: impact.CascadedHashes,
+		VersionHash:    impact.VersionHash,
+		Reason:         req.Reason,
 	}, s.signer)
 	if err != nil {
 		return RedactionRecord{}, err
@@ -512,6 +726,222 @@ func (s *Store) RedactNode(id store.NodeID, req RedactionRequest) (RedactionReco
 	}
 	return rec, nil
 }
+
+// RedactNodeProperties removes a node's property blob and keeps the node.
+//
+// **This is the lawful-erasure case.** Personal data goes; the entity's ID, its
+// labels and every edge touching it survive, so the graph's shape is intact and
+// the entity remains available as a subject of provenance. Removing the whole
+// node to erase one property destroys evidence that was never in scope.
+//
+// The record keeps the version hash the node had *before*, and the hash it has
+// after, so a recipient can confirm the entity now in the image is the one this
+// record describes rather than taking it on trust.
+func (s *Store) RedactNodeProperties(id store.NodeID, req RedactionRequest) (RedactionRecord, error) {
+	if req.Reason == "" {
+		return RedactionRecord{}, ErrRedactionUnexplained
+	}
+	if s.redactions == nil {
+		return RedactionRecord{}, errRedactionDisabled
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	before, err := s.nodeVersionHashLocked(id)
+	if err != nil {
+		return RedactionRecord{}, err
+	}
+	n, ok := s.getNodeLocked(id)
+	if !ok {
+		return RedactionRecord{}, &store.ErrNotFound{Kind: "node", ID: uint64(id)}
+	}
+	if len(n.Properties) == 0 {
+		return RedactionRecord{}, fmt.Errorf("disk: node %d carries no properties to redact", id)
+	}
+
+	// The surviving record: same ID, same labels, no properties.
+	stripped := &store.Node{ID: n.ID, Labels: slices.Clone(n.Labels)}
+	after := s.nodeVersionHashOf(nodeRecord{ID: stripped.ID, Labels: stripped.Labels})
+	priorProps := propertiesHash(n.Properties)
+
+	rec, err := s.redactions.append(RedactionRecord{
+		UnixNano:            time.Now().UnixNano(),
+		ActorID:             req.ActorID,
+		RoleID:              req.RoleID,
+		Scope:               ScopeProperties,
+		NodeID:              id,
+		VersionHash:         before,
+		SurvivingHash:       after,
+		PriorPropertiesHash: priorProps,
+		Reason:              req.Reason,
+	}, s.signer)
+	if err != nil {
+		return RedactionRecord{}, err
+	}
+
+	if err := s.wal.AppendNode(marshalNode(stripped)); err != nil {
+		return rec, fmt.Errorf("disk: redaction %d was recorded but the rewrite failed: %w", rec.Seq, err)
+	}
+
+	// **Unconditionally, regardless of ReindexPolicy.** The property index holds
+	// the values themselves; leaving its entries behind would keep the redacted
+	// content queryable and searchable, which defeats the entire operation. This
+	// is the one place the policy does not get a say.
+	if err := s.purgeNodeIndexLocked(id); err != nil {
+		return rec, fmt.Errorf("disk: redaction %d was recorded but the index purge failed: %w", rec.Seq, err)
+	}
+	s.applyNodeUpsert(stripped)
+
+	if err := s.recordAudit(AuditRedaction, req.ActorID,
+		fmt.Sprintf("redacted properties of node %d: %s", id, req.Reason)); err != nil {
+		return rec, err
+	}
+	return rec, nil
+}
+
+// RedactEdgeProperties removes an edge's property blob and keeps the edge.
+//
+// The relationship survives — endpoints, labels and weight — so the graph's
+// shape is untouched and only the data the erasure was about goes. Same argument
+// as RedactNodeProperties: removing the relationship to erase a property
+// destroys evidence that was never in scope.
+func (s *Store) RedactEdgeProperties(id store.EdgeID, req RedactionRequest) (RedactionRecord, error) {
+	if req.Reason == "" {
+		return RedactionRecord{}, ErrRedactionUnexplained
+	}
+	if s.redactions == nil {
+		return RedactionRecord{}, errRedactionDisabled
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur, ok := s.getEdgeLocked(id)
+	if !ok {
+		return RedactionRecord{}, &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
+	}
+	if len(cur.Properties) == 0 {
+		return RedactionRecord{}, fmt.Errorf("disk: edge %d carries no properties to redact", id)
+	}
+
+	before, err := s.edgeVersionHashLocked(id)
+	if err != nil {
+		return RedactionRecord{}, err
+	}
+
+	stripped := &store.Edge{
+		ID: cur.ID, Src: cur.Src, Dst: cur.Dst,
+		Weight: cur.Weight,
+		Labels: slices.Clone(cur.Labels),
+	}
+	after := merkle.HashLeaf(edgeLeafFor(s.leafVersionLocked(), rawEdge{
+		ID: stripped.ID, Src: stripped.Src, Dst: stripped.Dst,
+		Labels: stripped.Labels, Weight: stripped.Weight,
+	}))
+
+	rec, err := s.redactions.append(RedactionRecord{
+		UnixNano:            time.Now().UnixNano(),
+		ActorID:             req.ActorID,
+		RoleID:              req.RoleID,
+		Scope:               ScopeProperties,
+		EdgeID:              id,
+		VersionHash:         before,
+		SurvivingHash:       after,
+		PriorPropertiesHash: propertiesHash(cur.Properties),
+		Reason:              req.Reason,
+	}, s.signer)
+	if err != nil {
+		return RedactionRecord{}, err
+	}
+
+	if err := s.wal.AppendEdge(marshalEdge(stripped)); err != nil {
+		return rec, fmt.Errorf("disk: redaction %d was recorded but the rewrite failed: %w", rec.Seq, err)
+	}
+	// Unconditional, for the same reason as the node form: the property index
+	// holds the values, so leaving its entries would keep the content queryable.
+	if err := s.purgeEdgeIndexLocked(id); err != nil {
+		return rec, fmt.Errorf("disk: redaction %d was recorded but the index purge failed: %w", rec.Seq, err)
+	}
+	s.applyEdgeUpsert(stripped)
+
+	if err := s.recordAudit(AuditRedaction, req.ActorID,
+		fmt.Sprintf("redacted properties of edge %d: %s", id, req.Reason)); err != nil {
+		return rec, err
+	}
+	return rec, nil
+}
+
+// RedactEdge removes one relationship, leaving both endpoints.
+//
+// A node redaction takes every incident edge with it, which is often more than
+// the decision called for. This removes the single relationship that was
+// actually in scope.
+func (s *Store) RedactEdge(id store.EdgeID, req RedactionRequest) (RedactionRecord, error) {
+	if req.Reason == "" {
+		return RedactionRecord{}, ErrRedactionUnexplained
+	}
+	if s.redactions == nil {
+		return RedactionRecord{}, errRedactionDisabled
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.edgeExistsLocked(id) {
+		return RedactionRecord{}, &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
+	}
+	h, err := s.edgeVersionHashLocked(id)
+	if err != nil {
+		return RedactionRecord{}, err
+	}
+
+	rec, err := s.redactions.append(RedactionRecord{
+		UnixNano:    time.Now().UnixNano(),
+		ActorID:     req.ActorID,
+		RoleID:      req.RoleID,
+		Scope:       ScopeEdge,
+		EdgeID:      id,
+		VersionHash: h,
+		Reason:      req.Reason,
+	}, s.signer)
+	if err != nil {
+		return RedactionRecord{}, err
+	}
+
+	if err := s.wal.AppendEdgeDelete(marshalID(uint64(id))); err != nil {
+		return rec, fmt.Errorf("disk: redaction %d was recorded but the deletion failed: %w", rec.Seq, err)
+	}
+	s.applyEdgeDelete(id)
+
+	if err := s.recordAudit(AuditRedaction, req.ActorID,
+		fmt.Sprintf("redacted edge %d: %s", id, req.Reason)); err != nil {
+		return rec, err
+	}
+	return rec, nil
+}
+
+// edgeVersionHashLocked computes the identity of an edge's current content,
+// using the same canonical bytes the snapshot's Merkle leaves use.
+func (s *Store) edgeVersionHashLocked(id store.EdgeID) (merkle.Hash, error) {
+	e, ok := s.getEdgeLocked(id)
+	if !ok {
+		return merkle.Hash{}, &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
+	}
+	return merkle.HashLeaf(edgeLeafFor(s.leafVersionLocked(), rawEdge{
+		ID:         e.ID,
+		Src:        e.Src,
+		Dst:        e.Dst,
+		Labels:     e.Labels,
+		Weight:     e.Weight,
+		Properties: e.Properties,
+	})), nil
+}
+
+// errRedactionDisabled is shared by every redaction entry point, so a caller who
+// has not opted in gets the same instruction whichever one they reached for.
+var errRedactionDisabled = errors.New("disk: redaction requires Options.Redaction; " +
+	"use DeleteNode for an unrecorded removal")
 
 // Redactions returns this store's redaction ledger, oldest first.
 func (s *Store) Redactions() ([]RedactionRecord, error) { return ReadRedactions(s.dir) }

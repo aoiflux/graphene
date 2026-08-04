@@ -148,6 +148,10 @@ func (r CustodyReport) Summary() string {
 	switch {
 	case r.Broken():
 		return fmt.Sprintf("node %d: custody BROKEN (%d gaps)", r.NodeID, len(r.Gaps))
+	case r.Redacted != nil && r.Redacted.Scope == ScopeProperties && r.Live:
+		return fmt.Sprintf("node %d: present, properties redacted at %s by actor %d — %q",
+			r.NodeID, time.Unix(0, r.Redacted.UnixNano).UTC().Format(time.RFC3339),
+			r.Redacted.ActorID, r.Redacted.Reason)
 	case r.Redacted != nil && !r.Live:
 		// **Before the unknown-entity branch.** A redacted entity is also absent,
 		// and reporting it as unknown would describe a documented removal in the
@@ -319,11 +323,13 @@ func (s *Store) CustodyFor(id store.NodeID, verifier store.Verifier) (CustodyRep
 				Detail: fmt.Sprintf("the redaction ledger is broken: %v", verr),
 			})
 		}
+		// The most recent record for this node, not the first: properties may have
+		// been stripped before the entity was removed outright, and the record
+		// describing its present state is the later one.
 		for i := range reds {
-			if reds[i].NodeID == id {
+			if reds[i].EdgeID == 0 && reds[i].NodeID != 0 && reds[i].NodeID == id {
 				rec := reds[i]
 				r.Redacted = &rec
-				break
 			}
 		}
 	}
@@ -346,9 +352,22 @@ func (s *Store) CustodyFor(id store.NodeID, verifier store.Verifier) (CustodyRep
 		}
 	}
 
-	// A redaction explains an absence. Report it as such rather than leaving the
-	// snapshot gap to read as an unexplained hole.
-	if r.Redacted != nil && !r.InSnapshot {
+	// A property strip leaves the entity in place, so it explains no absence —
+	// there is none. Reporting it is still worth doing: the node a reader is
+	// looking at is not the node that was ingested.
+	if r.Redacted != nil && r.Redacted.Scope == ScopeProperties {
+		r.Gaps = append(r.Gaps, CustodyGap{
+			Layer: LayerRedaction,
+			Detail: fmt.Sprintf("the entity is present but its properties were redacted at %s "+
+				"by actor %d (role %d): %q. Its content differs from what was ingested",
+				time.Unix(0, r.Redacted.UnixNano).UTC().Format(time.RFC3339),
+				r.Redacted.ActorID, r.Redacted.RoleID, r.Redacted.Reason),
+		})
+	}
+
+	// A whole-entity redaction explains an absence. Report it as such rather than
+	// leaving the snapshot gap to read as an unexplained hole.
+	if r.Redacted != nil && r.Redacted.Scope == ScopeNode && !r.InSnapshot {
 		// The snapshot layer ran before the ledger was read and concluded the
 		// store had never heard of this entity. It had; the entity was removed on
 		// purpose. Leaving both lines in place would have the report contradict

@@ -542,3 +542,229 @@ func TestRedact_CustodyGapsDoNotContradictEachOther(t *testing.T) {
 		}
 	}
 }
+
+// --- scoped redaction ---
+
+// **The lawful-erasure case.** Personal data goes; the entity, its labels and
+// its edges stay, so the graph's shape survives and provenance is intact.
+func TestRedact_PropertiesGoTheEntityStays(t *testing.T) {
+	_, s, ring := redactableStore(t)
+	hub := hubWithSpokes(t, s, 3)
+
+	if err := s.UpdateNode(&store.Node{
+		ID: hub, Labels: []store.NodeType{store.NodeTypeMicroArtefact},
+		Properties: []byte("name=jane.doe;dob=1984"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := s.RedactionImpactFor(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := s.RedactNodeProperties(hub, RedactionRequest{
+		ActorID: 7, RoleID: 2, Reason: "erasure request 12",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !s.NodeExists(hub) {
+		t.Fatal("a property redaction removed the entity")
+	}
+	n, err := s.GetNode(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(n.Properties) != 0 {
+		t.Fatalf("the properties survived the redaction: %q", n.Properties)
+	}
+	if len(n.Labels) != 1 || n.Labels[0] != store.NodeTypeMicroArtefact {
+		t.Fatalf("the labels did not survive: %v", n.Labels)
+	}
+
+	// Every edge must still be there — that is the point of the narrower scope.
+	after, err := s.RedactionImpactFor(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.CascadedEdges) != len(before.CascadedEdges) {
+		t.Fatalf("edges went from %d to %d; a property redaction must not cascade",
+			len(before.CascadedEdges), len(after.CascadedEdges))
+	}
+
+	if rec.Scope != ScopeProperties {
+		t.Errorf("the record's scope is %s", rec.Scope)
+	}
+	if rec.VersionHash != before.VersionHash {
+		t.Error("the record does not carry the hash the node had before")
+	}
+	if rec.SurvivingHash != after.VersionHash {
+		t.Error("the record's surviving hash is not the node's current identity")
+	}
+	if rec.SurvivingHash == rec.VersionHash {
+		t.Error("before and after hash identically; the redaction changed nothing")
+	}
+	ledger, err := s.Redactions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRedactionChain(ledger, ring); err != nil {
+		t.Fatalf("a scoped record broke the chain: %v", err)
+	}
+}
+
+// **Redacted content must not remain queryable.** The property index holds the
+// values themselves, so it is purged regardless of ReindexPolicy.
+func TestRedact_PropertiesLeaveTheIndexToo(t *testing.T) {
+	_, s, _ := redactableStore(t)
+
+	id := addNodeD(t, s, store.NodeTypeMicroArtefact)
+	if err := s.UpdateNode(&store.Node{
+		ID: id, Labels: []store.NodeType{store.NodeTypeMicroArtefact},
+		Properties: []byte("secret"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexNodeProperty(id, "email", []byte("jane@example.com")); err != nil {
+		t.Fatal(err)
+	}
+
+	found, err := s.NodesByProperty("email", []byte("jane@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) == 0 {
+		t.Fatal("the value was never indexed, so this test proves nothing")
+	}
+
+	if _, err := s.RedactNodeProperties(id, RedactionRequest{ActorID: 1, Reason: "purge"}); err != nil {
+		t.Fatal(err)
+	}
+
+	still, err := s.NodesByProperty("email", []byte("jane@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(still) != 0 {
+		t.Fatalf("redacted content is still queryable through the property index: %v", still)
+	}
+}
+
+// A node with nothing to redact is refused, rather than writing a record that
+// describes no change.
+func TestRedact_PropertiesRefusesWhenThereAreNone(t *testing.T) {
+	_, s, _ := redactableStore(t)
+	id := addNodeD(t, s, store.NodeTypeTag)
+
+	if _, err := s.RedactNodeProperties(id, RedactionRequest{ActorID: 1, Reason: "nothing here"}); err == nil {
+		t.Fatal("a node with no properties was redacted anyway")
+	}
+	ledger, err := s.Redactions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ledger) != 0 {
+		t.Fatalf("a refused redaction wrote %d records", len(ledger))
+	}
+}
+
+// **One relationship, both endpoints kept.** A node redaction takes every
+// incident edge; this takes the one that was actually in scope.
+func TestRedact_EdgeLeavesBothEndpoints(t *testing.T) {
+	_, s, ring := redactableStore(t)
+	hub := hubWithSpokes(t, s, 3)
+
+	impact, err := s.RedactionImpactFor(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := impact.CascadedEdges[1]
+
+	rec, err := s.RedactEdge(target, RedactionRequest{ActorID: 4, Reason: "relationship withdrawn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Scope != ScopeEdge || rec.EdgeID != target {
+		t.Fatalf("the record does not describe an edge redaction: %+v", rec)
+	}
+	if rec.NodeID != 0 {
+		t.Errorf("an edge redaction named node %d", rec.NodeID)
+	}
+
+	if _, err := s.GetEdge(target); err == nil {
+		t.Fatal("the edge survived its own redaction")
+	}
+	if !s.NodeExists(hub) {
+		t.Fatal("redacting an edge removed an endpoint")
+	}
+	after, err := s.RedactionImpactFor(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.CascadedEdges) != 2 {
+		t.Fatalf("%d edges remain, want 2", len(after.CascadedEdges))
+	}
+
+	ledger, err := s.Redactions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRedactionChain(ledger, ring); err != nil {
+		t.Fatalf("an edge record broke the chain: %v", err)
+	}
+}
+
+// Both scoped forms require a reason and the ledger, like the whole-entity form.
+func TestRedact_ScopedFormsShareTheSameRefusals(t *testing.T) {
+	_, s, _ := redactableStore(t)
+	hub := hubWithSpokes(t, s, 1)
+	impact, err := s.RedactionImpactFor(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.RedactNodeProperties(hub, RedactionRequest{ActorID: 1}); !errors.Is(err, ErrRedactionUnexplained) {
+		t.Errorf("RedactNodeProperties accepted an unexplained redaction: %v", err)
+	}
+	if _, err := s.RedactEdge(impact.CascadedEdges[0], RedactionRequest{ActorID: 1}); !errors.Is(err, ErrRedactionUnexplained) {
+		t.Errorf("RedactEdge accepted an unexplained redaction: %v", err)
+	}
+
+	bare, _ := openFresh(t)
+	defer bare.Close()
+	bid := addNodeD(t, bare, store.NodeTypeTag)
+	if _, err := bare.RedactNodeProperties(bid, RedactionRequest{ActorID: 1, Reason: "x"}); err == nil {
+		t.Error("RedactNodeProperties worked without Options.Redaction")
+	}
+	if _, err := bare.RedactEdge(store.EdgeID(1), RedactionRequest{ActorID: 1, Reason: "x"}); err == nil {
+		t.Error("RedactEdge worked without Options.Redaction")
+	}
+}
+
+// **A record written before scopes existed must still verify.** The scope fields
+// are appended, so an older, shorter record hashes exactly as it did.
+func TestRedact_PreScopeRecordsStillVerify(t *testing.T) {
+	// A record as the previous format wrote it: no scope, no edge, no surviving
+	// hash — which is what the zero values mean.
+	old := RedactionRecord{
+		Seq: 1, UnixNano: 1234567890, ActorID: 3, RoleID: 1,
+		NodeID: 42, VersionHash: merkle.HashLeaf([]byte("v")),
+		Reason: "written before scopes existed",
+	}
+	old.Hash = computeRedactionHash(old)
+
+	if err := VerifyRedactionChain([]RedactionRecord{old}, nil); err != nil {
+		t.Fatalf("a pre-scope record no longer verifies: %v", err)
+	}
+
+	// And it round-trips through the current encoder.
+	back, err := parseRedactionRecord(appendRedactionRecord(nil, old)[4:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Scope != ScopeNode || back.Hash != old.Hash {
+		t.Fatalf("a pre-scope record did not round-trip: %+v", back)
+	}
+}
