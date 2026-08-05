@@ -69,6 +69,10 @@ func main() {
 		err = cmdAnchor(args)
 	case "redactions":
 		err = cmdRedactions(args)
+	case "prove":
+		err = cmdProve(args)
+	case "verify-proof":
+		err = cmdVerifyProof(args)
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -95,10 +99,16 @@ Usage:
   graphene custody <dir>        account for one entity across every history (opens the store)
   graphene anchor  <dir>        publish or check a checkpoint (opens the store)
   graphene redactions <dir>     ledger of attributed removals: who, when, why
+  graphene prove   <dir>        export a proof to hand to someone else (opens the store)
+  graphene verify-proof <file>  check a proof against a root you retained (no store needed)
 
 info, csr, wal and redactions read the files directly and are safe to run
-against a store another process is using. verify, custody and anchor open the store, which
-replays the log and takes a handle on the WAL.
+against a store another process is using. verify, custody, anchor and prove open
+the store, which replays the log and takes a handle on the WAL.
+
+verify-proof touches nothing but the file you give it. That is the point: a
+proof checked against the root inside it proves nothing, because whoever wrote
+the file chose both.
 
 'anchor -publish' is the only subcommand that writes, and it only appends.
 
@@ -110,6 +120,12 @@ Flags:
            -anchor HEX  a snapshot root retained outside this system
   redactions -node ID   show only records for one entity
              -edge ID   show only records for one relationship
+  prove    -node ID     the entity to prove something about
+           -edge ID     the relationship (with -kind redaction)
+           -kind K      inclusion | redaction | property-redaction
+           -out FILE    write the proof here instead of stdout
+  verify-proof -root HEX
+                        the snapshot root you retained (required)
   anchor   -publish     capture and publish a checkpoint instead of checking one
            -insecure-local-file PATH
                         a local anchor file, which is NOT an anchor: anyone who
@@ -668,6 +684,117 @@ func cmdRedactions(args []string) error {
 		os.Exit(1)
 	}
 	fmt.Println(", hash chain intact (signatures unchecked: no key supplied)")
+	return nil
+}
+
+// cmdProve exports a proof so it can be handed to someone else.
+//
+// Opens the store, because a proof is built from the compacted image and the
+// ledger together.
+func cmdProve(args []string) error {
+	fs := flag.NewFlagSet("prove", flag.ExitOnError)
+	node := fs.Uint64("node", 0, "entity to prove something about")
+	edge := fs.Uint64("edge", 0, "relationship to prove something about")
+	kind := fs.String("kind", "inclusion", "inclusion | redaction | property-redaction")
+	out := fs.String("out", "", "write the proof here instead of stdout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir := fs.Arg(0)
+	if dir == "" {
+		return fmt.Errorf("need a store directory")
+	}
+	if (*node == 0) == (*edge == 0) {
+		return fmt.Errorf("need exactly one of -node or -edge")
+	}
+
+	fmt.Fprintln(os.Stderr, "prove opens the store; do not run it against one another process is writing")
+
+	s, err := disk.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	var blob []byte
+	switch {
+	case *edge != 0 && *kind == "redaction":
+		blob, err = s.ExportEdgeRedactionProof(store.EdgeID(*edge))
+	case *edge != 0:
+		return fmt.Errorf("-edge supports only -kind redaction")
+	case *kind == "inclusion":
+		blob, err = s.ExportNodeProof(store.NodeID(*node))
+	case *kind == "redaction":
+		blob, err = s.ExportRedactionProof(store.NodeID(*node))
+	case *kind == "property-redaction":
+		blob, err = s.ExportPropertyRedactionProof(store.NodeID(*node))
+	default:
+		return fmt.Errorf("unknown -kind %q", *kind)
+	}
+	if err != nil {
+		return err
+	}
+
+	if *out == "" {
+		_, werr := os.Stdout.Write(blob)
+		return werr
+	}
+	if err := os.WriteFile(*out, blob, 0600); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "wrote %d bytes to %s\n", len(blob), *out)
+	return nil
+}
+
+// cmdVerifyProof checks a proof file against a root supplied on the command
+// line.
+//
+// **Touches no store.** That is the property the whole exercise exists for: a
+// recipient has the bytes and a root they obtained independently, and needs
+// nothing else. If this command needed the store it would be verifying evidence
+// against its own author, which proves nothing.
+func cmdVerifyProof(args []string) error {
+	fs := flag.NewFlagSet("verify-proof", flag.ExitOnError)
+	rootHex := fs.String("root", "", "the snapshot root you retained, as hex (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := fs.Arg(0)
+	if path == "" {
+		return fmt.Errorf("need a proof file")
+	}
+	if *rootHex == "" {
+		return fmt.Errorf("need -root: a proof checked against the root inside it proves nothing,\n" +
+			"because whoever wrote the file chose both")
+	}
+
+	var root merkle.Hash
+	raw, derr := hex.DecodeString(*rootHex)
+	if derr != nil || len(raw) != len(root) {
+		return fmt.Errorf("-root must be %d hex bytes", len(root))
+	}
+	copy(root[:], raw)
+
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	proof, err := disk.UnmarshalProof(blob)
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "kind\t%s\n", proof.Kind)
+	fmt.Fprintf(w, "subject\t%s\n", proof.Subject())
+	fmt.Fprintf(w, "checked against\t%x\n", root)
+	w.Flush()
+
+	if err := disk.VerifyExportedProof(root, proof); err != nil {
+		fmt.Printf("\nFAILED: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("\nVERIFIED: %s of %s under the root supplied\n", proof.Kind, proof.Subject())
 	return nil
 }
 

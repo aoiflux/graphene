@@ -310,6 +310,40 @@ A verified claim means: *the holder of key K asserted, at time T, that a
 snapshot with root R contained this entity.* It does not mean the entity's
 contents are true, that T is accurate, or that K's holder was uncompromised.
 
+### Handing a proof over
+
+Proofs can leave the process as bytes, and be checked by a recipient with no
+store, no image and no directory:
+
+```go
+blob, err := s.ExportNodeProof(id)                    // producer
+proof, err := disk.UnmarshalProof(blob)               // recipient
+err = disk.VerifyExportedProof(retainedRoot, proof)   // recipient
+```
+
+or from a shell, where the two halves are deliberately different commands:
+
+```
+graphene prove -node 7 -out claim.gprf <dir>
+graphene verify-proof -root <hex> claim.gprf          # touches no store
+```
+
+**The root is never bundled with the proof, and there is no form of the API or
+the command that lets it be.** A proof checked against a root carried inside it
+proves nothing, because whoever wrote the file chose both. The root has to come
+from somewhere its author does not control — a published checkpoint (§5), a
+co-signed attestation, or a value written down when the evidence was collected.
+
+What travels is the leaf, the sibling hashes and the component roots — never the
+image, and never any other entity. That is what makes handing a proof over safe
+where handing over the file would not be. A redaction proof carries less still:
+a tombstone names an entity and a digest, never an actor or a reason.
+
+A proof file is **not** signed. Its integrity does not depend on that: every
+field a verifier relies on is bound into the root it is checked against, so a
+single altered byte either fails to parse or fails to verify. Signing it would
+say who sent it, which is a different question from whether it is true.
+
 ---
 
 ## 5. Anchoring: the only check that is not the store's own word

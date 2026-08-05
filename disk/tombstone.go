@@ -333,6 +333,11 @@ func VerifyRedactionInclusion(snapshotRoot merkle.Hash, p RedactionInclusionProo
 	if bindSnapshotRoot(p.Roots) != snapshotRoot {
 		return fmt.Errorf("verify redaction: the proof's component roots do not produce this snapshot root")
 	}
+	// Same reason as VerifyNodeInclusion: Roots.Snapshot is not consulted above,
+	// so without this it is a field the proof could state freely.
+	if p.Roots.Snapshot != snapshotRoot {
+		return fmt.Errorf("verify redaction: the proof states a different snapshot root than the one it is checked against")
+	}
 	if p.Roots.BodyVersion < snapshotBodyV2 {
 		// A v1 snapshot root does not commit to a tombstone root at all, so a
 		// proof "under" one proves nothing about that image. Saying so beats

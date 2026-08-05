@@ -1433,3 +1433,103 @@ than to the whole log.
 
 The returned uninstall function exists so tests and embedded uses can avoid
 leaving a global signal handler behind.
+
+---
+
+## 21. Forensic integrity (`disk` package)
+
+Every entry below is **opt-in** and lives on `disk.Store`, not `graphene.Graph`.
+This section is a lookup table; [FORENSICS.md](FORENSICS.md) is the working
+guide and [SECURITY.md](../SECURITY.md) is the authority on what each mechanism
+proves and what it does not.
+
+### Configuration
+
+| Symbol | Purpose |
+| --- | --- |
+| `StrictOptions(signer, verifier, actorID) Options` | The cautious posture: commits signed and required to be signed, image verified on open, audit log on |
+| `Options.Signer` / `.Verifier` | Sign each batch commit; check signatures during replay |
+| `Options.RequireSignedCommits` | Reject a log containing an unsigned committed batch — closes the downgrade |
+| `Options.VerifyOnOpen` | Check digest, roots and attestation before loading the image |
+| `Options.Audit` | Hash-chained record of operator actions in `graphene.audit` |
+| `Options.Retention` (`RetentionPolicy`) | Which retired WAL segments survive compaction |
+| `Options.Redaction` / `.RedactionPolicy` | Enable the redaction ledger; bound a single cascade |
+
+### Snapshot roots, attestations, proofs
+
+| Symbol | Purpose |
+| --- | --- |
+| `(*Store).SnapshotRoots() (SnapshotRoots, error)` | The Merkle identity of the compacted image. **Retain `.Snapshot` externally** |
+| `(*Store).SnapshotAttestation() (Attestation, error)` | The signed assertion over that image |
+| `VerifyAttestation(v, a) error` | Check an attestation with only a public key |
+| `(*Store).AttestNode(id) (NodeAttestation, error)` | A transferable claim about one entity |
+| `VerifyNodeAttestation(v, na) error` | Check one |
+| `(*Store).ProveNode(id) (NodeInclusionProof, error)` | Inclusion proof for an entity |
+| `VerifyNodeInclusion(root, p) error` | Package-level; needs no store |
+| `VerifyCSRDigest(path)` / `VerifyCSRRoots(path)` | Whole-image checks |
+| `VerifyChain(earlier, later) error` | That one snapshot follows another |
+
+### Exporting a proof
+
+| Symbol | Purpose |
+| --- | --- |
+| `(*Store).ExportNodeProof(id) ([]byte, error)` | Inclusion proof as bytes |
+| `(*Store).ExportRedactionProof(id) ([]byte, error)` | Node removal |
+| `(*Store).ExportEdgeRedactionProof(id) ([]byte, error)` | Edge removal |
+| `(*Store).ExportPropertyRedactionProof(id) ([]byte, error)` | Content-free property removal |
+| `UnmarshalProof(data) (ExportedProof, error)` | Decode; says nothing about truth |
+| `VerifyExportedProof(root, e) error` | **Needs no store.** The root is an argument, never read from the proof |
+| `MarshalProof(e) ([]byte, error)` | Re-encode |
+| `ErrProofMalformed` | Unreadable, as distinct from readable and false |
+
+### Redaction
+
+| Symbol | Purpose |
+| --- | --- |
+| `(*Store).RedactionImpactFor(id) (RedactionImpact, error)` | What a removal would take, before it takes it |
+| `(*Store).RedactNode(id, req)` | The entity and every incident edge |
+| `(*Store).RedactNodeProperties(id, req)` | The property blob; entity, labels and edges stay |
+| `(*Store).RedactEdge(id, req)` | One relationship, both endpoints kept |
+| `(*Store).RedactEdgeProperties(id, req)` | An edge's properties; the relationship stays |
+| `(*Store).Redactions() ([]RedactionRecord, error)` | The ledger, oldest first |
+| `ReadRedactions(dir)` | Same, without opening the store |
+| `VerifyRedactionChain(records, verifier) error` | Hash chain and signatures |
+| `(*Store).ProveRedaction(id)` / `.ProveEdgeRedaction(id)` | A removal is recorded under the snapshot root |
+| `(*Store).ProvePropertyRedaction(id)` | Properties went and nothing else changed |
+| `VerifyRedactionInclusion` / `VerifyPropertyRedaction` | Package-level verifiers |
+| `(*Store).Tombstones() []Tombstone` | What the image records as removed |
+| `ErrRedactionUnexplained` / `ErrCascadeTooLarge` / `ErrNoTombstone` | Refusals |
+
+`RedactionRequest{ActorID, RoleID, Reason}` — **`Reason` is required.** An
+unexplained redaction is indistinguishable from evidence destruction.
+
+### Chain of custody
+
+| Symbol | Purpose |
+| --- | --- |
+| `(*Store).CustodyFor(id, verifier)` | Walks every history. **Never `Complete()`** — it reports that all checks are self-referential |
+| `(*Store).CustodyForAnchored(id, verifier, root)` | Against a root you retained |
+| `(*Store).CustodyForAnchor(id, verifier, anchor)` | Against an anchor — strongest |
+| `CustodyReport.Complete()` / `.Broken()` / `.Summary()` / `.Gaps` | Gaps, not a verdict |
+
+### Anchoring
+
+| Symbol | Purpose |
+| --- | --- |
+| `Anchor` (interface) | `Publish(digest)` and `Records()`. **The engine ships no transport** |
+| `(*Store).Checkpoint() (Checkpoint, error)` | Capture every history's head without publishing |
+| `(*Store).PublishCheckpoint(a)` | Capture, publish, record locally |
+| `(*Store).VerifyAgainstAnchor(a) (AnchorAudit, error)` | Bidirectional: local vs published, both ways |
+| `(*Store).CheckpointHistory()` / `ReadCheckpoints(dir)` | The local chain |
+| `VerifyCheckpointChain(chain) error` | Local only — weak by design |
+| `NewInsecureLocalAnchor(path, storeDir)` | **Not an anchor.** For tests and demos; refuses a path inside the store |
+
+### Audit log and key rotation
+
+| Symbol | Purpose |
+| --- | --- |
+| `(*Store).AuditEntries()` / `ReadAuditLog(dir)` | Operator actions, oldest first |
+| `(*Store).RecordAudit(kind, actorID, detail)` | Your own events. Kinds below `AuditCustom` are the engine's |
+| `VerifyAuditChain(entries) error` | Distinguishes an edited entry from an excised one |
+| `(*Store).RotateKey(...)` / `.KeyTimeline()` | Signed by the outgoing key |
+| `ListSegments(dir)` / `VerifySegmentChain(segs)` | Retired WAL segments |

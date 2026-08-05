@@ -73,6 +73,18 @@ func main() {
 	example20_VisualizationSimilarityMesh()
 	example21_VisualizationPatternScope()
 	example22_VisualizationExplorationDemo()
+
+	// The integrity machinery. All of it is opt-in and none of it is reachable
+	// from graphene.Graph, so these open disk.Store directly. SECURITY.md is the
+	// authority on what each mechanism does and does not prove.
+	fmt.Println("--- Forensic Integrity (signing, proofs, redaction, anchoring) ---")
+	fmt.Println()
+	exampleForensic1_SignedStoreAndAttestation()
+	exampleForensic2_InclusionProof()
+	exampleForensic3_HandingAProofOver()
+	exampleForensic4_LawfulRedaction()
+	exampleForensic5_ChainOfCustody()
+	exampleForensic6_Checkpoints()
 }
 
 // ----------------------------------------------------------------------------

@@ -220,6 +220,43 @@ Scale validation covered by stress tests:
 - Pattern discovery: scoped VF2-inspired subgraph matching.
 - Persistence lifecycle: open, replay, compact, reopen.
 - Visualization export: interactive HTML graph maps for quick analysis.
+- **Forensic integrity (opt-in)**: signed commits, signed snapshot attestations,
+  Merkle inclusion proofs you can hand to a third party, attributed redaction
+  with content-free proof, a chain-of-custody report, and externally anchored
+  checkpoints. See below.
+
+## Forensic Integrity
+
+Graphene is built for evidence, so it can produce claims about what it holds
+that survive leaving the process: *this artefact was in this snapshot*, *this
+one was deliberately removed, by whom and why*, and *neither statement has been
+altered since*.
+
+```go
+opts := disk.StrictOptions(key, ring, actorID)   // signed, verified, audited
+s, _ := disk.OpenWithOptions(dir, opts)
+s.Compact()
+
+blob, _ := s.ExportNodeProof(id)                 // hand this over
+proof, _ := disk.UnmarshalProof(blob)            // recipient has no store
+err := disk.VerifyExportedProof(retainedRoot, proof)
+```
+
+All of it is **opt-in** and none of it is on `graphene.Graph` — it lives on
+`disk.Store`. Three things worth knowing before you rely on any of it:
+
+- **It prevents nothing.** Graphene is a library in your process; anything
+  running there can call any API and use your signing key. What the machinery
+  does is make the *result* detectable to someone outside.
+- **Retain a snapshot root outside the system.** Every internal check compares
+  the store against itself. Only a value you kept elsewhere distinguishes
+  "internally consistent" from "not tampered with".
+- **The engine ships no anchoring transport**, by design — so until you supply
+  one, every guarantee is the store vouching for itself.
+
+**[SECURITY.md](SECURITY.md)** states what each mechanism proves and what it
+does not. **[docs/FORENSICS.md](docs/FORENSICS.md)** is the working guide.
+`go run ./examples` executes the whole flow.
 
 ## Mutation (update / delete)
 
@@ -450,6 +487,11 @@ go run ./examples
   read this before relying on the integrity machinery for anything evidentiary.
   It states what digests, Merkle roots, signatures, and attestations actually
   prove, and what they do not.
+- **Using the integrity machinery:** [FORENSICS.md](docs/FORENSICS.md) — the
+  working guide. Signing, inclusion proofs, exporting a proof to a third party,
+  lawful redaction, chain of custody, and anchoring, in the order you adopt
+  them. Runnable form:
+  [`examples/forensic_examples.go`](examples/forensic_examples.go).
 
 ## Query Migration
 

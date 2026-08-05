@@ -13,6 +13,7 @@ package disk
 // in the snapshot, and the snapshot is what compaction wrote.
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -126,13 +127,69 @@ func VerifyNodeInclusion(snapshotRoot merkle.Hash, p NodeInclusionProof) error {
 	if bindSnapshotRoot(p.Roots) != snapshotRoot {
 		return errors.New("verify: the proof's component roots do not produce this snapshot root")
 	}
+	// And the roots must agree with themselves. Roots.Snapshot is not consulted
+	// above — the caller's root is what matters — so without this it would be a
+	// field a proof could state freely and a reader could believe.
+	if p.Roots.Snapshot != snapshotRoot {
+		return errors.New("verify: the proof states a different snapshot root than the one it is checked against")
+	}
 	if p.Roots.NodeRoot != p.NodeRoot {
 		return errors.New("verify: the proof's node root disagrees with its snapshot")
+	}
+	// **The label must match the evidence.** Nothing below reads NodeID — the
+	// leaf is what binds the claim — so a proof carrying entity A's leaf under a
+	// header naming entity B would verify while telling its reader the opposite.
+	// The header is not decoration; anyone rendering a proof shows it.
+	if id, ok := leafNodeID(p.LeafData); !ok {
+		return errors.New("verify: the proof's leaf data is not a node leaf")
+	} else if id != p.NodeID {
+		return fmt.Errorf("verify: the proof is labelled node %d but its leaf describes node %d",
+			p.NodeID, id)
+	}
+	// **The stated body version must match the leaf encoding.** v2 and v3 bind
+	// the same five components, so the binding above cannot tell them apart and
+	// the version would otherwise be a byte anyone could flip. The leaf's tag
+	// settles it, and tying the two removes the freedom.
+	if err := checkLeafVersionAgrees(p.LeafData, p.Roots.bodyVersion()); err != nil {
+		return err
 	}
 	if !merkle.VerifyProof(p.NodeRoot, merkle.HashLeaf(p.LeafData), p.Proof) {
 		return errors.New("verify: inclusion proof does not resolve to the node root")
 	}
 	return nil
+}
+
+// checkLeafVersionAgrees confirms a leaf's encoding is the one its stated body
+// version implies.
+func checkLeafVersionAgrees(leaf []byte, version uint8) error {
+	if len(leaf) == 0 {
+		return errors.New("verify: empty leaf data")
+	}
+	separated := leaf[0] == leafTagNodeV2 || leaf[0] == leafTagEdgeV2
+	switch {
+	case separated && version < snapshotBodyV3:
+		return fmt.Errorf("verify: the leaf uses the separated property hash but the proof "+
+			"claims snapshot body version %d", version)
+	case !separated && version >= snapshotBodyV3:
+		return fmt.Errorf("verify: the proof claims snapshot body version %d but its leaf "+
+			"hashes properties inline", version)
+	}
+	return nil
+}
+
+// leafNodeID reads the entity ID out of a node leaf, under either encoding.
+//
+// Both put the tag first and the ID immediately after, which is what lets one
+// function serve both — and the tags differ, so a v1 leaf can never be read as
+// a v2 one.
+func leafNodeID(leaf []byte) (store.NodeID, bool) {
+	if len(leaf) < 9 {
+		return 0, false
+	}
+	if leaf[0] != leafTagNode && leaf[0] != leafTagNodeV2 {
+		return 0, false
+	}
+	return store.NodeID(binary.LittleEndian.Uint64(leaf[1:9])), true
 }
 
 // VerifyCSRRoots recomputes a file's Merkle roots from its records and compares
