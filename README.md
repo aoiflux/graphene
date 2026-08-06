@@ -282,7 +282,7 @@ _ = g.DeleteNode(artID)
 On the disk backend, updates and deletes are written to the WAL (deletes as
 tombstone records) and take effect immediately for reads; the freed space is
 reclaimed at the next `Compact()`. IDs are monotonic and never reused. See the
-[API reference](docs/API_REFERENCE.md#mutation) for full semantics.
+[API reference](docs/API_REFERENCE.md#7-mutation) for full semantics.
 
 ## Query Model
 
@@ -482,8 +482,8 @@ go run ./examples
 
 ## Docs
 
-- Release notes: [v0.3.0](docs/RELEASE_NOTES_v0.3.0.md) — breaking changes,
-  upgrade path, measured results
+- Release notes: [v0.4.0](docs/RELEASE_NOTES_v0.4.0.md) — the forensic release:
+  what is new, what changed on disk, and what is still absent
 - Easy usage guide: [USER_GUIDE.md](docs/USER_GUIDE.md)
 - Complete API reference: [API_REFERENCE.md](docs/API_REFERENCE.md)
 - Deep technical architecture and LLD:

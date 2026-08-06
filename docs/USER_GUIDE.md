@@ -188,6 +188,14 @@ Deletes take effect immediately for reads and persist across restart. On the dis
 store the freed space is reclaimed at the next `Compact()` (which rebuilds the CSR
 without the deleted records).
 
+> **If the store holds evidence, `DeleteNode` is probably not what you want.**
+> It records nothing about who removed the entity or why, and after the next
+> compaction there is no trace it existed — so a lawful erasure and a destruction
+> of evidence are indistinguishable afterwards. The attributed forms
+> (`RedactNodeProperties`, `RedactNode`) keep the actor, the reason and a proof
+> that the removal happened. See §16 below and
+> [FORENSICS.md](FORENSICS.md).
+
 ## 5. Indexing and Bucketing
 
 Property indexing is explicit. You decide which keys become queryable.
@@ -794,3 +802,104 @@ Fix:
 This guide covers the complete concept set currently implemented in GrapheneDB,
 including buckets, nodes, edges, multi-hop traversal, indexing, persistence, and
 visualization.
+
+---
+
+## 16. Evidence and integrity
+
+Everything up to here works the same whether you are storing a social graph or a
+case file. This section is for the second one.
+
+Full treatment lives in three places, and the split matters:
+[SECURITY.md](../SECURITY.md) says what each mechanism **proves and does not**,
+[FORENSICS.md](FORENSICS.md) is the **working guide**, and
+[API_REFERENCE.md §22](API_REFERENCE.md#22-best-practices-for-evidentiary-use)
+is the **checklist**. This is the orientation.
+
+### It is all opt-in, and `Open` does not turn it on
+
+```go
+g, _ := graphene.Open(dir)   // unsigned, unverified, unaudited — the default
+```
+
+That is the right default for a graph database and the wrong one for evidence.
+Ask for the other posture explicitly:
+
+```go
+key, pub, _ := signing.GenerateKey(1)
+ring := signing.NewKeyring()
+ring.Add(1, pub)
+
+opts := disk.StrictOptions(key, ring, operatorActorID)
+opts.Retention = disk.RetentionPolicy{MaxSegments: 50}  // keep commit history
+opts.Redaction = true                                   // attributed removal
+opts.Roles = true                                       // record privilege changes
+
+g, _ := graphene.OpenWithOptions(dir, opts)
+s, _ := g.Forensics()   // the machinery; false on the in-memory backend
+```
+
+`Forensics` returns the same store the Graph is using, not a copy.
+
+### The four things worth knowing on day one
+
+**Attribute your writes.** A bare `Begin()` commits anonymously and attribution
+cannot be added later:
+
+```go
+tx := g.Begin().As(store.TxContext{ActorID: 7, RoleID: 3, KeyID: 1})
+```
+
+**Compaction is what makes things provable.** Snapshot roots and the attestation
+over them are written by `Compact()`. Before the first one an entity is live but
+unaccounted for — which is not the same as absent.
+
+**Retain a root outside the system.** `SnapshotRoots().Snapshot` is the value to
+keep. Every check the engine runs compares the store against itself; only a copy
+you hold elsewhere distinguishes "internally consistent" from "not tampered
+with".
+
+**Hand over proofs, not files.** A few hundred bytes proving one entity was in
+one snapshot, disclosing nothing about any other:
+
+```go
+blob, _ := s.ExportNodeProof(id)                       // you
+proof, _ := disk.UnmarshalProof(blob)                  // them, with no store
+err := disk.VerifyExportedProof(retainedRoot, proof)   // root from elsewhere
+```
+
+### Erasing something lawfully
+
+```go
+impact, _ := s.RedactionImpactFor(id)   // what a full removal would take with it
+rec, _ := s.RedactNodeProperties(id, disk.RedactionRequest{
+    ActorID: 7, RoleID: 3, Reason: "subject access request 41",
+})
+```
+
+`RedactNodeProperties` removes the property blob and keeps the entity, its
+labels and its edges — usually what an erasure request actually asks for.
+A reason is **required**: an unexplained redaction is indistinguishable from
+destroying evidence.
+
+Compact afterwards, or the removal is known to the ledger and not to the image.
+
+### From a shell
+
+```
+graphene custody -node 7 <dir>       account for one entity across every history
+graphene redactions <dir>            who removed what, when, and why
+graphene grants <dir>                who was permitted to do it
+graphene prove -node 7 -out c.gprf <dir>
+graphene verify-proof -root <hex> c.gprf     # needs no store
+```
+
+### What none of it does
+
+Graphene is a library in your process. Anything running there can call any API
+and use your signing key, so **nothing here prevents anything** — it makes the
+result detectable to someone outside. There is no access control: `RoleID` is
+recorded and never checked. And until you supply an anchor, every guarantee is
+the store vouching for itself.
+
+`go run ./examples` executes the whole flow end to end.

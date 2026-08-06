@@ -191,40 +191,101 @@ this is accepted rather than fixed.
 
 ## 4. On-disk formats
 
-Two files per store directory: `graphene.csr` and `graphene.wal`.
 **Everything is little-endian.**
+
+A minimal store is two files. Each opt-in integrity mechanism adds one more, and
+none of them is created unless the corresponding option is set:
+
+| File | Always? | Written by |
+|---|---|---|
+| `graphene.csr` | after the first `Compact()` | compaction |
+| `graphene.wal` | yes | every mutation |
+| `graphene.NNN.wal` | `Options.Retention` | segment rotation at compaction |
+| `graphene.audit` | `Options.Audit` | operator actions |
+| `graphene.redactions` | `Options.Redaction` | attributed removals |
+| `graphene.grants` | `Options.Roles` | privilege changes |
+| `graphene.checkpoints` | on `PublishCheckpoint` | anchoring |
+
+The four ledgers are each hash-chained and independently readable; see
+[FORENSICS.md](FORENSICS.md).
 
 ### 4.1 CSR file layout
 
+v8 turned the file into a **sectioned container**. Before it, every capability
+needing to persist something required a version bump; v8 carries a section
+directory instead, so a new capability adds a section and leaves the version
+alone. Three have been added since without touching it.
+
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ HEADER (46 bytes, v6+)                                  │
+│ HEADER (102 bytes, v8)                                  │
 ├─────────────────────────────────────────────────────────┤
 │ NODE RECORDS      × nodeCount     (variable length)     │
 ├─────────────────────────────────────────────────────────┤
 │ EDGE RECORDS      × edgeCount     (variable length)     │
 ├─────────────────────────────────────────────────────────┤
-│ PROPERTY INDEX SECTION  ("GIDX")   ← at header.indexOffset│
+│ SECTIONS, in directory order                            │
+├─────────────────────────────────────────────────────────┤
+│ SECTION DIRECTORY  ← at header.sectionTableOffset        │
 └─────────────────────────────────────────────────────────┘
-
-v2–v6 also carried flat adjacency arrays between the edge records and the index
-section (`outOffset[] │ outEdges[] │ inOffset[] │ inEdges[]`). **v7 does not
-write them**: the reader always rebuilt adjacency from the edge records and
-skipped the arrays entirely, so they were ~21% of the file, written on every
-`Compact()` and read by nobody. A v2–v6 file is still read, arrays and all.
 ```
 
-**Header, v6+ — 46 bytes (unchanged in v7):**
+v2–v6 also carried flat adjacency arrays between the edge records and the index
+section (`outOffset[] │ outEdges[] │ inOffset[] │ inEdges[]`). **v7 dropped
+them**: the reader always rebuilt adjacency from the edge records and skipped the
+arrays entirely, so they were ~21% of the file, written on every `Compact()` and
+read by nobody. A v2–v6 file is still read, arrays and all.
+
+**Header, v8 — 102 bytes.** The first 46 bytes are byte-identical in meaning to
+v6/v7, so a reader can identify the file and its counts before it knows anything
+about sections — which is what lets `cmd/graphene` report on a partially corrupt
+file rather than refusing to say anything.
 
 | Offset | Size | Field | Since |
 |---:|---:|---|---|
 | 0 | 4 | magic `GCSR` | v2 |
-| 4 | 2 | version (2–7 readable, 7 written) | v2 |
+| 4 | 2 | version (2–8 readable, 8 written) | v2 |
 | 6 | 8 | node count | v2 |
 | 14 | 8 | edge count | v2 |
 | 22 | 8 | node sequence high-water mark | v5 |
 | 30 | 8 | edge sequence high-water mark | v5 |
-| 38 | 8 | property-index section offset | v6 |
+| 38 | 8 | property-index section offset (**0 in v8**) | v6 |
+| 46 | 8 | commit sequence high-water mark | v8 |
+| 54 | 8 | last compaction time (**excluded from the digest**) | v8 |
+| 62 | 8 | section table offset | v8 |
+| 70 | 32 | SHA-256 digest, computed with these bytes zeroed | v8 |
+
+The compaction timestamp is excluded from the digest deliberately: the digest is
+an identity for *content*, two parties holding the same evidence must compute the
+same value, and hashing a wall-clock reading would make two compactions of
+identical content disagree.
+
+**Sections.** Each directory entry is magic(4) + flags(4) + offset(8) +
+length(8). Bit 0 of flags marks a section **CRITICAL**: a reader meeting an
+unknown critical section must refuse the file, while an unknown optional one is
+skipped. Same rule as unknown WAL record types, for the same reason — a build
+that cannot check an attestation must not present the file as though it had.
+
+| Magic | Contents | Critical |
+|---|---|---|
+| `GIDX` | property index | no — losing it costs a scan, not an answer |
+| `GORD` | ordered-key declarations | no |
+| `GHSH` | snapshot roots | **yes** |
+| `GATT` | signed attestation | **yes** |
+| `GRDT` | redaction tombstones | **yes** |
+| `GCMP` | composite index declarations (reserved) | no |
+
+**Snapshot roots (`GHSH`) are themselves versioned**, because adding a component
+changes what a snapshot root *is* and a retained root must stay verifiable:
+
+| Body version | Binds | Leaf encoding |
+|---|---|---|
+| v1 | node, edge, index, prev | properties hashed inline |
+| v2 | + tombstone root | properties hashed inline |
+| v3 | + tombstone root | properties hashed **separately** (`SHA256(0x07 ‖ props)`) |
+
+Every proof and every recomputation reads the encoding from the image rather than
+using this build's preference, so a v1 image stays checkable by a v3 binary.
 
 **Node record** (variable length):
 
@@ -318,8 +379,22 @@ record:  [type:1][length:4][payload:length][crc32:4]
 | `0x07` | node property purge |
 | `0x08` | edge property purge |
 | `0x09` | batch begin — payload is the record count |
-| `0x0A` | batch commit — payload is count then a CRC over the batch body |
+| `0x0A` | batch commit — payload is count, a CRC over the batch body, and (v8+) the commit sequence, timestamp, actor and signature |
+| `0x0D` | signing-key transition, signed by the **outgoing** key |
 | `0xFF` | checkpoint |
+
+Replay **rejects** an unknown record type rather than skipping it. Skipping would
+let an older binary apply a rolled-back batch by ignoring the very begin/commit
+markers meant to suppress it, so a log written by a newer build is deliberately
+unreadable by an older one — forward-compatible only in the direction that is
+safe.
+
+The log also carries a container header (`GWAL`) naming its **framing version**.
+v2 framing checksums each record's type and length along with its payload; v1
+covered the payload only. A pre-existing log keeps its original framing until the
+store is compacted, because changing what the checksums cover would invalidate
+every record already written. `graphene wal <dir>` reports which framing is in
+use.
 
 **The purge types exist for a specific bug.** With `ReindexPurge`, an update drops
 an entity's index entries. If that were not journalled, replay would re-apply the
@@ -1174,6 +1249,73 @@ located either cost.
 
 The read buffer is capped to the log's own size. A fixed 1 MiB buffer cost a
 megabyte on every open, including compacted stores that replay almost nothing.
+
+---
+
+
+---
+
+## 11a. Integrity architecture
+
+All of this is opt-in and none of it is on the critical path of a store that has
+not asked for it. [SECURITY.md](../SECURITY.md) is the authority on what each
+mechanism proves; [FORENSICS.md](FORENSICS.md) is how to call it. This section is
+how it is put together.
+
+### 11a.1 Six chains, and what each answers
+
+| Chain | Where | Question |
+|---|---|---|
+| snapshot roots | `GHSH` in the image | what does this image contain, and what did it replace |
+| attestations | `GATT` in the image | who asserted this image, and when |
+| WAL segments | `graphene.NNN.wal` | which commits produced it, across past compactions |
+| audit entries | `graphene.audit` | what was done to the store |
+| redactions | `graphene.redactions` | what was destroyed on purpose, by whom, why |
+| grants | `graphene.grants` | who was permitted to do any of it |
+
+Each is hash-linked and verifies on its own. Each was built for a different
+question, and **none of them answers the one an investigation asks** — *can this
+artefact be accounted for end to end?* `CustodyFor` walks all six and returns the
+gaps; it is synthesis over the chains rather than a seventh mechanism.
+
+### 11a.2 Why the ledgers are not in the WAL
+
+Compaction truncates the WAL. A deletion record living there would be destroyed
+by the very operation that makes the deletion permanent — a record that
+disappears exactly when it becomes the only evidence. The same argument applies
+to grants and audit entries, so each is its own append-only file that compaction
+never touches.
+
+The cost is more files and more fsyncs; BL-33's measurement puts the audit +
+retention overhead at a flat ~15–16 ms per compaction, independent of image size,
+because it is durable writes rather than hashing.
+
+### 11a.3 What binds them together
+
+A `Checkpoint` hashes every chain's head into one digest — snapshot root,
+attestation ID, segment head, audit head, redaction head, grant head — plus the
+count of each. Publishing only the snapshot root would leave the others free to
+be rewritten, so binding them jointly removes the choice.
+
+The digest is what leaves the system. The engine **ships no anchor transport**:
+what makes an anchor an anchor is being beyond the reach of whoever can rewrite
+the store, and nothing in-process can establish that. `disk.Anchor` is two
+methods; supplying one is the deployment's job.
+
+### 11a.4 The boundary, restated
+
+Graphene is a library in the caller's process, so every check here compares the
+store against the store. That catches corruption and it catches an outsider. It
+does not catch an insider holding the signing key, who can rebuild every chain
+consistently. Only a value retained outside the system closes that, which is why
+`CustodyFor` can never report `Complete()` and says so rather than letting a
+clean report be mistaken for proof.
+
+The role model is the same shape and is documented as such: nothing in the engine
+calls `CheckCapability`. What the grant ledger provides is that capabilities are
+derived from it and nothing else, so a privilege change cannot happen without
+leaving a record — an invariant that holds by construction rather than by
+checking, which is the only way it could hold here.
 
 ---
 
