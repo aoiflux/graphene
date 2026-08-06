@@ -21,9 +21,20 @@ Two companion documents, and the split matters:
 nothing, which is the historical behaviour and stays the default. Nothing below
 happens unless you ask for it.
 
-**None of it is on `graphene.Graph`.** The integrity machinery lives on
-`disk.Store`, so these calls open the disk backend directly rather than going
-through the façade.
+**It lives on `disk.Store`, not `graphene.Graph`** — but you can get there from
+the façade, and if you already hold a `Graph` that is the way:
+
+```go
+g, err := graphene.OpenWithOptions(dir, opts)   // opts below
+s, ok := g.Forensics()                          // false on the in-memory backend
+```
+
+`Forensics` returns the *same* store the Graph is using, so writes through
+either are visible to both. `graphene.Open` still gives the historical defaults —
+unsigned, unverified — which is why the strict posture needs
+`OpenWithOptions`.
+
+Examples in this guide call the store directly for brevity:
 
 ```go
 import "github.com/aoiflux/graphene/disk"
@@ -57,6 +68,10 @@ opts.Redaction = true
 opts.RedactionPolicy = disk.RedactionPolicy{MaxCascade: 50}
 
 s, err := disk.OpenWithOptions(dir, opts)
+
+// or, from the façade:
+g, err := graphene.OpenWithOptions(dir, opts)
+s, _ := g.Forensics()
 ```
 
 `StrictOptions` is the cautious posture: every commit signed **and required to

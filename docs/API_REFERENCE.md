@@ -1060,6 +1060,48 @@ fixture. They are **illustrative ratios, not promises** — see
 under ~25% are not resolvable in that data. The order-of-magnitude gaps are the
 ones worth designing around.
 
+> **Rows marked ✔ were re-measured** on a Ryzen 9 5980HS at `-count=3..5` after
+> the integrity work landed. Unmarked rows have **not** been re-run since
+> signing, attestation, tombstones and the v3 leaf encoding; treat them as
+> directional. §22.2 carries the forensic costs, which were measured separately.
+>
+> **Every row's advice survived re-measurement; three of the magnitudes did
+> not.** `BFSIDs` was documented as "20 allocations vs 394" and is nearer half:
+> 97 vs 198 on a deep walk, 104 vs 237 on a wide one — still the right call, for
+> a smaller reason than claimed. `EdgeExists` was ~280 ns and is ~0.5 µs. The
+> point-lookup figure was wrong outright; see §19.2.
+>
+> That pattern is worth stating rather than quietly patching: the *guidance* here
+> has held up, and the numbers attached to it had drifted by up to 4×. A reader
+> choosing between two calls was being told the right thing for the wrong reason.
+>
+> Benchmarks live behind the `stress` build tag. `go test -bench` **without**
+> `-tags stress` matches nothing and exits successfully, which is an easy way to
+> conclude there are no regressions.
+
+#### Why batching is recommended, since the old numbers were wrong
+
+The batch row previously claimed **−53 to −64% on disk, 21–38% in memory**.
+Neither figure survives contact with the suite:
+
+- **In memory, batching and looping measure the same** — 42.7 vs 48.2 µs at
+  n=100, 440 vs 445 µs at n=1000, allocations identical to within one. The
+  in-memory store has no WAL and no fsync, so there is nothing for a batch to
+  amortise. The honest number is ~0%.
+- **On disk there is no paired benchmark at all.** `BulkWrite_AddNodeLoop` exists
+  only in a `_Memory` variant, so the headline disk percentage could not have
+  been reproduced from this suite by anyone who tried.
+
+**Batch anyway, for a better reason.** An unbatched write is *not* fsynced; a
+batch commit is (§16). So a loop can genuinely be faster in wall-clock while
+leaving the writes exposed to power loss — the throughput comparison was
+measuring the wrong thing, and the direction it implied was not even safe. A
+commit is also the only unit that carries an actor and a signature (§22.4).
+
+Restoring a real number here needs a disk `AddNodeLoop` benchmark, which does not
+exist. Until it does, the guidance stands on durability and attribution, which
+are measured (§22.2) rather than asserted.
+
 ### 19.1 The fast-path matrix
 
 The single most useful table here: what you want, the call that is slow, and the
@@ -1067,14 +1109,14 @@ call that is not.
 
 | If you want… | Slower | **Faster** | Difference |
 |---|---|---|---|
-| **Degree of a node** | `EdgesOf(...)` then `len()` | **`Degree` / `InDegree` / `OutDegree` with `nil` types** | ~15 ns vs materialising every edge |
-| **Degree of one edge type** | `Degree(id, []EdgeType{t})` | **`Degree(id, nil)`, filter later if you can** | **~488×** — 15 ns vs 7.4 µs |
-| **Reachable node IDs** | `BFS(...)` then read `.Nodes` | **`BFSIDs(...)`** | 20 allocations vs 394 |
+| **Degree of a node** | `EdgesOf(...)` then `len()` | **`Degree` / `InDegree` / `OutDegree` with `nil` types** | ~18 ns vs materialising every edge ✔ |
+| **Degree of one edge type** | `Degree(id, []EdgeType{t})` | **`Degree(id, nil)`, filter later if you can** | **~470×** — 18 ns vs 8.3 µs ✔ |
+| **Reachable node IDs** | `BFS(...)` then read `.Nodes` | **`BFSIDs(...)`** | ~half the allocations and ~half the bytes ✔ |
 | **"Are these connected?"** | `ShortestPath(...)` then check error | **`IsConnected(src, dst)`** | no path materialised |
-| **"Is there an edge?"** | `EdgesOf` then scan | **`EdgeExists(src, dst, types)`** | ~280 ns, stops at first hit |
+| **"Is there an edge?"** | `EdgesOf` then scan | **`EdgeExists(src, dst, types)`** | ~0.5 µs, stops at first hit ✔ |
 | **IDs for a follow-up query** | `QueryNodes(...)` | **`QueryNodeIDs(...)`** | skips building every record |
-| **One property lookup** | `QueryNodeIDs` with one filter | **`NodesByProperty(key, val)`** | ~78 ns vs ~320 ns — no planner |
-| **Many nodes** | `AddNode` in a loop | **`AddNodes(batch)`** | **−53 to −64% on disk**, 21–38% in memory |
+| **One property lookup** | `QueryNodeIDs` with one filter | **`NodesByProperty(key, val)`** | ~77 ns vs ~270 ns — no planner ✔ |
+| **Many nodes** | `AddNode` in a loop | **`AddNodes(batch)`** | **Durability, not throughput** — see below ✔ |
 | **Nodes *and* their edges** | `AddNodes` then `AddEdges` | **`Begin()` / `Commit()`** | same speed, but one commit instead of two — a crash between them cannot orphan nodes |
 | **Many index entries** | `IndexNodeProperty` × N | **`IndexNodeProperties(id, map)`** | one call per entity |
 | **Update an indexed entity** | `UpdateNode` then re-index | **`UpdateNodeIndexed(n, props)`** | atomic; no stale window |
@@ -1087,10 +1129,21 @@ call that is not.
 
 #### Point lookups are already optimal — don't build around them
 
-`GetNode` on the disk backend resolves through a direct array offset: **~6 ns** at
-the store level. There is nothing to tune. If a profile says point lookups are
-your cost, you are making too many of them — batch with `GetNodes`, or avoid
-materialising records at all (below).
+`GetNode` on the disk backend resolves through a direct array offset, so the
+*lookup* is free. What it is not is allocation-free: measured at the store level
+it is **~47 ns and one 64-byte allocation per call**, because the API hands back
+a `*store.Node` and building that pointer is the cost.
+
+> An earlier edition of this section quoted **~6 ns** here. That figure is the
+> array offset — `CSRGraph.GetNode`, which returns a record by value — and not
+> what `Store.GetNode` costs. It was attributed to the wrong call, and the number
+> a caller actually gets is the one above. Re-measured on a Ryzen 9 5980HS;
+> ratios, not promises.
+
+There is still nothing to *tune* in the lookup itself. If a profile says point
+lookups are your cost, you are making too many of them, and the allocation is
+what you are paying for — batch with `GetNodes`, or avoid materialising records
+at all (below).
 
 #### Ask for IDs, not records
 

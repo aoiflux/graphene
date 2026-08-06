@@ -79,6 +79,7 @@ func main() {
 	// authority on what each mechanism does and does not prove.
 	fmt.Println("--- Forensic Integrity (signing, proofs, redaction, anchoring) ---")
 	fmt.Println()
+	exampleForensic0_FromTheFacade()
 	exampleForensic1_SignedStoreAndAttestation()
 	exampleForensic2_InclusionProof()
 	exampleForensic3_HandingAProofOver()

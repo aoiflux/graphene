@@ -459,8 +459,14 @@ func cmdCustody(args []string) error {
 	fs := flag.NewFlagSet("custody", flag.ExitOnError)
 	node := fs.Uint64("node", 0, "node ID to account for")
 	anchor := fs.String("anchor", "", "hex snapshot root retained outside this system")
+	var keys pubkeyList
+	fs.Var(&keys, "pubkey", "ID:HEX Ed25519 public key to verify signatures with (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	verifier, verr := verifierFromFlag(keys)
+	if verr != nil {
+		return verr
 	}
 	dir := fs.Arg(0)
 	if dir == "" {
@@ -479,9 +485,9 @@ func cmdCustody(args []string) error {
 	}
 	defer s.Close()
 
-	// No verifier: this command has no key material, so signature-dependent
-	// layers report as unchecked rather than verified. A caller holding a public
-	// key gets a stronger answer from the API.
+	// Without -pubkey the verifier is nil and signature-dependent layers report
+	// as unchecked rather than verified — which the summary says, so a reader
+	// cannot mistake "no gaps" for "signatures confirmed".
 	var report disk.CustodyReport
 	if *anchor != "" {
 		var h merkle.Hash
@@ -490,9 +496,9 @@ func cmdCustody(args []string) error {
 			return fmt.Errorf("-anchor must be %d hex bytes", len(h))
 		}
 		copy(h[:], raw)
-		report, err = s.CustodyForAnchored(store.NodeID(*node), nil, h)
+		report, err = s.CustodyForAnchored(store.NodeID(*node), verifier, h)
 	} else {
-		report, err = s.CustodyFor(store.NodeID(*node), nil)
+		report, err = s.CustodyFor(store.NodeID(*node), verifier)
 	}
 	if err != nil {
 		return err
@@ -506,6 +512,7 @@ func cmdCustody(args []string) error {
 		fmt.Fprintf(w, "snapshot root\t%x\n", report.SnapshotRoot)
 	}
 	fmt.Fprintf(w, "attested\t%v (verified: %v)\n", report.Attested, report.AttestationVerified)
+	fmt.Fprintf(w, "signatures\t%s\n", signatureNote(verifier))
 	fmt.Fprintf(w, "segments walked\t%d\n", report.SegmentsChecked)
 	fmt.Fprintf(w, "audit entries\t%d (%d compactions)\n", report.AuditEntriesWalked, report.CompactionsRecorded)
 	w.Flush()

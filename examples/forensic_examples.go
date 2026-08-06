@@ -21,11 +21,88 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/aoiflux/graphene"
 	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/merkle"
 	"github.com/aoiflux/graphene/signing"
 	"github.com/aoiflux/graphene/store"
 )
+
+// exampleForensic0_FromTheFacade shows the entry point a consumer actually
+// starts from.
+//
+// Everything below this opens disk.Store directly, which is shorter. But a
+// caller who already holds a graphene.Graph does not need to: OpenWithOptions
+// takes the same options, and Forensics returns the same store rather than a
+// copy — so writes through either are visible to both.
+func exampleForensic0_FromTheFacade() {
+	fmt.Println("Forensic 0: reaching the machinery from graphene.Graph")
+
+	dir, _ := os.MkdirTemp("", "graphene-forensic0")
+	defer os.RemoveAll(dir)
+
+	key, pub, err := signing.GenerateKey(1)
+	if err != nil {
+		fmt.Println("  key:", err)
+		return
+	}
+	ring := signing.NewKeyring()
+	if err := ring.Add(1, pub); err != nil {
+		fmt.Println("  ring:", err)
+		return
+	}
+
+	g, err := graphene.OpenWithOptions(dir, disk.StrictOptions(key, ring, 42))
+	if err != nil {
+		fmt.Println("  open:", err)
+		return
+	}
+	defer g.Close()
+
+	s, ok := g.Forensics()
+	if !ok {
+		fmt.Println("  this Graph has no integrity machinery")
+		return
+	}
+
+	// Written through the façade, proved through the store.
+	id, err := g.AddNode(&store.Node{
+		Labels:     []store.NodeType{store.NodeTypeMicroArtefact},
+		Properties: []byte("sha256=abc123"),
+	})
+	if err != nil {
+		fmt.Println("  add:", err)
+		return
+	}
+	if err := g.Compact(); err != nil {
+		fmt.Println("  compact:", err)
+		return
+	}
+
+	roots, err := s.SnapshotRoots()
+	if err != nil {
+		fmt.Println("  roots:", err)
+		return
+	}
+	proof, err := s.ProveNode(id)
+	if err != nil {
+		fmt.Println("  prove:", err)
+		return
+	}
+	if err := disk.VerifyNodeInclusion(roots.Snapshot, proof); err != nil {
+		fmt.Println("  VERIFY FAILED:", err)
+		return
+	}
+	fmt.Printf("  node %d added via Graph, proved via Forensics()\n", id)
+
+	// The in-memory backend has none of it, and says so once.
+	mem := graphene.NewInMemory()
+	defer mem.Close()
+	if _, ok := mem.Forensics(); !ok {
+		fmt.Println("  in-memory backend: no integrity machinery, reported once")
+	}
+	fmt.Println()
+}
 
 // openForensicStore is the configuration every example below shares.
 //

@@ -234,16 +234,20 @@ altered since*.
 
 ```go
 opts := disk.StrictOptions(key, ring, actorID)   // signed, verified, audited
-s, _ := disk.OpenWithOptions(dir, opts)
-s.Compact()
+g, _ := graphene.OpenWithOptions(dir, opts)
+s, _ := g.Forensics()                            // the same store, not a copy
+g.Compact()
 
 blob, _ := s.ExportNodeProof(id)                 // hand this over
 proof, _ := disk.UnmarshalProof(blob)            // recipient has no store
 err := disk.VerifyExportedProof(retainedRoot, proof)
 ```
 
-All of it is **opt-in** and none of it is on `graphene.Graph` — it lives on
-`disk.Store`. Three things worth knowing before you rely on any of it:
+All of it is **opt-in**: `graphene.Open` keeps the historical defaults —
+unsigned, unverified — so the strict posture is something you ask for. The
+machinery itself lives on `disk.Store`, reachable via `Graph.Forensics()`, which
+returns false on the in-memory backend. Three things worth knowing before you
+rely on any of it:
 
 - **It prevents nothing.** Graphene is a library in your process; anything
   running there can call any API and use your signing key. What the machinery

@@ -73,6 +73,60 @@ func Open(dir string) (*Graph, error) {
 	return &Graph{GraphStore: s}, nil
 }
 
+// OpenWithOptions returns a Graph backed by a disk store opened with opts.
+//
+// Open gives you the historical defaults: unsigned commits, no verification on
+// open, no audit log. That is the right default for a graph database and the
+// wrong one for a store holding evidence, and there was previously no way to ask
+// for the other posture without bypassing this package entirely.
+//
+//	key, pub, _ := signing.GenerateKey(1)
+//	ring := signing.NewKeyring()
+//	ring.Add(1, pub)
+//
+//	opts := disk.StrictOptions(key, ring, operatorActorID)
+//	opts.Retention = disk.RetentionPolicy{MaxSegments: 50}
+//	opts.Redaction = true
+//	g, err := graphene.OpenWithOptions(dir, opts)
+//
+// See docs/API_REFERENCE.md §22 for which options an evidentiary deployment
+// wants and why.
+func OpenWithOptions(dir string, opts disk.Options) (*Graph, error) {
+	s, err := disk.OpenWithOptions(dir, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Graph{GraphStore: s}, nil
+}
+
+// Forensics returns the disk store behind this Graph, and whether there is one.
+//
+// The integrity machinery — signed commits, snapshot roots, inclusion proofs,
+// attributed redaction, chain of custody, checkpoints and anchoring — lives on
+// disk.Store rather than here, and this is the supported way to reach it.
+//
+// # Why an accessor and not forty methods
+//
+// Forwarding each call would double an API surface of about fifty symbols, and
+// every one of them would be a place for the façade's version to drift from the
+// engine's. It would also flatten a distinction worth keeping: none of that
+// machinery works on the in-memory backend, so a Graph that cannot do it should
+// say so once rather than fail fifty times. Returning false is that answer.
+//
+//	if s, ok := g.Forensics(); ok {
+//	    proof, err := s.ProveNode(id)
+//	}
+//
+// The store is the same one the Graph is using, not a copy — calls through it
+// are visible to the Graph immediately, and closing the Graph closes it.
+//
+// See SECURITY.md for what each mechanism proves and does not, and
+// docs/FORENSICS.md for how to use them.
+func (g *Graph) Forensics() (*disk.Store, bool) {
+	s, ok := g.GraphStore.(*disk.Store)
+	return s, ok
+}
+
 // Compact is available when the Graph is backed by a disk.Store. It merges
 // the delta layer into the CSR and truncates the WAL. Call it after a bulk
 // ingest is complete.
