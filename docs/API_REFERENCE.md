@@ -421,6 +421,15 @@ outbound), so the graph never keeps an edge pointing at a missing node.
 Property-index entries for the node and every cascaded edge are purged. Missing
 node → `*store.ErrNotFound`.
 
+> **`DeleteNode` is unattributed and unrecoverable.** It records nothing about
+> who removed the entity or why, and after the next `Compact()` there is no trace
+> it ever existed — so a lawful erasure and a destruction of evidence look
+> identical afterwards. If the store holds anything evidentiary, use
+> `disk.Store.RedactNodeProperties` (or `RedactNode`) instead: same effect, plus
+> an actor, a reason, the version hash of what went, and a tombstone that makes
+> the removal provable from the image. See §21 and
+> [FORENSICS.md](FORENSICS.md).
+
 ### Semantics & guarantees
 
 | Property | Behavior |
@@ -745,7 +754,15 @@ Disk write model: **WAL (append-only) + in-memory delta overlay + CSR snapshot.*
 
 WAL record types: `0x01` node (add/update), `0x02` edge (add/update), `0x03`
 node-property, `0x04` edge-property, `0x05` node tombstone, `0x06` edge
-tombstone, `0xFF` checkpoint.
+tombstone, `0x0D` key transition, `0xFF` checkpoint.
+
+> **`Compact()` is not only space reclamation.** It is the operation that
+> computes the snapshot roots and writes the attestation over them, so it is what
+> makes anything *provable*. Before the first compaction an entity is live but
+> unaccounted for — which is a different thing from absent — and a redaction is
+> known to the ledger but not yet recorded in the image. It also truncates the
+> WAL, so without `Options.Retention` every commit's actor, timestamp and
+> signature from before it are discarded. See §21.
 
 Typical bulk pattern:
 
@@ -860,20 +877,28 @@ readers sample before each lookup, which is what makes the two distinguishable.
   read-only and mutate exclusively through the API.
 - Type-lookup and property-lookup results are unordered. The typed `Query*` APIs
   apply deterministic ordering and pagination.
-- **Durability boundary (disk) — read this carefully.** A returned write is *not*
-  yet on disk. `fsync` happens only in `Compact()` and `Close()`; the write path
-  never calls it, and the WAL's drain is opportunistic, so a returned record may
-  still be in the process's own ring buffer.
+- **Durability boundary (disk) — read this carefully.** It depends on whether the
+  write was batched, and the difference is the whole of it.
 
-  | Failure | Survives? |
-  |---|---|
-  | Nothing crashes | yes — visible to all readers immediately |
-  | Process crash | **usually** — the drain normally succeeds, so the OS has the bytes; a record can linger in the ring only under write contention |
-  | Power loss / kernel panic | **only if `Compact()` or `Close()` has run since** |
+  **A committed batch is durable when `Commit()` returns.** `SetSyncOnCommit`
+  defaults to `true`, so each batch commit is fsynced before it returns. This is
+  the engine's one well-defined durability boundary and the reason transactions
+  are the right unit for anything you intend to rely on.
 
-  Measured: 200 `AddNode` calls with no `Close()` or `Compact()` left all 4 800
-  bytes already in the file. So the practical exposure is **power loss, not
-  process crash**.
+  **An individual write is not.** `AddNode`, `UpdateNode` and `DeleteNode`
+  outside a transaction append without fsync, and the WAL's drain is
+  opportunistic, so a returned record may still be in the process's own ring
+  buffer.
+
+  | Failure | Batched write | Individual write |
+  |---|---|---|
+  | Nothing crashes | yes | yes — visible to all readers immediately |
+  | Process crash | **yes** | **usually** — the drain normally succeeds; a record can linger in the ring only under write contention |
+  | Power loss / kernel panic | **yes** | **only if `Sync()`, `Compact()` or `Close()` has run since** |
+
+  Measured: 200 unbatched `AddNode` calls with no `Close()` or `Compact()` left
+  all 4 800 bytes already in the file. So for individual writes the practical
+  exposure is **power loss, not process crash**.
 
   **`Sync()` is the cheap durability point:**
 
@@ -1023,6 +1048,11 @@ not the whole query — except for the result count, which requires running it.
 
 How to get the most out of Graphene, on both the read and the write path, with
 the specific calls to reach for.
+
+> If the store holds anything evidentiary, read this alongside
+> [§22](#22-best-practices-for-evidentiary-use). Most of the advice here is
+> neutral to integrity and a few items are not — §22.2 names them and says which
+> to prefer.
 
 Figures below are from the benchmark suite on a 100 000-node / 201 000-edge
 fixture. They are **illustrative ratios, not promises** — see
@@ -1524,6 +1554,27 @@ unexplained redaction is indistinguishable from evidence destruction.
 | `VerifyCheckpointChain(chain) error` | Local only — weak by design |
 | `NewInsecureLocalAnchor(path, storeDir)` | **Not an anchor.** For tests and demos; refuses a path inside the store |
 
+### Roles and capabilities
+
+**Attribution, not enforcement — nothing in the engine consults any of this.**
+See [SECURITY.md §7](../SECURITY.md).
+
+| Symbol | Purpose |
+| --- | --- |
+| `Options.Roles` | Enable the grant ledger |
+| `(*Store).GrantRole(subject, roleID, caps, req)` | Record capabilities given |
+| `(*Store).RevokeRole(subject, roleID, caps, req)` | Record capabilities withdrawn |
+| `(*Store).Capabilities(actor) (Capability, error)` | Derived from the ledger, and from nothing else |
+| `(*Store).CheckCapability(actor, want) error` | **Advisory.** Call it at your own boundary |
+| `(*Store).Grants()` / `ReadGrants(dir)` | The ledger, oldest first |
+| `CapabilitiesFrom(records)` | Same derivation, for a third party holding only the ledger |
+| `VerifyGrantChain(records, verifier) error` | Hash chain and signatures |
+| `CapRead` … `CapGrant` | The capability bitmap |
+| `ErrGrantUnexplained` / `ErrNoGrantLedger` / `ErrNotPermitted` | Refusals |
+
+`GrantRequest{GrantedBy, Reason}` — **`Reason` is required**, for the same reason
+a redaction's is.
+
 ### Audit log and key rotation
 
 | Symbol | Purpose |
@@ -1533,3 +1584,205 @@ unexplained redaction is indistinguishable from evidence destruction.
 | `VerifyAuditChain(entries) error` | Distinguishes an edited entry from an excised one |
 | `(*Store).RotateKey(...)` / `.KeyTimeline()` | Signed by the outgoing key |
 | `ListSegments(dir)` / `VerifySegmentChain(segs)` | Retired WAL segments |
+
+---
+
+## 22. Best practices for evidentiary use
+
+§19 optimises for speed. This section optimises for a store whose contents may
+have to be **defended** — in an audit, a disclosure exercise, or a courtroom.
+The two mostly agree; where they do not, this section says which to prefer and
+why, because a fast answer nobody can stand behind is not cheaper.
+
+Read [SECURITY.md](../SECURITY.md) for what the machinery proves, and
+[FORENSICS.md](FORENSICS.md) for how to call it. This is the checklist.
+
+### 22.1 The five-minute version
+
+| Do | Instead of | Because |
+|---|---|---|
+| `disk.OpenWithOptions(dir, StrictOptions(...))` | `disk.Open(dir)` | Unsigned commits cannot be attributed to anyone, ever, retrospectively |
+| `Begin()` / `Commit()` | loose `AddNode` calls | A commit is the only fsync'd durability boundary — **and** the only unit that carries an actor and a signature |
+| `RedactNodeProperties` | `DeleteNode` | Erasure that is indistinguishable from destruction is a liability, not a feature |
+| `Compact()` on a schedule | compacting when disk pressure says so | Nothing is provable between compactions — and the roots are computed either way, so you are already paying for it |
+| `Options.Retention` set | the zero value | The default discards every pre-compaction actor, timestamp and signature |
+| `PublishCheckpoint` on a schedule | never | Everything since the last checkpoint is freely rewritable |
+| Retain `SnapshotRoots().Snapshot` externally | trusting the store | Every internal check compares the store against itself |
+
+### 22.2 Performance, without giving up the record
+
+Most of §19 is neutral to integrity. Four items are not:
+
+| §19 advice | Under evidentiary use |
+|---|---|
+| **Batch with `AddNodes` / `Begin()`** | **Reinforced.** Batching is faster *and* it is what attaches an actor and a signature. There is no tension here — take it |
+| **`disk.Store.SetSyncOnCommit(false)`** | **Do not.** It trades the one durability boundary the engine defines for throughput. A commit that is not on the platter is not a commit |
+| **`Compact()` for space** | **Insufficient reason to skip it.** It is also what produces roots and attestations; schedule it on time, not on disk pressure |
+| **`VerifyOnOpen`** | **On**, but know the price: it re-derives every Merkle root, which measured ~5× on a 10 k-node open — not the "one hash of the image" it sounds like. Where opening is rare relative to querying, still the right trade |
+
+#### What it actually costs
+
+Measured by `BenchmarkForensic_*`, on a Ryzen 9 5980HS. Ratios, not promises —
+re-run them on your hardware. Where a figure is missing it is because the
+timings overlapped and the honest answer is *unresolved*, not zero.
+
+| Operation | Cost of turning the machinery on |
+|---|---|
+| **Batch commit, signing** | **+8 allocations and ~0.5 KB per commit, flat.** Independent of batch size — a signature is per commit, not per record. Timing is fsync-dominated and unresolvable |
+| **Compaction, attestation** | **+6 allocations, ~0.8 KB.** One Ed25519 signature per compaction. Timing unresolvable at 1 k and 10 k nodes |
+| **Compaction, audit + retention** | **~+15–16 ms, flat.** This is the real cost, and it is durable writes — a segment rotation and an fsynced audit append — not hashing |
+| **`VerifyOnOpen`** | **~5× on a 10 k-node store** (3.6 ms → 20 ms), +10 MB and +90 k allocations |
+| **Building an inclusion proof** | ~8 ms on 10 k nodes — one pass over the records, recomputing every leaf |
+| **Verifying one** | **~5 µs**, 29 allocations — about 1 500× cheaper than building it |
+
+Three of these are worth reading twice:
+
+- **Signing is not the expensive part.** It is a flat handful of allocations per
+  commit. §19's advice to batch is what makes it disappear, and batching is
+  advice you should be taking anyway.
+- **The Merkle pass is not a strict-options cost.** `Compact()` computes snapshot
+  roots unconditionally, so *every* store already pays for it, configured or not.
+  What strict options add at compaction time is the audit entry and the segment
+  rotation — fixed-cost durable writes.
+- **Verification is asymmetric, in the direction that matters.** Producing a
+  proof is expensive and is paid by whoever owns the store; checking one is
+  microseconds and is paid by the recipient, who did not choose to use this
+  engine.
+
+Everything else in §19 — ID-only queries, `Degree(id, nil)`, scoped pattern
+matching, declared ordered keys — is free of integrity consequences. Use it.
+
+### 22.3 Auditability
+
+**Turn the audit log on** (`Options.Audit`, which `StrictOptions` sets). It
+records operator actions — opens, compactions, key rotations, retention
+deletions, checkpoint publications, redactions — hash-chained, so removing one
+entry from the middle breaks every link after it.
+
+**Record your own events.** The engine cannot know what matters in your
+workflow:
+
+```go
+s.RecordAudit(disk.AuditCustom, actorID, "exported to case file 2026-114")
+```
+
+Kinds below `AuditCustom` are refused: a caller who could write `AuditCompact`
+could fabricate engine history, and the custody report compares recorded
+compactions against retired segments precisely to catch a compaction that was
+never recorded.
+
+**Know what is not recorded.** Reads and queries are not, deliberately — a
+synchronous append on the query path is how audit logs come to be switched off.
+If your obligations cover access as well as change, record it yourself at the
+boundary where you know who is asking.
+
+**Deleting the whole log is still undetectable** without an external anchor.
+Chaining narrows the attack to wholesale deletion; anchoring closes it.
+
+### 22.4 Accountability
+
+**Attribute every mutation.** `Begin()` on its own commits anonymously; `As`
+records who is responsible:
+
+```go
+tx := g.Begin().As(store.TxContext{ActorID: 7, RoleID: 3, KeyID: 1})
+tx.AddNode(n)
+err := tx.Commit()
+```
+
+Without it the log records that something changed and nothing about who changed
+it. Attribution cannot be retrofitted — the commit is already written.
+
+**Set `AttestActorID`** so compactions are attributable too. A compaction is an
+operator action, not a transaction, and it carries its own actor rather than
+inheriting one from whichever write happened last.
+
+**`RoleID` is recorded and never checked.** There is no role model. Recording it
+makes a later access decision reconstructible from the log; it does not enforce
+anything today, and presenting it as a control would be misleading.
+
+**Rotate keys through `RotateKey`**, which signs the transition with the
+*outgoing* key so the chain of authority is unbroken. Rotations live in the WAL,
+so they need `Options.Retention` to survive a compaction.
+
+**Give redactions a real reason.** It is required, it is hashed, and it is the
+only thing distinguishing a lawful erasure from destroying evidence. `"cleanup"`
+satisfies the API and answers nothing.
+
+### 22.5 Reliance — what a third party can actually check
+
+The point of the machinery is a claim that survives leaving your process. Three
+things make that real:
+
+1. **Retain roots externally, at collection time.** `SnapshotRoots().Snapshot`
+   is the value to keep. Without an independently held copy, every verification
+   is the store agreeing with itself.
+2. **Export proofs rather than files.** `ExportNodeProof` produces a few hundred
+   bytes that prove one entity was in one snapshot and disclose nothing about
+   any other. Handing over the image discloses everything.
+3. **Never bundle the root with the proof.** There is no API that does, and
+   `graphene verify-proof` requires `-root` for the same reason: a proof checked
+   against a root its author chose proves nothing.
+
+```go
+blob, _ := s.ExportNodeProof(id)                      // producer
+proof, _ := disk.UnmarshalProof(blob)                 // recipient, no store
+err := disk.VerifyExportedProof(retainedRoot, proof)  // root from elsewhere
+```
+
+**Check custody before you rely on a store**, not after something looks wrong:
+
+```go
+report, _ := s.CustodyForAnchor(id, ring, anchor)
+report.Broken()    // a chain actively failed
+report.Complete()  // every layer established and unbroken
+```
+
+It returns gaps rather than a verdict, because "not verified" tells an
+investigator nothing they can act on.
+
+### 22.6 Keeping the forensic features intact
+
+Ways to have the machinery configured and get no benefit from it:
+
+| Anti-pattern | What breaks |
+|---|---|
+| `Options.Retention` left at zero | Every pre-compaction actor, timestamp, signature and key rotation is discarded at the next `Compact()` |
+| Never compacting | Nothing is provable; the ledger knows about redactions and the image does not |
+| Compacting but never publishing | The unanchored window is the whole store's life |
+| Anchoring to the same disk | `InsecureLocalAnchor` is **not** an anchor; anyone who can rewrite the store can rewrite it |
+| `DeleteNode` on evidentiary data | Unattributed and untraceable after the next compaction |
+| Redacting without compacting | `CustodyReport.RemovalProvable` stays false; a recipient given only the image cannot tell the entity from one that never existed |
+| Holding the signing key in the same process forever | Everything the key can sign, an attacker in that process can sign |
+| Verifying with the store's own root | Circular; catches damage, never tampering |
+
+**A store's own report of its health is not evidence of it.** Every check the
+engine runs is internal. The external parts — a retained root, a published
+checkpoint, a key held elsewhere, an anchor you do not control — are the parts
+that make the rest mean anything, and they are the parts the engine cannot
+supply for you.
+
+### 22.7 A worked configuration
+
+```go
+opts := disk.StrictOptions(signer, verifier, operatorActorID)
+opts.Retention = disk.RetentionPolicy{MaxSegments: 50}  // keep commit history
+opts.Redaction = true                                   // attributed removal
+opts.RedactionPolicy = disk.RedactionPolicy{MaxCascade: 100}
+
+s, err := disk.OpenWithOptions(dir, opts)
+```
+
+Then, on a schedule rather than on demand:
+
+```go
+s.Compact()                  // roots + attestation; makes the interval provable
+s.PublishCheckpoint(anchor)  // closes the rewritable window
+```
+
+And once, at collection time, into somewhere the store cannot reach:
+
+```go
+roots, _ := s.SnapshotRoots()
+recordExternally(roots.Snapshot)
+```

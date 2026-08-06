@@ -1,14 +1,15 @@
 package disk
 
-// Chain of custody: one answer, assembled from four separate histories.
+// Chain of custody: one answer, assembled from every history the store keeps.
 //
-// By this point the engine keeps four hash-linked records, and each was built
-// to answer a different question:
+// Each was built to answer a different question:
 //
 //	snapshot roots   what the compacted image contains, and what it replaced
 //	attestations     who asserted that image, and when
 //	WAL segments     the commits that produced it, across past compactions
 //	audit entries    what was done to the store, including deletions
+//	redactions       what was destroyed on purpose, by whom, and why
+//	grants           who was permitted to do any of it, and since when
 //
 // Every one of them verifies on its own. None of them, on its own, answers the
 // question an investigation actually asks: *can this artefact's presence be
@@ -50,6 +51,7 @@ const (
 	LayerSegments    CustodyLayer = "segments"
 	LayerAudit       CustodyLayer = "audit"
 	LayerRedaction   CustodyLayer = "redaction"
+	LayerRoles       CustodyLayer = "roles"
 	LayerExternal    CustodyLayer = "external"
 )
 
@@ -106,6 +108,7 @@ type CustodyReport struct {
 	AuditEntriesWalked  int
 	CompactionsRecorded int
 	RedactionsWalked    int
+	GrantsWalked        int
 
 	// Redacted is the ledger record for this entity, when one exists. Non-nil
 	// turns an absence from an unexplained hole into a documented removal — the
@@ -385,6 +388,33 @@ func (s *Store) CustodyFor(id store.NodeID, verifier store.Verifier) (CustodyRep
 				"Its content is gone; the fact, actor, time and version hash are not",
 				time.Unix(0, r.Redacted.UnixNano).UTC().Format(time.RFC3339),
 				r.Redacted.ActorID, r.Redacted.RoleID, r.Redacted.Reason),
+		})
+	}
+
+	// --- who was permitted to do any of it ---
+	//
+	// Walked for the same reason as the audit log: the ledger cannot stop an
+	// escalation, so the only thing that makes it worth keeping is that the
+	// record of one holds together. A grant chain that has been edited is the
+	// single most valuable thing for an adversary to edit, because it is what
+	// says whether their actions were ever authorised.
+	grants, gerr := ReadGrants(s.dir)
+	if gerr != nil {
+		return r, gerr
+	}
+	r.GrantsWalked = len(grants)
+	if len(grants) > 0 {
+		if verr := VerifyGrantChain(grants, verifier); verr != nil {
+			r.Gaps = append(r.Gaps, CustodyGap{
+				Layer: LayerRoles, Fatal: true,
+				Detail: fmt.Sprintf("the grant ledger is broken: %v", verr),
+			})
+		}
+	} else {
+		r.Gaps = append(r.Gaps, CustodyGap{
+			Layer: LayerRoles,
+			Detail: "no role grants are recorded, so nothing says who was permitted to " +
+				"write, redact or compact. Set Options.Roles to record it",
 		})
 	}
 

@@ -63,6 +63,7 @@ const (
 	AuditAttestationExport
 	AuditCheckpoint
 	AuditRedaction
+	AuditRoleGrant
 
 	// AuditCustom is the caller's, whose meaning the engine does not interpret.
 	AuditCustom AuditKind = 1000
@@ -86,6 +87,8 @@ func (k AuditKind) String() string {
 		return "checkpoint"
 	case AuditRedaction:
 		return "redaction"
+	case AuditRoleGrant:
+		return "role-grant"
 	case AuditCustom:
 		return "custom"
 	default:

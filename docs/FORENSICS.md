@@ -11,6 +11,9 @@ Two companion documents, and the split matters:
   something evidentiary. Everything here assumes you have.
 - [`examples/forensic_examples.go`](../examples/forensic_examples.go) is the
   same material as runnable code. `go run ./examples` executes it.
+- [API_REFERENCE.md §22](API_REFERENCE.md#22-best-practices-for-evidentiary-use)
+  is the checklist: what to do, what not to, and where the performance guide's
+  advice and evidentiary requirements pull in different directions.
 
 ## Two things to know first
 

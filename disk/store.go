@@ -116,6 +116,9 @@ type Store struct {
 	redactions *RedactionLedger
 	redaction  RedactionPolicy
 
+	// grants is the ledger of privilege changes, nil when Options.Roles is off.
+	grants *GrantLedger
+
 	// keyTimeline holds the rotations seen in the current log, in the order they
 	// were recorded. Guarded by mu.
 	//
@@ -323,6 +326,16 @@ type Options struct {
 	// much, because that is the caller's legal and operational question.
 	RedactionPolicy RedactionPolicy
 
+	// Roles enables the grant ledger, which records who was given which
+	// capabilities, by whom, and why.
+	//
+	// Off by default, and worth being clear about what turning it on buys: it is
+	// an **audit mechanism, not a security boundary**. Nothing in the engine
+	// consults it. What it provides is that a privilege change cannot happen
+	// without leaving an attested record, because capabilities are derived from
+	// the ledger and from nothing else. See rbac.go.
+	Roles bool
+
 	// VerifyOnOpen checks the compacted image before loading it: the body
 	// digest, the Merkle roots against the records they describe, and — when a
 	// Verifier is set — the snapshot attestation's signature. A failure fails
@@ -516,6 +529,17 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		s.redactions = rl
 	}
 
+	if opts.Roles {
+		gl, gerr := OpenGrantLedger(dir)
+		if gerr != nil {
+			wal.Close()
+			s.audit.Close()
+			s.redactions.Close()
+			return nil, fmt.Errorf("disk.Open: %w", gerr)
+		}
+		s.grants = gl
+	}
+
 	// Resume numbering past whatever segments already exist, so a reopened store
 	// never reuses a sequence number and never overwrites retired history.
 	if existing, lerr := ListSegments(dir); lerr == nil {
@@ -537,6 +561,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		// file undeletable.
 		s.audit.Close()
 		s.redactions.Close()
+		s.grants.Close()
 		return nil, fmt.Errorf(format, args...)
 	}
 
@@ -1602,6 +1627,9 @@ func (s *Store) Close() error {
 		walErr = err
 	}
 	if err := s.redactions.Close(); err != nil && walErr == nil {
+		walErr = err
+	}
+	if err := s.grants.Close(); err != nil && walErr == nil {
 		walErr = err
 	}
 	return walErr

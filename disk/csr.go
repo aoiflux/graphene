@@ -403,7 +403,12 @@ func adjacencySlice(id store.NodeID, offsets []uint64, edgeList []store.EdgeID) 
 
 // GetNode returns the nodeRecord for the given ID.
 func (g *CSRGraph) GetNode(id store.NodeID) (nodeRecord, bool) {
-	if int(id) >= len(g.nodes) {
+	// Slot 0 is the unused placeholder — the arrays are indexed by ID and IDs
+	// start at 1. Without this the zero-valued record in that slot satisfies
+	// `n.ID == id` for id 0 and is returned as a real one, so InvalidNodeID
+	// reads as an entity that exists. Every other walk here already starts at
+	// index 1; this is the one that did not.
+	if id == store.InvalidNodeID || int(id) >= len(g.nodes) {
 		return nodeRecord{}, false
 	}
 	n := g.nodes[id]
@@ -412,7 +417,8 @@ func (g *CSRGraph) GetNode(id store.NodeID) (nodeRecord, bool) {
 
 // GetEdge returns the rawEdge for the given ID.
 func (g *CSRGraph) GetEdge(id store.EdgeID) (rawEdge, bool) {
-	if int(id) >= len(g.edges) {
+	// Same placeholder slot as GetNode; same reason.
+	if id == store.InvalidEdgeID || int(id) >= len(g.edges) {
 		return rawEdge{}, false
 	}
 	e := g.edges[id]

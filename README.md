@@ -255,8 +255,11 @@ All of it is **opt-in** and none of it is on `graphene.Graph` — it lives on
   one, every guarantee is the store vouching for itself.
 
 **[SECURITY.md](SECURITY.md)** states what each mechanism proves and what it
-does not. **[docs/FORENSICS.md](docs/FORENSICS.md)** is the working guide.
-`go run ./examples` executes the whole flow.
+does not. **[docs/FORENSICS.md](docs/FORENSICS.md)** is the working guide, and
+**[API_REFERENCE.md §22](docs/API_REFERENCE.md#22-best-practices-for-evidentiary-use)**
+is the best-practice checklist — including the handful of places where the
+performance guide's advice and evidentiary requirements disagree, and which to
+prefer. `go run ./examples` executes the whole flow.
 
 ## Mutation (update / delete)
 

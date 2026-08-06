@@ -108,9 +108,12 @@ Do not assume any of the following. None of it exists:
 
 - **No encryption.** Data at rest is not encrypted. Property blobs are stored as
   you supply them. Use filesystem or volume encryption if you need it.
-- **No access control.** There is no RBAC, no permissions, no principals. Every
-  caller has every capability. `TxContext.RoleID` is *recorded* for later audit
-  reconstruction; **nothing checks it**.
+- **No access control.** There is a role model (`Options.Roles`), and it enforces
+  **nothing**. `CheckCapability` is advisory and the engine never calls it: every
+  caller still has every capability, because a check inside the process is one
+  that anything in the process steps around by calling a layer down. What the
+  role model provides is that a privilege change leaves an attested record —
+  see §7. `TxContext.RoleID` is likewise *recorded*, never checked.
 - **The audit log records operator actions, not reads.** With `Audit` enabled,
   compactions, key rotations and retention deletions are hash-chained into
   `graphene.audit`, and callers can add their own entries. Reads and queries are
@@ -579,7 +582,100 @@ Three properties worth stating:
 
 ---
 
-## 7. Residual risks
+---
+
+## 7. Roles: attribution, not enforcement
+
+§12.4's T-16 asks for a role model and says in the same breath what it can be
+here:
+
+> The engine is in-process — RBAC here is an *audit and attribution* mechanism,
+> not a security boundary. Saying otherwise would be misleading.
+
+`Options.Roles` enables a hash-chained ledger of privilege changes.
+**Nothing in the engine consults it.**
+
+```go
+opts.Roles = true
+
+s.GrantRole(analyst, roleID, disk.CapRead|disk.CapWrite, disk.GrantRequest{
+    GrantedBy: 1, Reason: "analyst onboarding",
+})
+s.RevokeRole(analyst, roleID, disk.CapRedact, disk.GrantRequest{
+    GrantedBy: 1, Reason: "redaction moved to the compliance role",
+})
+
+caps, _ := s.Capabilities(analyst)      // derived from the ledger
+err := s.CheckCapability(analyst, disk.CapRedact)   // advisory
+```
+
+### What it does not do
+
+**It does not stop anybody doing anything.** `CheckCapability` returns an error
+you are free to ignore, and the engine ignores it too — a caller with no
+capabilities can still call `AddNode`. Wiring the check into the engine's own
+write paths would produce something that looks like a control and is stepped
+around by calling one layer down, which is worse than no control at all.
+
+If you need admission control, call `CheckCapability` at **your** boundary — the
+RPC handler, the CLI entry point, the queue consumer — where there is a real
+edge for it to sit on.
+
+### What it does do
+
+**A privilege change cannot happen without leaving a record.** That is §13.2's
+INV-3:
+
+> Permissions granted within a session never increase without an attested grant
+> record. Formally: `caps(t₂) ⊆ caps(t₁) ∪ granted(t₁,t₂)`.
+
+The invariant holds **by construction**, not by checking. `Capabilities` is a
+pure function of the grant ledger and there is no other path by which an actor
+acquires one, so a capability appearing without a record is not a thing the API
+can express. That is a stronger property than a capability that is checked for,
+because a check can be bypassed and a derivation cannot be.
+
+The ledger behaves like the others here:
+
+- **hash-chained**, so removing a record from the middle breaks every link after;
+- **signed**, when a `Signer` is configured;
+- **reason required** — an unexplained privilege change is indistinguishable from
+  an escalation, which is the distinction the ledger exists to preserve;
+- **bound into the checkpoint** (§5), so deleting it wholesale is externally
+  detectable rather than silent;
+- **recorded in the audit log** as well, so the two corroborate.
+
+`CapabilitiesFrom` is package-level and takes a slice, so a third party holding
+an exported ledger computes the same answer the store would.
+
+### Self-granting is legal, and recorded
+
+An actor granting themselves `CapGrant` is not refused. It is written down, with
+their own ID in both the subject and the granting field. Refusing it would
+imply the engine is a boundary; recording it is what an audit actually wants,
+because the interesting question after an incident is *when did this actor's
+privileges change and who signed it off*, not *was it permitted*.
+
+### Capabilities
+
+| | Covers |
+|---|---|
+| `CapRead` | queries and traversal — never gated, present so a read-only role is expressible |
+| `CapWrite` | adding and updating entities |
+| `CapDelete` | unattributed removal (`DeleteNode`, `DeleteEdge`) |
+| `CapRedact` | attributed removal — a different decision, usually different people |
+| `CapCompact` | compaction, which produces roots and attestations |
+| `CapRotateKey` | signing-key rotation |
+| `CapPublish` | publishing a checkpoint to an anchor |
+| `CapGrant` | changing what other actors may do |
+
+Deliberately coarse. A finer model would invite the belief that the engine is
+enforcing something subtle, and it is enforcing nothing.
+
+
+---
+
+## 8. Residual risks
 
 Stated plainly, because they do not go away:
 
@@ -595,7 +691,7 @@ Stated plainly, because they do not go away:
 
 ---
 
-## 8. Reporting a vulnerability
+## 9. Reporting a vulnerability
 
 **When in doubt, report privately.** Private is the default this policy assumes,
 and no report is ever criticised for having been sent that way.
@@ -622,7 +718,7 @@ report, requesting a private channel"* and no detail, and wait to be contacted.
 
 ### Two tiers, and why
 
-Treating parser robustness as a security concern (§9) and requiring private
+Treating parser robustness as a security concern (§10) and requiring private
 disclosure pull against each other: applied strictly, every fuzz-found panic
 becomes an embargoed report, which slows fixes for bugs that benefit from public
 corpora and outside eyes. So the routing depends on impact, not on category:
@@ -642,7 +738,7 @@ evidence it was handed is a tool that cannot be used at the moment it is needed.
 
 ---
 
-## 9. Scope
+## 10. Scope
 
 **In scope**
 

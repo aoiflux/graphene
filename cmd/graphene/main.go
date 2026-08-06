@@ -29,20 +29,26 @@
 //	graphene custody <dir>       chain-of-custody account for one entity (opens the store)
 //	graphene anchor <dir>        publish or check a checkpoint (opens the store; -publish writes)
 //	graphene redactions <dir>    the ledger of attributed removals
+//	graphene grants <dir>        role grants and the capabilities they imply
 package main
 
 import (
+	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/aoiflux/graphene"
 	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/merkle"
+	"github.com/aoiflux/graphene/signing"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -69,6 +75,8 @@ func main() {
 		err = cmdAnchor(args)
 	case "redactions":
 		err = cmdRedactions(args)
+	case "grants":
+		err = cmdGrants(args)
 	case "prove":
 		err = cmdProve(args)
 	case "verify-proof":
@@ -99,10 +107,11 @@ Usage:
   graphene custody <dir>        account for one entity across every history (opens the store)
   graphene anchor  <dir>        publish or check a checkpoint (opens the store)
   graphene redactions <dir>     ledger of attributed removals: who, when, why
+  graphene grants  <dir>        role grants, and the capabilities they imply
   graphene prove   <dir>        export a proof to hand to someone else (opens the store)
   graphene verify-proof <file>  check a proof against a root you retained (no store needed)
 
-info, csr, wal and redactions read the files directly and are safe to run
+info, csr, wal, redactions and grants read the files directly and are safe to run
 against a store another process is using. verify, custody, anchor and prove open
 the store, which replays the log and takes a handle on the WAL.
 
@@ -120,6 +129,9 @@ Flags:
            -anchor HEX  a snapshot root retained outside this system
   redactions -node ID   show only records for one entity
              -edge ID   show only records for one relationship
+  grants   -actor ID    show only records concerning one actor
+  redactions, grants, custody also take:
+           -pubkey ID:HEX  verify signatures with this key (repeatable)
   prove    -node ID     the entity to prove something about
            -edge ID     the relationship (with -kind redaction)
            -kind K      inclusion | redaction | property-redaction
@@ -608,8 +620,14 @@ func cmdRedactions(args []string) error {
 	fs := flag.NewFlagSet("redactions", flag.ExitOnError)
 	node := fs.Uint64("node", 0, "show only records for this node ID")
 	edge := fs.Uint64("edge", 0, "show only records for this edge ID")
+	var keys pubkeyList
+	fs.Var(&keys, "pubkey", "ID:HEX Ed25519 public key to verify signatures with (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	verifier, verr := verifierFromFlag(keys)
+	if verr != nil {
+		return verr
 	}
 	dir := fs.Arg(0)
 	if dir == "" {
@@ -627,7 +645,7 @@ func cmdRedactions(args []string) error {
 
 	// Verified over the whole ledger before anything is filtered: a chain break
 	// anywhere makes every record suspect, including the ones asked for.
-	chainErr := disk.VerifyRedactionChain(records, nil)
+	chainErr := disk.VerifyRedactionChain(records, verifier)
 
 	shown := 0
 	for _, r := range records {
@@ -683,8 +701,150 @@ func cmdRedactions(args []string) error {
 		fmt.Printf("\nCHAIN BROKEN: %v\n", chainErr)
 		os.Exit(1)
 	}
-	fmt.Println(", hash chain intact (signatures unchecked: no key supplied)")
+	fmt.Printf(", hash chain intact (%s)\n", signatureNote(verifier))
 	return nil
+}
+
+// cmdGrants prints the role-grant ledger and the capabilities it implies.
+//
+// Reads the file directly, like the other ledger dumps. The derived view is the
+// point: a reader asking "what could this actor do" should not have to replay
+// grants and revocations in their head, and the replay is exactly where a
+// mistake would be invisible.
+func cmdGrants(args []string) error {
+	fs := flag.NewFlagSet("grants", flag.ExitOnError)
+	actor := fs.Uint64("actor", 0, "show only records concerning this actor")
+	var keys pubkeyList
+	fs.Var(&keys, "pubkey", "ID:HEX Ed25519 public key to verify signatures with (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	verifier, err := verifierFromFlag(keys)
+	if err != nil {
+		return err
+	}
+	dir := fs.Arg(0)
+	if dir == "" {
+		return fmt.Errorf("need a store directory")
+	}
+
+	records, rerr := disk.ReadGrants(dir)
+	if rerr != nil {
+		return rerr
+	}
+	if len(records) == 0 {
+		fmt.Println("no role grants recorded")
+		return nil
+	}
+
+	// Verified over the whole ledger before filtering: a break anywhere makes
+	// every record suspect, including the ones asked for.
+	chainErr := disk.VerifyGrantChain(records, verifier)
+
+	shown := 0
+	for _, g := range records {
+		if *actor != 0 && g.Subject != *actor && g.GrantedBy != *actor {
+			continue
+		}
+		shown++
+		fmt.Println(g)
+		if len(g.Signature) > 0 {
+			fmt.Printf("    signed by    key %d\n", g.KeyID)
+		} else {
+			fmt.Printf("    unsigned\n")
+		}
+	}
+
+	// The derived state, which is what INV-3 makes meaningful: capabilities are
+	// a function of this ledger and of nothing else.
+	fmt.Println("\ncapabilities now held:")
+	held := disk.CapabilitiesFrom(records)
+	if len(held) == 0 {
+		fmt.Println("  (none — every grant has been revoked)")
+	}
+	for _, a := range sortedActors(held) {
+		if *actor != 0 && a != *actor {
+			continue
+		}
+		fmt.Printf("  actor %d: %s\n", a, held[a])
+	}
+
+	if *actor != 0 {
+		fmt.Printf("\n%d shown of ", shown)
+	} else {
+		fmt.Print("\n")
+	}
+	fmt.Printf("%d records in the ledger", len(records))
+	if chainErr != nil {
+		fmt.Printf("\nCHAIN BROKEN: %v\n", chainErr)
+		os.Exit(1)
+	}
+	fmt.Printf(", hash chain intact (%s)\n", signatureNote(verifier))
+	return nil
+}
+
+// verifierFromFlag builds a keyring from repeated `-pubkey ID:HEX` values.
+//
+// The ledger dumps otherwise report "signatures unchecked", which is honest and
+// useless to the one reader who most needs the check — an auditor holding the
+// public key and not the store. Taking keys on the command line closes that
+// without the tool ever touching private material.
+func verifierFromFlag(specs []string) (store.Verifier, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	ring := signing.NewKeyring()
+	for _, spec := range specs {
+		id, hexKey, ok := strings.Cut(spec, ":")
+		if !ok {
+			return nil, fmt.Errorf("-pubkey wants ID:HEX, got %q", spec)
+		}
+		keyID, err := strconv.ParseUint(id, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("-pubkey %q: %w", spec, err)
+		}
+		raw, err := hex.DecodeString(hexKey)
+		if err != nil {
+			return nil, fmt.Errorf("-pubkey %q: %w", spec, err)
+		}
+		if len(raw) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("-pubkey %q: an Ed25519 public key is %d hex bytes, got %d",
+				spec, ed25519.PublicKeySize, len(raw))
+		}
+		if err := ring.Add(keyID, ed25519.PublicKey(raw)); err != nil {
+			return nil, err
+		}
+	}
+	return ring, nil
+}
+
+// pubkeyList collects repeated -pubkey flags.
+type pubkeyList []string
+
+func (p *pubkeyList) String() string { return strings.Join(*p, ",") }
+func (p *pubkeyList) Set(v string) error {
+	*p = append(*p, v)
+	return nil
+}
+
+// signatureNote says what was actually checked, so "intact" is never read as
+// more than it is.
+func signatureNote(v store.Verifier) string {
+	if v == nil {
+		return "signatures unchecked: no -pubkey supplied"
+	}
+	return "signatures verified against the supplied keys"
+}
+
+// sortedActors gives the capability listing a stable order, so two runs against
+// the same store produce the same output and a diff means something.
+func sortedActors(m map[uint64]disk.Capability) []uint64 {
+	out := make([]uint64, 0, len(m))
+	for a := range m {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // cmdProve exports a proof so it can be handed to someone else.

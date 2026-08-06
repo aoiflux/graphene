@@ -22,12 +22,22 @@ func fullyProvisionedStore(t *testing.T, compactions int) (dir string, s *Store,
 
 	opts := StrictOptions(key, ring, 500)
 	opts.Retention = RetentionPolicy{MaxSegments: 20}
+	opts.Roles = true
 
 	s, err := OpenWithOptions(dir, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
+
+	// A store with no grant at all has an unestablished role layer, so "fully
+	// provisioned" has to include one. Recording who may compact is the minimum
+	// that makes the layer mean anything.
+	if _, err := s.GrantRole(500, 1, CapWrite|CapCompact, GrantRequest{
+		GrantedBy: 500, Reason: "operator bootstrap",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	for i := 0; i < compactions; i++ {
 		id := addNodeD(t, s, store.NodeTypeMicroArtefact)

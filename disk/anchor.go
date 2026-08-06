@@ -13,7 +13,7 @@ package disk
 // # What is anchored
 //
 // A Checkpoint binds every history's head into one digest — snapshot,
-// attestation, WAL segments, audit log, redaction ledger. Anchoring the snapshot
+// attestation, WAL segments, audit log, redaction ledger, grant ledger. Anchoring the snapshot
 // root alone — which is what CustodyForAnchored accepts — leaves the others
 // free: an adversary who rewrites only the audit log changes no snapshot root
 // and passes that check. Binding them together removes the choice.
@@ -76,12 +76,14 @@ type Checkpoint struct {
 	SegmentHead   [walPrevDigestSize]byte
 	AuditHead     [sha256.Size]byte
 	RedactionHead [sha256.Size]byte
+	GrantHead     [sha256.Size]byte
 
 	// Counts, so a truncation is visible as more than a changed hash. A reader
 	// comparing two checkpoints learns whether history grew or shrank.
 	SegmentCount   uint64
 	AuditCount     uint64
 	RedactionCount uint64
+	GrantCount     uint64
 
 	// Prev is the digest of the checkpoint before this one, zero for the first.
 	// Chaining them means a removed checkpoint is a broken link rather than an
@@ -95,7 +97,7 @@ type Checkpoint struct {
 
 // checkpointSignedData is the canonical byte string a checkpoint's digest covers.
 func checkpointSignedData(c Checkpoint) []byte {
-	buf := make([]byte, 0, 1+8+8+8+merkle.Size+attestationIDSize+walPrevDigestSize+2*sha256.Size+8+8+8+merkle.Size)
+	buf := make([]byte, 0, 1+8+8+8+merkle.Size+attestationIDSize+walPrevDigestSize+3*sha256.Size+8+8+8+8+merkle.Size)
 	buf = append(buf, domainCheckpoint)
 	buf = binary.LittleEndian.AppendUint64(buf, c.Seq)
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(c.UnixNano))
@@ -105,9 +107,11 @@ func checkpointSignedData(c Checkpoint) []byte {
 	buf = append(buf, c.SegmentHead[:]...)
 	buf = append(buf, c.AuditHead[:]...)
 	buf = append(buf, c.RedactionHead[:]...)
+	buf = append(buf, c.GrantHead[:]...)
 	buf = binary.LittleEndian.AppendUint64(buf, c.SegmentCount)
 	buf = binary.LittleEndian.AppendUint64(buf, c.AuditCount)
 	buf = binary.LittleEndian.AppendUint64(buf, c.RedactionCount)
+	buf = binary.LittleEndian.AppendUint64(buf, c.GrantCount)
 	return append(buf, c.Prev[:]...)
 }
 
@@ -118,9 +122,9 @@ func computeCheckpointDigest(c Checkpoint) merkle.Hash {
 
 // String is a one-line rendering for a log or a CLI.
 func (c Checkpoint) String() string {
-	return fmt.Sprintf("checkpoint %d at %s: digest %x (snapshot %x, %d segments, %d audit entries, %d redactions)",
+	return fmt.Sprintf("checkpoint %d at %s: digest %x (snapshot %x, %d segments, %d audit entries, %d redactions, %d grants)",
 		c.Seq, time.Unix(0, c.UnixNano).UTC().Format(time.RFC3339), c.Digest[:8],
-		c.SnapshotRoot[:8], c.SegmentCount, c.AuditCount, c.RedactionCount)
+		c.SnapshotRoot[:8], c.SegmentCount, c.AuditCount, c.RedactionCount, c.GrantCount)
 }
 
 // --- the interface, and nothing behind it ---
@@ -225,6 +229,18 @@ func (s *Store) Checkpoint() (Checkpoint, error) {
 		c.RedactionHead = reds[n-1].Hash
 	}
 
+	// Grant ledger head, read from disk for the same reason as the redactions:
+	// turning Options.Roles off must not make past privilege changes vanish from
+	// the digest.
+	grants, gerr := ReadGrants(s.dir)
+	if gerr != nil {
+		return Checkpoint{}, gerr
+	}
+	c.GrantCount = uint64(len(grants))
+	if n := len(grants); n > 0 {
+		c.GrantHead = grants[n-1].Hash
+	}
+
 	c.UnixNano = time.Now().UnixNano()
 	c.Digest = computeCheckpointDigest(c)
 	return c, nil
@@ -295,7 +311,7 @@ func (s *Store) PublishCheckpoint(a Anchor) (Checkpoint, AnchorRecord, error) {
 
 // checkpointRecordSize is the fixed on-disk size of one checkpoint.
 const checkpointRecordSize = 8 + 8 + 8 + merkle.Size + attestationIDSize +
-	walPrevDigestSize + 2*sha256.Size + 8 + 8 + 8 + merkle.Size + merkle.Size
+	walPrevDigestSize + 3*sha256.Size + 8 + 8 + 8 + 8 + merkle.Size + merkle.Size
 
 func appendCheckpointRecord(buf []byte, c Checkpoint) []byte {
 	buf = binary.LittleEndian.AppendUint64(buf, c.Seq)
@@ -306,9 +322,11 @@ func appendCheckpointRecord(buf []byte, c Checkpoint) []byte {
 	buf = append(buf, c.SegmentHead[:]...)
 	buf = append(buf, c.AuditHead[:]...)
 	buf = append(buf, c.RedactionHead[:]...)
+	buf = append(buf, c.GrantHead[:]...)
 	buf = binary.LittleEndian.AppendUint64(buf, c.SegmentCount)
 	buf = binary.LittleEndian.AppendUint64(buf, c.AuditCount)
 	buf = binary.LittleEndian.AppendUint64(buf, c.RedactionCount)
+	buf = binary.LittleEndian.AppendUint64(buf, c.GrantCount)
 	buf = append(buf, c.Prev[:]...)
 	return append(buf, c.Digest[:]...)
 }
@@ -329,11 +347,15 @@ func readCheckpointRecord(b []byte) Checkpoint {
 	off += sha256.Size
 	copy(c.RedactionHead[:], b[off:off+sha256.Size])
 	off += sha256.Size
+	copy(c.GrantHead[:], b[off:off+sha256.Size])
+	off += sha256.Size
 	c.SegmentCount = binary.LittleEndian.Uint64(b[off : off+8])
 	off += 8
 	c.AuditCount = binary.LittleEndian.Uint64(b[off : off+8])
 	off += 8
 	c.RedactionCount = binary.LittleEndian.Uint64(b[off : off+8])
+	off += 8
+	c.GrantCount = binary.LittleEndian.Uint64(b[off : off+8])
 	off += 8
 	copy(c.Prev[:], b[off:off+merkle.Size])
 	off += merkle.Size
@@ -578,7 +600,8 @@ func (s *Store) VerifyAgainstAnchor(a Anchor) (AnchorAudit, error) {
 		current.AttestationID == last.AttestationID &&
 		current.SegmentHead == last.SegmentHead &&
 		current.AuditHead == last.AuditHead &&
-		current.RedactionHead == last.RedactionHead
+		current.RedactionHead == last.RedactionHead &&
+		current.GrantHead == last.GrantHead
 
 	// **History that shrank is the fatal case.** A store moving forward is
 	// ordinary; a store with fewer segments or audit entries than the anchor
@@ -586,7 +609,7 @@ func (s *Store) VerifyAgainstAnchor(a Anchor) (AnchorAudit, error) {
 	// except retention — which is why the detail names it rather than leaving
 	// the reader to wonder.
 	if current.SegmentCount < last.SegmentCount || current.AuditCount < last.AuditCount ||
-		current.RedactionCount < last.RedactionCount {
+		current.RedactionCount < last.RedactionCount || current.GrantCount < last.GrantCount {
 		audit.Gaps = append(audit.Gaps, CustodyGap{
 			Layer: LayerExternal, Fatal: true,
 			Detail: fmt.Sprintf("history shrank since checkpoint %d: %d→%d segments, %d→%d audit entries, "+
