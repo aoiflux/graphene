@@ -58,14 +58,14 @@ if (-not $Bench -or $All) {
 # --- Stress tests ---
 if ($Stress -or $All) {
     $stressFilter = if ($Filter) { $Filter } else { "TestStress" }
-    $stressArgs = @("test", ".", "-tags=stress", "-race", "-count=1") + $verboseFlag + @("-run", $stressFilter)
+    $stressArgs = @("test", "./tests/", "-tags=stress", "-race", "-count=1") + $verboseFlag + @("-run", $stressFilter)
     Run-Step "Stress tests" $stressArgs
 }
 
 # --- Benchmarks ---
 if ($Bench -or $All) {
     $benchFilter = if ($Filter) { $Filter } else { "." }
-    $benchArgs = @("test", ".", "-tags=stress", "-bench=$benchFilter", "-benchmem", "-benchtime=$BenchTime", "-run=^$")
+    $benchArgs = @("test", "./tests/", "-tags=stress", "-bench=$benchFilter", "-benchmem", "-benchtime=$BenchTime", "-run=^$")
     Run-Step "Benchmarks (benchtime=$BenchTime)" $benchArgs
 }
 

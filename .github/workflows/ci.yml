@@ -74,7 +74,7 @@ jobs:
       # and finishes in well under a minute; the 1M-node path is separately gated
       # behind GRAPHENE_PERSISTENT_STRESS and runs in the scheduled job below.
       - name: Stress tests (race)
-        run: go test . -tags=stress -race -count=1 -run Test
+        run: go test ./tests/ -tags=stress -race -count=1 -run Test
 
   # Benchmarks are not a pass/fail gate — benchmark timings are far too sensitive
   # to runner load to assert on, and CONTRIBUTING.md's method (interleaved A/B
@@ -92,7 +92,7 @@ jobs:
           cache: true
 
       - name: Benchmark smoke run
-        run: go test . ./index/ -tags=stress -bench=. -benchtime=1x -run='^$'
+        run: go test ./tests/ ./index/ -tags=stress -bench=. -benchtime=1x -run='^$'
 
   # Fuzzing found three parser defects on its first run — two unbounded
   # allocations and an out-of-range index, all reachable from a file under 110
@@ -152,4 +152,4 @@ jobs:
       - name: Deep stress
         env:
           GRAPHENE_PERSISTENT_STRESS: "1"
-        run: go test . -tags=stress -count=1 -run TestStress -timeout 50m
+        run: go test ./tests/ -tags=stress -count=1 -run TestStress -timeout 50m

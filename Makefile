@@ -62,14 +62,15 @@ test:
 	$(GO) test $(PKG) -race -count=1 $(RUN_FLAG)
 
 ## stress: the stress suite, which lives behind a build tag and is therefore
-## never compiled by `make test`.
+## never compiled by `make test`. Like the rest of the engine's black-box
+## tests it lives in ./tests/, not the root package.
 stress:
-	$(GO) test . -tags=stress -race -count=1 -run $(if $(FILTER),$(FILTER),Test)
+	$(GO) test ./tests/ -tags=stress -race -count=1 -run $(if $(FILTER),$(FILTER),Test)
 
 ## bench: benchmarks. Read CONTRIBUTING.md first — a number from a single run on
 ## a loaded machine is not evidence. Interleave against a control.
 bench:
-	$(GO) test . -tags=stress -bench=$(if $(FILTER),$(FILTER),.) -benchmem \
+	$(GO) test ./tests/ -tags=stress -bench=$(if $(FILTER),$(FILTER),.) -benchmem \
 		-benchtime=$(BENCHTIME) -run='^$$'
 
 ## fuzz: explore each parser for FUZZTIME. Seed corpora and saved crash
@@ -99,8 +100,13 @@ fmt:
 	gofmt -w .
 
 ## cover: coverage profile and a per-package summary.
+##
+## -coverpkg is load-bearing. The root package's tests are black-box tests in
+## ./tests/, so by default Go attributes their coverage to that package — which
+## has no statements of its own — and reports the library as 0%. -coverpkg=./...
+## measures the library, which is the number anyone running this wants.
 cover:
-	$(GO) test $(PKG) -coverprofile=coverage.out -covermode=atomic $(RUN_FLAG)
+	$(GO) test $(PKG) -coverprofile=coverage.out -covermode=atomic -coverpkg=./... $(RUN_FLAG)
 	@$(GO) tool cover -func=coverage.out | tail -n 1
 	@echo "full report: go tool cover -html=coverage.out"
 

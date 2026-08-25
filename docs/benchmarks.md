@@ -9,7 +9,7 @@
 | **Go**       | go1.26.2                                                                                                                                                                          |
 | **Hardware** | AMD Ryzen 9 5980HS, 16 cores                                                                                                                                                      |
 | **Baseline** | git `036aac0`, the commit before this work began                                                                                                                                  |
-| **Suites**   | [bench](../graphene_bench_test.go) · [parallel](../graphene_parallel_bench_test.go) · [coverage](../graphene_coverage_bench_test.go) · [footprint](../graphene_footprint_test.go) |
+| **Suites**   | [bench](../tests/graphene_bench_test.go) · [parallel](../tests/graphene_parallel_bench_test.go) · [coverage](../tests/graphene_coverage_bench_test.go) · [footprint](../tests/graphene_footprint_test.go) |
 | **Method**   | Baseline and current run **interleaved** — alternating rounds of `-count=2` — then compared with `benchstat`, n=6 per side                                                        |
 
 68 benchmarks, up from the 29 this work started with and the 5 the project had
@@ -650,9 +650,9 @@ way:
 
 ```powershell
 ./test.ps1 -Bench                                    # default 5s benchtime
-go test . -tags=stress -bench=. -benchmem -count=6 -run='^$'
-go test . -tags=stress -bench=Footprint -benchtime=1x -run='^$'
-go test . -tags=stress -bench=Parallel -cpu=1,2,4,8,16 -run='^$'
+go test ./tests/ -tags=stress -bench=. -benchmem -count=6 -run='^$'
+go test ./tests/ -tags=stress -bench=Footprint -benchtime=1x -run='^$'
+go test ./tests/ -tags=stress -bench=Parallel -cpu=1,2,4,8,16 -run='^$'
 ```
 
 Sweep the fixture size with `GRAPHENE_BENCH_NODES` (default 100 000).

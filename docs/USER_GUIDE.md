@@ -746,7 +746,7 @@ go run ./examples
 ### Direct Go stress targeting
 
 ```powershell
-go test . -tags=stress -run TestStress
+go test ./tests/ -tags=stress -run TestStress
 ```
 
 ## 14. Troubleshooting
