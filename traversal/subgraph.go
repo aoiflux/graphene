@@ -1,6 +1,8 @@
 package traversal
 
 import (
+	"context"
+
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -43,13 +45,40 @@ type SubgraphMatch struct {
 //
 // maxMatches caps results to avoid unbounded output; pass 0 for no cap.
 func FindSubgraphMatches(
-	g store.GraphStore,
+	g store.GraphReader,
 	pattern *Pattern,
 	scope []store.NodeID,
 	maxMatches int,
 ) ([]SubgraphMatch, error) {
+	return FindSubgraphMatchesCtx(context.Background(), g, pattern, scope, maxMatches, store.Budget{})
+}
+
+// FindSubgraphMatchesCtx is FindSubgraphMatches with a cancellable context and
+// a budget. See BFSCtx.
+//
+// maxMatches caps the output; a budget caps the *search*, which is a different
+// thing and usually the one that matters. An unscoped pattern over a graph with
+// a hub in it can explore an enormous number of partial mappings before finding
+// its first match, so a cap on results is no protection at all.
+//
+// Budget.MaxNodes counts candidates tried, not distinct nodes: backtracking
+// revisits the same node under different partial mappings, and it is the trying
+// that costs.
+func FindSubgraphMatchesCtx(
+	ctx context.Context,
+	g store.GraphReader,
+	pattern *Pattern,
+	scope []store.NodeID,
+	maxMatches int,
+	budget store.Budget,
+) ([]SubgraphMatch, error) {
 	if len(pattern.Nodes) == 0 {
 		return nil, nil
+	}
+
+	guard := newGuard(ctx, budget)
+	if err := guard.enter(); err != nil {
+		return nil, err
 	}
 
 	// Build candidate lists per pattern node from scope.
@@ -69,6 +98,9 @@ func FindSubgraphMatches(
 
 	var backtrack func(depth int) error
 	backtrack = func(depth int) error {
+		if err := guard.descend(depth); err != nil {
+			return err
+		}
 		if depth == len(pattern.Nodes) {
 			// Full mapping found — verify all pattern edges are satisfied.
 			if checkEdges(probe, pattern, mapping) {
@@ -80,6 +112,9 @@ func FindSubgraphMatches(
 		}
 
 		for _, cand := range candidates[depth] {
+			if err := guard.visitNode(); err != nil {
+				return err
+			}
 			if used[cand] {
 				continue
 			}
@@ -112,7 +147,7 @@ func FindSubgraphMatches(
 
 // buildCandidates returns, for each pattern node index, the list of data nodes
 // that carry ALL of the pattern node's required labels.
-func buildCandidates(g store.GraphStore, pattern *Pattern, scope []store.NodeID) ([][]store.NodeID, error) {
+func buildCandidates(g store.GraphReader, pattern *Pattern, scope []store.NodeID) ([][]store.NodeID, error) {
 	candidates := make([][]store.NodeID, len(pattern.Nodes))
 
 	// Label postings, fetched once per distinct label rather than per (scope
@@ -259,7 +294,7 @@ func checkEdges(probe *edgeProbe, pattern *Pattern, mapping []store.NodeID) bool
 // has to be checked, which the store's own filter cannot express (it is OR, the
 // pattern's is AND).
 type edgeProbe struct {
-	g   store.GraphStore
+	g   store.GraphReader
 	adj store.AdjacencyReader // nil when the backend does not support it
 	buf []store.IncidentEdge
 
@@ -279,7 +314,7 @@ type edgeProbe struct {
 	memoHasFil bool
 }
 
-func newEdgeProbe(g store.GraphStore) *edgeProbe {
+func newEdgeProbe(g store.GraphReader) *edgeProbe {
 	p := &edgeProbe{g: g}
 	if a, ok := g.(store.AdjacencyReader); ok {
 		p.adj = a

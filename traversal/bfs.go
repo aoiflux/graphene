@@ -1,6 +1,8 @@
 package traversal
 
 import (
+	"context"
+
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -21,15 +23,37 @@ type BFSResult struct {
 //
 // If you only need the reachable node IDs, use BFSIDs: it does the same walk
 // without materialising a single node or edge record.
-func BFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) (*BFSResult, error) {
+func BFS(g store.GraphReader, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) (*BFSResult, error) {
+	return BFSCtx(context.Background(), g, origin, maxDepth, dir, edgeTypes, store.Budget{})
+}
+
+// BFSCtx is BFS with a cancellable context and a budget.
+//
+// The budget is what makes this safe to run against a graph whose shape is not
+// known. Depth alone does not bound a walk: one hub of degree 100 000 puts
+// 100 000 entries in the visited set at depth one, and the walk has no way to
+// say it is in trouble. store.Budget bounds the nodes, the edges and the time,
+// and the walk returns store.ErrBudgetExceeded rather than a partial result
+// that looks complete.
+//
+// A zero Budget and a background context are exactly BFS, at the same cost.
+func BFSCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) (*BFSResult, error) {
 	if maxDepth < 0 {
 		maxDepth = 0
+	}
+
+	guard := newGuard(ctx, budget)
+	if err := guard.enter(); err != nil {
+		return nil, err
 	}
 
 	w := newWalker(g)
 
 	originNode, err := g.GetNode(origin)
 	if err != nil {
+		return nil, err
+	}
+	if err := guard.visitNode(); err != nil {
 		return nil, err
 	}
 
@@ -56,6 +80,9 @@ func BFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direct
 		next = next[:0]
 
 		for _, id := range current {
+			if err := guard.step(); err != nil {
+				return nil, err
+			}
 			incident, err := w.incidentEdges(id, dir, edgeTypes)
 			if err != nil {
 				return nil, err
@@ -87,12 +114,18 @@ func BFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direct
 					if err != nil {
 						continue
 					}
+					if err := guard.crossEdge(); err != nil {
+						return nil, err
+					}
 					seenEdges[eid] = struct{}{}
 					result.Edges = append(result.Edges, edge)
 				}
 
 				if alreadyVisited {
 					continue
+				}
+				if err := guard.visitNode(); err != nil {
+					return nil, err
 				}
 				visited[nbID] = struct{}{}
 				result.Nodes = append(result.Nodes, nbNode)
@@ -114,14 +147,27 @@ func BFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direct
 // allocates only the visited set and the queue, independent of how many edges it
 // crosses. Prefer it whenever the records themselves are not needed — reachability
 // checks, scoping a pattern match, or feeding IDs into a query.
-func BFSIDs(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) ([]store.NodeID, error) {
+func BFSIDs(g store.GraphReader, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) ([]store.NodeID, error) {
+	return BFSIDsCtx(context.Background(), g, origin, maxDepth, dir, edgeTypes, store.Budget{})
+}
+
+// BFSIDsCtx is BFSIDs with a cancellable context and a budget. See BFSCtx.
+func BFSIDsCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) ([]store.NodeID, error) {
 	if maxDepth < 0 {
 		maxDepth = 0
+	}
+
+	guard := newGuard(ctx, budget)
+	if err := guard.enter(); err != nil {
+		return nil, err
 	}
 
 	w := newWalker(g)
 	if !w.nodeExists(origin) {
 		return nil, &store.ErrNotFound{Kind: "node", ID: uint64(origin)}
+	}
+	if err := guard.visitNode(); err != nil {
+		return nil, err
 	}
 
 	out := []store.NodeID{origin}
@@ -131,17 +177,26 @@ func BFSIDs(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Dir
 	// allocation is needed. levelEnd marks where the current depth stops.
 	for depth, start, levelEnd := 0, 0, 1; depth < maxDepth && start < levelEnd; depth++ {
 		for ; start < levelEnd; start++ {
+			if err := guard.step(); err != nil {
+				return nil, err
+			}
 			incident, err := w.incidentEdges(out[start], dir, edgeTypes)
 			if err != nil {
 				return nil, err
 			}
 			for _, step := range incident {
 				nbID := step.Neighbour
+				if err := guard.crossEdge(); err != nil {
+					return nil, err
+				}
 				if _, seen := visited[nbID]; seen {
 					continue
 				}
 				if !w.nodeExists(nbID) {
 					continue
+				}
+				if err := guard.visitNode(); err != nil {
+					return nil, err
 				}
 				visited[nbID] = struct{}{}
 				out = append(out, nbID)

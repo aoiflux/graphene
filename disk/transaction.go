@@ -2,6 +2,7 @@ package disk
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/aoiflux/graphene/store"
 )
@@ -231,8 +232,11 @@ func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error 
 		return nil
 	}
 
+	// Released before the durability wait at the end, so concurrent transactions
+	// share an fsync instead of queueing behind each other's. See syncgate.go.
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock := sync.OnceFunc(s.mu.Unlock)
+	defer unlock()
 
 	actions, err := s.resolveTransaction(ops)
 	if err != nil {
@@ -273,25 +277,48 @@ func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error 
 	if err != nil {
 		return fmt.Errorf("ApplyTransaction: %w", err)
 	}
-	if err := s.wal.AppendBatch(framed, s.syncOnCommit); err != nil {
+	ticket, err := s.wal.QueueBatch(framed)
+	if err != nil {
 		return fmt.Errorf("ApplyTransaction: wal: %w", err)
 	}
 
+	// One epoch for the whole transaction. That is what makes it atomic to a
+	// reader as well as to the log: every record in it becomes visible together
+	// when the epoch is published, and until then none of it is.
+	epoch := s.nextEpoch()
 	for _, a := range actions {
 		switch a.kind {
 		case txActionPutNode:
-			s.applyNodeUpsert(a.node)
+			s.applyNodeUpsert(epoch, a.node)
 		case txActionPutEdge:
-			s.applyEdgeUpsert(a.edge)
+			s.applyEdgeUpsert(epoch, a.edge)
 		case txActionDelNode:
-			s.applyNodeDelete(a.nodeID)
+			s.applyNodeDelete(epoch, a.nodeID)
 		case txActionDelEdge:
-			s.applyEdgeDelete(a.edgeID)
+			s.applyEdgeDelete(epoch, a.edgeID)
 		case txActionPurgeNodeIndex:
 			s.propIdx.RemoveNode(a.nodeID)
 		case txActionPurgeEdgeIndex:
 			s.propIdx.RemoveEdge(a.edgeID)
 		}
 	}
+	sync := s.syncOnCommit
+	unlock()
+
+	if sync {
+		if err := s.wal.AwaitSync(ticket); err != nil {
+			// Deliberately unpublished: the records are staged in the delta but
+			// no reader can reach them, because visibility is the epoch. A
+			// transaction the disk did not take is not a transaction.
+			return fmt.Errorf("ApplyTransaction: wal: %w", err)
+		}
+	} else if err := s.wal.FlushQueued(); err != nil {
+		// Not waiting for durability does not mean leaving the bytes in a
+		// queue. syncOnCommit off is documented as "durable at the next Sync,
+		// Compact or Close", and bytes still in the ring would not survive even
+		// a process kill, which the page cache does.
+		return fmt.Errorf("ApplyTransaction: wal: %w", err)
+	}
+	s.publishEpoch(epoch)
 	return nil
 }

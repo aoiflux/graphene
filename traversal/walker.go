@@ -18,13 +18,13 @@ import (
 // buffered path. Anything else falls back to EdgesOf, which allocates per call
 // but keeps third-party stores working unchanged.
 type walker struct {
-	g        store.GraphStore
+	g        store.GraphReader
 	adj      store.AdjacencyReader // nil when the backend lacks the extension
 	edgeBuf  []store.IncidentEdge  // reused across every expansion
 	seenNbrs map[store.NodeID]struct{}
 }
 
-func newWalker(g store.GraphStore) *walker {
+func newWalker(g store.GraphReader) *walker {
 	w := &walker{g: g}
 	if adj, ok := g.(store.AdjacencyReader); ok {
 		w.adj = adj

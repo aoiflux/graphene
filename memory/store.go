@@ -38,6 +38,15 @@ type Store struct {
 
 	nodeSeq atomic.Uint64
 	edgeSeq atomic.Uint64
+
+	// version counts record mutations, so a Snapshot can name the graph it
+	// froze. It is bumped under the write lock by every method that can change
+	// a record, which is what makes two snapshots with the same version
+	// necessarily the same graph.
+	//
+	// Property-index writes do not bump it: the index is shared with snapshots
+	// rather than copied into them, so it is not part of what a version names.
+	version atomic.Uint64
 }
 
 // New returns an initialised in-memory Store.
@@ -181,6 +190,7 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 	}
 
 	s.mu.Lock()
+	s.version.Add(1)
 	s.nodes[id] = stored
 	s.indexNodeLabels(id, stored.Labels)
 	s.ensureAdj(id)
@@ -195,6 +205,7 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 	ids := make([]store.NodeID, len(nodes))
 
 	s.mu.Lock()
+	s.version.Add(1)
 	defer s.mu.Unlock()
 
 	for i, n := range nodes {
@@ -237,6 +248,7 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 	// Validate and insert under one lock hold so an edge can never be created
 	// onto a node a concurrent DeleteNode has removed.
 	s.mu.Lock()
+	s.version.Add(1)
 	defer s.mu.Unlock()
 
 	if _, ok := s.nodes[e.Src]; !ok {
@@ -273,6 +285,7 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	ids := make([]store.EdgeID, len(edges))
 
 	s.mu.Lock()
+	s.version.Add(1)
 	defer s.mu.Unlock()
 
 	// Validate the whole batch before applying any of it.
@@ -370,6 +383,7 @@ func (s *Store) UpdateNode(n *store.Node) error {
 	}
 
 	s.mu.Lock()
+	s.version.Add(1)
 	defer s.mu.Unlock()
 
 	existing, ok := s.nodes[n.ID]
@@ -403,6 +417,7 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 	}
 
 	s.mu.Lock()
+	s.version.Add(1)
 	defer s.mu.Unlock()
 
 	existing, ok := s.edges[e.ID]
@@ -438,6 +453,7 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 
 func (s *Store) DeleteEdge(id store.EdgeID) error {
 	s.mu.Lock()
+	s.version.Add(1)
 	defer s.mu.Unlock()
 	if _, ok := s.edges[id]; !ok {
 		return &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
@@ -448,6 +464,7 @@ func (s *Store) DeleteEdge(id store.EdgeID) error {
 
 func (s *Store) DeleteNode(id store.NodeID) error {
 	s.mu.Lock()
+	s.version.Add(1)
 	defer s.mu.Unlock()
 	node, ok := s.nodes[id]
 	if !ok {
@@ -1023,6 +1040,7 @@ func (s *Store) VerifyIndexes() error {
 // property-index entries belonging to entities that no longer exist.
 func (s *Store) RebuildIndexes() error {
 	s.mu.Lock()
+	s.version.Add(1)
 
 	s.nodesByType = make(map[store.NodeType][]store.NodeID, len(s.nodesByType))
 	s.edgesByType = make(map[store.EdgeType][]store.EdgeID, len(s.edgesByType))

@@ -111,6 +111,22 @@ type WAL struct {
 	inFlight atomic.Int64  // append calls currently in progress
 	closed   atomic.Uint32 // 1 once Close() starts
 
+	// gate shares one fsync across every commit it covers. See syncgate.go.
+	gate *syncGate
+
+	// writeHook and syncHook stand in for the file's own calls when set.
+	//
+	// Nil in production, and the only way to reach them is from inside this
+	// package. They exist because the engine's crash behaviour was previously
+	// only testable by killing a process: there was no way to make a write short,
+	// a disk full, or an fsync lie, so the ordering arguments in compact.go and
+	// syncgate.go were argued and never exercised. Every write path below routes
+	// through writeFile/syncFile so that a test can.
+	//
+	// Set once, before the WAL is used.
+	writeHook func([]byte) (int, error)
+	syncHook  func() error
+
 	// readOnly refuses every path that writes. Fixed at open and never changed.
 	//
 	// This is a backstop rather than the guard callers meet: Store.mustWrite
@@ -124,6 +140,22 @@ type WAL struct {
 	readOnly bool
 }
 
+// writeFile writes to the log, through the injected hook when one is set.
+func (w *WAL) writeFile(b []byte) (int, error) {
+	if w.writeHook != nil {
+		return w.writeHook(b)
+	}
+	return w.file.Write(b)
+}
+
+// syncFile flushes the log, through the injected hook when one is set.
+func (w *WAL) syncFile() error {
+	if w.syncHook != nil {
+		return w.syncHook()
+	}
+	return w.file.Sync()
+}
+
 // errWALReadOnly is the backstop refusal. Callers should be meeting
 // disk.ErrReadOnly from the store instead; see the readOnly field.
 var errWALReadOnly = errors.New("wal: log is open read-only")
@@ -132,6 +164,15 @@ type walSlot struct {
 	seq     atomic.Uint64
 	ready   atomic.Uint32
 	recType byte
+	// raw marks a slot whose payload is already framed — a batch straight from
+	// walBatch.finish(), complete with its begin and commit markers — and is
+	// written to the file verbatim rather than wrapped in a record header.
+	//
+	// Batches go through the same ring as single records because the ring's
+	// sequence *is* the log order, and mixing a queue with a direct write would
+	// give two ways for a record to reach the file and no way to say which one
+	// got there first.
+	raw     bool
 	payload []byte
 }
 
@@ -159,7 +200,7 @@ func openWALFor(path string, readOnly bool) (*WAL, error) {
 // file is simply an empty log — the honest reading of "this store has never been
 // written to" — and a headerless file keeps its framing untouched.
 func openWALReadOnly(path string) (*WAL, error) {
-	w := &WAL{readOnly: true}
+	w := &WAL{readOnly: true, gate: newSyncGate()}
 
 	f, err := os.Open(path)
 	switch {
@@ -229,6 +270,7 @@ func openWALWithCapacity(path string, capacity int) (*WAL, error) {
 		dataStart: dataStart,
 		ring:      make([]walSlot, capPow2),
 		ringMask:  uint64(capPow2 - 1),
+		gate:      newSyncGate(),
 	}
 	for i := range w.ring {
 		w.ring[i].seq.Store(uint64(i))
@@ -352,7 +394,11 @@ func (w *WAL) Checkpoint() error {
 	if err := w.writeRecord(walRecordCheckpoint, nil); err != nil {
 		return err
 	}
-	return w.file.Sync()
+	if err := w.syncFile(); err != nil {
+		return err
+	}
+	w.gate.noteSynced(w.tail.Load())
+	return nil
 }
 
 // Truncate removes all records from the WAL (called after successful compaction).
@@ -376,6 +422,11 @@ func (w *WAL) Truncate() error {
 	if err := w.file.Close(); err != nil {
 		return fmt.Errorf("wal truncate: close: %w", err)
 	}
+	// Every outstanding ticket names bytes this is about to discard. They are
+	// discarded because compaction has already folded them into an image it
+	// fsynced, so they are durable in the sense a committer waiting on one
+	// cares about — and nothing will ever sync the log position they name.
+	w.gate.noteSynced(w.tail.Load())
 	if err := os.Truncate(name, 0); err != nil {
 		return fmt.Errorf("wal truncate: %w", err)
 	}
@@ -719,7 +770,10 @@ func (w *WAL) Close() error {
 		return err
 	}
 
-	syncErr := w.file.Sync()
+	syncErr := w.syncFile()
+	if syncErr == nil {
+		w.gate.noteSynced(w.tail.Load())
+	}
 	w.closed.Store(1)
 	closeErr := w.file.Close()
 
@@ -755,7 +809,7 @@ func (w *WAL) append(recType byte, payload []byte) error {
 		copy(copied, payload)
 	}
 
-	if err := w.enqueue(recType, copied); err != nil {
+	if _, err := w.enqueue(recType, false, copied); err != nil {
 		return err
 	}
 
@@ -783,7 +837,7 @@ func (w *WAL) writeRecord(recType byte, payload []byte) error {
 	}
 	binary.LittleEndian.PutUint32(buf[walHeaderSize+int(length):], crc)
 
-	if _, err := w.file.Write(buf); err != nil {
+	if _, err := w.writeFile(buf); err != nil {
 		return fmt.Errorf("wal write: %w", err)
 	}
 	return nil
@@ -826,40 +880,45 @@ func (w *WAL) enterAppend() bool {
 	}
 }
 
-func (w *WAL) enqueue(recType byte, payload []byte) error {
+// enqueue reserves a ring slot and returns the ticket naming it.
+//
+// The ticket is the slot's sequence plus one, so that "everything up to ticket
+// T" is exactly "tail has reached T" and zero can mean "nothing to wait for".
+func (w *WAL) enqueue(recType byte, raw bool, payload []byte) (uint64, error) {
+	fill := func(seq uint64) {
+		slot := &w.ring[seq&w.ringMask]
+		slot.recType = recType
+		slot.raw = raw
+		slot.payload = payload
+		slot.seq.Store(seq)
+		slot.ready.Store(1)
+	}
+
 	for {
 		if seq, ok := w.tryReserve(); ok {
-			slot := &w.ring[seq&w.ringMask]
-			slot.recType = recType
-			slot.payload = payload
-			slot.seq.Store(seq)
-			slot.ready.Store(1)
-			return nil
+			fill(seq)
+			return seq + 1, nil
 		}
 
 		// Overflow path: lock and drain until there is room.
 		w.writeMu.Lock()
 		if err := w.drainQueuedLocked(); err != nil {
 			w.writeMu.Unlock()
-			return err
+			return 0, err
 		}
 		for {
 			if seq, ok := w.tryReserve(); ok {
-				slot := &w.ring[seq&w.ringMask]
-				slot.recType = recType
-				slot.payload = payload
-				slot.seq.Store(seq)
-				slot.ready.Store(1)
+				fill(seq)
 				if err := w.drainQueuedLocked(); err != nil {
 					w.writeMu.Unlock()
-					return err
+					return 0, err
 				}
 				w.writeMu.Unlock()
-				return nil
+				return seq + 1, nil
 			}
 			if err := w.drainQueuedLocked(); err != nil {
 				w.writeMu.Unlock()
-				return err
+				return 0, err
 			}
 			runtime.Gosched()
 		}
@@ -894,11 +953,16 @@ func (w *WAL) drainQueuedLocked() error {
 			return nil
 		}
 
-		if err := w.writeRecord(slot.recType, slot.payload); err != nil {
+		if slot.raw {
+			if _, err := w.writeFile(slot.payload); err != nil {
+				return fmt.Errorf("wal append batch: %w", err)
+			}
+		} else if err := w.writeRecord(slot.recType, slot.payload); err != nil {
 			return err
 		}
 
 		slot.payload = nil
+		slot.raw = false
 		slot.ready.Store(0)
 		w.tail.Store(tail + 1)
 	}
@@ -932,43 +996,127 @@ func computeCRC32(data []byte) uint32 {
 	return crc32.ChecksumIEEE(data)
 }
 
-// AppendBatch writes a pre-framed batch in a single write, optionally syncing.
+// QueueBatch places a pre-framed batch in the log's queue and returns the
+// ticket naming it. It is durable once AwaitSync(ticket) returns.
 //
-// The buffer must come from walBatch.finish(), so it is already bracketed by
-// begin/commit markers. Replay applies it only on reaching a valid commit, which
-// is what makes the batch atomic: a torn write leaves the commit absent and the
-// whole batch is discarded.
+// Queued rather than written, deliberately. The obvious shape — write the bytes
+// here, fsync in AwaitSync — was built first and measured, and on Windows it
+// gave no group commit at all: WriteFile blocks while FlushFileBuffers is in
+// flight on the same handle, so committers pile up behind the leader's own
+// fsync instead of arriving in time to share it. Measured on a 640-commit run,
+// the write cost per commit rose from 37 microseconds with one writer to 604
+// with four — exactly the fsync duration — and 640 commits cost 639 fsyncs.
 //
-// Queued records are drained first. A batch must not jump ahead of writes
-// already sitting in the ring, because replay order is apply order.
-func (w *WAL) AppendBatch(framed []byte, sync bool) error {
+// Queueing moves both the write and the fsync inside the leader. No other
+// goroutine touches the file while either is happening, so there is nothing for
+// the platform to serialise against.
+//
+// framed must not be modified afterwards; it is written from this buffer.
+func (w *WAL) QueueBatch(framed []byte) (uint64, error) {
 	if len(framed) == 0 {
-		return nil
+		return 0, nil
+	}
+	if w.readOnly {
+		return 0, errWALReadOnly
 	}
 	if w.closed.Load() != 0 {
-		return fmt.Errorf("wal append batch: closed")
+		return 0, fmt.Errorf("wal append batch: closed")
 	}
 	if !w.enterAppend() {
-		return fmt.Errorf("wal append batch: closed")
+		return 0, fmt.Errorf("wal append batch: closed")
+	}
+	defer w.inFlight.Add(-1)
+
+	return w.enqueue(0, true, framed)
+}
+
+// FlushQueued writes everything queued without syncing it, for a caller that is
+// not going to wait for durability.
+//
+// Opportunistic: if another goroutine is already writing, the bytes stay queued
+// and that goroutine will carry them. The ring is drained by whoever gets there
+// first, and every path that must not leave anything behind — Sync, Checkpoint,
+// Truncate, Close — drains under the maintenance barrier.
+func (w *WAL) FlushQueued() error {
+	if w.readOnly || w.closed.Load() != 0 {
+		return nil
+	}
+	if !w.writeMu.TryLock() {
+		return nil
+	}
+	err := w.drainQueuedLocked()
+	w.writeMu.Unlock()
+	return err
+}
+
+// AwaitSync returns once the write named by ticket is on the medium.
+//
+// A ticket of zero is already durable by definition: it names nothing.
+func (w *WAL) AwaitSync(ticket uint64) error {
+	if ticket == 0 {
+		return nil
+	}
+	if w.readOnly {
+		return errWALReadOnly
+	}
+	return w.gate.await(ticket, w.flushAndSync)
+}
+
+// flushAndSync is the leader's work: write everything queued, then fsync it,
+// then report how far the log is now durable.
+//
+// writeMu is held across both. That is the point — see QueueBatch — and it
+// costs nothing, because a committer that is not leading never wants the lock:
+// it queued its bytes without one and is asleep on the gate.
+func (w *WAL) flushAndSync() (uint64, error) {
+	if w.closed.Load() != 0 {
+		return 0, fmt.Errorf("wal sync: closed")
+	}
+	// Registers against the maintenance barrier, so a Checkpoint or Truncate
+	// cannot start draining the same ring underneath this. enterAppend waits
+	// for a barrier already up rather than failing, which is what a committer
+	// with bytes in the queue needs it to do.
+	if !w.enterAppend() {
+		return 0, fmt.Errorf("wal sync: closed")
 	}
 	defer w.inFlight.Add(-1)
 
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 
-	// Preserve ordering against concurrent single-record writers.
 	if err := w.drainQueuedLocked(); err != nil {
+		return 0, err
+	}
+	// Read after the drain and before the sync: everything the drain wrote is
+	// covered by the sync about to happen, and anything queued after this point
+	// is not.
+	done := w.tail.Load()
+	if err := w.syncFile(); err != nil {
+		return 0, fmt.Errorf("wal append batch: sync: %w", err)
+	}
+	return done, nil
+}
+
+// AppendBatch queues a pre-framed batch and optionally waits for it to be
+// durable.
+//
+// The buffer must come from walBatch.finish(), so it is already bracketed by
+// begin/commit markers. Replay applies it only on reaching a valid commit,
+// which is what makes the batch atomic: a torn write leaves the commit absent
+// and the whole batch is discarded.
+//
+// This is the do-both form. The commit path uses QueueBatch and AwaitSync
+// separately so it can release the store lock in between, which is what lets
+// two committers share one fsync.
+func (w *WAL) AppendBatch(framed []byte, sync bool) error {
+	ticket, err := w.QueueBatch(framed)
+	if err != nil {
 		return err
 	}
-	if _, err := w.file.Write(framed); err != nil {
-		return fmt.Errorf("wal append batch: %w", err)
+	if !sync {
+		return w.FlushQueued()
 	}
-	if sync {
-		if err := w.file.Sync(); err != nil {
-			return fmt.Errorf("wal append batch: sync: %w", err)
-		}
-	}
-	return nil
+	return w.AwaitSync(ticket)
 }
 
 // pendingRecord is one record buffered inside an uncommitted batch.
@@ -1057,5 +1205,9 @@ func (w *WAL) Sync() error {
 	if err := w.drainQueuedLocked(); err != nil {
 		return err
 	}
-	return w.file.Sync()
+	if err := w.syncFile(); err != nil {
+		return err
+	}
+	w.gate.noteSynced(w.tail.Load())
+	return nil
 }

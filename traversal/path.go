@@ -1,6 +1,8 @@
 package traversal
 
 import (
+	"context"
+
 	"errors"
 
 	"github.com/aoiflux/graphene/store"
@@ -34,7 +36,23 @@ type visitEntry struct {
 //
 // Pass nil edgeTypes to traverse all edge types.
 // The search treats the graph as undirected (DirectionBoth) for path finding.
-func ShortestPath(g store.GraphStore, src, dst store.NodeID, edgeTypes []store.EdgeType) (*PathResult, error) {
+func ShortestPath(g store.GraphReader, src, dst store.NodeID, edgeTypes []store.EdgeType) (*PathResult, error) {
+	return ShortestPathCtx(context.Background(), g, src, dst, edgeTypes, store.Budget{})
+}
+
+// ShortestPathCtx is ShortestPath with a cancellable context and a budget.
+// See BFSCtx.
+//
+// Both frontiers charge against one budget, which is the right accounting: the
+// cost of a bidirectional search is what the two halves spend together, and
+// splitting the allowance between them would let a search that has exhausted
+// its budget on one side keep going on the other.
+func ShortestPathCtx(ctx context.Context, g store.GraphReader, src, dst store.NodeID, edgeTypes []store.EdgeType, budget store.Budget) (*PathResult, error) {
+	guard := newGuard(ctx, budget)
+	if err := guard.enter(); err != nil {
+		return nil, err
+	}
+
 	if src == dst {
 		node, err := g.GetNode(src)
 		if err != nil {
@@ -55,14 +73,21 @@ func ShortestPath(g store.GraphStore, src, dst store.NodeID, edgeTypes []store.E
 
 	for len(fwdFrontier) > 0 && len(bwdFrontier) > 0 {
 		var nextFwd []store.NodeID
-		meetNode, nextFwd = expandAndAdvance(w, fwdFrontier, fwdVisited, bwdVisited, edgeTypes)
+		var err error
+		meetNode, nextFwd, err = expandAndAdvance(w, &guard, fwdFrontier, fwdVisited, bwdVisited, edgeTypes)
+		if err != nil {
+			return nil, err
+		}
 		if meetNode != store.InvalidNodeID {
 			break
 		}
 		fwdFrontier = nextFwd
 
 		var nextBwd []store.NodeID
-		meetNode, nextBwd = expandAndAdvance(w, bwdFrontier, bwdVisited, fwdVisited, edgeTypes)
+		meetNode, nextBwd, err = expandAndAdvance(w, &guard, bwdFrontier, bwdVisited, fwdVisited, edgeTypes)
+		if err != nil {
+			return nil, err
+		}
 		if meetNode != store.InvalidNodeID {
 			break
 		}
@@ -81,13 +106,17 @@ func ShortestPath(g store.GraphStore, src, dst store.NodeID, edgeTypes []store.E
 // with otherVisited. Returns the meeting node (or InvalidNodeID) and the next frontier.
 func expandAndAdvance(
 	w *walker,
+	guard *guard,
 	frontier []store.NodeID,
 	myVisited map[store.NodeID]visitEntry,
 	otherVisited map[store.NodeID]visitEntry,
 	edgeTypes []store.EdgeType,
-) (store.NodeID, []store.NodeID) {
+) (store.NodeID, []store.NodeID, error) {
 	var next []store.NodeID
 	for _, id := range frontier {
+		if err := guard.step(); err != nil {
+			return store.InvalidNodeID, nil, err
+		}
 		incident, err := w.incidentEdges(id, store.DirectionBoth, edgeTypes)
 		if err != nil {
 			continue
@@ -99,24 +128,30 @@ func expandAndAdvance(
 			if !w.markNeighbour(nbID) {
 				continue
 			}
+			if err := guard.crossEdge(); err != nil {
+				return store.InvalidNodeID, nil, err
+			}
 			if !w.nodeExists(nbID) {
 				continue
 			}
 			if _, seen := myVisited[nbID]; !seen {
+				if err := guard.visitNode(); err != nil {
+					return store.InvalidNodeID, nil, err
+				}
 				myVisited[nbID] = visitEntry{parent: id, edge: eid}
 				next = append(next, nbID)
 			}
 			if _, inOther := otherVisited[nbID]; inOther {
-				return nbID, next
+				return nbID, next, nil
 			}
 		}
 	}
-	return store.InvalidNodeID, next
+	return store.InvalidNodeID, next, nil
 }
 
 // reconstructPath assembles src→meet (fwdVisited) then meet→dst (bwdVisited).
 func reconstructPath(
-	g store.GraphStore,
+	g store.GraphReader,
 	meet store.NodeID,
 	fwd, bwd map[store.NodeID]visitEntry,
 ) (*PathResult, error) {

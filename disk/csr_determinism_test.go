@@ -178,7 +178,7 @@ func TestCompact_IsByteDeterministic(t *testing.T) {
 	}
 
 	s.mu.RLock()
-	csr := s.csr
+	csr := s.cur().csr
 	s.mu.RUnlock()
 
 	payload := func() csrPayload {

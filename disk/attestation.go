@@ -204,7 +204,7 @@ type NodeAttestation struct {
 // image.
 func (s *Store) AttestNode(id store.NodeID) (NodeAttestation, error) {
 	s.mu.RLock()
-	csr := s.csr
+	csr := s.cur().csr
 	s.mu.RUnlock()
 
 	if csr == nil {
@@ -224,7 +224,7 @@ func (s *Store) AttestNode(id store.NodeID) (NodeAttestation, error) {
 // image.
 func (s *Store) SnapshotAttestation() (Attestation, error) {
 	s.mu.RLock()
-	csr := s.csr
+	csr := s.cur().csr
 	s.mu.RUnlock()
 
 	if csr == nil || csr.attestation.Signature == nil {

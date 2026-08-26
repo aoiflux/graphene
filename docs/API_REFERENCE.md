@@ -24,6 +24,7 @@ import (
 5. [Create](#5-create)
 5.1. [Transactions — `Begin`](#51-transactions--begin) ← recommended for ingest
 6. [Read](#6-read)
+6a. [Snapshots — consistent reads](#6a-snapshots--consistent-reads)
 7. [Mutation](#7-mutation)  ← update / delete
 8. [Type lookups](#8-type-lookups)
 9. [Property index](#9-property-index)
@@ -384,6 +385,72 @@ and a 10 000-node bulk read from 2.05 ms to 0.48 ms. See
 
 ---
 
+## 6a. Snapshots — consistent reads
+
+```go
+func (g *Graph) Snapshot() (store.Snapshot, error)
+```
+
+A plain read is point-in-time: it answers from whatever the store holds at the
+instant it runs, and two reads in a row can disagree if a writer runs between
+them (§16). A snapshot fixes the answer.
+
+```go
+snap, err := g.Snapshot()
+if err != nil {
+    return err
+}
+defer snap.Close()
+
+n, _ := snap.GetNode(id)            // the same node, every time
+count, _ := snap.NodeCount()        // the same count, every time
+```
+
+**Close it.** On the disk backend a snapshot pins the image it was taken against
+and every record version written since; an abandoned one holds memory the next
+compaction would otherwise release. `StorageStats().OpenSnapshots` is where a
+leak shows up, and `disk.Options.MaxSnapshotAge` is the guard against one.
+
+### Using a snapshot where a graph goes
+
+`store.Snapshot` is the read half of `store.GraphStore` — the same methods, the
+same semantics, minus everything that writes — so it satisfies
+`store.GraphReader` and every traversal takes one directly:
+
+```go
+snap, _ := g.Snapshot()
+defer snap.Close()
+
+res, err := traversal.BFS(snap, origin, 3, store.DirectionBoth, nil)
+path, err := traversal.ShortestPath(snap, src, dst, nil)
+ids, err := snap.QueryNodeIDs(store.NodeQuery{Types: []store.NodeType{store.NodeTypeCase}})
+```
+
+This is what a multi-step read needs: a traversal is many reads, and on a live
+store a concurrent delete can leave it holding an edge to a node that no longer
+exists. Over a snapshot it cannot.
+
+### What is fixed and what is not
+
+**Fixed:** nodes, edges, adjacency, labels, and everything derived from them —
+including `NodeCount`, `EdgeCount`, `NodesByType` and typed queries.
+
+**Not fixed:** the property index, which is a live structure shared with the
+store. `NodesByProperty` and `EdgesByProperty` resolve the *current* postings
+against the *pinned* records: a posting whose node did not exist at this epoch,
+or has since been deleted, is dropped. An entry registered after the snapshot was
+taken, for a node that already existed, is the one case this cannot exclude.
+
+```go
+func (s store.Snapshot) Epoch() uint64
+```
+
+Names the version of the graph the snapshot reads. Two snapshots with the same
+epoch over the same store see the same graph. Monotonic within one open store;
+meaningless across processes.
+
+---
+
 ## 7. Mutation
 
 Update and delete are first-class and **durable** (they survive restart and
@@ -695,6 +762,78 @@ func (g *Graph) ShortestPath(src, dst store.NodeID, edgeTypes []store.EdgeType) 
 func (g *Graph) FindPatterns(pattern *traversal.Pattern, scope []store.NodeID, maxMatches int) ([]traversal.SubgraphMatch, error)
 ```
 
+### Bounded and cancellable walks
+
+```go
+func (g *Graph) BFSCtx(ctx context.Context, origin store.NodeID, maxDepth int,
+    dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) (*traversal.BFSResult, error)
+func (g *Graph) BFSIDsCtx(ctx context.Context, origin store.NodeID, maxDepth int,
+    dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) ([]store.NodeID, error)
+func (g *Graph) DFSCtx(ctx context.Context, origin store.NodeID, maxDepth int,
+    dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) (*traversal.BFSResult, error)
+func (g *Graph) ProvenanceChainCtx(ctx context.Context, origin store.NodeID, maxDepth int,
+    edgeTypes []store.EdgeType, budget store.Budget) (*traversal.DFSResult, error)
+func (g *Graph) ShortestPathCtx(ctx context.Context, src, dst store.NodeID,
+    edgeTypes []store.EdgeType, budget store.Budget) (*traversal.PathResult, error)
+func (g *Graph) FindPatternsCtx(ctx context.Context, pattern *traversal.Pattern,
+    scope []store.NodeID, maxMatches int, budget store.Budget) ([]traversal.SubgraphMatch, error)
+```
+
+Each is the method above it with a context and a budget. The unbounded forms are
+unchanged and cost what they always did.
+
+```go
+type Budget struct {
+    MaxNodes int           // nodes visited, including the origin
+    MaxEdges int           // edges crossed
+    MaxTime  time.Duration // wall clock from the start of the walk
+}
+var ErrBudgetExceeded = errors.New("graphene: traversal budget exceeded")
+```
+
+A zero `Budget` is unlimited, so `BFSCtx(ctx, ..., store.Budget{})` is exactly
+`BFS`.
+
+**Reach for these whenever the shape of the graph is not known in advance.**
+Depth does not bound a walk that passes through a hub: one node of degree 100 000
+puts 100 000 entries in the visited set at depth one, and without a budget the
+only symptom is the process growing until it stops.
+
+```go
+res, err := g.BFSCtx(ctx, origin, 3, store.DirectionBoth, nil,
+    store.Budget{MaxNodes: 100_000, MaxTime: 5 * time.Second})
+switch {
+case errors.Is(err, store.ErrBudgetExceeded):
+    // too big — narrow the walk, or scope it and try again
+case errors.Is(err, context.Canceled):
+    // the caller gave up
+}
+```
+
+Exceeding a limit is a **refusal, not a truncation**: nothing partial is returned
+alongside the error, because a partial answer that looks complete is the failure
+this exists to prevent.
+
+`MaxNodes` bounds memory, `MaxEdges` bounds work on a dense graph, and `MaxTime`
+is the limit of last resort. The context and the clock are checked every 256
+steps, so a cancel takes effect within a few microseconds of walking rather than
+instantly.
+
+The recursive walks — `DFSCtx`, `ProvenanceChainCtx`, `FindPatternsCtx` — also
+carry a hard limit of 100 000 stack frames whatever the budget says. A goroutine
+stack that runs out is a crash rather than an error, which is the one failure a
+caller cannot handle.
+
+Budgets compose with snapshots, which is the combination an analytical read over
+a live store actually wants:
+
+```go
+snap, _ := g.Snapshot()
+defer snap.Close()
+res, err := traversal.BFSCtx(ctx, snap, origin, 3, store.DirectionBoth, nil,
+    store.Budget{MaxNodes: 100_000})
+```
+
 ### Result & pattern types
 ```go
 type BFSResult struct { Nodes []*store.Node; Edges []*store.Edge }
@@ -837,8 +976,12 @@ A read returns data that was correct at some instant during the call:
 
 **The instant is inside the call, not after it.** By the time you act on a result
 the entity may already be gone, and `GetNode` on an ID you were just handed can
-legitimately fail. That is not a bug in the store, and closing it would require
-snapshot isolation, which is not on offer.
+legitimately fail. That is not a bug in the store.
+
+To close it, read through a snapshot (§6a). `g.Snapshot()` fixes the graph for as
+long as it is held, so every read through it agrees with every other — which is
+what a traversal, a report or an export needs, and what a single lookup does
+not.
 
 How often it happens depends on how much the call returns and how long it takes.
 Measured against a deleter running flat out with six concurrent readers:

@@ -210,7 +210,7 @@ func (w *WAL) Rotate(dir string, seq uint64) (SegmentInfo, error) {
 	}
 
 	name := w.file.Name()
-	if err := w.file.Sync(); err != nil {
+	if err := w.syncFile(); err != nil {
 		return SegmentInfo{}, fmt.Errorf("wal rotate: sync: %w", err)
 	}
 	if err := w.file.Close(); err != nil {
@@ -243,6 +243,12 @@ func (w *WAL) Rotate(dir string, seq uint64) (SegmentInfo, error) {
 	w.file = f
 	w.framing = walFramingV2
 	w.dataStart = walFileHeaderSize
+
+	// The retired log has been written out and closed, so every outstanding
+	// ticket names bytes that are now on the medium in a file nothing will write
+	// to again. Telling the gate keeps a committer waiting on one of them from
+	// waiting for a sync of the *new* file, which would never cover it.
+	w.gate.noteSynced(w.tail.Load())
 
 	fi, _ := os.Stat(dst)
 	out := SegmentInfo{Path: dst, Sequence: seq, Digest: digest}

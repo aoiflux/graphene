@@ -76,13 +76,10 @@ const (
 
 // batchMeta is the provenance recorded against one commit.
 //
-// CommitSeq is monotonic per store. It is currently only monotonic within a WAL
-// generation: Compact truncates the log, and the CSR header has nowhere to keep
-// a high-water mark, so the counter restarts from whatever the surviving log
-// replays. Persisting it needs a CSR header field, which is deliberately being
-// held for the single v8 format change that also carries the digest and
-// attestation sections rather than being spent on its own bump. Until then,
-// treat CommitSeq as ordering within a generation, not as a durable identity.
+// CommitSeq is monotonic per store, and monotonic across compaction: v8 keeps a
+// high-water mark in the CSR header, so truncating the log no longer restarts
+// the counter. Treat CommitSeq as a durable identity for a commit — it is the
+// only number in the engine that names one.
 type batchMeta struct {
 	CommitSeq uint64
 	UnixNano  int64

@@ -325,17 +325,29 @@ func FuzzDeserialiseCSR(f *testing.F) {
 // from the log and was passed to make() unchecked, so a five-byte header
 // claiming 0xFFFFFFFF demanded 4 GiB before reading any of it.
 func FuzzWALReplay(f *testing.F) {
-	f.Add(walSeedBytes(f))
-	f.Add([]byte{})
-	// A single header declaring a 4 GiB payload — the allocation bug.
-	huge := make([]byte, walHeaderSize)
-	huge[0] = walRecordNode
-	binary.LittleEndian.PutUint32(huge[1:5], ^uint32(0))
-	f.Add(huge)
-	// A batch that begins and never commits: replay must apply none of it.
-	f.Add(walUncommittedBatchBytes(f))
+	// Both framings, because both are read in production and only one used to be
+	// explored here. v1 checksums the payload alone; v2 checksums the record
+	// header along with it, so the two disagree about which byte sequences are a
+	// valid record — and v2 is the framing every store opened since the
+	// container header landed actually writes. Fuzzing v1 only left the live
+	// format uncovered.
+	for _, v2 := range []bool{false, true} {
+		f.Add(walSeedBytes(f), v2)
+		f.Add([]byte{}, v2)
+		// A single header declaring a 4 GiB payload — the allocation bug.
+		huge := make([]byte, walHeaderSize)
+		huge[0] = walRecordNode
+		binary.LittleEndian.PutUint32(huge[1:5], ^uint32(0))
+		f.Add(huge, v2)
+		// A batch that begins and never commits: replay must apply none of it.
+		f.Add(walUncommittedBatchBytes(f), v2)
+	}
 
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Fuzz(func(t *testing.T, data []byte, framingV2 bool) {
+		framing := uint16(walFramingV1)
+		if framingV2 {
+			framing = walFramingV2
+		}
 		// Driven through replayRecords rather than WAL.Replay so each candidate
 		// costs a bytes.Reader instead of a file write and an open. Going through
 		// the file handle held this target to a few thousand executions a minute,
@@ -351,7 +363,7 @@ func FuzzWALReplay(f *testing.F) {
 
 		// Either outcome is fine — a malformed log should be reported, a torn one
 		// truncated. What must not happen is a panic or an unbounded allocation.
-		if err := replayRecords(bytes.NewReader(data), int64(len(data)), walFramingV1, cb); err != nil {
+		if err := replayRecords(bytes.NewReader(data), int64(len(data)), framing, cb); err != nil {
 			return
 		}
 
@@ -371,7 +383,7 @@ func FuzzWALReplay(f *testing.F) {
 			NodePropPurgeFunc: func([]byte) error { second++; return nil },
 			EdgePropPurgeFunc: func([]byte) error { second++; return nil },
 		}
-		if err := replayRecords(bytes.NewReader(data), int64(len(data)), walFramingV1, cb2); err != nil {
+		if err := replayRecords(bytes.NewReader(data), int64(len(data)), framing, cb2); err != nil {
 			t.Fatalf("replay succeeded then failed on the same %d bytes: %v", len(data), err)
 		}
 		if second != applied {

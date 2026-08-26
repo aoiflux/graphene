@@ -27,49 +27,60 @@ func (s *Store) Compact() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Everything is read through one reader at the newest visible epoch, so the
+	// image being built is the graph as it stood at a single instant rather than
+	// a walk over fields that could each have moved.
+	r := s.writerLocked()
+	cur := r.v
+
 	// Collect all nodes and edges from both CSR and delta.
 	var nodes []nodeRecord
 	var edges []rawEdge
 
-	// From existing CSR — skip entries that a delta update has overridden or a
-	// tombstone has deleted, so the rebuilt CSR reclaims their space and never
-	// double-counts an updated entry.
-	if s.csr != nil {
-		for i := 1; i < len(s.csr.nodes); i++ {
-			n := s.csr.nodes[i]
+	// From existing CSR — skip entries the delta has an opinion about, whether
+	// that is an update (the delta copy is emitted below) or a tombstone (the
+	// record is gone). Either way the rebuilt CSR reclaims the space and never
+	// double-counts.
+	if cur.csr != nil {
+		for i := 1; i < len(cur.csr.nodes); i++ {
+			n := cur.csr.nodes[i]
 			if n.ID == store.InvalidNodeID {
 				continue
 			}
-			if _, over := s.deltaNodes[n.ID]; over {
-				continue
-			}
-			if _, del := s.deletedNodes[n.ID]; del {
+			if r.deltaNodeKnown(n.ID) {
 				continue
 			}
 			nodes = append(nodes, n)
 		}
-		for i := 1; i < len(s.csr.edges); i++ {
-			e := s.csr.edges[i]
+		for i := 1; i < len(cur.csr.edges); i++ {
+			e := cur.csr.edges[i]
 			if e.ID == store.InvalidEdgeID {
 				continue
 			}
-			if _, over := s.deltaEdges[e.ID]; over {
-				continue
-			}
-			if _, del := s.deletedEdges[e.ID]; del {
+			if r.deltaEdgeKnown(e.ID) {
 				continue
 			}
 			edges = append(edges, e)
 		}
 	}
 
-	// From delta.
-	for _, n := range s.deltaNodes {
-		nodes = append(nodes, nodeRecord{ID: n.ID, Labels: n.Labels, Properties: cloneBytes(n.Properties)})
+	// From delta. A tombstoned entry resolves to nil and is simply not carried
+	// forward, which is what makes compaction the point at which a delete stops
+	// costing memory.
+	for id, ver := range cur.delta.nodes {
+		n, ok := ver.at(r.epoch)
+		if !ok || n == nil {
+			continue
+		}
+		nodes = append(nodes, nodeRecord{ID: id, Labels: n.Labels, Properties: cloneBytes(n.Properties)})
 	}
-	for _, e := range s.deltaEdges {
+	for id, ver := range cur.delta.edges {
+		e, ok := ver.at(r.epoch)
+		if !ok || e == nil {
+			continue
+		}
 		edges = append(edges, rawEdge{
-			ID:         e.ID,
+			ID:         id,
 			Src:        e.Src,
 			Dst:        e.Dst,
 			Labels:     e.Labels,
@@ -104,17 +115,17 @@ func (s *Store) Compact() error {
 	// itself verifiable. A substituted snapshot breaks the link even when the
 	// substitute is internally consistent.
 	var prevRoot merkle.Hash
-	if s.csr != nil {
-		if r, ok := s.csr.Roots(); ok {
-			prevRoot = r.Snapshot
+	if cur.csr != nil {
+		if roots, ok := cur.csr.Roots(); ok {
+			prevRoot = roots.Snapshot
 		}
 	}
 
 	// The attestation chains to the previous image's, so a removed attestation is
 	// provably missing rather than invisibly absent.
 	var prevAttestation [attestationIDSize]byte
-	if s.csr != nil {
-		prevAttestation = s.csr.attestation.ID
+	if cur.csr != nil {
+		prevAttestation = cur.csr.attestation.ID
 	}
 
 	// Tombstones are rebuilt from the ledger rather than carried forward from the
@@ -146,7 +157,11 @@ func (s *Store) Compact() error {
 		return fmt.Errorf("compact: %w", err)
 	}
 	tmpPath := filepath.Join(s.dir, csrFileName+".tmp")
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+	// Synced, not merely written. The checkpoint below is itself fsynced and
+	// says "everything before this record is in the image"; if the image's
+	// blocks are still in the page cache when the power goes, that marker is a
+	// durable lie. The sync has to land before the checkpoint, not after.
+	if err := writeFileSync(tmpPath, data, 0600); err != nil {
 		return fmt.Errorf("compact: write tmp CSR: %w", err)
 	}
 
@@ -158,6 +173,14 @@ func (s *Store) Compact() error {
 	csrPath := filepath.Join(s.dir, csrFileName)
 	if err := os.Rename(tmpPath, csrPath); err != nil {
 		return fmt.Errorf("compact: rename CSR: %w", err)
+	}
+	// And the rename itself. os.Rename is atomic with respect to a concurrent
+	// reader — either name resolves to one whole file or the other — but that
+	// is a different property from surviving a power loss, which needs the
+	// directory's own entries flushed. Before the WAL is retired below, because
+	// the log is what recovers the store if this fails.
+	if err := syncDir(s.dir); err != nil {
+		return fmt.Errorf("compact: %w", err)
 	}
 
 	// Retire the WAL.
@@ -217,18 +240,20 @@ func (s *Store) Compact() error {
 	// restart replayed it, making both costs grow with the total number of
 	// indexed entries no matter how little had changed.
 
-	// Swap in new CSR and clear delta + delete masks (both are now baked into
-	// the freshly built CSR).
+	// Swap in the new image under a fresh, empty delta layer. Both halves change
+	// together because they are one value; the old layer is left exactly as it
+	// is rather than cleared, so a snapshot still reading it keeps working and
+	// the garbage collector reclaims it when the last one closes.
 	s.publishCSR(newCSR)
-	s.deltaNodes = make(map[store.NodeID]*store.Node)
-	s.deltaEdges = make(map[store.EdgeID]*store.Edge)
-	s.deltaAdj = make(map[store.NodeID]*deltaAdj)
-	s.deletedNodes = make(map[store.NodeID]struct{})
-	s.deletedEdges = make(map[store.EdgeID]struct{})
-	s.deltaNodesByType = make(map[store.NodeType][]store.NodeID)
-	s.deltaEdgesByType = make(map[store.EdgeType][]store.EdgeID)
 
 	s.lastCompact = compactedAt
+
+	// Everything folded into the image is durable in it, including any commit
+	// that had been written but was still waiting on its fsync when this
+	// started: the image was synced and the log checkpointed above. Publishing
+	// the applied epoch is what stops those commits being stranded invisible
+	// after the log that held them was retired.
+	s.publishEpoch(s.mutEpoch.Load())
 
 	return nil
 }

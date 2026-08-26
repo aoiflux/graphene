@@ -405,9 +405,21 @@ dangling edge and no index entry, in any index, under any key. Reads give you:
 the entity may be gone, so `GetNode` on an ID you were just handed can
 legitimately fail — measured at 0.7% of IDs from a single-key lookup and 4–11%
 from a typed query, against a deleter running flat out. Treat a result set as
-candidates. Closing that gap needs snapshot isolation, which Graphene does not
-offer — `Begin()` gives a multi-write transaction that is atomic and durable,
-but **not isolated**, so read-decide-write across a concurrent writer still
+candidates.
+
+To close that gap, take a snapshot. `g.Snapshot()` returns a fixed read view —
+every read through it sees the graph as it stood when it was taken, for as long
+as it is held — and it satisfies `store.GraphReader`, so traversals and queries
+accept one directly:
+
+```go
+snap, _ := g.Snapshot()
+defer snap.Close()
+res, _ := traversal.BFS(snap, origin, 3, store.DirectionBoth, nil)
+```
+
+That fixes *reads*. `Begin()` is the other half: a multi-write transaction that
+is atomic and durable, but read-decide-write across a concurrent writer still
 needs your own serialisation.
 
 Holding that line needed one fix worth naming: property lookups consulted the

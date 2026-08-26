@@ -55,7 +55,7 @@ type NodeInclusionProof struct {
 // SnapshotRoots returns the Merkle identity of the compacted image.
 func (s *Store) SnapshotRoots() (SnapshotRoots, error) {
 	s.mu.RLock()
-	csr := s.csr
+	csr := s.cur().csr
 	s.mu.RUnlock()
 
 	if csr == nil {
@@ -76,7 +76,7 @@ func (s *Store) SnapshotRoots() (SnapshotRoots, error) {
 // path. Revisit if it becomes one.
 func (s *Store) ProveNode(id store.NodeID) (NodeInclusionProof, error) {
 	s.mu.RLock()
-	csr := s.csr
+	csr := s.cur().csr
 	s.mu.RUnlock()
 
 	if csr == nil {

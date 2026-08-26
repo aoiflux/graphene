@@ -43,6 +43,9 @@
 package graphene
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/memory"
 	"github.com/aoiflux/graphene/store"
@@ -314,6 +317,40 @@ func (g *Graph) UpdateEdgeIndexed(e *store.Edge, props map[string][]byte) error 
 	return g.IndexEdgeProperties(e.ID, props)
 }
 
+// Snapshot returns a consistent read view of the graph.
+//
+// Every read through it sees the graph as it stood when the snapshot was taken,
+// however long it is held and whatever writers do meanwhile. That is what makes
+// a multi-step read — a traversal, a report, an export — describe one graph
+// rather than a sequence of instants that happen to be adjacent.
+//
+//	snap, err := g.Snapshot()
+//	if err != nil {
+//		return err
+//	}
+//	defer snap.Close()
+//	result, err := traversal.BFS(snap, origin, 3, store.DirectionBoth, nil)
+//
+// The traversal functions take a store.GraphReader, which both a Graph and a
+// Snapshot satisfy, so the walk above is the same call it would be against the
+// live store.
+//
+// Close it. On the disk backend a snapshot pins the image it was taken against
+// and every delta version written since, so an abandoned one holds memory that
+// the next compaction would otherwise release —
+// StorageStats().OpenSnapshots is where that shows up.
+//
+// A backend that cannot provide one returns an error naming itself, matching
+// how the other optional capabilities report their absence. Both bundled
+// backends can.
+func (g *Graph) Snapshot() (store.Snapshot, error) {
+	sn, ok := g.GraphStore.(store.Snapshotter)
+	if !ok {
+		return nil, fmt.Errorf("Snapshot: %T does not support snapshots", g.GraphStore)
+	}
+	return sn.Snapshot()
+}
+
 // --- Traversal convenience methods ---
 
 // BFS performs a breadth-first traversal from origin up to maxDepth hops.
@@ -358,4 +395,59 @@ func (g *Graph) ShortestPath(src, dst store.NodeID, edgeTypes []store.EdgeType) 
 // maxMatches caps output; pass 0 for no cap.
 func (g *Graph) FindPatterns(pattern *traversal.Pattern, scope []store.NodeID, maxMatches int) ([]traversal.SubgraphMatch, error) {
 	return traversal.FindSubgraphMatches(g.GraphStore, pattern, scope, maxMatches)
+}
+
+// --- Bounded and cancellable traversals ---
+//
+// Each of these is the method above it with a context and a store.Budget. The
+// unbounded forms remain exactly what they were and cost exactly what they
+// cost; nothing here changes an existing call.
+//
+// Reach for these whenever the shape of the graph is not known in advance. A
+// depth limit does not bound a walk that passes through a hub — one node of
+// degree 100 000 puts 100 000 entries in the visited set at depth one — and
+// without a budget the only symptom is the process growing until it stops.
+// A budget turns that into store.ErrBudgetExceeded, which is something a caller
+// can act on.
+//
+//	res, err := g.BFSCtx(ctx, origin, 3, store.DirectionBoth, nil,
+//	        store.Budget{MaxNodes: 100_000, MaxTime: 5 * time.Second})
+//	if errors.Is(err, store.ErrBudgetExceeded) {
+//	        // too big: narrow the walk, or scope it and try again
+//	}
+//
+// For a walk that must also see one consistent graph, take a Snapshot and pass
+// it to the traversal package directly — every function there accepts a
+// store.GraphReader, which a Snapshot is.
+
+// BFSCtx is BFS bounded by budget and cancellable through ctx.
+func (g *Graph) BFSCtx(ctx context.Context, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) (*traversal.BFSResult, error) {
+	return traversal.BFSCtx(ctx, g.GraphStore, origin, maxDepth, dir, edgeTypes, budget)
+}
+
+// BFSIDsCtx is BFSIDs bounded by budget and cancellable through ctx.
+func (g *Graph) BFSIDsCtx(ctx context.Context, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) ([]store.NodeID, error) {
+	return traversal.BFSIDsCtx(ctx, g.GraphStore, origin, maxDepth, dir, edgeTypes, budget)
+}
+
+// DFSCtx is DFS bounded by budget and cancellable through ctx.
+func (g *Graph) DFSCtx(ctx context.Context, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) (*traversal.BFSResult, error) {
+	return traversal.DFSCtx(ctx, g.GraphStore, origin, maxDepth, dir, edgeTypes, budget)
+}
+
+// ProvenanceChainCtx is ProvenanceChain bounded by budget and cancellable
+// through ctx.
+func (g *Graph) ProvenanceChainCtx(ctx context.Context, origin store.NodeID, maxDepth int, edgeTypes []store.EdgeType, budget store.Budget) (*traversal.DFSResult, error) {
+	return traversal.ProvenanceChainCtx(ctx, g.GraphStore, origin, maxDepth, edgeTypes, budget)
+}
+
+// ShortestPathCtx is ShortestPath bounded by budget and cancellable through ctx.
+func (g *Graph) ShortestPathCtx(ctx context.Context, src, dst store.NodeID, edgeTypes []store.EdgeType, budget store.Budget) (*traversal.PathResult, error) {
+	return traversal.ShortestPathCtx(ctx, g.GraphStore, src, dst, edgeTypes, budget)
+}
+
+// FindPatternsCtx is FindPatterns bounded by budget and cancellable through
+// ctx.
+func (g *Graph) FindPatternsCtx(ctx context.Context, pattern *traversal.Pattern, scope []store.NodeID, maxMatches int, budget store.Budget) ([]traversal.SubgraphMatch, error) {
+	return traversal.FindSubgraphMatchesCtx(ctx, g.GraphStore, pattern, scope, maxMatches, budget)
 }

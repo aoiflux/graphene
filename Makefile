@@ -15,7 +15,7 @@
 #   make test       unit tests, race detector on
 #   make stress     the build-tagged stress suite
 #   make bench      benchmarks (see CONTRIBUTING.md before believing any number)
-#   make fuzz       time-boxed fuzzing of all four parser targets
+#   make fuzz       time-boxed fuzzing of every fuzz target in the tree
 #   make lint       gofmt and go vet
 #   make cover      coverage profile plus a per-package summary
 #   make fmt        rewrite files that are not gofmt-clean
@@ -43,7 +43,9 @@ FUZZTIME  ?= 30s
 FUZZ_TARGETS := ./disk/:FuzzDeserialiseCSR \
                 ./disk/:FuzzWALReplay \
                 ./store/:FuzzParseNodeType \
-                ./store/:FuzzParseEdgeType
+                ./store/:FuzzParseEdgeType \
+                ./merkle/:FuzzProofSoundness \
+                ./merkle/:FuzzRootDistinguishesContent
 
 ifdef FILTER
 RUN_FLAG := -run $(FILTER)
@@ -73,7 +75,9 @@ bench:
 	$(GO) test ./tests/ -tags=stress -bench=$(if $(FILTER),$(FILTER),.) -benchmem \
 		-benchtime=$(BENCHTIME) -run='^$$'
 
-## fuzz: explore each parser for FUZZTIME. Seed corpora and saved crash
+## fuzz: explore each target for FUZZTIME. This list must stay equal to what
+## `grep -rn "^func Fuzz" --include=*.go .` reports — the two merkle targets sat
+## outside it for a release, written and never run. Seed corpora and saved crash
 ## reproducers already run under `make test`; this looks for new ones.
 ##
 ## A failure writes the offending input to testdata/fuzz — that file is the bug

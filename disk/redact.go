@@ -663,8 +663,8 @@ func (s *Store) nodeVersionHashOf(n nodeRecord) merkle.Hash {
 // defaulting to what a fresh compaction would write when there is no image yet.
 // Caller must hold s.mu.
 func (s *Store) leafVersionLocked() uint8 {
-	if s.csr != nil {
-		if r, ok := s.csr.Roots(); ok {
+	if csr := s.cur().csr; csr != nil {
+		if r, ok := csr.Roots(); ok {
 			return r.bodyVersion()
 		}
 	}
@@ -797,7 +797,9 @@ func (s *Store) RedactNodeProperties(id store.NodeID, req RedactionRequest) (Red
 	if err := s.purgeNodeIndexLocked(id); err != nil {
 		return rec, fmt.Errorf("disk: redaction %d was recorded but the index purge failed: %w", rec.Seq, err)
 	}
-	s.applyNodeUpsert(stripped)
+	ep := s.nextEpoch()
+	s.applyNodeUpsert(ep, stripped)
+	s.publishEpoch(ep)
 
 	if err := s.recordAudit(AuditRedaction, req.ActorID,
 		fmt.Sprintf("redacted properties of node %d: %s", id, req.Reason)); err != nil {
@@ -872,7 +874,9 @@ func (s *Store) RedactEdgeProperties(id store.EdgeID, req RedactionRequest) (Red
 	if err := s.purgeEdgeIndexLocked(id); err != nil {
 		return rec, fmt.Errorf("disk: redaction %d was recorded but the index purge failed: %w", rec.Seq, err)
 	}
-	s.applyEdgeUpsert(stripped)
+	ep := s.nextEpoch()
+	s.applyEdgeUpsert(ep, stripped)
+	s.publishEpoch(ep)
 
 	if err := s.recordAudit(AuditRedaction, req.ActorID,
 		fmt.Sprintf("redacted properties of edge %d: %s", id, req.Reason)); err != nil {
@@ -924,7 +928,9 @@ func (s *Store) RedactEdge(id store.EdgeID, req RedactionRequest) (RedactionReco
 	if err := s.wal.AppendEdgeDelete(marshalID(uint64(id))); err != nil {
 		return rec, fmt.Errorf("disk: redaction %d was recorded but the deletion failed: %w", rec.Seq, err)
 	}
-	s.applyEdgeDelete(id)
+	ep := s.nextEpoch()
+	s.applyEdgeDelete(ep, id)
+	s.publishEpoch(ep)
 
 	if err := s.recordAudit(AuditRedaction, req.ActorID,
 		fmt.Sprintf("redacted edge %d: %s", id, req.Reason)); err != nil {

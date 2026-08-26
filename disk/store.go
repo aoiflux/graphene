@@ -26,30 +26,41 @@ type Store struct {
 	mu  sync.RWMutex
 	dir string
 	wal *WAL
-	csr *CSRGraph // nil until first compaction
 
-	// Delta layer: nodes and edges added since last compaction.
-	deltaNodes map[store.NodeID]*store.Node
-	deltaEdges map[store.EdgeID]*store.Edge
-	deltaAdj   map[store.NodeID]*deltaAdj
+	// viewPtr is the CSR image and the delta layer above it, as one value. See
+	// view.go for why the two travel together and why the epoch does not.
+	//
+	// Replaced only by Compact and only under the write lock, so every read
+	// under s.mu sees one view for the whole of its work. Loaded without the
+	// lock by the point-read fast path and by Snapshot.
+	viewPtr atomic.Pointer[view]
 
-	// Delete masks: IDs removed since the last compaction that still live in the
-	// CSR. They hide the stale CSR record from every read until Compact rebuilds
-	// the CSR without them. Delta-only deletions are handled by removing the
-	// entry from the delta maps directly and never appear here.
-	deletedNodes map[store.NodeID]struct{}
-	deletedEdges map[store.EdgeID]struct{}
+	// mutEpoch stamps delta mutations; visibleEpoch is how far a reader may see.
+	//
+	// They are the same number in the steady state and differ only while a
+	// commit is written but not yet durable. That gap is the whole of the
+	// group-commit design: a batch appends its records and stamps them under the
+	// lock, releases the lock, waits for the fsync that covers them, and only
+	// then advances visibleEpoch. Because visibility is the epoch and not the
+	// map write, no reader can observe a commit that a crash would take back.
+	//
+	// Single-record mutators, which have never fsynced (see Sync), advance both
+	// under the lock: their durability boundary is the next Sync, exactly as
+	// documented, and making them invisible until then would break
+	// read-your-writes for no gain.
+	mutEpoch     atomic.Uint64
+	visibleEpoch atomic.Uint64
 
-	// Type indexes over delta (CSR has its own type lookups).
-	deltaNodesByType map[store.NodeType][]store.NodeID
-	deltaEdgesByType map[store.EdgeType][]store.EdgeID
+	// snaps tracks open snapshots so version chains know how far back to keep
+	// history, and so an operator can see a leaked one. Guarded by mu.
+	snaps snapshotRegistry
 
 	// --- lock-free read support ---
 	//
 	// A CSRGraph is immutable once published, so a reader that gets the pointer
 	// atomically can read a record from it without holding s.mu. The lock is
-	// still needed for the delta maps and the delete masks, which are ordinary Go
-	// maps — but those only *shadow* CSR records, they never rewrite them.
+	// still needed for the delta maps, which are ordinary Go maps — but those
+	// only *shadow* CSR records, they never rewrite them.
 	//
 	// csrShadowed counts CSR records that a delta update or a tombstone has
 	// superseded within the current epoch. While it is zero, every CSR record is
@@ -62,7 +73,11 @@ type Store struct {
 	// it was zero throughout. A reader also re-checks the CSR *pointer* it read
 	// from, which is what catches a Compact that swapped the CSR and cleared the
 	// counter underneath it.
-	csrPtr      atomic.Pointer[CSRGraph]
+	//
+	// The validity check compares the CSR, not the view: a view is replaced by
+	// every compaction *and* is the thing Snapshot pins, but a plain commit
+	// leaves v.csr identical. Comparing the image is what keeps a concurrent
+	// writer from knocking every in-flight point read off the fast path.
 	csrShadowed atomic.Int64
 
 	// Property index (in-memory; rebuilt from WAL on restart).
@@ -78,16 +93,21 @@ type Store struct {
 	nodeSeq atomic.Uint64
 	edgeSeq atomic.Uint64
 
-	// commitSeq numbers batch commits. Unlike nodeSeq and edgeSeq it has no
-	// high-water mark in the CSR header, so it currently resumes from the
-	// highest value the surviving WAL replays and restarts after a compaction
-	// truncates that log. See batchMeta for why persisting it is being held for
-	// the v8 format change rather than spent on a bump of its own.
+	// commitSeq numbers batch commits. Like nodeSeq and edgeSeq it has a
+	// high-water mark in the CSR header (v8, commitSeqHW), so compaction
+	// truncating the log no longer resets it: on open it resumes from the larger
+	// of the mark in the image and the highest value the surviving WAL replays.
+	// That is what makes a commit sequence number a durable identity rather than
+	// an ordering within one log generation.
 	commitSeq atomic.Uint64
 
 	// nowUnixNano supplies the commit timestamp. Indirected so tests can pin it;
 	// production leaves it nil and reads the clock.
 	nowUnixNano func() int64
+
+	// maxSnapshotAge bounds how long a snapshot may pin history; zero is
+	// unlimited. Set once at Open. See Options.MaxSnapshotAge.
+	maxSnapshotAge time.Duration
 
 	// signer signs each batch commit; nil leaves commits unsigned. Set through
 	// Open's options and not changed afterwards, so a log never contains a
@@ -159,11 +179,6 @@ type Store struct {
 	unclean bool
 }
 
-type deltaAdj struct {
-	out []store.EdgeID
-	in  []store.EdgeID
-}
-
 // nextCommitMeta allocates the provenance for one batch commit.
 //
 // Callers hold s.mu, but commitSeq is atomic anyway so the number is unique
@@ -181,6 +196,15 @@ func (s *Store) nextCommitMeta(ctx store.TxContext) batchMeta {
 	}
 }
 
+// now reads the clock through the same indirection the commit timestamp uses,
+// so a test that pins time pins all of it rather than half.
+func (s *Store) now() time.Time {
+	if s.nowUnixNano != nil {
+		return time.Unix(0, s.nowUnixNano())
+	}
+	return time.Now()
+}
+
 // StorageStats implements store.StorageReporter.
 //
 // Taken under a read lock so the delta counts are mutually consistent — a
@@ -191,16 +215,26 @@ func (s *Store) StorageStats() store.StorageStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	v := s.viewPtr.Load()
 	st := store.StorageStats{
-		DeltaNodes:   len(s.deltaNodes),
-		DeltaEdges:   len(s.deltaEdges),
-		DeletedNodes: len(s.deletedNodes),
-		DeletedEdges: len(s.deletedEdges),
+		DeltaNodes:   v.delta.liveNodes,
+		DeltaEdges:   v.delta.liveEdges,
+		DeletedNodes: v.delta.maskedNodes,
+		DeletedEdges: v.delta.maskedEdges,
 		WALBytes:     s.wal.Size(),
 		CommitSeq:    s.commitSeq.Load(),
 		LastCompact:  s.lastCompact,
+
+		// What is holding history open. An operator looking at a store whose
+		// memory will not come down needs to be able to distinguish "the delta
+		// is genuinely large" from "one abandoned snapshot is pinning an image
+		// and every version written since", and these are the figures that
+		// separate them.
+		OpenSnapshots:       s.snaps.count,
+		OldestSnapshotEpoch: s.snaps.oldest,
+		VisibleEpoch:        s.visibleEpoch.Load(),
 	}
-	if csr := s.csr; csr != nil {
+	if csr := v.csr; csr != nil {
 		st.CSRNodes = csr.NodeCount()
 		st.CSREdges = csr.EdgeCount()
 	}
@@ -394,6 +428,16 @@ type Options struct {
 	// Use it for the read-only work the CLI does — verify, custody, prove — and
 	// for any consumer querying a store another process might want to write.
 	ReadOnly bool
+
+	// MaxSnapshotAge bounds how long a Snapshot may be held before its reads
+	// start returning ErrSnapshotExpired. Zero, the default, is unlimited.
+	//
+	// A snapshot pins the image it was taken against and every delta version
+	// written since, so one that is never closed holds memory the store can
+	// otherwise release at the next compaction. This is the guard for a caller
+	// that leaks one — it does not close the snapshot, it stops it being useful,
+	// which turns a silent leak into an error at the point of use.
+	MaxSnapshotAge time.Duration
 }
 
 // recordAudit appends an entry when auditing is enabled, and does nothing
@@ -580,22 +624,16 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		// crashed writer's evidence is still there for the next *writer* to find
 		// — and a reader reporting a recovery it did not perform would be a claim
 		// about a directory it does not own.
-		unclean:          !opts.ReadOnly && prevOwner.Present && !prevOwner.Clean,
-		deltaNodes:       make(map[store.NodeID]*store.Node),
-		deltaEdges:       make(map[store.EdgeID]*store.Edge),
-		deltaAdj:         make(map[store.NodeID]*deltaAdj),
-		deletedNodes:     make(map[store.NodeID]struct{}),
-		deletedEdges:     make(map[store.EdgeID]struct{}),
-		deltaNodesByType: make(map[store.NodeType][]store.NodeID),
-		deltaEdgesByType: make(map[store.EdgeType][]store.EdgeID),
-		propIdx:          index.NewPropertyIndex(),
-		syncOnCommit:     true,
-		signer:           opts.Signer,
-		verifier:         opts.Verifier,
-		requireSigned:    opts.RequireSignedCommits,
-		attestActorID:    opts.AttestActorID,
-		retention:        opts.Retention,
-		redaction:        opts.RedactionPolicy,
+		unclean:        !opts.ReadOnly && prevOwner.Present && !prevOwner.Clean,
+		propIdx:        index.NewPropertyIndex(),
+		maxSnapshotAge: opts.MaxSnapshotAge,
+		syncOnCommit:   true,
+		signer:         opts.Signer,
+		verifier:       opts.Verifier,
+		requireSigned:  opts.RequireSignedCommits,
+		attestActorID:  opts.AttestActorID,
+		retention:      opts.Retention,
+		redaction:      opts.RedactionPolicy,
 	}
 
 	// The three ledgers all open their files for append, so a read-only store
@@ -685,6 +723,11 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		return nil, fmt.Errorf(format, args...)
 	}
 
+	// A store always has a view, even before the first compaction: an empty delta
+	// layer over a nil image. Nothing may read or write the delta before this,
+	// which is why it is published here rather than lazily.
+	s.publishView(&view{delta: newDeltaLayer()})
+
 	// Try to load existing CSR.
 	csrPath := filepath.Join(dir, csrFileName)
 	if _, err := os.Stat(csrPath); err == nil {
@@ -752,9 +795,12 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 		return store.InvalidNodeID, fmt.Errorf("AddNode: wal: %w", err)
 	}
 
-	s.deltaNodes[id] = stored
-	s.indexDeltaNodeLabels(id, stored.Labels)
-	s.ensureDeltaAdj(id)
+	// Visible immediately. A single write has never been fsynced (see Sync), so
+	// its durability boundary is the next Sync and holding it invisible until
+	// then would break read-your-writes without buying any guarantee.
+	e := s.nextEpoch()
+	s.putNode(e, stored)
+	s.publishEpoch(e)
 
 	return id, nil
 }
@@ -768,10 +814,13 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 	ids := make([]store.NodeID, len(nodes))
 	stored := make([]*store.Node, len(nodes))
 
-	// The whole batch runs under one lock hold: WAL append order matches apply
-	// order and the batch is atomic w.r.t. other writers.
+	// The batch is assembled, written and applied under one lock hold — WAL
+	// order matches apply order, and the batch is atomic with respect to other
+	// writers. The lock is released *before* waiting for durability, which is
+	// what lets a second committer join this one's fsync; see syncgate.go.
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock := sync.OnceFunc(s.mu.Unlock)
+	defer unlock()
 
 	for i, n := range nodes {
 		id := store.NodeID(s.nodeSeq.Add(1))
@@ -802,7 +851,8 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.wal.AppendBatch(framed, s.syncOnCommit); err != nil {
+	ticket, err := s.wal.QueueBatch(framed)
+	if err != nil {
 		// Apply nothing. The commit marker never reached the file, so replay will
 		// discard whatever partial bytes did — that absence *is* the rollback.
 		// The IDs assigned above are simply never used, which is allowed: IDs are
@@ -810,7 +860,28 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 		return nil, fmt.Errorf("AddNodesBatch: wal: %w", err)
 	}
 
-	s.commitNodesBatch(stored)
+	epoch := s.nextEpoch()
+	s.commitNodesBatch(epoch, stored)
+	sync := s.syncOnCommit
+	unlock()
+
+	if sync {
+		if err := s.wal.AwaitSync(ticket); err != nil {
+			// Not published. The records are in the delta but no reader can see
+			// them, because visibility is the epoch — so a failed fsync cannot
+			// hand anyone a commit the disk never took. A later commit whose
+			// sync succeeds covers these bytes too and will publish past them,
+			// which is correct: at that point they are durable.
+			return nil, fmt.Errorf("AddNodesBatch: wal: %w", err)
+		}
+	} else if err := s.wal.FlushQueued(); err != nil {
+		// Not waiting for durability does not mean leaving the bytes in a
+		// queue. syncOnCommit off is documented as "durable at the next Sync,
+		// Compact or Close", and bytes still in the ring would not survive even
+		// a process kill, which the page cache does.
+		return nil, fmt.Errorf("AddNodesBatch: wal: %w", err)
+	}
+	s.publishEpoch(epoch)
 	return ids, nil
 }
 
@@ -852,10 +923,9 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 		return store.InvalidEdgeID, fmt.Errorf("AddEdge: wal: %w", err)
 	}
 
-	s.deltaEdges[id] = stored
-	s.indexDeltaEdgeLabels(id, stored.Labels)
-	s.ensureDeltaAdj(stored.Src).out = append(s.ensureDeltaAdj(stored.Src).out, id)
-	s.ensureDeltaAdj(stored.Dst).in = append(s.ensureDeltaAdj(stored.Dst).in, id)
+	ep := s.nextEpoch()
+	s.putEdge(ep, stored, true)
+	s.publishEpoch(ep)
 
 	return id, nil
 }
@@ -870,9 +940,11 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	stored := make([]*store.Edge, len(edges))
 
 	// Whole batch under one lock hold: endpoint validation cannot race a
-	// concurrent DeleteNode, and WAL order matches apply order.
+	// concurrent DeleteNode, and WAL order matches apply order. Released before
+	// the durability wait, as in AddNodesBatch.
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock := sync.OnceFunc(s.mu.Unlock)
+	defer unlock()
 
 	for i, e := range edges {
 		// Validation happens before anything is written, so a failure here means
@@ -916,11 +988,28 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.wal.AppendBatch(framed, s.syncOnCommit); err != nil {
+	ticket, err := s.wal.QueueBatch(framed)
+	if err != nil {
 		return nil, fmt.Errorf("AddEdgesBatch: wal: %w", err)
 	}
 
-	s.commitEdgesBatch(stored)
+	epoch := s.nextEpoch()
+	s.commitEdgesBatch(epoch, stored)
+	sync := s.syncOnCommit
+	unlock()
+
+	if sync {
+		if err := s.wal.AwaitSync(ticket); err != nil {
+			return nil, fmt.Errorf("AddEdgesBatch: wal: %w", err)
+		}
+	} else if err := s.wal.FlushQueued(); err != nil {
+		// Not waiting for durability does not mean leaving the bytes in a
+		// queue. syncOnCommit off is documented as "durable at the next Sync,
+		// Compact or Close", and bytes still in the ring would not survive even
+		// a process kill, which the page cache does.
+		return nil, fmt.Errorf("AddEdgesBatch: wal: %w", err)
+	}
+	s.publishEpoch(epoch)
 	return ids, nil
 }
 
@@ -1042,7 +1131,9 @@ func (s *Store) UpdateNode(n *store.Node) error {
 			return fmt.Errorf("UpdateNode: %w", err)
 		}
 	}
-	s.applyNodeUpsert(stored)
+	e := s.nextEpoch()
+	s.applyNodeUpsert(e, stored)
+	s.publishEpoch(e)
 	return nil
 }
 
@@ -1084,7 +1175,9 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 			return fmt.Errorf("UpdateEdge: %w", err)
 		}
 	}
-	s.applyEdgeUpsert(stored)
+	ep := s.nextEpoch()
+	s.applyEdgeUpsert(ep, stored)
+	s.publishEpoch(ep)
 	return nil
 }
 
@@ -1100,7 +1193,9 @@ func (s *Store) DeleteEdge(id store.EdgeID) error {
 	if err := s.wal.AppendEdgeDelete(marshalID(uint64(id))); err != nil {
 		return fmt.Errorf("DeleteEdge: wal: %w", err)
 	}
-	s.applyEdgeDelete(id)
+	e := s.nextEpoch()
+	s.applyEdgeDelete(e, id)
+	s.publishEpoch(e)
 	return nil
 }
 
@@ -1134,211 +1229,101 @@ func (s *Store) deleteNodeLocked(id store.NodeID, incident []store.EdgeID) error
 		return fmt.Errorf("DeleteNode: wal node tombstone: %w", err)
 	}
 
+	// One epoch for the whole cascade, so no reader can catch the node deleted
+	// and its edges not, or the reverse. The atomicity used to rest on holding
+	// the lock across both; now it is a property of the records themselves.
+	e := s.nextEpoch()
 	for _, eid := range incident {
-		s.applyEdgeDelete(eid)
+		s.applyEdgeDelete(e, eid)
 	}
-	s.applyNodeDelete(id)
+	s.applyNodeDelete(e, id)
+	s.publishEpoch(e)
 	return nil
-}
-
-// publishCSR makes csr visible to lock-free readers and starts a fresh epoch.
-// Caller must hold s.mu.
-//
-// The shadow counter resets because a freshly built CSR already incorporates
-// every update and tombstone that had accumulated against the previous one.
-func (s *Store) publishCSR(csr *CSRGraph) {
-	s.csr = csr
-	// Order matters: publish the pointer *before* clearing the shadow count.
-	//
-	// Clearing first would open a window in which a reader still holding the old
-	// pointer sees a clean count and concludes the old CSR is authoritative —
-	// even though the CSR it is about to read from was just superseded, tombstones
-	// and all. Publishing first means any reader that trusts a zero count is
-	// re-checking against a pointer that has already moved, and bails out.
-	s.csrPtr.Store(csr)
-	s.csrShadowed.Store(0)
 }
 
 // shadowCSRNode records that a CSR-resident node has been superseded by the
 // delta layer, disabling the lock-free read path until the next Compact.
 // Caller must hold s.mu.
 func (s *Store) shadowCSRNode(id store.NodeID) {
-	if s.nodeInCSR(id) {
+	if s.readerLocked().nodeInCSR(id) {
 		s.csrShadowed.Add(1)
 	}
 }
 
 // shadowCSREdge is shadowCSRNode for edges. Caller must hold s.mu.
 func (s *Store) shadowCSREdge(id store.EdgeID) {
-	if s.edgeInCSR(id) {
+	if s.readerLocked().edgeInCSR(id) {
 		s.csrShadowed.Add(1)
 	}
 }
 
 // --- in-memory apply helpers (shared by live mutators and WAL replay) ---
-// All require s.mu held.
+//
+// All require s.mu held exclusively and all stamp the epoch they are given, so
+// the record they write is visible to a reader at that epoch and to no earlier
+// one. Replay uses them too: a log replayed at open produces the same version
+// stack a live run would have, one epoch per record, which is what makes the
+// reopened state indistinguishable from the state that was lost.
 
-// applyNodeUpsert inserts or updates a node in the delta overlay, reconciling
-// the delta type index and clearing any delete mask. A CSR-resident node being
-// updated simply gains a delta entry that shadows the CSR copy.
-func (s *Store) applyNodeUpsert(n *store.Node) {
+// applyNodeUpsert inserts or updates a node in the delta overlay. A CSR-resident
+// node being updated simply gains a delta version that shadows the CSR copy.
+func (s *Store) applyNodeUpsert(epoch uint64, n *store.Node) {
 	s.shadowCSRNode(n.ID)
-	if prev, ok := s.deltaNodes[n.ID]; ok {
-		s.unindexDeltaNodeLabels(n.ID, prev.Labels)
-	}
-	s.deltaNodes[n.ID] = n
-	s.indexDeltaNodeLabels(n.ID, n.Labels)
-	s.ensureDeltaAdj(n.ID)
-	delete(s.deletedNodes, n.ID)
+	s.putNode(epoch, n)
 }
 
-// applyEdgeUpsert inserts or updates an edge in the delta overlay. Delta
-// adjacency is recorded only for a genuinely new edge (not previously in the
-// delta and not present in the CSR, whose adjacency arrays already list it), so
-// an updated edge is never double-listed.
-func (s *Store) applyEdgeUpsert(e *store.Edge) {
+// applyEdgeUpsert inserts or updates an edge in the delta overlay.
+func (s *Store) applyEdgeUpsert(epoch uint64, e *store.Edge) {
 	s.shadowCSREdge(e.ID)
-	prev, inDelta := s.deltaEdges[e.ID]
-	if inDelta {
-		s.unindexDeltaEdgeLabels(e.ID, prev.Labels)
-	}
-	s.deltaEdges[e.ID] = e
-	s.indexDeltaEdgeLabels(e.ID, e.Labels)
-	if !inDelta && !s.edgeInCSR(e.ID) {
-		s.ensureDeltaAdj(e.Src).out = append(s.ensureDeltaAdj(e.Src).out, e.ID)
-		s.ensureDeltaAdj(e.Dst).in = append(s.ensureDeltaAdj(e.Dst).in, e.ID)
-	}
-	delete(s.deletedEdges, e.ID)
+	s.putEdge(epoch, e, false)
 }
 
-// applyNodeDelete removes a node from the delta overlay and masks any CSR copy.
-// Incident-edge cascade is performed by the caller (DeleteNode) / by separate
-// edge tombstones on replay, so this does not touch edges.
-func (s *Store) applyNodeDelete(id store.NodeID) {
+// applyNodeDelete tombstones a node. The incident-edge cascade is performed by
+// the caller (DeleteNode) or by separate edge tombstones on replay, so this does
+// not touch edges.
+func (s *Store) applyNodeDelete(epoch uint64, id store.NodeID) {
 	s.shadowCSRNode(id)
-	if n, ok := s.deltaNodes[id]; ok {
-		s.unindexDeltaNodeLabels(id, n.Labels)
-		delete(s.deltaNodes, id)
-	}
-	delete(s.deltaAdj, id)
-	if s.nodeInCSR(id) {
-		s.deletedNodes[id] = struct{}{}
-	}
-	s.propIdx.RemoveNode(id)
+	s.tombstoneNode(epoch, id)
 }
 
-// applyEdgeDelete removes an edge from the delta overlay and masks any CSR copy.
-func (s *Store) applyEdgeDelete(id store.EdgeID) {
+// applyEdgeDelete tombstones an edge.
+func (s *Store) applyEdgeDelete(epoch uint64, id store.EdgeID) {
 	s.shadowCSREdge(id)
-	if e, ok := s.deltaEdges[id]; ok {
-		s.unindexDeltaEdgeLabels(id, e.Labels)
-		if a := s.deltaAdj[e.Src]; a != nil {
-			a.out = removeEdgeID(a.out, id)
-		}
-		if a := s.deltaAdj[e.Dst]; a != nil {
-			a.in = removeEdgeID(a.in, id)
-		}
-		delete(s.deltaEdges, id)
-	}
-	if s.edgeInCSR(id) {
-		s.deletedEdges[id] = struct{}{}
-	}
-	s.propIdx.RemoveEdge(id)
+	s.tombstoneEdge(epoch, id)
 }
 
-// nodeExistsLocked reports whether the node is live (present in delta or CSR and
-// not masked by a tombstone). Caller must hold s.mu.
+// The *Locked helpers below are the mutation paths' view of the graph, and so
+// resolve at the newest applied epoch rather than the newest visible one — see
+// writerLocked. Read paths build their own reader; a Snapshot supplies one.
+// All three run the identical resolution code in view.go and view_read.go.
+
+// nodeExistsLocked reports whether the node is live. Caller must hold s.mu
+// exclusively.
 func (s *Store) nodeExistsLocked(id store.NodeID) bool {
-	if _, del := s.deletedNodes[id]; del {
-		return false
-	}
-	if _, ok := s.deltaNodes[id]; ok {
-		return true
-	}
-	return s.nodeInCSR(id)
+	return s.writerLocked().nodeExists(id)
 }
 
-// edgeExistsLocked reports whether the edge is live. Caller must hold s.mu.
+// edgeExistsLocked reports whether the edge is live. Caller must hold s.mu
+// exclusively.
 func (s *Store) edgeExistsLocked(id store.EdgeID) bool {
-	if _, del := s.deletedEdges[id]; del {
-		return false
-	}
-	if _, ok := s.deltaEdges[id]; ok {
-		return true
-	}
-	return s.edgeInCSR(id)
+	return s.writerLocked().edgeExists(id)
 }
 
 // getEdgeLocked returns the authoritative live edge (delta override or CSR copy)
-// or (nil, false) if it is missing or masked. Caller must hold s.mu.
+// or (nil, false) if it is missing or masked. Caller must hold s.mu exclusively.
 func (s *Store) getEdgeLocked(id store.EdgeID) (*store.Edge, bool) {
-	if _, del := s.deletedEdges[id]; del {
-		return nil, false
-	}
-	if e, ok := s.deltaEdges[id]; ok {
-		return e, true
-	}
-	if s.csr != nil {
-		if rec, found := s.csr.GetEdge(id); found {
-			return rawEdgeToStore(rec), true
-		}
-	}
-	return nil, false
+	return s.writerLocked().edge(id)
 }
 
-func (s *Store) nodeInCSR(id store.NodeID) bool {
-	if s.csr == nil {
-		return false
-	}
-	_, found := s.csr.GetNode(id)
-	return found
-}
-
-func (s *Store) edgeInCSR(id store.EdgeID) bool {
-	if s.csr == nil {
-		return false
-	}
-	_, found := s.csr.GetEdge(id)
-	return found
+// getNodeLocked is getEdgeLocked for nodes. Caller must hold s.mu exclusively.
+func (s *Store) getNodeLocked(id store.NodeID) (*store.Node, bool) {
+	return s.writerLocked().node(id)
 }
 
 // incidentEdgeIDsLocked returns the deduped, still-live edge IDs incident to id
-// (as Src or Dst) gathered from both the delta adjacency and the CSR. Caller
-// must hold s.mu.
+// (as Src or Dst) gathered from both layers. Caller must hold s.mu exclusively.
 func (s *Store) incidentEdgeIDsLocked(id store.NodeID) []store.EdgeID {
-	seen := make(map[store.EdgeID]struct{})
-	var out []store.EdgeID
-	add := func(eid store.EdgeID) {
-		if _, del := s.deletedEdges[eid]; del {
-			return
-		}
-		if _, ok := seen[eid]; ok {
-			return
-		}
-		seen[eid] = struct{}{}
-		out = append(out, eid)
-	}
-	if a := s.deltaAdj[id]; a != nil {
-		for _, eid := range a.out {
-			add(eid)
-		}
-		for _, eid := range a.in {
-			add(eid)
-		}
-	}
-	if s.csr != nil {
-		if outE, err := s.csr.OutboundEdges(id); err == nil {
-			for _, re := range outE {
-				add(re.ID)
-			}
-		}
-		if inE, err := s.csr.InboundEdges(id); err == nil {
-			for _, re := range inE {
-				add(re.ID)
-			}
-		}
-	}
-	return out
+	return s.writerLocked().incidentEdgeIDsOf(id)
 }
 
 // csrFastRead returns the published CSR when a point read may safely bypass the
@@ -1348,7 +1333,7 @@ func (s *Store) incidentEdgeIDsLocked(id store.NodeID) []store.EdgeID {
 // it. Callers must confirm with csrFastReadValid *after* reading the record;
 // only then is the answer known to have been current throughout.
 func (s *Store) csrFastRead() (*CSRGraph, bool) {
-	csr := s.csrPtr.Load()
+	csr := s.viewPtr.Load().csr
 	if csr == nil || s.csrShadowed.Load() != 0 {
 		return nil, false
 	}
@@ -1370,7 +1355,7 @@ func (s *Store) csrFastRead() (*CSRGraph, bool) {
 // be collected and its address cannot be reused by a later one while the check
 // is running.
 func (s *Store) csrFastReadValid(csr *CSRGraph) bool {
-	return s.csrShadowed.Load() == 0 && s.csrPtr.Load() == csr
+	return s.csrShadowed.Load() == 0 && s.viewPtr.Load().csr == csr
 }
 
 func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
@@ -1385,21 +1370,12 @@ func (s *Store) GetNode(id store.NodeID) (*store.Node, error) {
 		}
 	}
 
-	// Hold RLock across the delta + CSR lookup so the CSR pointer read is not
-	// racing a concurrent Compact swap.
+	// Hold RLock across the delta + CSR lookup so the view read is not racing a
+	// concurrent Compact swap.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if _, del := s.deletedNodes[id]; del {
-		return nil, &store.ErrNotFound{Kind: "node", ID: uint64(id)}
-	}
-	if n, ok := s.deltaNodes[id]; ok {
+	if n, ok := s.readerLocked().node(id); ok {
 		return n, nil
-	}
-	if s.csr != nil {
-		rec, found := s.csr.GetNode(id)
-		if found {
-			return &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: csrBytes(rec.Properties)}, nil
-		}
 	}
 	return nil, &store.ErrNotFound{Kind: "node", ID: uint64(id)}
 }
@@ -1416,185 +1392,29 @@ func (s *Store) GetEdge(id store.EdgeID) (*store.Edge, error) {
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if _, del := s.deletedEdges[id]; del {
-		return nil, &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
-	}
-	if e, ok := s.deltaEdges[id]; ok {
+	if e, ok := s.readerLocked().edge(id); ok {
 		return e, nil
-	}
-	if s.csr != nil {
-		rec, found := s.csr.GetEdge(id)
-		if found {
-			return rawEdgeToStore(rec), nil
-		}
 	}
 	return nil, &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
 }
 
+// EdgesOf holds the read lock across BOTH the delta and CSR passes: the view and
+// the versions it resolves must come from one consistent state, otherwise a
+// concurrent Compact could swap the image between reading its adjacency and
+// resolving the (now-replaced) delta — re-emitting a deleted edge.
 func (s *Store) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]*store.Edge, error) {
-	var result []*store.Edge
-
-	// Hold the read lock across BOTH the delta and CSR passes: the CSR pointer,
-	// its adjacency, and the delete masks must be read from one consistent
-	// snapshot, otherwise a concurrent Compact could swap the CSR between reading
-	// its adjacency and consulting the (now-cleared) masks — re-emitting a
-	// deleted edge.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	// Collect from delta.
-	da := s.deltaAdj[id]
-	if da != nil {
-		var eids []store.EdgeID
-		switch dir {
-		case store.DirectionOutbound:
-			eids = da.out
-		case store.DirectionInbound:
-			eids = da.in
-		case store.DirectionBoth:
-			eids = make([]store.EdgeID, 0, len(da.out)+len(da.in))
-			eids = append(eids, da.out...)
-			eids = append(eids, da.in...)
-		}
-		for _, eid := range eids {
-			e := s.deltaEdges[eid]
-			if e == nil {
-				continue
-			}
-			if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, e) {
-				continue
-			}
-			result = append(result, e)
-		}
-	}
-
-	// Collect from CSR.
-	if s.csr != nil {
-		var rawEdges []rawEdge
-		var err error
-		switch dir {
-		case store.DirectionOutbound:
-			rawEdges, err = s.csr.OutboundEdges(id)
-		case store.DirectionInbound:
-			rawEdges, err = s.csr.InboundEdges(id)
-		case store.DirectionBoth:
-			out, e1 := s.csr.OutboundEdges(id)
-			in, e2 := s.csr.InboundEdges(id)
-			if e1 == nil {
-				rawEdges = append(rawEdges, out...)
-			}
-			if e2 == nil {
-				rawEdges = append(rawEdges, in...)
-			}
-			err = nil
-		}
-		if err == nil {
-			for _, re := range rawEdges {
-				if _, del := s.deletedEdges[re.ID]; del {
-					continue
-				}
-				// A CSR edge updated in the delta is emitted from the delta
-				// (authoritative) copy; endpoints are immutable so CSR adjacency
-				// still lists it correctly.
-				if de, ok := s.deltaEdges[re.ID]; ok {
-					if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, de) {
-						continue
-					}
-					result = append(result, de)
-					continue
-				}
-				if edgeTypes != nil && !rawEdgeMatchesFilter(edgeTypes, re.Labels) {
-					continue
-				}
-				result = append(result, rawEdgeToStore(re))
-			}
-		}
-	}
-
-	return result, nil
+	return s.readerLocked().edgesOf(id, dir, edgeTypes), nil
 }
 
 // IncidentEdges implements store.AdjacencyReader. It walks the same delta-then-
 // CSR sequence as EdgesOf, applying the same tombstone and delta-override rules,
 // but appends to the caller's buffer instead of materialising edge records.
 func (s *Store) IncidentEdges(dst []store.IncidentEdge, id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]store.IncidentEdge, error) {
-	// One lock hold across both layers, for the same reason EdgesOf does it: a
-	// concurrent Compact must not swap the CSR between reading its adjacency and
-	// consulting the delete masks.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	add := func(eid store.EdgeID, src, dstNode store.NodeID) {
-		nb := dstNode
-		if src != id {
-			nb = src
-		}
-		dst = append(dst, store.IncidentEdge{Edge: eid, Neighbour: nb})
-	}
-
-	// Delta layer.
-	if da := s.deltaAdj[id]; da != nil {
-		appendDelta := func(eids []store.EdgeID) {
-			for _, eid := range eids {
-				e := s.deltaEdges[eid]
-				if e == nil {
-					continue
-				}
-				if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, e) {
-					continue
-				}
-				add(eid, e.Src, e.Dst)
-			}
-		}
-		switch dir {
-		case store.DirectionOutbound:
-			appendDelta(da.out)
-		case store.DirectionInbound:
-			appendDelta(da.in)
-		case store.DirectionBoth:
-			appendDelta(da.out)
-			appendDelta(da.in)
-		}
-	}
-
-	// CSR layer.
-	if s.csr != nil {
-		appendCSR := func(eids []store.EdgeID) {
-			for _, eid := range eids {
-				if _, del := s.deletedEdges[eid]; del {
-					continue
-				}
-				// A CSR edge updated in the delta is authoritative there; its
-				// labels may have changed, so filter against the delta copy.
-				if de, ok := s.deltaEdges[eid]; ok {
-					if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, de) {
-						continue
-					}
-					add(eid, de.Src, de.Dst)
-					continue
-				}
-				rec, found := s.csr.GetEdge(eid)
-				if !found {
-					continue
-				}
-				if edgeTypes != nil && !rawEdgeMatchesFilter(edgeTypes, rec.Labels) {
-					continue
-				}
-				add(eid, rec.Src, rec.Dst)
-			}
-		}
-		switch dir {
-		case store.DirectionOutbound:
-			appendCSR(s.csr.OutboundEdgeIDs(id))
-		case store.DirectionInbound:
-			appendCSR(s.csr.InboundEdgeIDs(id))
-		case store.DirectionBoth:
-			appendCSR(s.csr.OutboundEdgeIDs(id))
-			appendCSR(s.csr.InboundEdgeIDs(id))
-		}
-	}
-
-	return dst, nil
+	return s.readerLocked().incidentEdges(dst, id, dir, edgeTypes), nil
 }
 
 // NodeExists implements store.AdjacencyReader.
@@ -1606,38 +1426,20 @@ func (s *Store) NodeExists(id store.NodeID) bool {
 	}
 
 	s.mu.RLock()
-	ok := s.nodeExistsLocked(id)
-	s.mu.RUnlock()
-	return ok
+	defer s.mu.RUnlock()
+	return s.readerLocked().nodeExists(id)
 }
 
+// Neighbours resolves the incident edges into distinct neighbouring nodes.
+//
+// One lock hold covers the edge walk and every node resolution. It used to take
+// the lock again per neighbour through GetNode, which was both slower and a
+// weaker guarantee: the node records could come from a different instant than
+// the edges that led to them.
 func (s *Store) Neighbours(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]store.NeighbourResult, error) {
-	edges, err := s.EdgesOf(id, dir, edgeTypes)
-	if err != nil {
-		return nil, err
-	}
-
-	seen := make(map[store.NodeID]struct{})
-	var results []store.NeighbourResult
-
-	for _, e := range edges {
-		var nbID store.NodeID
-		if e.Src == id {
-			nbID = e.Dst
-		} else {
-			nbID = e.Src
-		}
-		if _, already := seen[nbID]; already {
-			continue
-		}
-		seen[nbID] = struct{}{}
-		n, err := s.GetNode(nbID)
-		if err != nil {
-			continue
-		}
-		results = append(results, store.NeighbourResult{Node: n, Edge: e})
-	}
-	return results, nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.readerLocked().neighbours(id, dir, edgeTypes), nil
 }
 
 func (s *Store) NodesByType(t store.NodeType) ([]store.NodeID, error) {
@@ -1645,132 +1447,25 @@ func (s *Store) NodesByType(t store.NodeType) ([]store.NodeID, error) {
 	// lock once per candidate (via GetNode) dominated the cost on large graphs.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	candidates := make([]store.NodeID, len(s.deltaNodesByType[t]))
-	copy(candidates, s.deltaNodesByType[t])
-	if s.csr != nil {
-		candidates = append(candidates, s.csr.NodesByType(t)...)
-	}
-
-	// Re-validate against the authoritative view: a candidate may be masked by a
-	// tombstone or have had label t removed/added by an update. Dedup as we go.
-	seen := make(map[store.NodeID]struct{}, len(candidates))
-	out := make([]store.NodeID, 0, len(candidates))
-	for _, id := range candidates {
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		if !s.nodeHasLabelLocked(id, t) {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	return out, nil
-}
-
-// nodeHasLabelLocked reports whether the live record for id carries label t,
-// without allocating a *store.Node. Caller must hold s.mu.
-func (s *Store) nodeHasLabelLocked(id store.NodeID, t store.NodeType) bool {
-	if _, del := s.deletedNodes[id]; del {
-		return false
-	}
-	if n, ok := s.deltaNodes[id]; ok {
-		return n.HasLabel(t)
-	}
-	if s.csr == nil {
-		return false
-	}
-	rec, found := s.csr.GetNode(id)
-	return found && nodeRecordHasLabel(rec.Labels, t)
+	return s.readerLocked().nodesByType(t), nil
 }
 
 func (s *Store) EdgesByType(t store.EdgeType) ([]store.EdgeID, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	candidates := make([]store.EdgeID, len(s.deltaEdgesByType[t]))
-	copy(candidates, s.deltaEdgesByType[t])
-	if s.csr != nil {
-		candidates = append(candidates, s.csr.EdgesByType(t)...)
-	}
-
-	seen := make(map[store.EdgeID]struct{}, len(candidates))
-	out := make([]store.EdgeID, 0, len(candidates))
-	for _, id := range candidates {
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		if !s.edgeHasLabelLocked(id, t) {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	return out, nil
-}
-
-// edgeHasLabelLocked reports whether the live record for id carries label t,
-// without allocating a *store.Edge. Caller must hold s.mu.
-func (s *Store) edgeHasLabelLocked(id store.EdgeID, t store.EdgeType) bool {
-	if _, del := s.deletedEdges[id]; del {
-		return false
-	}
-	if e, ok := s.deltaEdges[id]; ok {
-		return e.HasLabel(t)
-	}
-	if s.csr == nil {
-		return false
-	}
-	rec, found := s.csr.GetEdge(id)
-	return found && rawEdgeHasLabel(rec.Labels, t)
+	return s.readerLocked().edgesByType(t), nil
 }
 
 func (s *Store) NodeCount() (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// Every delta node is live (deleted entries are removed from the map).
-	total := uint64(len(s.deltaNodes))
-	if s.csr != nil {
-		// Count CSR nodes that are neither overridden by a delta entry nor
-		// masked by a tombstone.
-		for i := 1; i < len(s.csr.nodes); i++ {
-			id := s.csr.nodes[i].ID
-			if id == store.InvalidNodeID {
-				continue
-			}
-			if _, over := s.deltaNodes[id]; over {
-				continue
-			}
-			if _, del := s.deletedNodes[id]; del {
-				continue
-			}
-			total++
-		}
-	}
-	return total, nil
+	return s.readerLocked().nodeCount(), nil
 }
 
 func (s *Store) EdgeCount() (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	total := uint64(len(s.deltaEdges))
-	if s.csr != nil {
-		for i := 1; i < len(s.csr.edges); i++ {
-			id := s.csr.edges[i].ID
-			if id == store.InvalidEdgeID {
-				continue
-			}
-			if _, over := s.deltaEdges[id]; over {
-				continue
-			}
-			if _, del := s.deletedEdges[id]; del {
-				continue
-			}
-			total++
-		}
-	}
-	return total, nil
+	return s.readerLocked().edgeCount(), nil
 }
 
 func (s *Store) Close() error {
@@ -1908,116 +1603,29 @@ func (s *Store) IndexEdgeProperty(id store.EdgeID, key string, value []byte) err
 // checked.
 //
 // That is the guarantee, and it is deliberately not stronger: the node may be
-// deleted the moment this returns. Ruling that out needs snapshot isolation,
-// which the store does not offer.
+// deleted the moment this returns. A caller that needs the result to stay true
+// while it is used should take a Snapshot and query through that, which fixes
+// the records the postings resolve against.
 func (s *Store) NodesByProperty(key string, value []byte) ([]store.NodeID, error) {
-	return s.liveNodeIDs(s.propIdx.NodesByProperty(key, value)), nil
+	ids := s.propIdx.NodesByProperty(key, value)
+	if len(ids) == 0 {
+		return ids, nil // a miss should not pay for the lock
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return liveNodeIDs(s.readerLocked(), ids), nil
 }
 
 // EdgesByProperty returns the edges indexed under key with exactly value. It
 // resolves postings against the records for the reason given on NodesByProperty.
 func (s *Store) EdgesByProperty(key string, value []byte) ([]store.EdgeID, error) {
-	return s.liveEdgeIDs(s.propIdx.EdgesByProperty(key, value)), nil
-}
-
-// degreeSumLocked totals the live incident-edge counts for ids across the delta
-// overlay and the CSR. Caller must hold s.mu.
-func (s *Store) degreeSumLocked(ids []store.NodeID, dir store.Direction) int {
-	total := 0
-	for _, id := range ids {
-		total += s.degreeLocked(id, dir)
+	ids := s.propIdx.EdgesByProperty(key, value)
+	if len(ids) == 0 {
+		return ids, nil
 	}
-	return total
-}
-
-// degreeLocked counts live incident edges for one node. Caller must hold s.mu.
-//
-// Delta adjacency and CSR adjacency never list the same edge (applyEdgeUpsert
-// records delta adjacency only for edges absent from the CSR), so the two counts
-// simply add.
-func (s *Store) degreeLocked(id store.NodeID, dir store.Direction) int {
-	total := 0
-	if a := s.deltaAdj[id]; a != nil {
-		switch dir {
-		case store.DirectionOutbound:
-			total += len(a.out)
-		case store.DirectionInbound:
-			total += len(a.in)
-		default:
-			total += len(a.out) + len(a.in)
-		}
-	}
-	if s.csr == nil {
-		return total
-	}
-	countCSR := func(eids []store.EdgeID) {
-		if len(s.deletedEdges) == 0 {
-			total += len(eids)
-			return
-		}
-		for _, eid := range eids {
-			if _, del := s.deletedEdges[eid]; !del {
-				total++
-			}
-		}
-	}
-	switch dir {
-	case store.DirectionOutbound:
-		countCSR(s.csr.OutboundEdgeIDs(id))
-	case store.DirectionInbound:
-		countCSR(s.csr.InboundEdgeIDs(id))
-	default:
-		countCSR(s.csr.OutboundEdgeIDs(id))
-		countCSR(s.csr.InboundEdgeIDs(id))
-	}
-	return total
-}
-
-// incidentEdgeIDs returns the deduplicated live edge IDs incident to ids in dir.
-func (s *Store) incidentEdgeIDs(ids []store.NodeID, dir store.Direction) []store.EdgeID {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	seen := make(map[store.EdgeID]struct{})
-	var out []store.EdgeID
-	add := func(eids []store.EdgeID) {
-		for _, eid := range eids {
-			if _, ok := seen[eid]; ok {
-				continue
-			}
-			if !s.edgeExistsLocked(eid) {
-				continue
-			}
-			seen[eid] = struct{}{}
-			out = append(out, eid)
-		}
-	}
-	for _, id := range ids {
-		if a := s.deltaAdj[id]; a != nil {
-			switch dir {
-			case store.DirectionOutbound:
-				add(a.out)
-			case store.DirectionInbound:
-				add(a.in)
-			default:
-				add(a.out)
-				add(a.in)
-			}
-		}
-		if s.csr == nil {
-			continue
-		}
-		switch dir {
-		case store.DirectionOutbound:
-			add(s.csr.OutboundEdgeIDs(id))
-		case store.DirectionInbound:
-			add(s.csr.InboundEdgeIDs(id))
-		default:
-			add(s.csr.OutboundEdgeIDs(id))
-			add(s.csr.InboundEdgeIDs(id))
-		}
-	}
-	return out
+	return liveEdgeIDs(s.readerLocked(), ids), nil
 }
 
 // DegreeOf implements store.DegreeCounter. With no edge-type filter it answers
@@ -2028,194 +1636,11 @@ func (s *Store) DegreeOf(id store.NodeID, dir store.Direction, edgeTypes []store
 	// adjacency rather than an error on this backend.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	r := s.readerLocked()
 	if edgeTypes == nil {
-		return s.degreeLocked(id, dir), nil
+		return r.degree(id, dir), nil
 	}
-	return s.degreeFilteredLocked(id, dir, edgeTypes), nil
-}
-
-// degreeFilteredLocked counts incident edges carrying one of edgeTypes, without
-// materialising any of them.
-//
-// The untyped path reads offsets and is O(1); this one has to inspect each
-// incident edge's labels, so it is O(degree) — but O(degree) reads, not
-// O(degree) allocations. Routing this through EdgesOf instead, as it used to,
-// built a *store.Edge and cloned a property blob per incident edge just to take
-// len() of the result: 73.8 µs against 14.22 ns for the same node untyped.
-//
-// The order of checks mirrors EdgesOf exactly — delta layer first, then CSR with
-// tombstones skipped and delta overrides taking precedence — so the count always
-// equals len(EdgesOf(...)).
-// Caller must hold s.mu.
-func (s *Store) degreeFilteredLocked(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) int {
-	total := 0
-
-	if da := s.deltaAdj[id]; da != nil {
-		countDelta := func(eids []store.EdgeID) {
-			for _, eid := range eids {
-				e := s.deltaEdges[eid]
-				if e == nil {
-					continue
-				}
-				if storeEdgeMatchesFilter(edgeTypes, e) {
-					total++
-				}
-			}
-		}
-		switch dir {
-		case store.DirectionOutbound:
-			countDelta(da.out)
-		case store.DirectionInbound:
-			countDelta(da.in)
-		default:
-			countDelta(da.out)
-			countDelta(da.in)
-		}
-	}
-
-	if s.csr == nil {
-		return total
-	}
-	// On a compacted store with no pending deletions — the steady state for a
-	// read-heavy workload — no CSR edge can be masked or overridden, so the two
-	// map probes per edge are pure overhead and are skipped entirely.
-	pristine := len(s.deletedEdges) == 0 && len(s.deltaEdges) == 0
-	countCSR := func(eids []store.EdgeID) {
-		if pristine {
-			for _, eid := range eids {
-				if rec, found := s.csr.GetEdge(eid); found && rawEdgeMatchesFilter(edgeTypes, rec.Labels) {
-					total++
-				}
-			}
-			return
-		}
-		for _, eid := range eids {
-			if _, del := s.deletedEdges[eid]; del {
-				continue
-			}
-			// A CSR edge updated in the delta is authoritative there, and its
-			// labels may have changed.
-			if de, ok := s.deltaEdges[eid]; ok {
-				if storeEdgeMatchesFilter(edgeTypes, de) {
-					total++
-				}
-				continue
-			}
-			rec, found := s.csr.GetEdge(eid)
-			if found && rawEdgeMatchesFilter(edgeTypes, rec.Labels) {
-				total++
-			}
-		}
-	}
-	switch dir {
-	case store.DirectionOutbound:
-		countCSR(s.csr.OutboundEdgeIDs(id))
-	case store.DirectionInbound:
-		countCSR(s.csr.InboundEdgeIDs(id))
-	default:
-		countCSR(s.csr.OutboundEdgeIDs(id))
-		countCSR(s.csr.InboundEdgeIDs(id))
-	}
-	return total
-}
-
-// indexDeltaNodeLabels adds id to the delta postings for each distinct label.
-//
-// Labels are deduplicated here because a caller may pass the same label twice;
-// without this the postings would list id once per repetition, yielding
-// duplicate query results. The record's own Labels slice is left untouched.
-// Caller must hold s.mu.
-func (s *Store) indexDeltaNodeLabels(id store.NodeID, labels []store.NodeType) {
-	for i, lbl := range labels {
-		if containsNodeTypeValue(labels[:i], lbl) {
-			continue
-		}
-		ids := s.deltaNodesByType[lbl]
-		if n := len(ids); n == 0 || ids[n-1] < id {
-			s.deltaNodesByType[lbl] = append(ids, id)
-			continue
-		}
-		if updated, added := store.InsertSortedID(ids, id); added {
-			s.deltaNodesByType[lbl] = updated
-		}
-	}
-}
-
-// unindexDeltaNodeLabels removes id from the delta postings for each of its
-// labels. Caller must hold s.mu.
-func (s *Store) unindexDeltaNodeLabels(id store.NodeID, labels []store.NodeType) {
-	for _, lbl := range labels {
-		ids, removed := store.DeleteSortedID(s.deltaNodesByType[lbl], id)
-		if !removed {
-			continue
-		}
-		if len(ids) == 0 {
-			delete(s.deltaNodesByType, lbl)
-			continue
-		}
-		s.deltaNodesByType[lbl] = ids
-	}
-}
-
-// indexDeltaEdgeLabels adds id to the delta postings for each distinct label.
-// Caller must hold s.mu.
-func (s *Store) indexDeltaEdgeLabels(id store.EdgeID, labels []store.EdgeType) {
-	for i, lbl := range labels {
-		if containsEdgeTypeValue(labels[:i], lbl) {
-			continue
-		}
-		ids := s.deltaEdgesByType[lbl]
-		if n := len(ids); n == 0 || ids[n-1] < id {
-			s.deltaEdgesByType[lbl] = append(ids, id)
-			continue
-		}
-		if updated, added := store.InsertSortedID(ids, id); added {
-			s.deltaEdgesByType[lbl] = updated
-		}
-	}
-}
-
-// unindexDeltaEdgeLabels removes id from the delta postings for each of its
-// labels. Caller must hold s.mu.
-func (s *Store) unindexDeltaEdgeLabels(id store.EdgeID, labels []store.EdgeType) {
-	for _, lbl := range labels {
-		ids, removed := store.DeleteSortedID(s.deltaEdgesByType[lbl], id)
-		if !removed {
-			continue
-		}
-		if len(ids) == 0 {
-			delete(s.deltaEdgesByType, lbl)
-			continue
-		}
-		s.deltaEdgesByType[lbl] = ids
-	}
-}
-
-func containsNodeTypeValue(types []store.NodeType, t store.NodeType) bool {
-	for _, v := range types {
-		if v == t {
-			return true
-		}
-	}
-	return false
-}
-
-func containsEdgeTypeValue(types []store.EdgeType, t store.EdgeType) bool {
-	for _, v := range types {
-		if v == t {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Store) ensureDeltaAdj(id store.NodeID) *deltaAdj {
-	a, ok := s.deltaAdj[id]
-	if !ok {
-		a = &deltaAdj{}
-		s.deltaAdj[id] = a
-	}
-	return a
+	return r.degreeFiltered(id, dir, edgeTypes), nil
 }
 
 // commitNodesBatch applies node records to in-memory delta/index state.
@@ -2230,26 +1655,28 @@ func (s *Store) ReserveEdgeID() store.EdgeID {
 	return store.EdgeID(s.edgeSeq.Add(1))
 }
 
-func (s *Store) commitNodesBatch(nodes []*store.Node) {
+func (s *Store) commitNodesBatch(epoch uint64, nodes []*store.Node) {
 	for _, n := range nodes {
-		s.deltaNodes[n.ID] = n
-		s.indexDeltaNodeLabels(n.ID, n.Labels)
-		s.ensureDeltaAdj(n.ID)
+		s.putNode(epoch, n)
 	}
 }
 
 // commitEdgesBatch applies edge records to in-memory delta/index state.
 // Caller must hold s.mu.
-func (s *Store) commitEdgesBatch(edges []*store.Edge) {
+func (s *Store) commitEdgesBatch(epoch uint64, edges []*store.Edge) {
 	for _, e := range edges {
-		s.deltaEdges[e.ID] = e
-		s.indexDeltaEdgeLabels(e.ID, e.Labels)
-		s.ensureDeltaAdj(e.Src).out = append(s.ensureDeltaAdj(e.Src).out, e.ID)
-		s.ensureDeltaAdj(e.Dst).in = append(s.ensureDeltaAdj(e.Dst).in, e.ID)
+		s.putEdge(epoch, e, true)
 	}
 }
 
 func (s *Store) replayWAL() error {
+	// Everything a replay applies is durable by definition — it is already on
+	// the disk it was read from — so the epoch it lands at is published once at
+	// the end rather than per record. Publishing per record would make a
+	// half-applied log briefly visible, which is exactly the state replay exists
+	// to avoid, and there is nothing a reader could usefully do with it.
+	defer func() { s.publishEpoch(s.mutEpoch.Load()) }()
+
 	return s.wal.Replay(ReplayCallbacks{
 		Verifier:             s.verifier,
 		RequireSignedCommits: s.requireSigned,
@@ -2268,7 +1695,7 @@ func (s *Store) replayWAL() error {
 				return err
 			}
 			// Upsert: a re-appended record for an existing ID is an edit.
-			s.applyNodeUpsert(n)
+			s.applyNodeUpsert(s.nextEpoch(), n)
 			if uint64(n.ID) > s.nodeSeq.Load() {
 				s.nodeSeq.Store(uint64(n.ID))
 			}
@@ -2279,7 +1706,7 @@ func (s *Store) replayWAL() error {
 			if err != nil {
 				return err
 			}
-			s.applyEdgeUpsert(e)
+			s.applyEdgeUpsert(s.nextEpoch(), e)
 			if uint64(e.ID) > s.edgeSeq.Load() {
 				s.edgeSeq.Store(uint64(e.ID))
 			}
@@ -2290,7 +1717,7 @@ func (s *Store) replayWAL() error {
 			if err != nil {
 				return err
 			}
-			s.applyNodeDelete(store.NodeID(id))
+			s.applyNodeDelete(s.nextEpoch(), store.NodeID(id))
 			if id > s.nodeSeq.Load() {
 				s.nodeSeq.Store(id)
 			}
@@ -2301,7 +1728,7 @@ func (s *Store) replayWAL() error {
 			if err != nil {
 				return err
 			}
-			s.applyEdgeDelete(store.EdgeID(id))
+			s.applyEdgeDelete(s.nextEpoch(), store.EdgeID(id))
 			if id > s.edgeSeq.Load() {
 				s.edgeSeq.Store(id)
 			}
@@ -2443,8 +1870,11 @@ func (s *Store) GetNodesBatch(ids []store.NodeID) ([]*store.Node, []store.NodeID
 
 	if len(pending) > 0 {
 		s.mu.RLock()
+		r := s.readerLocked()
 		for _, i := range pending {
-			if n, ok := s.getNodeLocked(ids[i]); ok {
+			// One reader for the whole remainder, so the records that needed the
+			// lock still describe a single instant.
+			if n, ok := r.node(ids[i]); ok {
 				slots[i] = n
 			}
 		}
@@ -2487,10 +1917,12 @@ func (s *Store) GetEdgesBatch(ids []store.EdgeID) ([]*store.Edge, []store.EdgeID
 
 	if len(pending) > 0 {
 		s.mu.RLock()
+		r := s.readerLocked()
 		for _, i := range pending {
-			// The existing two-value helper is the authority here; duplicating
-			// its delta-then-CSR logic would be a second place to keep correct.
-			if e, ok := s.getEdgeLocked(ids[i]); ok {
+			// One reader resolves the whole remainder; the same code the point
+			// path uses, so there is not a second delta-then-CSR rule to keep
+			// correct.
+			if e, ok := r.edge(ids[i]); ok {
 				slots[i] = e
 			}
 		}
@@ -2498,26 +1930,6 @@ func (s *Store) GetEdgesBatch(ids []store.EdgeID) ([]*store.Edge, []store.EdgeID
 	}
 
 	return compactEdges(slots, ids)
-}
-
-// getNodeLocked returns the authoritative live node (delta override or CSR copy)
-// or (nil, false) if it is missing or masked. Caller must hold s.mu.
-//
-// Deliberately mirrors getEdgeLocked's shape, so the two layers are resolved the
-// same way on both paths.
-func (s *Store) getNodeLocked(id store.NodeID) (*store.Node, bool) {
-	if _, del := s.deletedNodes[id]; del {
-		return nil, false
-	}
-	if n, ok := s.deltaNodes[id]; ok {
-		return n, true
-	}
-	if s.csr != nil {
-		if rec, found := s.csr.GetNode(id); found {
-			return &store.Node{ID: rec.ID, Labels: rec.Labels, Properties: csrBytes(rec.Properties)}, true
-		}
-	}
-	return nil, false
 }
 
 // compactNodes removes the nil slots, preserving order, and reports which ids

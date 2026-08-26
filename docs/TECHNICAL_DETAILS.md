@@ -992,9 +992,17 @@ against a brute-force oracle over five pattern shapes on both backends.
 |---|---|---|---|
 | `storeLock` (`graphene.lock`) | **process** | the whole store directory | open to close |
 | `memory.Store.mu` | goroutine | records, adjacency, label postings | every operation |
-| `disk.Store.mu` | goroutine | delta maps, tombstones, delta postings, CSR pointer swap | locked reads, all writes |
+| `disk.Store.mu` | goroutine | the delta layer's maps and the view swap | locked reads, all writes |
 | `propertyShard.mu` × 16 | goroutine | one shard's forward and reverse maps | that shard's operations |
-| `WAL.writeMu` | goroutine | the drain pass | overflow and flush only |
+| `WAL.writeMu` | goroutine | the drain pass and the fsync that follows it | a group-commit flush, overflow, maintenance |
+| `syncGate.mu` | goroutine | which goroutine is flushing, and how far the log is durable | briefly, never across the fsync itself |
+
+**`disk.Store.mu` is released before the commit fsync.** A batch assigns IDs,
+queues its WAL bytes and applies its delta under the lock, then releases it and
+waits for durability outside — which is what lets a second committer join the
+first one's fsync (§11.1). It is safe because a commit becomes *visible* when its
+epoch is published, not when its map write lands, and the epoch is published
+after the wait (§10.3).
 
 **No operation holds two shard locks.** This is a design constraint, not an
 accident — it is what removes deadlock from the reasoning entirely.
@@ -1072,7 +1080,15 @@ reader advances.
 
 Making readers live is a reader-refresh protocol — replay-from-offset, a CSR
 generation marker, incremental property-index apply, and a torn-refresh story —
-and not a locking change. It is not built.
+and not a locking change. It is **not built**.
+
+Note that this is a different thing from §10.3's snapshots, which are about
+consistency *within* one open store and are built. A snapshot fixes what one
+process sees while it reads; reader refresh would let a second process see what
+the first has written since. The version machinery §10.3 describes is the
+foundation the refresh protocol needs — a refreshed view is a new view published
+at a new epoch, and the "torn refresh" problem is the one that single atomic
+publish already solves — but the replay-from-offset half does not exist.
 
 Read-only mode also has to leave the directory alone, which took more than
 withholding the mutators. `OpenWAL` creates the log if missing and writes a
@@ -1089,9 +1105,16 @@ A published `CSRGraph` is immutable, so a reader that obtains the pointer
 atomically can read a record from it with **no lock at all**.
 
 ```go
-csrPtr      atomic.Pointer[CSRGraph]
-csrShadowed atomic.Int64   // CSR records superseded by an update or tombstone
+viewPtr     atomic.Pointer[view] // the CSR image and the delta layer above it
+csrShadowed atomic.Int64         // CSR records superseded by an update or tombstone
 ```
+
+The image now reaches the fast path through the view (`viewPtr.Load().csr`)
+rather than through a `csrPtr` of its own, and the validity check compares that
+**image**, not the view. Deliberate: a view is what `Snapshot` pins and what a
+compaction replaces, but a plain commit leaves `v.csr` identical — comparing the
+view instead would knock every in-flight point read off the fast path whenever
+anyone wrote. Comparing the image keeps the argument below unchanged.
 
 ```mermaid
 sequenceDiagram
@@ -1178,8 +1201,16 @@ legitimately fail. Measured against a deleter running flat out: **0.7%** of IDs
 from a single-key lookup, **4–11%** from a typed query, which returns more IDs
 over a longer call.
 
-Closing that would require snapshot isolation, which is not offered. A sequence
-of calls is **not** a transaction.
+A sequence of plain calls is **not** a transaction. To close that gap, take a
+snapshot:
+
+```go
+snap, err := g.Snapshot()
+defer snap.Close()
+```
+
+Every read through one sees the graph as it stood when it was taken, for as long
+as it is held — see §10.3.
 
 ### 10.2 Why property lookups resolve against the records
 
@@ -1205,13 +1236,111 @@ more true, not less.
 
 ---
 
+### 10.3 Snapshots
+
+`Snapshot()` returns a fixed read view. Every read through it answers about the
+graph as it stood when it was taken, however long it is held and whatever
+writers do meanwhile. Both backends implement it.
+
+A `store.Snapshot` is the read half of `store.GraphStore` and nothing else, so
+it satisfies `store.GraphReader` and every traversal accepts one directly:
+
+```go
+snap, _ := g.Snapshot()
+defer snap.Close()
+res, err := traversal.BFS(snap, origin, 3, store.DirectionBoth, nil)
+```
+
+**What is fixed.** Nodes, edges, adjacency, labels, and everything derived from
+them, including counts and label queries.
+
+**What is not.** The property index is a live structure shared with the store,
+so `NodesByProperty` and `EdgesByProperty` resolve *current* postings against
+*pinned* records. A posting whose node did not exist at this epoch, or has since
+been deleted, is dropped; an entry registered after the snapshot was taken, for
+a node that already existed, is the one case this cannot exclude.
+
+**Epochs.** `Epoch()` names the version of the graph the snapshot reads. Two
+snapshots with the same epoch over the same store see the same graph. It is
+monotonic within one open store and means nothing across processes.
+
+#### How it works on disk
+
+The store holds one `view` — a CSR image paired with the delta layer above it —
+behind a single atomic pointer, and a separate `visibleEpoch` counter. Each delta
+entry is a version chain rather than a bare record, newest first, and a read at
+epoch E walks to the first version with `epoch <= E`. A delete stacks a tombstone
+rather than erasing the entry, which is precisely what the old delete masks could
+not express: they recorded *that* an ID was gone, never *when*.
+
+Opening a snapshot is therefore two words and a registry entry, not a copy. That
+matters because the delta is unbounded between compactions; copying it would make
+a snapshot cost O(everything written since the last compaction).
+
+Three structures cannot express a version — the adjacency lists, the label
+postings, and the property index. For those the rule is: remove an entry when no
+snapshot is open, leave it when one is. Leaving it is always safe because every
+read re-resolves each candidate against its own epoch, so a stale posting costs a
+filtered-out candidate and never a wrong result. `VerifyIndexes` checks the
+direction that still has teeth — that nothing a read *needs* is missing.
+
+A compaction publishes a new view with a fresh delta layer and leaves the old one
+untouched, so an open snapshot keeps working and the garbage collector reclaims
+what it pinned when it closes. `StorageStats` reports `OpenSnapshots` and
+`OldestSnapshotEpoch`; a store whose memory will not come down after a compaction
+is usually explained there. `Options.MaxSnapshotAge` is the guard against a
+leaked one.
+
+#### The memory backend copies
+
+`memory.Store` implements the same interface by copying its maps under the read
+lock — O(V+E) per snapshot in time and resident bytes. That is deliberate. It is
+the oracle the disk backend is tested against, so its answers have to be
+obviously correct by construction; a second versioning scheme would be a second
+thing that can be wrong in the same way.
+
+### 10.4 Traversal budgets
+
+Depth was the only limit a traversal took, and depth bounds nothing once a hub is
+in range: one node of degree 100 000 puts 100 000 entries in the visited set at
+depth one, and the walk has no way to report that it is in trouble.
+
+Every traversal now has a `*Ctx` variant taking a `context.Context` and a
+`store.Budget`:
+
+```go
+res, err := g.BFSCtx(ctx, origin, 3, store.DirectionBoth, nil,
+        store.Budget{MaxNodes: 100_000, MaxTime: 5 * time.Second})
+if errors.Is(err, store.ErrBudgetExceeded) { ... }
+```
+
+`MaxNodes` bounds memory (the visited set), `MaxEdges` bounds work on a dense
+graph, and `MaxTime` is the limit of last resort. Exceeding one is a **refusal,
+not a truncation** — a partial answer that looks complete is the failure mode
+this exists to prevent, so nothing partial comes back with the error.
+
+The context and clock are checked every 256 steps rather than every step:
+`ctx.Err()` takes a mutex on a cancellable context and `time.Now()` is a vDSO
+call, and neither is cheap a million times. The worst-case overshoot after a
+cancel is a few microseconds of walking.
+
+A zero `Budget` with a background context sets a flag that makes every check a
+single boolean test, so the unbounded call costs what it always did — the
+interleaved A/B against HEAD showed identical `B/op` and `allocs/op` once the
+guard was made a stack value rather than a heap allocation.
+
+The recursive walks (`DFS`, `ProvenanceChain`, `FindSubgraphMatches`) also carry
+a hard recursion limit of 100 000 frames. A goroutine stack that runs out is a
+crash rather than an error, which is the one failure a caller cannot handle.
+
 ## 11. Failure and recovery
 
 ### 11.1 Durability boundary
 
-**A returned write is not yet durable.** `fsync` is called in exactly two places —
-`WAL.Checkpoint()` (invoked only from `Compact`) and `WAL.Close()`. The write path
-never syncs.
+**An individual write is not durable when it returns.** `fsync` runs on the
+commit path (see the group-commit note below), in `WAL.Sync()`, in
+`WAL.Checkpoint()` (invoked only from `Compact`) and in `WAL.Close()`. The
+single-record path never syncs.
 
 Worse, the drain is opportunistic:
 
@@ -1246,7 +1375,7 @@ the last `Compact()` or `Close()`.
 
 | Write | Durable when |
 |---|---|
-| Batch (`AddNodesBatch` / `AddEdgesBatch`) | **at commit** — `AppendBatch` fsyncs by default; `SetSyncOnCommit(false)` opts out |
+| Batch (`AddNodesBatch` / `AddEdgesBatch` / `ApplyTransaction`) | **at commit** — fsynced by default; `SetSyncOnCommit(false)` opts out, and the bytes still reach the file immediately |
 | Individual | on `Sync()`, `Compact()`, or `Close()` |
 
 Individual writes are not synced per call by design: an fsync per `AddNode` turns
@@ -1257,6 +1386,43 @@ establish a durability point for ~1 ms instead of the ~64 ms a `Compact()` costs
 The previous text here — "recoverable once its WAL append returns" — was simply
 wrong, and was found by tracing the write path during bulk-write planning rather
 than by any test.
+
+#### Group commit
+
+One fsync makes every byte written before it durable, so a committer that
+arrives while a sync is in flight has nothing to do but wait for it. The first
+committer in becomes the leader; the rest wait on a condition variable and
+return when the leader's flush covers them. N commits, one fsync.
+
+Two things had to be true for that to work.
+
+**The store lock is released before the wait** (§9.1). Nothing is shared while
+the fsync happens under `Store.mu`, because then no second committer can reach
+the gate to join the cohort.
+
+**The leader owns the write as well as the sync.** The first version wrote each
+commit's bytes in its own goroutine and shared only the fsync, and on Windows it
+grouped nothing at all: `WriteFile` blocks while `FlushFileBuffers` is in flight
+on the same handle, so the committers who should have been forming a cohort were
+stuck in `write()` instead. Measured, the write cost per commit went from 37 µs
+at one writer to 604 µs at four — exactly the fsync duration — and 640 commits
+still cost 639 fsyncs. Commits therefore queue their framed bytes in the WAL's
+existing ring (whose sequence is already the log order) and the leader drains and
+syncs the queue holding `writeMu` across both. Nothing else touches the file
+while either is happening.
+
+Measured after that change, same machine, 40 batches per writer:
+
+| Writers | Commits | fsyncs | Per commit |
+|---|---|---|---|
+| 1 | 40 | 40 | 646 µs |
+| 4 | 160 | 49 | 181 µs |
+| 16 | 640 | 53 | 53 µs |
+
+Interleaved against a HEAD worktree with `PointLookupNode_Memory` as the control,
+`BenchmarkConcurrentCommits` is flat at ~610 µs/op on HEAD for every writer count
+— fully serialised — against 602 µs / 346 µs / 188 µs / 108 µs / 66 µs at 1, 2,
+4, 8 and 16 writers here: **9× at 16 writers**, and still scaling.
 
 Space held by deleted or superseded records is reclaimed at the next `Compact()`.
 
@@ -1701,10 +1867,13 @@ Any change must preserve these. Each is enforced by tests.
 6. **Ordered-key declarations are not persisted.** Re-declare after reopening.
 7. **Property indexing is explicit.** The engine will not infer which fields to
    index, because it cannot read the blob.
-8. **No snapshot isolation.** A sequence of calls is not a transaction (§10.1).
+8. **A sequence of plain calls is not a transaction** (§10.1). `Snapshot()`
+   gives a consistent read view (§10.3); it does not make a *write* sequence
+   atomic, which is what `Begin()` is for.
 9. **Pattern matching is unoptimised** (§8.3).
 10. **Memory-backend read concurrency is negative** past one core (§9.3).
-11. **Write scaling is bounded by a single WAL append point.**
+11. **Write scaling is bounded by a single WAL append point** — but no longer by
+    a serialised fsync: concurrent committers share one (§11.1).
 
 ---
 

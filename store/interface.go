@@ -492,10 +492,27 @@ type StorageStats struct {
 	// it is also the best proxy for how long the next open will take.
 	WALBytes int64
 
-	// CommitSeq is the last commit sequence number issued. See the disk
-	// backend's notes — it is currently per-WAL-generation, not durable across
-	// compaction.
+	// CommitSeq is the last commit sequence number issued. It is durable across
+	// compaction: v8 carries a high-water mark in the CSR header, so the counter
+	// survives the log truncation that used to reset it and names a commit for
+	// the life of the store rather than for the life of one WAL generation.
 	CommitSeq uint64
+
+	// VisibleEpoch is the newest version of the graph a reader can see. It
+	// orders mutations within one open store and means nothing across
+	// processes; a Snapshot's Epoch is a value this counter once had.
+	VisibleEpoch uint64
+
+	// OpenSnapshots is how many snapshots are currently held, and
+	// OldestSnapshotEpoch the epoch the oldest of them reads at (zero when there
+	// are none).
+	//
+	// These are the figures that separate "the delta is genuinely large" from
+	// "something is holding an old view open". A snapshot pins the image it was
+	// taken against and every version written since, so a store whose memory
+	// will not come down after a compaction is usually explained here.
+	OpenSnapshots       int
+	OldestSnapshotEpoch uint64
 
 	// LastCompact is when Compact last completed, zero if it has not run in this
 	// process. It is not persisted, so a reopened store reports zero even if the

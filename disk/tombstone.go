@@ -277,7 +277,7 @@ type RedactionInclusionProof struct {
 // redacted.
 func (s *Store) ProveRedaction(id store.NodeID) (RedactionInclusionProof, error) {
 	s.mu.RLock()
-	csr := s.csr
+	csr := s.cur().csr
 	s.mu.RUnlock()
 
 	if csr == nil {
@@ -374,7 +374,7 @@ func VerifyRedactionInclusion(snapshotRoot merkle.Hash, p RedactionInclusionProo
 // how a proof about one thing gets read as a proof about another.
 func (s *Store) ProveEdgeRedaction(id store.EdgeID) (RedactionInclusionProof, error) {
 	s.mu.RLock()
-	csr := s.csr
+	csr := s.cur().csr
 	s.mu.RUnlock()
 
 	if csr == nil {
@@ -402,7 +402,7 @@ func (s *Store) ProveEdgeRedaction(id store.EdgeID) (RedactionInclusionProof, er
 // Tombstones returns the removals this image records, oldest first.
 func (s *Store) Tombstones() []Tombstone {
 	s.mu.RLock()
-	csr := s.csr
+	csr := s.cur().csr
 	s.mu.RUnlock()
 	if csr == nil {
 		return nil

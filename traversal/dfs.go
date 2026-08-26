@@ -1,6 +1,8 @@
 package traversal
 
 import (
+	"context"
+
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -21,15 +23,31 @@ type DFSResult struct {
 //
 // Pass nil edgeTypes to follow all inbound edge types.
 // The returned chain is ordered from origin (index 0) to root (last index).
-func ProvenanceChain(g store.GraphStore, origin store.NodeID, maxDepth int, edgeTypes []store.EdgeType) (*DFSResult, error) {
+func ProvenanceChain(g store.GraphReader, origin store.NodeID, maxDepth int, edgeTypes []store.EdgeType) (*DFSResult, error) {
+	return ProvenanceChainCtx(context.Background(), g, origin, maxDepth, edgeTypes, store.Budget{})
+}
+
+// ProvenanceChainCtx is ProvenanceChain with a cancellable context and a
+// budget. See BFSCtx.
+//
+// This one recurses once per hop and its default depth is generous, so the
+// guard's recursion limit matters here even when no budget is set: a cyclic or
+// pathologically deep provenance graph would otherwise overflow the goroutine
+// stack, which is a crash rather than an error a caller can handle.
+func ProvenanceChainCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDepth int, edgeTypes []store.EdgeType, budget store.Budget) (*DFSResult, error) {
 	if maxDepth <= 0 {
 		maxDepth = 64 // safe default for provenance depth
+	}
+
+	guard := newGuard(ctx, budget)
+	if err := guard.enter(); err != nil {
+		return nil, err
 	}
 
 	result := &DFSResult{}
 	visited := make(map[store.NodeID]struct{})
 
-	if err := dfsInbound(g, origin, maxDepth, edgeTypes, visited, result); err != nil {
+	if err := dfsInbound(g, &guard, 0, origin, maxDepth, edgeTypes, visited, result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -38,13 +56,18 @@ func ProvenanceChain(g store.GraphStore, origin store.NodeID, maxDepth int, edge
 // dfsInbound is the recursive DFS kernel. It appends to result as it discovers
 // the provenance path.
 func dfsInbound(
-	g store.GraphStore,
+	g store.GraphReader,
+	guard *guard,
+	depth int,
 	id store.NodeID,
 	remaining int,
 	edgeTypes []store.EdgeType,
 	visited map[store.NodeID]struct{},
 	result *DFSResult,
 ) error {
+	if err := guard.descend(depth); err != nil {
+		return err
+	}
 	if _, seen := visited[id]; seen {
 		return nil
 	}
@@ -52,6 +75,9 @@ func dfsInbound(
 
 	node, err := g.GetNode(id)
 	if err != nil {
+		return err
+	}
+	if err := guard.visitNode(); err != nil {
 		return err
 	}
 	result.Chain = append(result.Chain, node)
@@ -72,8 +98,11 @@ func dfsInbound(
 		if _, seen := visited[parentID]; seen {
 			continue
 		}
+		if err := guard.crossEdge(); err != nil {
+			return err
+		}
 		result.Edges = append(result.Edges, e)
-		return dfsInbound(g, parentID, remaining-1, edgeTypes, visited, result)
+		return dfsInbound(g, guard, depth+1, parentID, remaining-1, edgeTypes, visited, result)
 	}
 	return nil
 }
@@ -87,17 +116,33 @@ func dfsInbound(
 // depth-first walk, and BFSIDs when you only need the reachable IDs.
 //
 // Pass nil edgeTypes to follow all edge types.
-func DFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) (*BFSResult, error) {
+func DFS(g store.GraphReader, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType) (*BFSResult, error) {
+	return DFSCtx(context.Background(), g, origin, maxDepth, dir, edgeTypes, store.Budget{})
+}
+
+// DFSCtx is DFS with a cancellable context and a budget. See BFSCtx.
+//
+// A depth-first walk can re-expand a node once per distinct remaining budget
+// (see dfsGeneral), so its worst case is O(V x maxDepth) expansions rather than
+// O(V) — which makes a budget more useful here than anywhere else in the
+// package, not less.
+func DFSCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) (*BFSResult, error) {
 	if maxDepth < 0 {
 		maxDepth = 0
 	}
+
+	guard := newGuard(ctx, budget)
+	if err := guard.enter(); err != nil {
+		return nil, err
+	}
+
 	// bestRemaining records the largest remaining budget each node has been
 	// expanded with — not merely whether it has been seen. See dfsGeneral.
 	bestRemaining := make(map[store.NodeID]int)
 	seenEdges := make(map[store.EdgeID]struct{})
 	result := &BFSResult{}
 
-	if err := dfsGeneral(newWalker(g), origin, maxDepth, dir, edgeTypes, bestRemaining, seenEdges, result); err != nil {
+	if err := dfsGeneral(newWalker(g), &guard, 0, origin, maxDepth, dir, edgeTypes, bestRemaining, seenEdges, result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -127,6 +172,8 @@ func DFS(g store.GraphStore, origin store.NodeID, maxDepth int, dir store.Direct
 // result only on first arrival, so no duplicates appear.
 func dfsGeneral(
 	w *walker,
+	guard *guard,
+	depth int,
 	id store.NodeID,
 	remaining int,
 	dir store.Direction,
@@ -135,6 +182,12 @@ func dfsGeneral(
 	seenEdges map[store.EdgeID]struct{},
 	result *BFSResult,
 ) error {
+	if err := guard.descend(depth); err != nil {
+		return err
+	}
+	if err := guard.step(); err != nil {
+		return err
+	}
 	prev, seen := bestRemaining[id]
 	if seen && prev >= remaining {
 		// Already expanded with at least this much budget; nothing new to find.
@@ -145,6 +198,9 @@ func dfsGeneral(
 	if !seen {
 		node, err := w.g.GetNode(id)
 		if err != nil {
+			return err
+		}
+		if err := guard.visitNode(); err != nil {
 			return err
 		}
 		result.Nodes = append(result.Nodes, node)
@@ -183,10 +239,13 @@ func dfsGeneral(
 			if err != nil {
 				continue
 			}
+			if err := guard.crossEdge(); err != nil {
+				return err
+			}
 			seenEdges[eid] = struct{}{}
 			result.Edges = append(result.Edges, edge)
 		}
-		if err := dfsGeneral(w, nbID, remaining-1, dir, edgeTypes, bestRemaining, seenEdges, result); err != nil {
+		if err := dfsGeneral(w, guard, depth+1, nbID, remaining-1, dir, edgeTypes, bestRemaining, seenEdges, result); err != nil {
 			return err
 		}
 	}

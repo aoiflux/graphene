@@ -11,8 +11,25 @@ import (
 	"github.com/aoiflux/graphene/store"
 )
 
+// QueryNodeIDs resolves query against the newest visible state.
+//
+// One read lock covers the whole query: the driving step, every candidate
+// resolution and the residual filters. It used to take the lock afresh at each
+// of those, which meant a query could drive from a candidate set the graph no
+// longer agreed with by the time the residuals ran — a query that returned an
+// ID for a node deleted halfway through it. Holding the lock once costs writers
+// a longer wait and buys the query an answer that was true at one instant.
 func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
-	candidates, sortedAsc, plan := s.driveNodeCandidates(query)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.queryNodeIDs(s.readerLocked(), query)
+}
+
+// queryNodeIDs is the body, resolved against a caller-supplied reader so a
+// snapshot runs the identical plan over its own pinned state. Caller holds
+// whatever lock that reader requires.
+func (s *Store) queryNodeIDs(r reader, query store.NodeQuery) ([]store.NodeID, error) {
+	candidates, sortedAsc, plan := s.driveNodeCandidates(r, query)
 
 	if len(query.Types) > 0 {
 		typeSet := make(map[store.NodeType]struct{}, len(query.Types))
@@ -21,8 +38,8 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 		}
 		filtered := make([]store.NodeID, 0, len(candidates))
 		for _, id := range candidates {
-			n, err := s.GetNode(id)
-			if err != nil {
+			n, ok := r.node(id)
+			if !ok {
 				continue
 			}
 			if nodeHasAnyType(n, typeSet) {
@@ -65,8 +82,16 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 	return store.ApplyNodeQueryWindow(candidates, query.Offset, query.Limit), nil
 }
 
+// QueryEdgeIDs resolves query against the newest visible state. See
+// QueryNodeIDs for why one lock covers the whole of it.
 func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
-	candidates, sortedAsc, plan := s.driveEdgeCandidates(query)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.queryEdgeIDs(s.readerLocked(), query)
+}
+
+func (s *Store) queryEdgeIDs(r reader, query store.EdgeQuery) ([]store.EdgeID, error) {
+	candidates, sortedAsc, plan := s.driveEdgeCandidates(r, query)
 
 	if len(query.Types) > 0 || len(query.SrcIDs) > 0 || len(query.DstIDs) > 0 {
 		typeSet := make(map[store.EdgeType]struct{}, len(query.Types))
@@ -78,8 +103,8 @@ func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 
 		filtered := make([]store.EdgeID, 0, len(candidates))
 		for _, id := range candidates {
-			e, err := s.GetEdge(id)
-			if err != nil {
+			e, ok := r.edge(id)
+			if !ok {
 				continue
 			}
 			if len(typeSet) > 0 && !edgeHasAnyType(e, typeSet) {
@@ -181,50 +206,15 @@ func labelDriverWins(labelSize, equalitySize int) bool {
 	return labelSize != labelSizeUnknown && labelSize < equalitySize
 }
 
-// nodeLabelCandidateCount is an upper bound on the number of nodes carrying any
-// of types. It double-counts a node present in both the delta and the CSR, and
-// it ignores tombstones.
-//
-// An upper bound is exactly what costing needs here: the chosen driver must be a
-// superset of the answer, and overestimating can only make the planner more
-// reluctant to pick labels — never wrong, just occasionally conservative.
-func (s *Store) nodeLabelCandidateCount(types []store.NodeType) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	total := 0
-	for _, t := range types {
-		total += len(s.deltaNodesByType[t])
-		if s.csr != nil {
-			// NodesByType aliases CSR memory; len is O(1) and nothing escapes.
-			total += len(s.csr.NodesByType(t))
-		}
-	}
-	return total
-}
-
-// edgeLabelCandidateCount is the edge equivalent of nodeLabelCandidateCount.
-func (s *Store) edgeLabelCandidateCount(types []store.EdgeType) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	total := 0
-	for _, t := range types {
-		total += len(s.deltaEdgesByType[t])
-		if s.csr != nil {
-			total += len(s.csr.EdgesByType(t))
-		}
-	}
-	return total
-}
-
 // driveNodeCandidates returns the starting candidate set for a node query and
 // whether it is already in ascending ID order.
 // driveNodeCandidates picks the cheapest source that is guaranteed to contain
 // the query's answer. It returns the candidates, whether they are ascending, and
 // a plan describing that choice — including the filter it consumed, so the
 // residual pass does not evaluate that filter a second time.
-func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool, store.QueryPlan) {
+func (s *Store) driveNodeCandidates(r reader, query store.NodeQuery) ([]store.NodeID, bool, store.QueryPlan) {
 	if len(query.IDs) > 0 {
-		return s.collectCandidateNodeIDs(query.IDs), false, store.QueryPlan{Driver: store.DriverIDs, DriverFilter: -1}
+		return collectCandidateNodeIDs(r, query.IDs), false, store.QueryPlan{Driver: store.DriverIDs, DriverFilter: -1}
 	}
 
 	// Most selective equality filter, if any qualifies as a driver. Its
@@ -247,14 +237,14 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 	// combined with a 14 000-hit filter drove from the filter.
 	labelSize := labelSizeUnknown
 	if len(query.Types) > 0 {
-		labelSize = s.nodeLabelCandidateCount(query.Types)
+		labelSize = r.nodeLabelCandidateCount(query.Types)
 	}
 
 	if bestFilter != nil {
 		if labelDriverWins(labelSize, bestSize) {
-			return s.driveNodeLabels(query.Types)
+			return driveNodeLabels(r, query.Types)
 		}
-		return s.liveNodeIDs(s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
+		return liveNodeIDs(r, s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
 			Driver:       store.DriverEquality,
 			DriverKey:    bestFilter.Key,
 			DriverFilter: store.FilterIndexOf(query.Filters, *bestFilter),
@@ -265,7 +255,7 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 	// and resolving it here means the query never enumerates the whole graph.
 	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
 		if ids, served := s.propIdx.NodesMatchingOrdered(nil, f); served {
-			return s.liveNodeIDs(sortDedupeNodeIDs(ids)), true, store.QueryPlan{
+			return liveNodeIDs(r, sortDedupeNodeIDs(ids)), true, store.QueryPlan{
 				Driver:       store.DriverOrdered,
 				DriverKey:    f.Key,
 				DriverFilter: store.FilterIndexOf(query.Filters, f),
@@ -274,10 +264,10 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 	}
 
 	if len(query.Types) > 0 {
-		return s.driveNodeLabels(query.Types)
+		return driveNodeLabels(r, query.Types)
 	}
 
-	return s.collectCandidateNodeIDs(nil), false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
+	return r.allNodeIDs(), false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
 }
 
 // driveNodeLabels resolves the union of the given labels' postings. It is served
@@ -286,15 +276,11 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 //
 // The result is unsorted: postings are individually ascending, but a union over
 // several labels interleaves them.
-func (s *Store) driveNodeLabels(types []store.NodeType) ([]store.NodeID, bool, store.QueryPlan) {
+func driveNodeLabels(r reader, types []store.NodeType) ([]store.NodeID, bool, store.QueryPlan) {
 	seen := make(map[store.NodeID]struct{})
 	var out []store.NodeID
 	for _, t := range types {
-		ids, err := s.NodesByType(t)
-		if err != nil {
-			continue
-		}
-		for _, id := range ids {
+		for _, id := range r.nodesByType(t) {
 			if _, ok := seen[id]; ok {
 				continue
 			}
@@ -305,32 +291,34 @@ func (s *Store) driveNodeLabels(types []store.NodeType) ([]store.NodeID, bool, s
 	return out, false, store.QueryPlan{Driver: store.DriverLabels, DriverFilter: -1}
 }
 
-// liveNodeIDs drops IDs that no longer resolve to a live node, preserving order.
-func (s *Store) liveNodeIDs(ids []store.NodeID) []store.NodeID {
+// liveNodeIDs drops IDs that do not resolve to a live node for r, preserving
+// order.
+//
+// This is what keeps the property index from handing back an entity the records
+// no longer have. The index is not versioned, so its postings are the current
+// ones whatever epoch r reads at; resolving each against r is what makes the
+// records the authority.
+func liveNodeIDs(r reader, ids []store.NodeID) []store.NodeID {
 	if len(ids) == 0 {
-		return ids // a miss should not pay for the lock
+		return ids
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	out := ids[:0]
 	for _, id := range ids {
-		if s.nodeExistsLocked(id) {
+		if r.nodeExists(id) {
 			out = append(out, id)
 		}
 	}
 	return out
 }
 
-// liveEdgeIDs drops IDs that no longer resolve to a live edge, preserving order.
-func (s *Store) liveEdgeIDs(ids []store.EdgeID) []store.EdgeID {
+// liveEdgeIDs is liveNodeIDs for edges.
+func liveEdgeIDs(r reader, ids []store.EdgeID) []store.EdgeID {
 	if len(ids) == 0 {
-		return ids // a miss should not pay for the lock
+		return ids
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	out := ids[:0]
 	for _, id := range ids {
-		if s.edgeExistsLocked(id) {
+		if r.edgeExists(id) {
 			out = append(out, id)
 		}
 	}
@@ -342,9 +330,9 @@ func (s *Store) liveEdgeIDs(ids []store.EdgeID) []store.EdgeID {
 // driveEdgeCandidates mirrors driveNodeCandidates: it returns the candidates,
 // whether they are ascending, and a plan naming the source it drove from and the
 // filter it consumed, so the residual pass does not re-evaluate that filter.
-func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool, store.QueryPlan) {
+func (s *Store) driveEdgeCandidates(r reader, query store.EdgeQuery) ([]store.EdgeID, bool, store.QueryPlan) {
 	if len(query.IDs) > 0 {
-		return s.collectCandidateEdgeIDs(query.IDs), false, store.QueryPlan{Driver: store.DriverIDs, DriverFilter: -1}
+		return collectCandidateEdgeIDs(r, query.IDs), false, store.QueryPlan{Driver: store.DriverIDs, DriverFilter: -1}
 	}
 
 	var bestFilter *store.PropertyFilter
@@ -364,14 +352,10 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 	anchors := query.SrcIDs
 	anchorSize := -1
 	if len(query.SrcIDs) > 0 {
-		s.mu.RLock()
-		anchorSize = s.degreeSumLocked(query.SrcIDs, store.DirectionOutbound)
-		s.mu.RUnlock()
+		anchorSize = r.degreeSum(query.SrcIDs, store.DirectionOutbound)
 	}
 	if len(query.DstIDs) > 0 {
-		s.mu.RLock()
-		dstSize := s.degreeSumLocked(query.DstIDs, store.DirectionInbound)
-		s.mu.RUnlock()
+		dstSize := r.degreeSum(query.DstIDs, store.DirectionInbound)
 		if anchorSize < 0 || dstSize < anchorSize {
 			anchorSize = dstSize
 			anchorDir = store.DirectionInbound
@@ -392,29 +376,29 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 	}
 	labelCost := math.MaxInt
 	if len(query.Types) > 0 {
-		labelCost = s.edgeLabelCandidateCount(query.Types)
+		labelCost = r.edgeLabelCandidateCount(query.Types)
 	}
 
 	switch {
 	// Labels must beat both alternatives strictly: they return unsorted
 	// candidates, where equality and adjacency both return ascending.
 	case labelCost < eqCost && labelCost < anchorCost:
-		return s.driveEdgeLabels(query.Types)
+		return driveEdgeLabels(r, query.Types)
 	case bestFilter != nil && eqCost <= anchorCost:
-		return s.liveEdgeIDs(s.propIdx.EdgesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
+		return liveEdgeIDs(r, s.propIdx.EdgesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
 			Driver:       store.DriverEquality,
 			DriverKey:    bestFilter.Key,
 			DriverFilter: store.FilterIndexOf(query.Filters, *bestFilter),
 		}
 	case anchorSize >= 0:
-		return s.incidentEdgeIDs(anchors, anchorDir), false, store.QueryPlan{
+		return r.incidentEdgeIDsForAll(anchors, anchorDir), false, store.QueryPlan{
 			Driver: store.DriverAdjacency, DriverFilter: -1,
 		}
 	}
 
 	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
 		if ids, served := s.propIdx.EdgesMatchingOrdered(nil, f); served {
-			return s.liveEdgeIDs(sortDedupeEdgeIDs(ids)), true, store.QueryPlan{
+			return liveEdgeIDs(r, sortDedupeEdgeIDs(ids)), true, store.QueryPlan{
 				Driver:       store.DriverOrdered,
 				DriverKey:    f.Key,
 				DriverFilter: store.FilterIndexOf(query.Filters, f),
@@ -423,24 +407,20 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 	}
 
 	if len(query.Types) > 0 {
-		return s.driveEdgeLabels(query.Types)
+		return driveEdgeLabels(r, query.Types)
 	}
 
-	return s.collectCandidateEdgeIDs(nil), false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
+	return r.allEdgeIDs(), false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
 }
 
 // driveEdgeLabels is the edge counterpart of driveNodeLabels: the union of the
 // given labels' postings, served by the CSR label index plus the delta, and
 // unsorted because a union over several labels interleaves ascending runs.
-func (s *Store) driveEdgeLabels(types []store.EdgeType) ([]store.EdgeID, bool, store.QueryPlan) {
+func driveEdgeLabels(r reader, types []store.EdgeType) ([]store.EdgeID, bool, store.QueryPlan) {
 	seen := make(map[store.EdgeID]struct{})
 	var out []store.EdgeID
 	for _, t := range types {
-		ids, err := s.EdgesByType(t)
-		if err != nil {
-			continue
-		}
-		for _, id := range ids {
+		for _, id := range r.edgesByType(t) {
 			if _, ok := seen[id]; ok {
 				continue
 			}
@@ -451,101 +431,37 @@ func (s *Store) driveEdgeLabels(types []store.EdgeType) ([]store.EdgeID, bool, s
 	return out, false, store.QueryPlan{Driver: store.DriverLabels, DriverFilter: -1}
 }
 
-func (s *Store) collectCandidateNodeIDs(ids []store.NodeID) []store.NodeID {
-	if len(ids) > 0 {
-		out := make([]store.NodeID, 0, len(ids))
-		seen := make(map[store.NodeID]struct{}, len(ids))
-		for _, id := range ids {
-			if _, ok := seen[id]; ok {
-				continue
-			}
-			if _, err := s.GetNode(id); err == nil {
-				seen[id] = struct{}{}
-				out = append(out, id)
-			}
+// collectCandidateNodeIDs resolves an explicit ID list against r, dropping the
+// ones that are not live and deduplicating what remains.
+func collectCandidateNodeIDs(r reader, ids []store.NodeID) []store.NodeID {
+	out := make([]store.NodeID, 0, len(ids))
+	seen := make(map[store.NodeID]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
 		}
-		return out
-	}
-
-	out := make([]store.NodeID, 0)
-	seen := make(map[store.NodeID]struct{})
-
-	s.mu.RLock()
-	for id := range s.deltaNodes {
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			out = append(out, id)
+		if !r.nodeExists(id) {
+			continue
 		}
+		seen[id] = struct{}{}
+		out = append(out, id)
 	}
-	s.mu.RUnlock()
-
-	if s.csr != nil {
-		s.mu.RLock()
-		for i := 1; i < len(s.csr.nodes); i++ {
-			n := s.csr.nodes[i]
-			if n.ID == store.InvalidNodeID {
-				continue
-			}
-			if _, del := s.deletedNodes[n.ID]; del {
-				continue
-			}
-			if _, ok := seen[n.ID]; !ok {
-				seen[n.ID] = struct{}{}
-				out = append(out, n.ID)
-			}
-		}
-		s.mu.RUnlock()
-	}
-
 	return out
 }
 
-func (s *Store) collectCandidateEdgeIDs(ids []store.EdgeID) []store.EdgeID {
-	if len(ids) > 0 {
-		out := make([]store.EdgeID, 0, len(ids))
-		seen := make(map[store.EdgeID]struct{}, len(ids))
-		for _, id := range ids {
-			if _, ok := seen[id]; ok {
-				continue
-			}
-			if _, err := s.GetEdge(id); err == nil {
-				seen[id] = struct{}{}
-				out = append(out, id)
-			}
+func collectCandidateEdgeIDs(r reader, ids []store.EdgeID) []store.EdgeID {
+	out := make([]store.EdgeID, 0, len(ids))
+	seen := make(map[store.EdgeID]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
 		}
-		return out
-	}
-
-	out := make([]store.EdgeID, 0)
-	seen := make(map[store.EdgeID]struct{})
-
-	s.mu.RLock()
-	for id := range s.deltaEdges {
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			out = append(out, id)
+		if !r.edgeExists(id) {
+			continue
 		}
+		seen[id] = struct{}{}
+		out = append(out, id)
 	}
-	s.mu.RUnlock()
-
-	if s.csr != nil {
-		s.mu.RLock()
-		for i := 1; i < len(s.csr.edges); i++ {
-			e := s.csr.edges[i]
-			if e.ID == store.InvalidEdgeID {
-				continue
-			}
-			if _, del := s.deletedEdges[e.ID]; del {
-				continue
-			}
-			if _, ok := seen[e.ID]; !ok {
-				seen[e.ID] = struct{}{}
-				out = append(out, e.ID)
-			}
-		}
-		s.mu.RUnlock()
-	}
-
 	return out
 }
 
@@ -685,12 +601,20 @@ func makeNodeIDSet(ids []store.NodeID) map[store.NodeID]struct{} {
 // The plan is diagnostic. Which index the planner picks is free to change as the
 // cost model improves; the results a query returns are not.
 func (s *Store) ExplainNodeQuery(query store.NodeQuery) (store.QueryPlan, error) {
-	candidates, _, plan := s.driveNodeCandidates(query)
+	// One lock hold, and the query runs through the internal entry point rather
+	// than the public one: re-entering QueryNodeIDs would take the read lock a
+	// second time, which a Go RWMutex does not promise to grant while a writer
+	// is queued behind the first.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r := s.readerLocked()
+
+	candidates, _, plan := s.driveNodeCandidates(r, query)
 	plan.Candidates = len(candidates)
 	if len(query.Filters) > 0 && store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
 		plan.Residuals = s.propIdx.PlanNodeResiduals(query.Filters, plan.DriverFilter, len(candidates))
 	}
-	ids, err := s.QueryNodeIDs(query)
+	ids, err := s.queryNodeIDs(r, query)
 	if err != nil {
 		return plan, err
 	}
@@ -700,12 +624,16 @@ func (s *Store) ExplainNodeQuery(query store.NodeQuery) (store.QueryPlan, error)
 
 // ExplainEdgeQuery is ExplainNodeQuery for edge queries.
 func (s *Store) ExplainEdgeQuery(query store.EdgeQuery) (store.QueryPlan, error) {
-	candidates, _, plan := s.driveEdgeCandidates(query)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r := s.readerLocked()
+
+	candidates, _, plan := s.driveEdgeCandidates(r, query)
 	plan.Candidates = len(candidates)
 	if len(query.Filters) > 0 && store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
 		plan.Residuals = s.propIdx.PlanEdgeResiduals(query.Filters, plan.DriverFilter, len(candidates))
 	}
-	ids, err := s.QueryEdgeIDs(query)
+	ids, err := s.queryEdgeIDs(r, query)
 	if err != nil {
 		return plan, err
 	}
