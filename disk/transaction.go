@@ -216,11 +216,17 @@ func (s *Store) resolveTransaction(ops []store.TxOp) ([]txAction, error) {
 
 // ApplyTransaction implements store.Transactor.
 func (s *Store) ApplyTransaction(ops []store.TxOp) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	return s.ApplyTransactionAs(ops, store.TxContext{})
 }
 
 // ApplyTransactionAs implements store.ActorTransactor.
 func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	if len(ops) == 0 {
 		return nil
 	}

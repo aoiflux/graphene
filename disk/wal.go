@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -109,7 +110,23 @@ type WAL struct {
 	barrier  atomic.Uint32 // 1 while maintenance op is active
 	inFlight atomic.Int64  // append calls currently in progress
 	closed   atomic.Uint32 // 1 once Close() starts
+
+	// readOnly refuses every path that writes. Fixed at open and never changed.
+	//
+	// This is a backstop rather than the guard callers meet: Store.mustWrite
+	// refuses first and says something useful about the store. What this catches
+	// is an engine path that reaches the log without going through a public
+	// mutator — the failure mode being guarded is a read-only store silently
+	// appending, which is exactly what the process lock exists to make impossible.
+	//
+	// When readOnly is set, file may be nil: a store whose log does not exist yet
+	// has nothing to open and nothing to create.
+	readOnly bool
 }
+
+// errWALReadOnly is the backstop refusal. Callers should be meeting
+// disk.ErrReadOnly from the store instead; see the readOnly field.
+var errWALReadOnly = errors.New("wal: log is open read-only")
 
 type walSlot struct {
 	seq     atomic.Uint64
@@ -123,6 +140,52 @@ const defaultWALRingCapacity = 1024
 // OpenWAL opens (or creates) the WAL at path.
 func OpenWAL(path string) (*WAL, error) {
 	return openWALWithCapacity(path, defaultWALRingCapacity)
+}
+
+// openWALFor opens the log for a store, writable or not.
+func openWALFor(path string, readOnly bool) (*WAL, error) {
+	if readOnly {
+		return openWALReadOnly(path)
+	}
+	return OpenWAL(path)
+}
+
+// openWALReadOnly opens the log for replay and nothing else.
+//
+// Two things the writable path does are writes, and a read-only store must do
+// neither. It opens O_CREATE, so pointing a reader at a store with no log would
+// create one; and it adopts v2 framing by writing a container header into an
+// empty file, so opening an empty log read-only would modify it. Here a missing
+// file is simply an empty log — the honest reading of "this store has never been
+// written to" — and a headerless file keeps its framing untouched.
+func openWALReadOnly(path string) (*WAL, error) {
+	w := &WAL{readOnly: true}
+
+	f, err := os.Open(path)
+	switch {
+	case os.IsNotExist(err):
+		// No log. Nothing to replay, and nothing to create. Every method that
+		// would touch the handle either refuses first (the write paths) or checks
+		// for nil (Size, Replay, Close).
+		w.framing = walFramingV2
+		w.dataStart = walFileHeaderSize
+		return w, nil
+	case err != nil:
+		return nil, fmt.Errorf("wal open: %w", err)
+	}
+
+	header, dataStart, err := readWALFileHeader(f)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("wal open: %w", err)
+	}
+	// No header adoption here, unlike the writable path: writing one would be a
+	// write. A headerless log replays under v1 framing, which is exactly what a
+	// writer opening the same file would do with it.
+	w.file = f
+	w.framing = header.Version
+	w.dataStart = dataStart
+	return w, nil
 }
 
 func openWALWithCapacity(path string, capacity int) (*WAL, error) {
@@ -261,6 +324,9 @@ func verifyCommitSignature(cb ReplayCallbacks, meta batchMeta, body []byte) erro
 // reason to slow it down. The figure may therefore lag an in-flight append by
 // one record, which does not matter for anything it is used for.
 func (w *WAL) Size() int64 {
+	if w.file == nil {
+		return 0
+	}
 	fi, err := w.file.Stat()
 	if err != nil {
 		return 0
@@ -272,6 +338,9 @@ func (w *WAL) Size() int64 {
 // checkpoint signals that all records before it are durable in the CSR and
 // the WAL can be safely truncated.
 func (w *WAL) Checkpoint() error {
+	if w.readOnly {
+		return errWALReadOnly
+	}
 	if err := w.beginMaintenance(); err != nil {
 		return err
 	}
@@ -288,6 +357,9 @@ func (w *WAL) Checkpoint() error {
 
 // Truncate removes all records from the WAL (called after successful compaction).
 func (w *WAL) Truncate() error {
+	if w.readOnly {
+		return errWALReadOnly
+	}
 	if err := w.beginMaintenance(); err != nil {
 		return err
 	}
@@ -383,13 +455,22 @@ type ReplayCallbacks struct {
 // to the matching callback in cb. It stops at EOF or a checkpoint record.
 // Partial/corrupted records at the tail are silently ignored (crash-safe).
 func (w *WAL) Replay(cb ReplayCallbacks) error {
+	// A read-only store whose log does not exist: an empty log, replayed as no
+	// records rather than as an error.
+	if w.file == nil {
+		return nil
+	}
+
 	if err := w.beginMaintenance(); err != nil {
 		return err
 	}
 	defer w.endMaintenance()
 
-	if err := w.drainQueuedLocked(); err != nil {
-		return err
+	// Nothing is ever queued on a read-only log, and draining writes.
+	if !w.readOnly {
+		if err := w.drainQueuedLocked(); err != nil {
+			return err
+		}
 	}
 
 	// Records begin past the container header, if there is one.
@@ -613,6 +694,22 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 
 // Close closes the underlying file.
 func (w *WAL) Close() error {
+	// A read-only log has nothing queued and nothing to sync, and may have no
+	// file at all. Handled before the barrier because draining and syncing are
+	// both writes.
+	if w.readOnly {
+		w.closed.Store(1)
+		if w.file == nil {
+			return nil
+		}
+		err := w.file.Close()
+		w.file = nil
+		if err != nil {
+			return fmt.Errorf("wal close: %w", err)
+		}
+		return nil
+	}
+
 	if err := w.beginMaintenance(); err != nil {
 		return err
 	}
@@ -640,6 +737,9 @@ func (w *WAL) Close() error {
 
 // append is the internal write path.
 func (w *WAL) append(recType byte, payload []byte) error {
+	if w.readOnly {
+		return errWALReadOnly
+	}
 	if w.closed.Load() != 0 {
 		return fmt.Errorf("wal append: closed")
 	}
@@ -940,6 +1040,9 @@ func applyWALRecord(cb ReplayCallbacks, recType byte, payload []byte) error {
 // Close — so a caller wanting "everything so far is safe" had to pay a full
 // compaction for it.
 func (w *WAL) Sync() error {
+	if w.readOnly {
+		return errWALReadOnly
+	}
 	if w.closed.Load() != 0 {
 		return fmt.Errorf("wal sync: closed")
 	}

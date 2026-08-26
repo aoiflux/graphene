@@ -273,6 +273,9 @@ func (s *Store) Checkpoint() (Checkpoint, error) {
 // fails, the anchor holds a digest this store cannot explain — loud, and
 // therefore the right failure.
 func (s *Store) PublishCheckpoint(a Anchor) (Checkpoint, AnchorRecord, error) {
+	if err := s.mustWrite(); err != nil {
+		return Checkpoint{}, AnchorRecord{}, err
+	}
 	if a == nil {
 		return Checkpoint{}, AnchorRecord{}, errors.New("disk: publish checkpoint: no anchor")
 	}

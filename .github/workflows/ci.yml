@@ -3,7 +3,7 @@ name: CI
 # Every correctness guarantee in this repository — the backend parity suites, the
 # index integrity suites, the pinned CRC and CSR format vectors, the race
 # detector — was previously enforced only when a human remembered to run
-# test.ps1, on Windows. This runs them on every push, on both platforms.
+# test.ps1, on Windows. This runs them on every push, on Linux, Windows and macOS.
 
 on:
   push:
@@ -49,13 +49,16 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+  # macOS joined the matrix with the process lock. The engine now makes an
+  # explicit claim about Darwin — flock semantics, and a reader/writer exclusion
+  # that depends on them — and a platform claim nothing exercises is a guess.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

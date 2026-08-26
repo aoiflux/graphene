@@ -146,6 +146,9 @@ var ErrNoSigner = errors.New("disk: store has no signer configured")
 // mid-rotation leaves a log whose transition is either absent or complete — and
 // in the absent case the store simply carries on with the old key.
 func (s *Store) RotateKey(newKey store.Signer, newPublicKey []byte) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

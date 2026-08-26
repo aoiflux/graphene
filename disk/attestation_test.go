@@ -47,7 +47,12 @@ func attestedStoreWithKey(t *testing.T, n int, key *signing.Key) (dir string, id
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
+	// Closed when this fixture returns, not by t.Cleanup. Every caller reopens
+	// the directory through openAttested, and the store holds an exclusive
+	// process lock until it is closed — a cleanup-deferred close would still be
+	// holding it when they tried. Deferred rather than placed at the end because
+	// t.Fatal unwinds through defers, so the failure paths release it too.
+	defer s.Close()
 
 	for i := 0; i < n; i++ {
 		id := addNodeD(t, s, store.NodeTypeMicroArtefact)

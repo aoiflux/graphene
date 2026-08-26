@@ -988,15 +988,100 @@ against a brute-force oracle over five pattern shapes on both backends.
 
 ### 9.1 Lock inventory
 
-| Lock | Covers | Held during |
-|---|---|---|
-| `memory.Store.mu` | records, adjacency, label postings | every operation |
-| `disk.Store.mu` | delta maps, tombstones, delta postings, CSR pointer swap | locked reads, all writes |
-| `propertyShard.mu` × 16 | one shard's forward and reverse maps | that shard's operations |
-| `WAL.writeMu` | the drain pass | overflow and flush only |
+| Lock | Scope | Covers | Held during |
+|---|---|---|---|
+| `storeLock` (`graphene.lock`) | **process** | the whole store directory | open to close |
+| `memory.Store.mu` | goroutine | records, adjacency, label postings | every operation |
+| `disk.Store.mu` | goroutine | delta maps, tombstones, delta postings, CSR pointer swap | locked reads, all writes |
+| `propertyShard.mu` × 16 | goroutine | one shard's forward and reverse maps | that shard's operations |
+| `WAL.writeMu` | goroutine | the drain pass | overflow and flush only |
 
 **No operation holds two shard locks.** This is a design constraint, not an
 accident — it is what removes deadlock from the reasoning entirely.
+
+**Acquisition order is process lock, then `s.mu`, then a shard.** The process
+lock is taken once in `Open` and released once in `Close`, so it is never
+acquired while an in-process lock is held and the ordering cannot be violated by
+a code path — only by moving the acquisition, which is why it sits before the WAL
+open rather than anywhere more convenient.
+
+**A lock is never upgraded in place.** A read-only store does not become
+writable; it is closed and reopened. Upgrading shared to exclusive means
+releasing and reacquiring, and the window in between is one where another process
+can take the store — so the API does not offer it, and a caller who needs to
+write reopens and handles `ErrStoreLocked` like any other opener.
+
+### 9.1a The process lock
+
+Before this existed, nothing stopped two processes opening one directory. The
+failure was not subtle: both replay the log, both append to it, and both build a
+temp CSR and rename it over the live image. The second rename wins, and the first
+process serves a graph that is no longer on disk. `inspect.go` and
+`cmd/graphene` had both grown prose warnings about it.
+
+| Platform | Primitive |
+|---|---|
+| Linux, macOS, BSD | `syscall.Flock` — `LOCK_EX`/`LOCK_SH`, always `LOCK_NB` |
+| Windows | kernel32 `LockFileEx` via `syscall.NewLazyDLL` — `LOCKFILE_FAIL_IMMEDIATELY`, `LOCKFILE_EXCLUSIVE_LOCK` for a writer |
+| solaris, aix, plan9, js | none; `LockEnforced()` returns `false` |
+
+Zero external dependencies is a property this repository keeps, so Windows
+resolves the two calls by hand rather than importing `golang.org/x/sys` — Go's
+standard `syscall` exposes `CreateFile` and `Overlapped` but not `LockFileEx`.
+
+**`flock`, not `fcntl`.** POSIX `fcntl` locks are owned by the *process*, and
+that breaks both halves of what this is for. A second `Open` in the same process
+would succeed silently, because the kernel merges the request into a lock the
+process already holds — and one process opening a store twice destroys it just as
+thoroughly as two processes opening it once. Worse, closing *any* descriptor to
+the file drops every lock the process holds on it, so unrelated code that stats
+the lock file through its own handle would silently unlock the store. `flock`
+locks belong to the open file description, which is the ownership model this
+needs. Windows handles behave the same way, which is what lets one set of
+in-process tests cover both platforms.
+
+**Why the locked byte is at offset 2^40.** A `LockFileEx` range is *mandatory*
+for I/O, not advisory: a process without the lock gets `ERROR_LOCK_VIOLATION`
+reading bytes inside it. Locking byte zero would make the owner record unreadable
+by exactly the process that most wants to read it — the one being refused, which
+wants to name the holder in its error. Locking a byte nothing ever writes keeps
+the 32-byte record at offset 0 readable by anyone. Locking past EOF is legal on
+both platforms and does not extend the file.
+
+**No blocking, no timeout.** `LOCK_NB` and `LOCKFILE_FAIL_IMMEDIATELY` always.
+Neither platform has a portable timed wait, so a timeout would be a polling loop,
+and the right interval depends on what the caller is. `ErrStoreLocked` comes back
+immediately, naming the holder's PID, and the caller decides.
+
+### 9.1b Why readers are snapshots
+
+The lock admits many readers alongside each other and none alongside a writer.
+That second half is not a limitation of file locking — it follows from how the
+store loads.
+
+`Open` materialises everything once: the delta maps and property index from a WAL
+replay (`store.go`), the CSR from a single `os.ReadFile` (`csr_io.go`). Nothing
+re-reads afterwards. A reader admitted alongside a writer would therefore serve
+the graph as it stood at its own open, for its whole lifetime, with no indication
+that it had gone stale — a wrong answer delivered confidently, which is worse
+than a refusal.
+
+So the shared lock exists for readers running alongside *other readers*, and the
+exclusive lock is what keeps a writer from being one of them. Reopening is how a
+reader advances.
+
+Making readers live is a reader-refresh protocol — replay-from-offset, a CSR
+generation marker, incremental property-index apply, and a torn-refresh story —
+and not a locking change. It is not built.
+
+Read-only mode also has to leave the directory alone, which took more than
+withholding the mutators. `OpenWAL` creates the log if missing and writes a
+container header into an empty one; the audit, redaction and grant ledgers all
+open `O_WRONLY|O_APPEND`. A read-only store opens the log through a separate
+read-only path and opens no ledger at all — their read paths were already
+directory-based (`ReadAuditLog(dir)` and friends), and every write path already
+refused on a nil ledger, so "the option is off" and "the store is read-only"
+reach the same check.
 
 ### 9.2 The lock-free CSR read path
 

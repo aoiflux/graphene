@@ -450,11 +450,17 @@ func CapabilitiesFrom(records []RoleGrant) map[uint64]Capability {
 
 // GrantRole records that an actor was given capabilities.
 func (s *Store) GrantRole(subject uint64, roleID uint32, caps Capability, req GrantRequest) (RoleGrant, error) {
+	if err := s.mustWrite(); err != nil {
+		return RoleGrant{}, err
+	}
 	return s.recordGrant(GrantAdd, subject, roleID, caps, req)
 }
 
 // RevokeRole records that capabilities were withdrawn.
 func (s *Store) RevokeRole(subject uint64, roleID uint32, caps Capability, req GrantRequest) (RoleGrant, error) {
+	if err := s.mustWrite(); err != nil {
+		return RoleGrant{}, err
+	}
 	return s.recordGrant(GrantRevoke, subject, roleID, caps, req)
 }
 

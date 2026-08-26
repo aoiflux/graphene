@@ -680,6 +680,9 @@ func (s *Store) leafVersionLocked() uint8 {
 // to prevent. A record with no matching deletion is recoverable; a deletion with
 // no record is not.
 func (s *Store) RedactNode(id store.NodeID, req RedactionRequest) (RedactionRecord, error) {
+	if err := s.mustWrite(); err != nil {
+		return RedactionRecord{}, err
+	}
 	if req.Reason == "" {
 		return RedactionRecord{}, ErrRedactionUnexplained
 	}
@@ -738,6 +741,9 @@ func (s *Store) RedactNode(id store.NodeID, req RedactionRequest) (RedactionReco
 // after, so a recipient can confirm the entity now in the image is the one this
 // record describes rather than taking it on trust.
 func (s *Store) RedactNodeProperties(id store.NodeID, req RedactionRequest) (RedactionRecord, error) {
+	if err := s.mustWrite(); err != nil {
+		return RedactionRecord{}, err
+	}
 	if req.Reason == "" {
 		return RedactionRecord{}, ErrRedactionUnexplained
 	}
@@ -807,6 +813,9 @@ func (s *Store) RedactNodeProperties(id store.NodeID, req RedactionRequest) (Red
 // as RedactNodeProperties: removing the relationship to erase a property
 // destroys evidence that was never in scope.
 func (s *Store) RedactEdgeProperties(id store.EdgeID, req RedactionRequest) (RedactionRecord, error) {
+	if err := s.mustWrite(); err != nil {
+		return RedactionRecord{}, err
+	}
 	if req.Reason == "" {
 		return RedactionRecord{}, ErrRedactionUnexplained
 	}
@@ -878,6 +887,9 @@ func (s *Store) RedactEdgeProperties(id store.EdgeID, req RedactionRequest) (Red
 // the decision called for. This removes the single relationship that was
 // actually in scope.
 func (s *Store) RedactEdge(id store.EdgeID, req RedactionRequest) (RedactionRecord, error) {
+	if err := s.mustWrite(); err != nil {
+		return RedactionRecord{}, err
+	}
 	if req.Reason == "" {
 		return RedactionRecord{}, ErrRedactionUnexplained
 	}

@@ -418,6 +418,31 @@ already removed from the records. Postings are now resolved against the records.
 distinguishes a genuinely torn read from the benign race above; conflating the
 two is what made its first version report 82 failures that were not bugs.
 
+### Across processes: one writer, many readers
+
+All of the above is about goroutines. Across processes, the disk backend takes an
+OS-level lock on the store directory — `flock` on Linux/macOS/BSD, `LockFileEx`
+on Windows, no external dependency either way. `Open` takes it exclusively;
+`OpenReadOnly` takes it shared, so any number of readers coexist. A conflicting
+open is **refused** with `disk.ErrStoreLocked` naming the holder's PID, rather
+than admitted into a race whose loser silently serves a graph that no longer
+exists on disk. Acquisition never blocks: whether to wait for a busy store is the
+caller's policy, not the engine's. A crashed process releases the lock — there is
+nothing stale to clean up.
+
+**A read-only store is a snapshot fixed at open.** The engine loads a store into
+memory once — delta and property index from a WAL replay, CSR from a single read
+— and never re-reads. That is also why a reader is refused alongside a writer
+instead of being admitted: it would serve a permanently stale view with nothing
+to signal it had gone stale, which is a worse failure than being told no. Reopen
+to advance. Nothing under the directory is modified by a read-only open, and
+every mutator returns `disk.ErrReadOnly`.
+
+The lock file also records whether the last writer closed cleanly, so a store
+recovered after a crash reports it — and audits it — without refusing to open.
+`graphene info`, `csr` and `wal` parse the files directly and still work against
+a store another process is writing, which is when you most want them.
+
 ### Keeping the index truthful
 
 The engine cannot re-derive property-index entries on its own: indexed values

@@ -138,6 +138,25 @@ type Store struct {
 	// compacted a moment earlier. Persisting it needs a CSR header field and is
 	// held for the v8 format change, like the commit sequence high-water mark.
 	lastCompact time.Time
+
+	// lock is the process-level lock on the store directory: exclusive for a
+	// writer, shared for a reader. Taken before any other file in the directory
+	// is touched and released after every one of them is closed. See lock.go for
+	// what it does and does not promise. Never nil after a successful Open, and
+	// its own methods are nil-safe regardless.
+	lock *storeLock
+
+	// readOnly refuses every mutation. Set once at Open and never changed, so no
+	// lock guards it — a store cannot become writable, and a caller racing a
+	// mutation against the Open that configured it has a worse problem than this
+	// field.
+	readOnly bool
+
+	// unclean records that the previous exclusive holder of this directory did
+	// not close cleanly. Informational: the store opens either way, because WAL
+	// replay is already crash-safe and refusing would turn every crash into a
+	// manual intervention. See RecoveredFromUncleanShutdown.
+	unclean bool
 }
 
 type deltaAdj struct {
@@ -353,6 +372,28 @@ type Options struct {
 	// Turn it on where opening is rare relative to querying, which is the
 	// ingest-once/query-many shape this engine is built for. See StrictOptions.
 	VerifyOnOpen bool
+
+	// ReadOnly opens the store for reading and takes a *shared* process lock, so
+	// it runs alongside other readers but never alongside a writer. Every
+	// mutating method returns ErrReadOnly, and nothing under dir is modified —
+	// not the WAL, not the ledgers. (The lock file itself is created if absent;
+	// a lock needs something to lock.)
+	//
+	// # The view is fixed at Open
+	//
+	// This is the part to understand before relying on it. Open materialises the
+	// whole store into memory once — the delta layer and property index from a
+	// WAL replay, the CSR from one os.ReadFile — and nothing re-reads afterwards.
+	// A read-only store therefore shows the graph as it stood when it opened, for
+	// as long as it lives. Reopen to advance.
+	//
+	// That is why a reader is refused alongside a writer rather than permitted:
+	// the alternative is a permanently stale view with nothing to indicate it is
+	// stale, which is worse than a clear refusal. See lock.go.
+	//
+	// Use it for the read-only work the CLI does — verify, custody, prove — and
+	// for any consumer querying a store another process might want to write.
+	ReadOnly bool
 }
 
 // recordAudit appends an entry when auditing is enabled, and does nothing
@@ -388,6 +429,9 @@ var ErrAuditKindReserved = errors.New("disk: that audit kind is the engine's to 
 // An audit log a caller can write arbitrary engine history into is not evidence
 // of what the engine did.
 func (s *Store) RecordAudit(kind AuditKind, actorID uint64, detail string) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	if kind < AuditCustom {
 		return fmt.Errorf("%w: %s (use AuditCustom or above)", ErrAuditKindReserved, kind)
 	}
@@ -469,8 +513,22 @@ func verifyImageOnOpen(csrPath string, opts Options) error {
 // Open opens (or creates) a disk-backed Store rooted at dir.
 // On first use dir will be created. On restart, the WAL is replayed into the
 // delta layer; the existing CSR (if any) is memory-mapped.
+// Open takes an exclusive process-level lock on dir and fails with
+// ErrStoreLocked if another process — or another Store in this one — already
+// holds it. Use OpenReadOnly for a store you only intend to query.
 func Open(dir string) (*Store, error) {
 	return OpenWithOptions(dir, Options{})
+}
+
+// OpenReadOnly opens dir for querying under a shared process lock, so any number
+// of readers coexist but none runs alongside a writer. Every mutating method
+// returns ErrReadOnly and nothing under dir is modified.
+//
+// The view is fixed at the moment of the call and never advances — see
+// Options.ReadOnly, which explains why, and lock.go for what the lock does and
+// does not promise.
+func OpenReadOnly(dir string) (*Store, error) {
+	return OpenWithOptions(dir, Options{ReadOnly: true})
 }
 
 // OpenWithOptions is Open with signing and verification configured.
@@ -481,18 +539,48 @@ func Open(dir string) (*Store, error) {
 // checked separately: the log is replayed on every open regardless, so checking
 // signatures there costs only the verification itself.
 func OpenWithOptions(dir string, opts Options) (*Store, error) {
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	// Creating the directory is a write, so a read-only open does not do it. A
+	// missing directory is then a real error rather than an empty store, which
+	// is the honest answer: there is nothing there to read.
+	if opts.ReadOnly {
+		if fi, err := os.Stat(dir); err != nil {
+			return nil, fmt.Errorf("disk.Open: read-only open of %s: %w", dir, err)
+		} else if !fi.IsDir() {
+			return nil, fmt.Errorf("disk.Open: read-only open of %s: not a directory", dir)
+		}
+	} else if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("disk.Open: mkdir %s: %w", dir, err)
 	}
 
-	wal, err := OpenWAL(filepath.Join(dir, walFileName))
+	// The process lock comes before every other file in the directory. Opening
+	// the WAL first would append a container header to a log another process is
+	// mid-write on, which is the corruption this exists to prevent.
+	mode := LockExclusive
+	if opts.ReadOnly {
+		mode = LockShared
+	}
+	lock, prevOwner, err := acquireStoreLock(dir, mode)
 	if err != nil {
+		return nil, fmt.Errorf("disk.Open: %w", err)
+	}
+
+	wal, err := openWALFor(filepath.Join(dir, walFileName), opts.ReadOnly)
+	if err != nil {
+		lock.release()
 		return nil, err
 	}
 
 	s := &Store{
-		dir:              dir,
-		wal:              wal,
+		dir:      dir,
+		wal:      wal,
+		lock:     lock,
+		readOnly: opts.ReadOnly,
+		// Only a writer inherits the previous holder's state. A read-only store
+		// never claims the directory and never overwrites the marker, so the
+		// crashed writer's evidence is still there for the next *writer* to find
+		// — and a reader reporting a recovery it did not perform would be a claim
+		// about a directory it does not own.
+		unclean:          !opts.ReadOnly && prevOwner.Present && !prevOwner.Clean,
 		deltaNodes:       make(map[store.NodeID]*store.Node),
 		deltaEdges:       make(map[store.EdgeID]*store.Edge),
 		deltaAdj:         make(map[store.NodeID]*deltaAdj),
@@ -510,34 +598,62 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		redaction:        opts.RedactionPolicy,
 	}
 
-	if opts.Audit {
+	// The three ledgers all open their files for append, so a read-only store
+	// opens none of them and leaves the fields nil.
+	//
+	// Nothing is lost by that. Every read path here is directory-based —
+	// ReadAuditLog, ReadRedactions, ReadGrants all take dir and parse the file
+	// themselves — and every write path already refuses on a nil ledger, which is
+	// how "the option is off" has always been expressed. Read-only is a third way
+	// to reach the same nil, and the existing checks cover it unchanged.
+	if opts.Audit && !opts.ReadOnly {
 		al, aerr := OpenAuditLog(dir)
 		if aerr != nil {
 			wal.Close()
+			lock.release()
 			return nil, fmt.Errorf("disk.Open: %w", aerr)
 		}
 		s.audit = al
 	}
 
-	if opts.Redaction {
+	if opts.Redaction && !opts.ReadOnly {
 		rl, rerr := OpenRedactionLedger(dir)
 		if rerr != nil {
 			wal.Close()
 			s.audit.Close()
+			lock.release()
 			return nil, fmt.Errorf("disk.Open: %w", rerr)
 		}
 		s.redactions = rl
 	}
 
-	if opts.Roles {
+	if opts.Roles && !opts.ReadOnly {
 		gl, gerr := OpenGrantLedger(dir)
 		if gerr != nil {
 			wal.Close()
 			s.audit.Close()
 			s.redactions.Close()
+			lock.release()
 			return nil, fmt.Errorf("disk.Open: %w", gerr)
 		}
 		s.grants = gl
+	}
+
+	// A store that came up after an unclean shutdown says so in the log, once,
+	// while it still knows. The store opens either way: WAL replay is crash-safe
+	// by construction, and refusing would turn every killed process into a manual
+	// intervention. What the record buys is that the *next* reader of the audit
+	// log can tell an orderly history from one with a gap in it.
+	if s.unclean && s.audit != nil {
+		if aerr := s.recordAudit(AuditUncleanRestart, opts.AttestActorID,
+			fmt.Sprintf("previous holder pid %d did not close the store", prevOwner.PID)); aerr != nil {
+			wal.Close()
+			s.audit.Close()
+			s.redactions.Close()
+			s.grants.Close()
+			lock.release()
+			return nil, fmt.Errorf("disk.Open: %w", aerr)
+		}
 	}
 
 	// Resume numbering past whatever segments already exist, so a reopened store
@@ -562,6 +678,10 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		s.audit.Close()
 		s.redactions.Close()
 		s.grants.Close()
+		// And the process lock, last, so a rejected store does not hold the
+		// directory against the next opener — which on a VerifyOnOpen failure is
+		// very likely to be an operator trying to work out what is wrong with it.
+		s.lock.release()
 		return nil, fmt.Errorf(format, args...)
 	}
 
@@ -606,6 +726,9 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 // --- GraphStore implementation ---
 
 func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
+	if err := s.mustWrite(); err != nil {
+		return store.InvalidNodeID, err
+	}
 	stored := &store.Node{}
 	if len(n.Labels) > 0 {
 		stored.Labels = make([]store.NodeType, len(n.Labels))
@@ -639,6 +762,9 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 // AddNodesBatch adds nodes in order and returns assigned IDs.
 // On error, successfully written prefixes are committed and returned.
 func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
+	if err := s.mustWrite(); err != nil {
+		return nil, err
+	}
 	ids := make([]store.NodeID, len(nodes))
 	stored := make([]*store.Node, len(nodes))
 
@@ -689,6 +815,9 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 }
 
 func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
+	if err := s.mustWrite(); err != nil {
+		return store.InvalidEdgeID, err
+	}
 	stored := &store.Edge{
 		Src:    e.Src,
 		Dst:    e.Dst,
@@ -734,6 +863,9 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 // AddEdgesBatch adds edges in order and returns assigned IDs.
 // On error, successfully written prefixes are committed and returned.
 func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
+	if err := s.mustWrite(); err != nil {
+		return nil, err
+	}
 	ids := make([]store.EdgeID, len(edges))
 	stored := make([]*store.Edge, len(edges))
 
@@ -816,12 +948,18 @@ func (s *Store) ReindexPolicy() store.ReindexPolicy {
 
 // DeclareOrderedNodeProperty implements store.OrderedIndexDeclarer.
 func (s *Store) DeclareOrderedNodeProperty(key string) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.propIdx.DeclareOrderedNodeKey(key)
 	return nil
 }
 
 // DeclareOrderedEdgeProperty implements store.OrderedIndexDeclarer.
 func (s *Store) DeclareOrderedEdgeProperty(key string) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.propIdx.DeclareOrderedEdgeKey(key)
 	return nil
 }
@@ -835,6 +973,9 @@ func (s *Store) OrderedEdgeProperties() []string { return s.propIdx.OrderedEdgeK
 // PurgeNodeIndex implements store.Reindexer. The purge is journalled so replay
 // does not resurrect the superseded entries.
 func (s *Store) PurgeNodeIndex(id store.NodeID) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.purgeNodeIndexLocked(id)
@@ -842,6 +983,9 @@ func (s *Store) PurgeNodeIndex(id store.NodeID) error {
 
 // PurgeEdgeIndex implements store.Reindexer.
 func (s *Store) PurgeEdgeIndex(id store.EdgeID) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.purgeEdgeIndexLocked(id)
@@ -868,6 +1012,9 @@ func (s *Store) purgeEdgeIndexLocked(id store.EdgeID) error {
 }
 
 func (s *Store) UpdateNode(n *store.Node) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	if len(n.Labels) == 0 {
 		return fmt.Errorf("UpdateNode: node %d must carry at least one label", n.ID)
 	}
@@ -900,6 +1047,9 @@ func (s *Store) UpdateNode(n *store.Node) error {
 }
 
 func (s *Store) UpdateEdge(e *store.Edge) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	if len(e.Labels) == 0 {
 		return fmt.Errorf("UpdateEdge: edge %d must carry at least one label", e.ID)
 	}
@@ -939,6 +1089,9 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 }
 
 func (s *Store) DeleteEdge(id store.EdgeID) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.edgeExistsLocked(id) {
@@ -952,6 +1105,9 @@ func (s *Store) DeleteEdge(id store.EdgeID) error {
 }
 
 func (s *Store) DeleteNode(id store.NodeID) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.nodeExistsLocked(id) {
@@ -1632,7 +1788,73 @@ func (s *Store) Close() error {
 	if err := s.grants.Close(); err != nil && walErr == nil {
 		walErr = err
 	}
+
+	// The clean marker goes down after every store file is closed and before the
+	// lock is released, which is the only window where "this process is done with
+	// the directory" is true and still recordable. Marking earlier would call a
+	// shutdown clean while the WAL was still open; marking later is impossible,
+	// because releasing the lock closes the file the marker lives in.
+	if err := s.lock.markClean(); err != nil && walErr == nil {
+		walErr = err
+	}
+	// Released last, so no other process can take the directory while this one
+	// still holds a handle on anything in it. Idempotent, so the double Close
+	// that a defer plus an explicit call produces is still harmless.
+	if err := s.lock.release(); err != nil && walErr == nil {
+		walErr = err
+	}
 	return walErr
+}
+
+// LockMode reports which process-level lock this store holds: LockExclusive for
+// a writable store, LockShared for one opened with Options.ReadOnly.
+func (s *Store) LockMode() LockMode {
+	if s.readOnly {
+		return LockShared
+	}
+	return LockExclusive
+}
+
+// LockEnforced reports whether the process-level lock is real on this platform.
+//
+// It is true on Windows, Linux, macOS and the BSDs. It is false on platforms
+// whose standard library offers no file-locking primitive — solaris, aix, plan9,
+// js/wasm — where the store still opens but nothing excludes a second process.
+// See lock_unsupported.go for why that is an honest false rather than a refusal
+// to open.
+func (s *Store) LockEnforced() bool { return lockingEnforced }
+
+// ReadOnly reports whether this store refuses mutations.
+func (s *Store) ReadOnly() bool { return s.readOnly }
+
+// RecoveredFromUncleanShutdown reports that the process which last held this
+// store exclusively did not close it — it crashed, was killed, or exited without
+// calling Close.
+//
+// The store opened anyway, and that is not a compromise: WAL replay is crash-safe
+// by construction, and refusing would make every killed process an incident
+// requiring manual intervention. What this exposes is the choice the engine
+// cannot make for the caller — whether *this* store, holding *this* evidence, is
+// one where an unclean restart warrants running VerifyIndexes, reopening under
+// Options.VerifyOnOpen, or escalating to a human.
+//
+// When Options.Audit is on, the same fact is recorded durably as
+// AuditUncleanRestart. This accessor is the in-process view of it, and is false
+// on a read-only store, which never claims the directory and so cannot have been
+// the holder that left it dirty.
+func (s *Store) RecoveredFromUncleanShutdown() bool { return s.unclean }
+
+// mustWrite refuses a mutation on a read-only store.
+//
+// Every exported mutator calls it first. The WAL and the ledgers refuse writes
+// on their own too, but those refusals arrive late and describe the wrong thing
+// — a caller who gets "wal: file is read-only" from AddNode has to work out that
+// the store, not the log, is what they misconfigured.
+func (s *Store) mustWrite() error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
+	return nil
 }
 
 // SetSyncOnCommit controls whether a batch write is flushed to the platter
@@ -1652,6 +1874,9 @@ func (s *Store) SetSyncOnCommit(v bool) {
 }
 
 func (s *Store) IndexNodeProperty(id store.NodeID, key string, value []byte) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.propIdx.IndexNode(id, key, value)
 	payload := marshalNodeProp(id, key, value)
 	if err := s.wal.AppendNodeProp(payload); err != nil {
@@ -1661,6 +1886,9 @@ func (s *Store) IndexNodeProperty(id store.NodeID, key string, value []byte) err
 }
 
 func (s *Store) IndexEdgeProperty(id store.EdgeID, key string, value []byte) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.propIdx.IndexEdge(id, key, value)
 	payload := marshalEdgeProp(id, key, value)
 	if err := s.wal.AppendEdgeProp(payload); err != nil {
@@ -2329,5 +2557,8 @@ func compactEdges(slots []*store.Edge, ids []store.EdgeID) ([]*store.Edge, []sto
 //
 // After it returns, everything written before the call survives power loss.
 func (s *Store) Sync() error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	return s.wal.Sync()
 }

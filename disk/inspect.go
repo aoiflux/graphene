@@ -3,10 +3,16 @@ package disk
 // Read-only inspection of a store's files.
 //
 // Everything here parses graphene.csr and graphene.wal directly and never calls
-// Open. That is the point: Open replays the log, rebuilds indexes, and takes a
-// handle on the WAL, so inspecting a store through it means contending with
-// whatever process owns it — and the moment you most want to look at a store is
-// the moment something is wrong with it and a live process is still attached.
+// Open. That is the point: Open replays the log, rebuilds indexes, and takes an
+// exclusive lock on the directory, so inspecting a store through it means being
+// refused by whatever process owns it — and the moment you most want to look at
+// a store is the moment something is wrong with it and a live process is still
+// attached.
+//
+// The refusal is now enforced rather than advised (see lock.go), which makes
+// this file more useful, not less: OpenReadOnly gets you a queryable store
+// beside other readers, but nothing at all beside a writer. These functions work
+// regardless, because they take no lock and hold no handle open.
 //
 // These functions read. They do not repair, truncate, or write, and nothing here
 // should ever learn how.

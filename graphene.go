@@ -65,8 +65,38 @@ func NewInMemory() *Graph {
 // dir is created if it does not exist. On restart, the WAL is replayed
 // automatically. Call Graph.Compact() after bulk ingest to rebuild the CSR
 // and free WAL space.
+//
+// Open takes an exclusive lock on dir for the lifetime of the Graph, so no other
+// process — and no other Graph in this one — can open it until Close. A store
+// already held returns disk.ErrStoreLocked naming the holder. Use OpenReadOnly
+// for a graph you only intend to query.
 func Open(dir string) (*Graph, error) {
 	s, err := disk.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	return &Graph{GraphStore: s}, nil
+}
+
+// OpenReadOnly returns a Graph that can query dir but never write to it, holding
+// a shared lock so any number of readers coexist.
+//
+// No reader runs alongside a writer, and that is deliberate rather than a
+// limitation of the lock. The engine loads a store into memory once at open and
+// never re-reads it, so a reader admitted alongside a writer would serve a graph
+// frozen at its own open, indefinitely, with nothing to signal that it had gone
+// stale. Being refused is the better answer, and reopening is how a reader
+// advances.
+//
+// Every mutating call returns disk.ErrReadOnly, including Compact. Nothing under
+// dir is modified.
+//
+//	g, err := graphene.OpenReadOnly(dir)
+//	if errors.Is(err, disk.ErrStoreLocked) {
+//	    // a writer has it; retry, wait, or report — the engine does not choose
+//	}
+func OpenReadOnly(dir string) (*Graph, error) {
+	s, err := disk.OpenReadOnly(dir)
 	if err != nil {
 		return nil, err
 	}

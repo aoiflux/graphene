@@ -110,6 +110,45 @@ if err != nil {
 defer g.Close()
 ```
 
+`Open` takes an **exclusive lock** on the directory until `Close`. No other
+process can open that store while you hold it, and trying returns
+`disk.ErrStoreLocked` naming the holder's PID. That is deliberate: two processes
+writing one store directory corrupts it, and previously nothing stopped them.
+
+### Read-only store
+
+Use when you only need to query — a report, a proof export, a dashboard reading
+a case another tool owns.
+
+```go
+g, err := graphene.OpenReadOnly("./case-data")
+if errors.Is(err, disk.ErrStoreLocked) {
+    // a writer has it — retry, wait, or report; the engine will not wait for you
+}
+defer g.Close()
+```
+
+This takes a **shared lock**, so any number of read-only opens coexist. Every
+mutating call returns `disk.ErrReadOnly`, including `Compact`, and nothing under
+the directory is modified.
+
+Two things to know before you rely on it:
+
+- **A reader is refused while a writer holds the store**, not queued behind it.
+- **The view is fixed at open and never advances.** The engine loads the store
+  into memory once and does not re-read, so later writes by anyone are invisible
+  to this handle for its whole life. Reopen to advance.
+
+Those two are the same fact. If a reader were admitted alongside a writer it
+would serve a snapshot that silently aged, which is a worse answer than being
+told the store is busy.
+
+If a store's previous holder crashed, the next writer's
+`(*disk.Store).RecoveredFromUncleanShutdown()` reports it — and an
+`AuditUncleanRestart` entry records it when `Options.Audit` is on. The store
+still opens; WAL replay handles the crash. Use the flag to decide whether *this*
+store warrants running `VerifyIndexes` before you trust it.
+
 ## 4. Data Modeling and Ingest
 
 ### Create nodes

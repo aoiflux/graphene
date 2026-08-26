@@ -109,6 +109,8 @@ that backend's data layout.
 | Crash recovery             | WAL replay into delta layer on Open()                    | Backend-managed                                        | WAL replay + checkpoint              |
 | Compaction / checkpointing | Manual `Compact()` — crash-safe via atomic rename        | Backend-managed                                        | Automatic                            |
 | Concurrent write safety    | Mutex-protected delta writes                             | Backend-dependent                                      | Full concurrent transactional writes |
+| Multi-process access       | One writer, many readers — enforced by an OS lock on the store directory (flock / LockFileEx) | Backend-dependent; most embedded KV stores are single-process | Client/server: any number of processes |
+| Reader freshness           | A read-only store is a snapshot fixed at open; reopen to advance | Backend-dependent | Live |
 | Optimistic locking         | No                                                       | No                                                     | Yes                                  |
 
 **On "ACID" for Graphene.** `Begin()` buffers creates, updates and deletes and
@@ -174,6 +176,11 @@ So: A and D yes, C structurally, I no.
   for a multi-record write, but no isolation or snapshot reads — concurrent
   readers observe a committed transaction as it lands, and a transaction does not
   see a stable view of the graph while it is open.
+- **Live multi-process access.** Graphene enforces one writer and many readers
+  across processes, but a reader's view is fixed at open: it loads the store into
+  memory once and never re-reads, so a reader is refused while a writer holds the
+  store rather than being served a view that would silently go stale. A
+  client/server database has no such constraint.
 - Full-text and vector similarity search over properties.
 
 **Cayley is not recommended** for Indicer given its unmaintained state, the RDF

@@ -21,6 +21,9 @@ import (
 // This should be called after a bulk ingest is complete.
 // Compact is crash-safe: it writes a temp CSR file then atomically renames it.
 func (s *Store) Compact() error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

@@ -804,8 +804,12 @@ _ = viz.ExportInteractiveHTMLWithOptions(nodes, edges, "graph.html", viz.ExportO
 
 ## 16. Concurrency & guarantees
 
-Both backends are safe for concurrent use; every method takes the locks it needs
-internally. What follows is what that safety does and does not buy you.
+Both backends are safe for concurrent use **by goroutines within one process**;
+every method takes the locks it needs internally. Across processes, the disk
+backend enforces one writer and many readers — see [Across
+processes](#across-processes) below, which is a different set of rules and worth
+reading before you run two programs against one directory. What follows first is
+what in-process safety does and does not buy you.
 
 ### Writes
 
@@ -870,6 +874,79 @@ already *completed* is a torn read and fails the suite, while a lookup returning
 an entity deleted after the lookup began is the benign race above and is counted
 and logged, never failed. The deleter publishes progress through an atomic that
 readers sample before each lookup, which is what makes the two distinguishable.
+
+### Across processes
+
+Everything above is about goroutines. Across processes the disk backend enforces
+**one writer, many readers**, with an OS-level lock on the store directory
+(`flock` on Linux/macOS/BSD, `LockFileEx` on Windows). This is not advice you
+have to follow — a conflicting open is refused.
+
+| Call | Lock | Coexists with |
+|---|---|---|
+| `graphene.Open` / `disk.Open` | exclusive | nothing |
+| `graphene.OpenReadOnly` / `disk.OpenReadOnly` | shared | other readers only |
+
+```go
+g, err := graphene.OpenReadOnly(dir)
+if errors.Is(err, disk.ErrStoreLocked) {
+    // a writer has it. The error names the holder's PID.
+}
+```
+
+Acquisition **never blocks and never retries**. Whether to wait for a busy store
+depends on what you are — a CLI that should print and exit, an ingest worker that
+should back off, a service that should fail its health check — so the engine
+refuses immediately and leaves the policy to you.
+
+The lock is held by the OS, so a process that crashes releases it. There is no
+stale lock to clear and no recovery step.
+
+#### A read-only store is a snapshot, and this is the part to understand
+
+**A reader's view is fixed at `Open` and never advances.** The engine
+materialises a store into memory once — the delta layer and property index from
+a WAL replay, the CSR from a single read — and nothing re-reads afterwards.
+Reopen to see later writes.
+
+That is also why a reader is *refused* alongside a writer rather than admitted.
+Admitting it would produce a permanently stale view with nothing to signal it had
+gone stale, which is a worse failure than being told no. Making readers live is a
+reader-refresh protocol, not a locking change, and it is not built.
+
+What `ReadOnly` additionally guarantees is that nothing under `dir` is modified.
+That took work: `OpenWAL` creates the log if it is missing and writes a container
+header into an empty one, and the audit, redaction and grant ledgers all open for
+append. A read-only store opens none of them, and every mutating method returns
+`disk.ErrReadOnly` — including `Compact`.
+
+#### Unclean shutdown
+
+The lock file records the last exclusive holder's PID and whether it closed
+cleanly. A store whose previous holder died reports
+`(*disk.Store).RecoveredFromUncleanShutdown()`, and records an
+`AuditUncleanRestart` entry when `Options.Audit` is on.
+
+**It still opens.** WAL replay is crash-safe by construction, and refusing would
+turn every killed process into a manual intervention. What the engine cannot
+decide for you is whether *this* store, holding *this* evidence, is one where an
+unclean restart warrants running `VerifyIndexes`, reopening under
+`Options.VerifyOnOpen`, or escalating — so it reports the fact and leaves the
+judgement where it belongs.
+
+#### Platforms
+
+Enforced on Windows, Linux, macOS and the BSDs. On platforms whose standard
+library has no locking primitive — solaris, aix, plan9, js/wasm — the store still
+opens and `(*disk.Store).LockEnforced()` returns `false`. Check it if you deploy
+there; nothing excludes a second process.
+
+#### Inspecting a busy store
+
+`graphene info`, `csr`, `wal`, `redactions` and `grants` parse the files directly
+and never open the store, so they work against a directory another process is
+writing. That is what they are for: the moment you most want to look at a store
+is the moment something is wrong with it and a live process is still attached.
 
 ### Other properties
 

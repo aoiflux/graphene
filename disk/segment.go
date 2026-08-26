@@ -197,6 +197,9 @@ func VerifySegmentChain(segments []SegmentInfo) error {
 // before the new one is created, so a crash leaves either a complete retired
 // segment or an active log that still holds everything.
 func (w *WAL) Rotate(dir string, seq uint64) (SegmentInfo, error) {
+	if w.readOnly {
+		return SegmentInfo{}, errWALReadOnly
+	}
 	if err := w.beginMaintenance(); err != nil {
 		return SegmentInfo{}, err
 	}

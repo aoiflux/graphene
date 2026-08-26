@@ -65,6 +65,16 @@ const (
 	AuditRedaction
 	AuditRoleGrant
 
+	// AuditUncleanRestart records that the process which last held this store
+	// exclusively did not close it. Written at Open, by the process that found
+	// the evidence, because it is the only one that ever will — the marker is
+	// overwritten the moment it is read.
+	//
+	// Appended at the end of the block deliberately: inserting it anywhere else
+	// would renumber the kinds after it, and a kind's number is hashed into every
+	// audit entry that carries it. Every existing chain would stop verifying.
+	AuditUncleanRestart
+
 	// AuditCustom is the caller's, whose meaning the engine does not interpret.
 	AuditCustom AuditKind = 1000
 )
@@ -89,6 +99,8 @@ func (k AuditKind) String() string {
 		return "redaction"
 	case AuditRoleGrant:
 		return "role-grant"
+	case AuditUncleanRestart:
+		return "unclean-restart"
 	case AuditCustom:
 		return "custom"
 	default:

@@ -7,9 +7,15 @@
 // is probably still attached. An inspector that cannot be used then is not much
 // of an inspector.
 //
-// `verify`, `custody` and `anchor` do open the store, because what they check
-// includes state that only exists once the log has been replayed. Each says so
-// on stderr before it does.
+// `verify`, `custody`, `prove` and `anchor` do open the store, because what they
+// check includes state that only exists once the log has been replayed. Each
+// says so on stderr before it does.
+//
+// The first three open read-only, which takes a *shared* lock: they run happily
+// alongside each other and alongside any other reader, and are refused — with
+// the holder's PID — while a writer has the store. That refusal used to be a
+// line of advice on stderr saying not to do it. `anchor` takes the exclusive
+// lock, because -publish writes.
 //
 // There is no repair, no truncate, no compact. A tool that is safe to point at
 // production is worth more than one that can also fix things, and adding a
@@ -92,6 +98,16 @@ func main() {
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "graphene %s: %v\n", cmd, err)
+		// Contention is the one failure here that is not a defect in the store,
+		// and an operator who reads "store is held by another process" as
+		// corruption will start reaching for repairs the tool deliberately does
+		// not offer. Say what it actually is, and point at the subcommands that
+		// work regardless.
+		if errors.Is(err, disk.ErrStoreLocked) {
+			fmt.Fprintln(os.Stderr,
+				"  the store is intact — another process simply has it open. "+
+					"info, csr and wal read the files directly and work anyway.")
+		}
 		os.Exit(1)
 	}
 }
@@ -103,17 +119,22 @@ Usage:
   graphene info    <dir>        summary of the image and the log
   graphene csr     <dir|file>   CSR header detail
   graphene wal     <dir|file>   record-by-record log dump
-  graphene verify  <dir>        structural index check (opens the store)
-  graphene custody <dir>        account for one entity across every history (opens the store)
-  graphene anchor  <dir>        publish or check a checkpoint (opens the store)
+  graphene verify  <dir>        structural index check (opens read-only)
+  graphene custody <dir>        account for one entity across every history (opens read-only)
+  graphene anchor  <dir>        publish or check a checkpoint (opens exclusively)
   graphene redactions <dir>     ledger of attributed removals: who, when, why
   graphene grants  <dir>        role grants, and the capabilities they imply
-  graphene prove   <dir>        export a proof to hand to someone else (opens the store)
+  graphene prove   <dir>        export a proof to hand to someone else (opens read-only)
   graphene verify-proof <file>  check a proof against a root you retained (no store needed)
 
 info, csr, wal, redactions and grants read the files directly and are safe to run
-against a store another process is using. verify, custody, anchor and prove open
-the store, which replays the log and takes a handle on the WAL.
+against a store another process is using — including one being written to.
+
+verify, custody and prove open the store, which replays the log. They take a
+shared lock: any number of them run at once, and all are refused while a writer
+holds the store. anchor takes the exclusive lock and is refused if anything else
+has it. A refusal names the holder's process ID and means the store is busy, not
+broken.
 
 verify-proof touches nothing but the file you give it. That is the point: a
 proof checked against the root inside it proves nothing, because whoever wrote
@@ -425,13 +446,14 @@ func cmdVerify(args []string) error {
 		return fmt.Errorf("need a store directory")
 	}
 
-	// The one subcommand that opens the store, because the check it runs is over
-	// reconstructed in-memory indexes rather than over the files. That means it
-	// replays the log and contends for the WAL handle — do not point it at a
-	// store another process is writing.
-	fmt.Fprintln(os.Stderr, "verify opens the store; do not run it against one another process is writing")
+	// Opens the store, because the check runs over reconstructed in-memory
+	// indexes rather than over the files — it has to replay the log to have
+	// anything to check. Read-only: VerifyIndexes only reads, and a shared lock
+	// lets this run beside other readers while a writer is refused outright
+	// rather than warned about.
+	fmt.Fprintln(os.Stderr, "verify opens the store read-only; a writer must not hold it")
 
-	g, err := graphene.Open(dir)
+	g, err := graphene.OpenReadOnly(dir)
 	if err != nil {
 		return err
 	}
@@ -477,9 +499,9 @@ func cmdCustody(args []string) error {
 	}
 
 	// Opens the store: the report walks in-memory state as well as the files.
-	fmt.Fprintln(os.Stderr, "custody opens the store; do not run it against one another process is writing")
+	fmt.Fprintln(os.Stderr, "custody opens the store read-only; a writer must not hold it")
 
-	s, err := disk.Open(dir)
+	s, err := disk.OpenReadOnly(dir)
 	if err != nil {
 		return err
 	}
@@ -566,7 +588,9 @@ func cmdAnchor(args []string) error {
 		return err
 	}
 
-	fmt.Fprintln(os.Stderr, "anchor opens the store; do not run it against one another process is writing")
+	// Exclusive, unlike the other three: -publish appends a checkpoint and an
+	// audit entry, so this is a writer and has to be the only one.
+	fmt.Fprintln(os.Stderr, "anchor opens the store exclusively; no other process may hold it")
 	fmt.Fprintln(os.Stderr, "warning: a local file is not an external witness; this proves nothing against "+
 		"an adversary who can write to this machine")
 
@@ -875,9 +899,9 @@ func cmdProve(args []string) error {
 		return fmt.Errorf("need exactly one of -node or -edge")
 	}
 
-	fmt.Fprintln(os.Stderr, "prove opens the store; do not run it against one another process is writing")
+	fmt.Fprintln(os.Stderr, "prove opens the store read-only; a writer must not hold it")
 
-	s, err := disk.Open(dir)
+	s, err := disk.OpenReadOnly(dir)
 	if err != nil {
 		return err
 	}

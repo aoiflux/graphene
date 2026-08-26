@@ -150,6 +150,9 @@ func (s *Store) VerifyIndexes() error {
 // disk and needs no WAL records. Use it after recovering a store whose indexes
 // may not match its records; a following Compact persists the repaired state.
 func (s *Store) RebuildIndexes() error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 
 	if s.csr != nil {
