@@ -1130,6 +1130,28 @@ func (s *Store) OrderedNodeProperties() []string { return s.propIdx.OrderedNodeK
 // OrderedEdgeProperties implements store.OrderedIndexDeclarer.
 func (s *Store) OrderedEdgeProperties() []string { return s.propIdx.OrderedEdgeKeys() }
 
+// DeclareCompositeNodeProperties implements store.CompositeIndexDeclarer.
+func (s *Store) DeclareCompositeNodeProperties(keys []string) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
+	return s.propIdx.DeclareCompositeNodeKeys(keys)
+}
+
+// DeclareCompositeEdgeProperties implements store.CompositeIndexDeclarer.
+func (s *Store) DeclareCompositeEdgeProperties(keys []string) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
+	return s.propIdx.DeclareCompositeEdgeKeys(keys)
+}
+
+// CompositeNodeProperties implements store.CompositeIndexDeclarer.
+func (s *Store) CompositeNodeProperties() [][]string { return s.propIdx.CompositeNodeKeys() }
+
+// CompositeEdgeProperties implements store.CompositeIndexDeclarer.
+func (s *Store) CompositeEdgeProperties() [][]string { return s.propIdx.CompositeEdgeKeys() }
+
 // PurgeNodeIndex implements store.Reindexer. The purge is journalled so replay
 // does not resurrect the superseded entries.
 func (s *Store) PurgeNodeIndex(id store.NodeID) error {

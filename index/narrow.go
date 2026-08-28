@@ -32,16 +32,17 @@ import (
 // afterwards — the same contract store.IntersectSortedIDs carries, for the same
 // reason.
 //
-// skip names a filter already applied to produce candidates, by index into
-// filters, or -1. It is not re-evaluated.
+// skip marks the filters already applied to produce the candidates. They are not
+// re-evaluated. It is a set rather than one index because a composite driver
+// consumes its whole key tuple.
 //
 // This implements MatchAll only. Under MatchAny a candidate set driven by one
 // filter is not a superset of the answer, so there is nothing to narrow.
-func (p *PropertyIndex) NarrowNodesByFilters(candidates []store.NodeID, filters []store.PropertyFilter, skip int) []store.NodeID {
+func (p *PropertyIndex) NarrowNodesByFilters(candidates []store.NodeID, filters []store.PropertyFilter, skip store.FilterMask) []store.NodeID {
 	if noResiduals(filters, skip) {
 		return candidates
 	}
-	plan := p.planResiduals(filters, skip, p.nodeKeyEntryCount, p.nodeCardinality)
+	plan := p.planResiduals(filters, skip, p.nodeCosts())
 	for _, step := range plan {
 		if len(candidates) == 0 {
 			return candidates
@@ -60,11 +61,11 @@ func (p *PropertyIndex) NarrowNodesByFilters(candidates []store.NodeID, filters 
 
 // NarrowEdgesByFilters is NarrowNodesByFilters for edge properties, and consumes
 // its candidates slice in the same way.
-func (p *PropertyIndex) NarrowEdgesByFilters(candidates []store.EdgeID, filters []store.PropertyFilter, skip int) []store.EdgeID {
+func (p *PropertyIndex) NarrowEdgesByFilters(candidates []store.EdgeID, filters []store.PropertyFilter, skip store.FilterMask) []store.EdgeID {
 	if noResiduals(filters, skip) {
 		return candidates
 	}
-	plan := p.planResiduals(filters, skip, p.edgeKeyEntryCount, p.edgeCardinality)
+	plan := p.planResiduals(filters, skip, p.edgeCosts())
 	for _, step := range plan {
 		if len(candidates) == 0 {
 			return candidates
@@ -92,13 +93,13 @@ type residualStep struct {
 // because each step shrinks the candidate set — so a filter reported here as
 // building its own set may end up probed once an earlier filter has thinned the
 // candidates. The order and the costs are exact; that one flag is a forecast.
-func (p *PropertyIndex) PlanNodeResiduals(filters []store.PropertyFilter, skip, candidateCount int) []store.ResidualStep {
-	return exportSteps(p.planResiduals(filters, skip, p.nodeKeyEntryCount, p.nodeCardinality), candidateCount)
+func (p *PropertyIndex) PlanNodeResiduals(filters []store.PropertyFilter, skip store.FilterMask, candidateCount int) []store.ResidualStep {
+	return exportSteps(p.planResiduals(filters, skip, p.nodeCosts()), candidateCount)
 }
 
 // PlanEdgeResiduals is PlanNodeResiduals for edge properties.
-func (p *PropertyIndex) PlanEdgeResiduals(filters []store.PropertyFilter, skip, candidateCount int) []store.ResidualStep {
-	return exportSteps(p.planResiduals(filters, skip, p.edgeKeyEntryCount, p.edgeCardinality), candidateCount)
+func (p *PropertyIndex) PlanEdgeResiduals(filters []store.PropertyFilter, skip store.FilterMask, candidateCount int) []store.ResidualStep {
+	return exportSteps(p.planResiduals(filters, skip, p.edgeCosts()), candidateCount)
 }
 
 func exportSteps(plan []residualStep, candidateCount int) []store.ResidualStep {
@@ -113,32 +114,63 @@ func exportSteps(plan []residualStep, candidateCount int) []store.ResidualStep {
 	return out
 }
 
+// filterCosts is the three ways a filter's set size can be sized, bundled so
+// that adding one does not touch four call sites.
+type filterCosts struct {
+	// keyCount is the number of entries registered under a key: what a scan of
+	// that key would touch, and an upper bound on any predicate over it.
+	keyCount func(string) int
+	// cardinality is an equality filter's exact postings length.
+	cardinality func(string, []byte) int
+	// rangeCardinality sizes a range or prefix from the ordered index, and
+	// reports false for a key that has none — in which case keyCount is all
+	// there is.
+	rangeCardinality func(store.PropertyFilter) (int, bool)
+}
+
+func (p *PropertyIndex) nodeCosts() filterCosts {
+	return filterCosts{p.nodeKeyEntryCount, p.nodeCardinality, p.NodeRangeCardinality}
+}
+
+func (p *PropertyIndex) edgeCosts() filterCosts {
+	return filterCosts{p.edgeKeyEntryCount, p.edgeCardinality, p.EdgeRangeCardinality}
+}
+
 // planResiduals costs every filter both ways and orders them most-selective-first.
 //
-// The estimate for an equality filter is its exact postings cardinality. For
-// anything else it is the number of entries under the key, which is what a scan
-// of that key would touch and therefore an upper bound on the matches. Both are
-// map lookups, not scans, so planning is cheap relative to any decision it makes.
+// The estimate for an equality filter is its exact postings cardinality. A range
+// or prefix on a key declared ordered is sized from that index — see stats.go,
+// which is what makes a selective range sort ahead of a weak equality filter
+// instead of behind every one of them.
+//
+// Anything else falls back to the number of entries under the key, which is what
+// a scan of that key would touch and therefore an upper bound on the matches.
+// It is a loose bound, and deliberately still a bound: without an ordering there
+// is nothing cheaper than a scan that could tighten it, and guessing a
+// selectivity would order the steps on a number with no evidence behind it.
+//
+// All of these are map lookups and binary searches, not scans, so planning stays
+// cheap relative to any decision it makes.
 func (p *PropertyIndex) planResiduals(
 	filters []store.PropertyFilter,
-	skip int,
-	keyCount func(string) int,
-	cardinality func(string, []byte) int,
+	skip store.FilterMask,
+	costs filterCosts,
 ) []residualStep {
-	n := len(filters)
-	if skip >= 0 {
-		n--
-	}
-	steps := make([]residualStep, 0, n)
+	steps := make([]residualStep, 0, len(filters)-skip.Count())
 	for i, f := range filters {
-		if i == skip {
+		if skip.Has(i) {
 			continue
 		}
 		cost := 0
-		if f.Op == store.PropertyOpEqual {
-			cost = cardinality(f.Key, f.Value)
-		} else {
-			cost = keyCount(f.Key)
+		switch {
+		case f.Op == store.PropertyOpEqual:
+			cost = costs.cardinality(f.Key, f.Value)
+		default:
+			if est, served := costs.rangeCardinality(f); served {
+				cost = est
+			} else {
+				cost = costs.keyCount(f.Key)
+			}
 		}
 		steps = append(steps, residualStep{
 			filter: f,
@@ -199,7 +231,11 @@ func postingsMatch[T entityID](p *postings[T], id T, f store.PropertyFilter, ord
 		if p.keyName(ref.keyID) != f.Key {
 			return true
 		}
-		v := []byte(ref.value)
+		// unsafeBytes, not a conversion: this runs once per candidate, and a copy
+		// here made the probe path allocate proportionally to the candidate set
+		// it exists to avoid materialising. The predicates below only read it,
+		// which is the same contract the scan path already relies on.
+		v := unsafeBytes(ref.value)
 		if ordered {
 			if store.PropertyFilterMatchesOrdered(f, v) {
 				matched = true
@@ -284,9 +320,10 @@ func (p *PropertyIndex) edgeKeyEntryCount(key string) int {
 // This is the single-filter query, which is also the most common one, and
 // planning it allocated a slice and consulted the index to conclude there was
 // nothing to do — measured at +14% and +70% allocations before this check
-// existed.
-func noResiduals(filters []store.PropertyFilter, skip int) bool {
-	return len(filters) == 0 || (len(filters) == 1 && skip == 0)
+// existed. A composite driver reaches it too, and for the same reason: it
+// consumes every filter it was matched on.
+func noResiduals(filters []store.PropertyFilter, skip store.FilterMask) bool {
+	return len(filters) == skip.Count()
 }
 
 // probeIsCheaper compares the two ways to apply one residual filter: probing

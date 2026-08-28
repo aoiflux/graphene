@@ -27,6 +27,19 @@ import (
 type orderedIndex[T entityID] struct {
 	// values is sorted ascending by bytes.Compare and holds no duplicates.
 	values []orderedValue[T]
+
+	// totalIDs is the sum of len(v.ids) over values — the number of (id, value)
+	// entries this index holds.
+	//
+	// Maintained rather than recomputed because the planner reads it on every
+	// range query to size a window against the whole key, and summing it there
+	// would cost a walk of every distinct value: exactly the scan the ordered
+	// index exists to avoid. Both writers already touch a value's postings, so
+	// keeping it is one increment on a path that is doing an insert anyway.
+	//
+	// verify recounts it, because a maintained counter that no one checks is a
+	// silent wrong answer rather than a loud one.
+	totalIDs int
 }
 
 type orderedValue[T entityID] struct {
@@ -51,12 +64,14 @@ func (o *orderedIndex[T]) add(id T, value string) {
 		ids, inserted := insertSorted(o.values[pos].ids, id)
 		if inserted {
 			o.values[pos].ids = ids
+			o.totalIDs++
 		}
 		return
 	}
 	o.values = append(o.values, orderedValue[T]{})
 	copy(o.values[pos+1:], o.values[pos:])
 	o.values[pos] = orderedValue[T]{value: value, ids: []T{id}}
+	o.totalIDs++
 }
 
 // remove drops id from value's postings, deleting the value when it empties.
@@ -69,6 +84,7 @@ func (o *orderedIndex[T]) remove(id T, value string) {
 	if !removed {
 		return
 	}
+	o.totalIDs--
 	if len(ids) == 0 {
 		o.values = append(o.values[:pos], o.values[pos+1:]...)
 		return
@@ -160,7 +176,9 @@ func (o *orderedIndex[T]) verify(kind, key string, bucket map[string][]T) error 
 		return errIndexf("%s ordered index %q: holds %d values but the postings hold %d",
 			kind, key, len(o.values), len(bucket))
 	}
+	counted := 0
 	for i, ov := range o.values {
+		counted += len(ov.ids)
 		if i > 0 && o.values[i-1].value >= ov.value {
 			return errIndexf("%s ordered index %q: values not strictly ascending at %d", kind, key, i)
 		}
@@ -178,6 +196,13 @@ func (o *orderedIndex[T]) verify(kind, key string, bucket map[string][]T) error 
 					kind, key, ov.value, j)
 			}
 		}
+	}
+	// The planner sizes every range against this number, so drift here does not
+	// corrupt a result — it silently makes the wrong plan, which is the kind of
+	// fault that never announces itself.
+	if counted != o.totalIDs {
+		return errIndexf("%s ordered index %q: entry count is %d but the values hold %d",
+			kind, key, o.totalIDs, counted)
 	}
 	return nil
 }

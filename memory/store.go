@@ -2,6 +2,7 @@ package memory
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -9,6 +10,50 @@ import (
 	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
 )
+
+// driverUnavailable is the cost of a driver this query cannot use. MaxInt so it
+// loses every comparison without the comparisons needing sentinel checks. Kept
+// identical to the disk planner's constant of the same name: the two planners
+// have to reach the same decision from the same numbers, and a divergence here
+// is a parity bug rather than a backend difference.
+const driverUnavailable = math.MaxInt
+
+// bestOrderedNodeDriver returns the most selective range or prefix filter the
+// ordered index can serve, and its estimated cardinality. See index/stats.go.
+func (s *Store) bestOrderedNodeDriver(query store.NodeQuery) (*store.PropertyFilter, int) {
+	var best *store.PropertyFilter
+	bestSize := 0
+	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
+		size, served := s.propIdx.NodeRangeCardinality(f)
+		if !served {
+			continue
+		}
+		if best == nil || size < bestSize {
+			filter := f
+			best = &filter
+			bestSize = size
+		}
+	}
+	return best, bestSize
+}
+
+// bestOrderedEdgeDriver is bestOrderedNodeDriver for edge queries.
+func (s *Store) bestOrderedEdgeDriver(query store.EdgeQuery) (*store.PropertyFilter, int) {
+	var best *store.PropertyFilter
+	bestSize := 0
+	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
+		size, served := s.propIdx.EdgeRangeCardinality(f)
+		if !served {
+			continue
+		}
+		if best == nil || size < bestSize {
+			filter := f
+			best = &filter
+			bestSize = size
+		}
+	}
+	return best, bestSize
+}
 
 // adjacency holds the outbound and inbound edge ID lists for a single node.
 type adjacency struct {
@@ -364,6 +409,22 @@ func (s *Store) OrderedNodeProperties() []string { return s.propIdx.OrderedNodeK
 
 // OrderedEdgeProperties implements store.OrderedIndexDeclarer.
 func (s *Store) OrderedEdgeProperties() []string { return s.propIdx.OrderedEdgeKeys() }
+
+// DeclareCompositeNodeProperties implements store.CompositeIndexDeclarer.
+func (s *Store) DeclareCompositeNodeProperties(keys []string) error {
+	return s.propIdx.DeclareCompositeNodeKeys(keys)
+}
+
+// DeclareCompositeEdgeProperties implements store.CompositeIndexDeclarer.
+func (s *Store) DeclareCompositeEdgeProperties(keys []string) error {
+	return s.propIdx.DeclareCompositeEdgeKeys(keys)
+}
+
+// CompositeNodeProperties implements store.CompositeIndexDeclarer.
+func (s *Store) CompositeNodeProperties() [][]string { return s.propIdx.CompositeNodeKeys() }
+
+// CompositeEdgeProperties implements store.CompositeIndexDeclarer.
+func (s *Store) CompositeEdgeProperties() [][]string { return s.propIdx.CompositeEdgeKeys() }
 
 // PurgeNodeIndex implements store.Reindexer.
 func (s *Store) PurgeNodeIndex(id store.NodeID) error {
@@ -803,7 +864,7 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 			// Every filter's own set contains the answer, so the residual pass
 			// can narrow the candidates directly and skip the driving filter
 			// entirely rather than re-deriving a set it was already built from.
-			candidates = s.propIdx.NarrowNodesByFilters(candidates, query.Filters, plan.DriverFilter)
+			candidates = s.propIdx.NarrowNodesByFilters(candidates, query.Filters, plan.DriverFilters)
 		} else {
 			matched := s.matchNodeIDsByFilters(query.Filters, store.MatchAny)
 			candidates = store.IntersectSortedIDs(candidates, matched)
@@ -865,7 +926,7 @@ func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 			sortedAsc = true
 		}
 		if store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
-			candidates = s.propIdx.NarrowEdgesByFilters(candidates, query.Filters, plan.DriverFilter)
+			candidates = s.propIdx.NarrowEdgesByFilters(candidates, query.Filters, plan.DriverFilters)
 		} else {
 			matched := s.matchEdgeIDsByFilters(query.Filters, store.MatchAny)
 			candidates = store.IntersectSortedIDs(candidates, matched)
@@ -1144,7 +1205,7 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 				out = append(out, id)
 			}
 		}
-		return out, false, store.QueryPlan{Driver: store.DriverIDs, DriverFilter: -1}
+		return out, false, store.QueryPlan{Driver: store.DriverIDs}
 	}
 
 	s.mu.RLock()
@@ -1170,31 +1231,88 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 		}
 	}
 
-	if bestFilter != nil && bestSize <= total && (typeSize < 0 || bestSize <= typeSize) {
-		ids := s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)
-		return s.liveNodeIDs(ids), true, store.QueryPlan{
-			Driver:       store.DriverEquality,
-			DriverKey:    bestFilter.Key,
-			DriverFilter: store.FilterIndexOf(query.Filters, *bestFilter),
-		}
-	}
-
 	// A range or prefix filter on a key declared ordered bounds the result too,
-	// and resolving it here means the query never enumerates the whole graph.
-	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
-		if ids, served := s.propIdx.NodesMatchingOrdered(nil, f); served {
-			return s.liveNodeIDs(sortDedupeNodeIDs(ids)), true, store.QueryPlan{
-				Driver:       store.DriverOrdered,
-				DriverKey:    f.Key,
-				DriverFilter: store.FilterIndexOf(query.Filters, f),
-			}
-		}
+	// and the ordered index can now say by how much, so it competes on cost
+	// instead of being tried in query order after everything else. See
+	// index/stats.go and the same restructuring in disk/planner.go.
+	bestOrdered, orderedSize := s.bestOrderedNodeDriver(query)
+
+	// A declared composite whose keys the query pins to values answers the whole
+	// conjunction at once, and reports exactly how many rows that is.
+	// A composite covers a tuple of at least two keys, so a query carrying
+	// fewer filters than that cannot match one however many are declared.
+	// Testing it here rather than inside MatchNodeComposite is what keeps a
+	// single-filter query from touching the property index at all: the flag it
+	// would otherwise read is a cold cache line on a struct this query has no
+	// other reason to load, and it measured at ~20 ns against a 230 ns query.
+	var comp index.CompositeMatch
+	hasComposite := false
+	if len(query.Filters) > 1 {
+		comp, hasComposite = s.propIdx.MatchNodeComposite(query.Filters, query.FilterMode)
 	}
 
-	if typeSize >= 0 && typeSize <= total {
+	// Four bounded drivers on one scale, plus the scan they all have to beat.
+	eqCost := driverUnavailable
+	if bestFilter != nil {
+		eqCost = bestSize
+	}
+	orderedCost := driverUnavailable
+	if bestOrdered != nil {
+		orderedCost = orderedSize
+	}
+	labelCost := driverUnavailable
+	if typeSize >= 0 {
+		labelCost = typeSize
+	}
+	compositeCost := driverUnavailable
+	if hasComposite {
+		compositeCost = comp.Size
+	}
+
+	switch {
+	// Labels must beat every alternative strictly: a union of several label
+	// postings is unsorted, where equality, ordered and composite all yield
+	// ascending.
+	case labelCost < eqCost && labelCost < orderedCost && labelCost < compositeCost &&
+		labelCost <= total:
 		// A single label's postings are already ascending, so the query path can
 		// skip its sort entirely. A union of several is not.
-		return s.nodeIDsForTypes(query.Types), len(query.Types) == 1, store.QueryPlan{Driver: store.DriverLabels, DriverFilter: -1}
+		return s.nodeIDsForTypes(query.Types), len(query.Types) == 1, store.QueryPlan{Driver: store.DriverLabels}
+
+	// The composite wins its ties against the other two ascending drivers: it
+	// retires every filter it covers, so a tie on candidates is not a tie on the
+	// work that follows. Same rule as disk/planner.go.
+	case hasComposite && compositeCost <= eqCost && compositeCost <= orderedCost &&
+		compositeCost <= total:
+		if ids, served := s.propIdx.NodesByComposite(comp); served {
+			return s.liveNodeIDs(ids), true, store.QueryPlan{
+				Driver:        store.DriverComposite,
+				DriverKey:     comp.Name(),
+				DriverFilters: comp.Filters,
+			}
+		}
+
+	// Equality wins ties against a range: both yield ascending candidates, but
+	// the ordered path pays a sort-and-dedupe that the postings do not.
+	case bestFilter != nil && eqCost <= orderedCost && eqCost <= total:
+		ids := s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)
+		return s.liveNodeIDs(ids), true, store.QueryPlan{
+			Driver:        store.DriverEquality,
+			DriverKey:     bestFilter.Key,
+			DriverFilters: store.FilterMaskOf(query.Filters, *bestFilter),
+		}
+
+	case bestOrdered != nil && orderedCost <= total:
+		if ids, served := s.propIdx.NodesMatchingOrdered(nil, *bestOrdered); served {
+			return s.liveNodeIDs(sortDedupeNodeIDs(ids)), true, store.QueryPlan{
+				Driver:        store.DriverOrdered,
+				DriverKey:     bestOrdered.Key,
+				DriverFilters: store.FilterMaskOf(query.Filters, *bestOrdered),
+			}
+		}
+
+	case typeSize >= 0 && typeSize <= total:
+		return s.nodeIDsForTypes(query.Types), len(query.Types) == 1, store.QueryPlan{Driver: store.DriverLabels}
 	}
 
 	s.mu.RLock()
@@ -1203,7 +1321,7 @@ func (s *Store) driveNodeCandidates(query store.NodeQuery) ([]store.NodeID, bool
 	for id := range s.nodes {
 		out = append(out, id)
 	}
-	return out, false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
+	return out, false, store.QueryPlan{Driver: store.DriverScan}
 }
 
 // liveNodeIDs drops IDs that no longer resolve to a node, preserving order.
@@ -1260,7 +1378,7 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 				out = append(out, id)
 			}
 		}
-		return out, false, store.QueryPlan{Driver: store.DriverIDs, DriverFilter: -1}
+		return out, false, store.QueryPlan{Driver: store.DriverIDs}
 	}
 
 	s.mu.RLock()
@@ -1300,44 +1418,75 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 		}
 	}
 
+	// The ordered driver joins the competition rather than waiting below it.
+	// See index/stats.go and the same restructuring in disk/planner.go.
+	bestOrdered, orderedSize := s.bestOrderedEdgeDriver(query)
+	// See driveNodeCandidates for why the filter count is tested here.
+	var comp index.CompositeMatch
+	hasComposite := false
+	if len(query.Filters) > 1 {
+		comp, hasComposite = s.propIdx.MatchEdgeComposite(query.Filters, query.FilterMode)
+	}
+
+	// The order of these tests is the tie-break rule, because a later one
+	// overrides an earlier one only on the comparison it makes. Everything after
+	// the first must beat what stands strictly, and the composite comes last with
+	// a non-strict test, which is what makes it win its ties. That reproduces
+	// disk/planner.go's switch exactly — see there for why each tie falls the way
+	// it does. The two implementations disagreeing here would be a parity bug,
+	// not a backend difference.
 	best := total
 	strategy := "all"
 	if bestFilter != nil && bestSize <= best {
 		best = bestSize
 		strategy = "property"
 	}
-	if anchorSize >= 0 && anchorSize <= best {
+	if anchorSize >= 0 && anchorSize < best {
 		best = anchorSize
 		strategy = "anchor"
 	}
-	if typeSize >= 0 && typeSize <= best {
+	if bestOrdered != nil && orderedSize < best {
+		best = orderedSize
+		strategy = "ordered"
+	}
+	if typeSize >= 0 && typeSize < best {
+		best = typeSize
 		strategy = "type"
+	}
+	if hasComposite && comp.Size <= best {
+		strategy = "composite"
 	}
 
 	switch strategy {
+	case "composite":
+		if ids, served := s.propIdx.EdgesByComposite(comp); served {
+			return s.liveEdgeIDs(ids), true, store.QueryPlan{
+				Driver:        store.DriverComposite,
+				DriverKey:     comp.Name(),
+				DriverFilters: comp.Filters,
+			}
+		}
 	case "property":
 		return s.liveEdgeIDs(s.propIdx.EdgesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
-			Driver:       store.DriverEquality,
-			DriverKey:    bestFilter.Key,
-			DriverFilter: store.FilterIndexOf(query.Filters, *bestFilter),
+			Driver:        store.DriverEquality,
+			DriverKey:     bestFilter.Key,
+			DriverFilters: store.FilterMaskOf(query.Filters, *bestFilter),
 		}
 	case "anchor":
 		return s.incidentEdgeIDs(anchors, anchorDir), false, store.QueryPlan{
-			Driver: store.DriverAdjacency, DriverFilter: -1,
+			Driver: store.DriverAdjacency,
+		}
+	case "ordered":
+		if ids, served := s.propIdx.EdgesMatchingOrdered(nil, *bestOrdered); served {
+			return s.liveEdgeIDs(sortDedupeEdgeIDs(ids)), true, store.QueryPlan{
+				Driver:        store.DriverOrdered,
+				DriverKey:     bestOrdered.Key,
+				DriverFilters: store.FilterMaskOf(query.Filters, *bestOrdered),
+			}
 		}
 	case "type":
 		return s.edgeIDsForTypes(query.Types), len(query.Types) == 1, store.QueryPlan{
-			Driver: store.DriverLabels, DriverFilter: -1,
-		}
-	}
-
-	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
-		if ids, served := s.propIdx.EdgesMatchingOrdered(nil, f); served {
-			return s.liveEdgeIDs(sortDedupeEdgeIDs(ids)), true, store.QueryPlan{
-				Driver:       store.DriverOrdered,
-				DriverKey:    f.Key,
-				DriverFilter: store.FilterIndexOf(query.Filters, f),
-			}
+			Driver: store.DriverLabels,
 		}
 	}
 
@@ -1347,7 +1496,7 @@ func (s *Store) driveEdgeCandidates(query store.EdgeQuery) ([]store.EdgeID, bool
 	for id := range s.edges {
 		out = append(out, id)
 	}
-	return out, false, store.QueryPlan{Driver: store.DriverScan, DriverFilter: -1}
+	return out, false, store.QueryPlan{Driver: store.DriverScan}
 }
 
 // degreeSumLocked totals the incident-edge counts for ids. Caller must hold s.mu.
@@ -1618,7 +1767,7 @@ func (s *Store) ExplainNodeQuery(query store.NodeQuery) (store.QueryPlan, error)
 	candidates, _, plan := s.driveNodeCandidates(query)
 	plan.Candidates = len(candidates)
 	if len(query.Filters) > 0 && store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
-		plan.Residuals = s.propIdx.PlanNodeResiduals(query.Filters, plan.DriverFilter, len(candidates))
+		plan.Residuals = s.propIdx.PlanNodeResiduals(query.Filters, plan.DriverFilters, len(candidates))
 	}
 	ids, err := s.QueryNodeIDs(query)
 	if err != nil {
@@ -1633,7 +1782,7 @@ func (s *Store) ExplainEdgeQuery(query store.EdgeQuery) (store.QueryPlan, error)
 	candidates, _, plan := s.driveEdgeCandidates(query)
 	plan.Candidates = len(candidates)
 	if len(query.Filters) > 0 && store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
-		plan.Residuals = s.propIdx.PlanEdgeResiduals(query.Filters, plan.DriverFilter, len(candidates))
+		plan.Residuals = s.propIdx.PlanEdgeResiduals(query.Filters, plan.DriverFilters, len(candidates))
 	}
 	ids, err := s.QueryEdgeIDs(query)
 	if err != nil {

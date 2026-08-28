@@ -53,6 +53,27 @@ func (s *Store) loadCSR(path string) error {
 		for _, k := range section.OrderedEdgeKeys {
 			s.propIdx.DeclareOrderedEdgeKey(k)
 		}
+		// Composites are re-declared here for the same reason and with the same
+		// effect: the entries below then maintain them as they land, rather than
+		// a backfill re-deriving what the incremental path would have built.
+		//
+		// A tuple this build will not accept is skipped, not fatal. GCMP is an
+		// optional section, which is a commitment that a reader ignoring it
+		// entirely still answers every query correctly — so refusing the whole
+		// store over one declaration would break exactly the compatibility the
+		// flag exists to provide, and would do it to a later version that
+		// declares tuples this one does not allow. What is skipped is visible:
+		// CompositeNodeProperties reports what is actually declared, so a tuple
+		// that did not survive the open is absent there rather than assumed.
+		//
+		// A malformed section *body* is still fatal — see readCompositeSection.
+		// That is damage to the file, not a disagreement about its contents.
+		for _, keys := range section.CompositeNodeKeys {
+			_ = s.propIdx.DeclareCompositeNodeKeys(keys)
+		}
+		for _, keys := range section.CompositeEdgeKeys {
+			_ = s.propIdx.DeclareCompositeEdgeKeys(keys)
+		}
 
 		// Deliberately per-entry. Bulk loading was built and measured here — one
 		// lock per shard, parallel fill, presized reverse map, batch-local value
@@ -375,6 +396,16 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		section.OrderedNodeKeys = nodeKeys
 		section.OrderedEdgeKeys = edgeKeys
 	}
+
+	// Composite declarations (v8+). Optional on the same terms as GORD.
+	if s, ok := findSection(trailer.Sections, csrSectionComposite); ok {
+		nodeTuples, edgeTuples, err := readCompositeSection(data[s.Offset : s.Offset+s.Length])
+		if err != nil {
+			return nil, nil, fmt.Errorf("deserialiseCSR: composite section: %w", err)
+		}
+		section.CompositeNodeKeys = nodeTuples
+		section.CompositeEdgeKeys = edgeTuples
+	}
 	return csr, section, nil
 }
 
@@ -391,6 +422,10 @@ type csrIndexSection struct {
 	// Keys declared ordered when the image was written (GORD, v8+).
 	OrderedNodeKeys []string
 	OrderedEdgeKeys []string
+
+	// Key tuples declared composite when the image was written (GCMP, v8+).
+	CompositeNodeKeys [][]string
+	CompositeEdgeKeys [][]string
 }
 
 // checkIDCeiling bounds the highest ID of one entity kind both absolutely and

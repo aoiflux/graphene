@@ -29,6 +29,7 @@ import (
 8. [Type lookups](#8-type-lookups)
 9. [Property index](#9-property-index)
 9a. [Ordered (range) keys](#9a-ordered-range-keys)
+9b. [Composite (multi-key) indexes](#9b-composite-multi-key-indexes)
 10. [Typed queries](#10-typed-queries)
 11. [Degree & connectivity](#11-degree--connectivity)
 12. [Traversal & patterns](#12-traversal--patterns)
@@ -632,8 +633,71 @@ are not comparable.
 Equality lookups are unaffected either way. `PropertyOpContains` cannot be served
 by any ordering and remains a scan.
 
-A declaration is a runtime choice about how to index, not part of the stored
-data: after reopening a store, re-declare the keys you want ordered.
+A declaration is written into the CSR image when the store compacts, and
+re-applied on open, so a store that has compacted since declaring reopens with
+its ordered keys intact. A key declared on a store that has *not* compacted since
+lives only in memory — re-declare it, or `Compact()` before closing.
+`OrderedProperties()` reports what is currently declared.
+
+**Declaring a key also changes how the planner costs it.** A range or prefix on a
+declared key can be sized, so it competes with the other drivers on cost; on an
+undeclared key it cannot be sized *or* served, so it neither drives nor sorts
+ahead of anything. That is a second, independent reason to declare a key you
+filter ranges on — see §18.
+
+---
+
+## 9b. Composite (multi-key) indexes
+
+Declaring a set of keys builds an index over the *tuple* of their values, so a
+query pinning all of them is answered by one lookup instead of by driving from
+the most selective and eliminating against the rest.
+
+```go
+func (g *Graph) DeclareCompositeProperties(keys []string) error
+func (g *Graph) DeclareCompositeEdgeProperties(keys []string) error
+func (g *Graph) CompositeProperties() (nodeKeys, edgeKeys [][]string)
+```
+
+The win is the conjunction that is far more selective than any of its parts —
+which is the common shape, not an exotic one. A case identifier and a bucket are
+each worth little alone and pin a query together:
+
+```go
+g.DeclareCompositeProperties([]string{"case", "bucket"})
+
+g.QueryNodes(store.NodeQuery{Filters: []store.PropertyFilter{
+    {Key: "case", Op: store.PropertyOpEqual, Value: []byte("C-17")},
+    {Key: "bucket", Op: store.PropertyOpEqual, Value: []byte("hot")},
+}})
+```
+
+Entries already registered are absorbed, so a tuple can be declared at any point.
+Declaring the same tuple twice is a no-op.
+
+**Every key must be pinned by an equality filter for the index to be used.** The
+postings are keyed by the whole tuple, so a partially specified one has no entry
+to look up: a declaration over three keys does nothing for a query fixing two.
+`ExplainNodeQuery` will report `driver=equality` in that case, which is how to
+tell. Order is part of a declaration's identity but not of its use — `(a, b)`
+serves a query filtering on `b` and `a`.
+
+**It is opt-in because it is not free.** Every registration on a member key files
+the entity into the composite as well, and the composite keeps that entity's
+values for each of its keys. Measured on a 100 000-node store: the conjunction
+runs **~56× faster**, and registering the member keys costs **~10% more** on the
+disk backend (~45% on the memory backend, where nothing else is in front of it).
+Declare the tuples your queries actually use.
+
+Returns an error for a tuple that cannot be indexed: fewer than two keys, a
+repeated key, an empty key, or more than 64. A one-key composite is refused
+because it is the single-key postings under another name, maintained twice to
+answer one question.
+
+Declarations are written into the CSR image when the store compacts and
+re-applied on open, on the same terms as §9a: they survive a compaction, not a
+bare reopen with no compaction since. `CompositeProperties()` reports what is
+currently declared.
 
 ---
 
@@ -1355,9 +1419,9 @@ fmt.Println(plan)
 
 | Field | Meaning |
 |---|---|
-| `Driver` | `ids`, `equality`, `ordered`, `labels`, `adjacency`, or `scan` |
-| `DriverKey` | the property key, when a filter drove the query |
-| `DriverFilter` | index into the query's `Filters`, or −1 |
+| `Driver` | `ids`, `equality`, `ordered`, `composite`, `labels`, `adjacency`, or `scan` |
+| `DriverKey` | the property key, when a filter drove the query; the `+`-joined tuple for a composite |
+| `DriverFilters` | a `store.FilterMask` marking the `Filters` the driver already applied, so the residual pass skips them; empty when it consumed none. A composite consumes its whole tuple, which is why this is a set rather than one index |
 | `Candidates` | size of the driving set |
 | `Residuals` | the remaining filters, in the order they were applied |
 | `Results` | final result count |
@@ -1366,8 +1430,10 @@ A residual is applied one of two ways. `Probe` tests the candidates directly
 through the index's reverse map, costing one lookup each. Otherwise the filter is
 resolved to its own set and intersected, costing that set's size — which for a
 filter no index can serve means scanning every entry under its key. `Cost` is the
-planner's estimate of that set's size: exact for equality, and the key's entry
-count otherwise.
+planner's estimate of that set's size: exact for equality, sized from the ordered
+index for a range or prefix on a **declared** key, and the key's entry count
+otherwise — an upper bound rather than an estimate, because without an ordering
+there is nothing cheaper than a scan that could tighten it.
 
 **What this is for.** A query can return exactly the right answer while doing far
 more work than it needed to, and the difference is invisible from the results —
@@ -1377,6 +1443,15 @@ hand.
 
 `adjacency` appears only for edge queries, where an anchored query is bounded by
 the incident-edge lists of its endpoints.
+
+**Every driver that can report a size is compared, not ranked.** `ordered` and
+`composite` are the two to watch, and both fail the same way — silently, by not
+appearing. A range on an undeclared key has no size and no index, so it will not
+drive however selective it is; a composite drives only when the query pins every
+one of its keys. If a range query plans as `labels` or `scan` when you expected
+`ordered`, the key is almost certainly not declared; if a conjunction plans as
+`equality` when you expected `composite`, either the tuple is not declared or the
+query does not cover all of it (§9b).
 
 **`Probe` is a forecast, the rest is fact.** The executor re-decides probe versus
 set at each step, because every step shrinks the candidate set and a filter not
@@ -1819,7 +1894,14 @@ structure, not cost. Measure with the benchmark suite instead.
 8. `UpdateNodeIndexed` rather than update-then-reindex.
 9. Spread concurrent property writes across keys; expect no scaling on `Add*`.
 10. `Compact()` between phases of bulk work — never per write.
-11. Re-declare ordered keys after reopening; declarations are runtime state.
+11. Declare ordered keys for the ranges you filter on — it is what lets the
+    planner both *serve* and *cost* them. They survive a compaction; re-declare
+    after a reopen with no compaction since.
+12. Declare a composite for a conjunction of equality filters you run often and
+    whose keys are weak individually (§9b). Check it with `ExplainNodeQuery`:
+    `driver=composite` means it is being used, `driver=equality` means it is not.
+    Do not declare tuples speculatively — each one costs write time on every
+    registration of a member key.
 
 **Both**
 

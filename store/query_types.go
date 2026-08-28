@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"fmt"
+	"math/bits"
 	"slices"
 	"strconv"
 	"strings"
@@ -479,6 +480,47 @@ func FilterIndexOf(filters []PropertyFilter, f PropertyFilter) int {
 	return -1
 }
 
+// FilterMask marks a subset of a query's Filters by position.
+//
+// This used to be a single index, because every driver consumed exactly one
+// filter. A composite index consumes its whole key tuple at once, so what the
+// residual pass must skip is a set.
+//
+// A bitmask rather than a slice: the set is small, the test runs once per
+// filter per query, and it costs no allocation. Positions at 64 and above cannot
+// be marked, which is deliberately the safe direction. An unmarked filter is
+// re-evaluated in the residual pass, and under MatchAll re-applying a filter the
+// candidates already satisfy returns the same candidates — so a missed mark
+// costs work and nothing else. Marking one that was *not* applied would drop the
+// filter entirely, and there is no way for this type to do that.
+type FilterMask uint64
+
+// filterMaskBits is how many filter positions a mask can name.
+const filterMaskBits = 64
+
+// Set returns m with position i marked. Out-of-range positions are ignored —
+// see the type comment for why that is safe rather than silent.
+func (m FilterMask) Set(i int) FilterMask {
+	if i < 0 || i >= filterMaskBits {
+		return m
+	}
+	return m | 1<<uint(i)
+}
+
+// Has reports whether position i is marked.
+func (m FilterMask) Has(i int) bool {
+	return i >= 0 && i < filterMaskBits && m&(1<<uint(i)) != 0
+}
+
+// Count returns how many positions the mask marks.
+func (m FilterMask) Count() int { return bits.OnesCount64(uint64(m)) }
+
+// FilterMaskOf marks the position of f within filters. The empty mask when f is
+// absent, which is what a driver that consumed no filter reports.
+func FilterMaskOf(filters []PropertyFilter, f PropertyFilter) FilterMask {
+	return FilterMask(0).Set(FilterIndexOf(filters, f))
+}
+
 // --- Query plans ---
 
 // DriverKind names the source a query was driven from — the set the planner
@@ -492,6 +534,7 @@ const (
 	DriverOrdered                     // a range or prefix on a key declared ordered
 	DriverLabels                      // the label postings for the query's types
 	DriverAdjacency                   // incident-edge lists of the anchored endpoints
+	DriverComposite                   // one declared key tuple's postings, for a conjunction of equality filters
 )
 
 func (d DriverKind) String() string {
@@ -506,6 +549,8 @@ func (d DriverKind) String() string {
 		return "labels"
 	case DriverAdjacency:
 		return "adjacency"
+	case DriverComposite:
+		return "composite"
 	default:
 		return "scan"
 	}
@@ -524,12 +569,17 @@ type ResidualStep struct {
 // planner's choices are not part of the API contract and may change as the cost
 // model improves. Results never do.
 type QueryPlan struct {
-	Driver       DriverKind
-	DriverKey    string // property key, when the driver was a filter
-	DriverFilter int    // index into the query's Filters, or -1
-	Candidates   int    // size of the driving set
-	Residuals    []ResidualStep
-	Results      int
+	Driver    DriverKind
+	DriverKey string // property key, when the driver was a filter; the joined tuple for a composite
+
+	// DriverFilters marks the query's Filters the driver already applied, so the
+	// residual pass does not evaluate them again. Empty when the driver consumed
+	// no filter — an ID list, labels, adjacency or a scan.
+	DriverFilters FilterMask
+
+	Candidates int // size of the driving set
+	Residuals  []ResidualStep
+	Results    int
 }
 
 // String renders a plan as a single line, for tests and for humans.

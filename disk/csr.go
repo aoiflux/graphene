@@ -495,6 +495,10 @@ type csrPayload struct {
 	OrderedNodeKeys []string
 	OrderedEdgeKeys []string
 
+	// Key tuples declared composite. Declarations only, for the same reason.
+	CompositeNodeKeys [][]string
+	CompositeEdgeKeys [][]string
+
 	// PrevSnapshotRoot chains this image to the one it replaces. Zero for a
 	// first compaction.
 	PrevSnapshotRoot merkle.Hash
@@ -652,6 +656,18 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 			Magic:  csrSectionOrderedKeys,
 			Offset: uint64(ordOffset),
 			Length: uint64(buf.Len() - ordOffset),
+		})
+	}
+
+	if len(payload.CompositeNodeKeys) > 0 || len(payload.CompositeEdgeKeys) > 0 {
+		cmpOffset := buf.Len()
+		buf.Write(appendCompositeSection(nil, payload.CompositeNodeKeys, payload.CompositeEdgeKeys))
+		sections = append(sections, csrSection{
+			// Optional, like GORD: a reader that skips it answers every query
+			// correctly and only pays the intersection the composite avoids.
+			Magic:  csrSectionComposite,
+			Offset: uint64(cmpOffset),
+			Length: uint64(buf.Len() - cmpOffset),
 		})
 	}
 

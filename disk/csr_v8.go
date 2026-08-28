@@ -374,6 +374,93 @@ func readOrderedKeySection(data []byte) (nodeKeys, edgeKeys []string, err error)
 	return nodeKeys, edgeKeys, nil
 }
 
+// minCompositeTuple is the smallest a composite declaration can be: a key count
+// and nothing else. Used to bound a count against the bytes that remain.
+const minCompositeTuple = 2
+
+// appendCompositeSection writes a GCMP body: the declared node key tuples, then
+// the edge ones.
+//
+// Only the declarations travel. The postings and the per-entity member values
+// are rebuilt from the property-index entries in the same file, which is the
+// same trade GORD makes and for the same reason: the derived structure cannot go
+// stale relative to the entries if it is always derived from them, and the bytes
+// it would have taken buy nothing that the entries do not already hold.
+func appendCompositeSection(buf []byte, nodeTuples, edgeTuples [][]string) []byte {
+	write := func(dst []byte, tuples [][]string) []byte {
+		var n [4]byte
+		binary.LittleEndian.PutUint32(n[:], uint32(len(tuples)))
+		dst = append(dst, n[:]...)
+		for _, tuple := range tuples {
+			var c [2]byte
+			binary.LittleEndian.PutUint16(c[:], uint16(len(tuple)))
+			dst = append(dst, c[:]...)
+			for _, k := range tuple {
+				var l [2]byte
+				binary.LittleEndian.PutUint16(l[:], uint16(len(k)))
+				dst = append(dst, l[:]...)
+				dst = append(dst, k...)
+			}
+		}
+		return dst
+	}
+	buf = write(buf, nodeTuples)
+	return write(buf, edgeTuples)
+}
+
+// readCompositeSection parses a GCMP section body.
+func readCompositeSection(data []byte) (nodeTuples, edgeTuples [][]string, err error) {
+	pos := 0
+	read := func(what string) ([][]string, error) {
+		if pos+4 > len(data) {
+			return nil, fmt.Errorf("truncated %s tuple count", what)
+		}
+		count := int(binary.LittleEndian.Uint32(data[pos:]))
+		pos += 4
+		// Same bound as every other length prefix read from a file: a count
+		// larger than the remaining bytes can encode is invalid by definition.
+		if count < 0 || count > (len(data)-pos)/minCompositeTuple {
+			return nil, fmt.Errorf("%s tuple count %d exceeds what %d remaining bytes can hold",
+				what, count, len(data)-pos)
+		}
+		out := make([][]string, 0, count)
+		for i := 0; i < count; i++ {
+			if pos+2 > len(data) {
+				return nil, fmt.Errorf("truncated %s tuple %d", what, i)
+			}
+			keys := int(binary.LittleEndian.Uint16(data[pos:]))
+			pos += 2
+			if keys > (len(data)-pos)/minOrderedKeyEntry {
+				return nil, fmt.Errorf("%s tuple %d claims %d keys, more than %d remaining bytes can hold",
+					what, i, keys, len(data)-pos)
+			}
+			tuple := make([]string, 0, keys)
+			for j := 0; j < keys; j++ {
+				if pos+2 > len(data) {
+					return nil, fmt.Errorf("truncated %s tuple %d key %d", what, i, j)
+				}
+				n := int(binary.LittleEndian.Uint16(data[pos:]))
+				pos += 2
+				if pos+n > len(data) {
+					return nil, fmt.Errorf("truncated %s tuple %d key %d body", what, i, j)
+				}
+				tuple = append(tuple, string(data[pos:pos+n]))
+				pos += n
+			}
+			out = append(out, tuple)
+		}
+		return out, nil
+	}
+
+	if nodeTuples, err = read("composite node"); err != nil {
+		return nil, nil, err
+	}
+	if edgeTuples, err = read("composite edge"); err != nil {
+		return nil, nil, err
+	}
+	return nodeTuples, edgeTuples, nil
+}
+
 // findSection returns the named section, if present.
 func findSection(sections []csrSection, magic string) (csrSection, bool) {
 	for _, s := range sections {

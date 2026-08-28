@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/aoiflux/graphene/store"
@@ -52,6 +53,18 @@ import (
 // PropertyIndex is safe for concurrent use.
 type PropertyIndex struct {
 	shards [propertyShards]propertyShard
+
+	// Composite indexes span several keys, which hash to several shards, so they
+	// cannot live in one. They sit beside the shards with their own locks — see
+	// composite_index.go, which is also where the argument that this introduces
+	// no lock ordering lives.
+	nodeComposites compositeSet[store.NodeID]
+	edgeComposites compositeSet[store.EdgeID]
+
+	// compDeclared is read on the registration path before either set is
+	// touched, so a store that declared no composite — the default — pays one
+	// atomic load per indexed property and no lock at all.
+	compDeclared atomic.Bool
 }
 
 // propertyShards must be a power of two so the hash can be masked.
@@ -114,7 +127,10 @@ type EdgePropEntry struct {
 
 // NewPropertyIndex returns an empty PropertyIndex.
 func NewPropertyIndex() *PropertyIndex {
-	p := &PropertyIndex{}
+	p := &PropertyIndex{
+		nodeComposites: newCompositeSet[store.NodeID](),
+		edgeComposites: newCompositeSet[store.EdgeID](),
+	}
 	for i := range p.shards {
 		p.shards[i] = propertyShard{
 			nodes:           newPostings[store.NodeID](),
@@ -171,6 +187,126 @@ func (p *PropertyIndex) DeclareOrderedEdgeKey(key string) {
 	sh.orderedEdgeKeys[key] = idx
 }
 
+// DeclareCompositeNodeKeys builds and maintains a composite index over the given
+// node property keys, so that a query pinning all of them to values is answered
+// by one lookup instead of by driving from the most selective of them and
+// eliminating against the rest.
+//
+// Entries already registered are absorbed, so this can be called at any point in
+// a store's life. Declaring the same tuple twice is a no-op. Order is part of a
+// declaration's identity but not of its use: a query is matched against the key
+// *set*, so (a, b) serves a query filtering on b and a.
+//
+// Returns ErrCompositeKeys for a tuple that cannot be indexed — fewer than two
+// keys, a repeated key, an empty key, or more than 64.
+func (p *PropertyIndex) DeclareCompositeNodeKeys(keys []string) error {
+	if err := validateCompositeKeys(keys); err != nil {
+		return err
+	}
+	idx, created := p.nodeComposites.declare(keys)
+	if !created {
+		return nil
+	}
+	// Published before the backfill, and after the declaration is visible to
+	// membersOf. That order is what makes a concurrent IndexNode unable to lose
+	// an entry: it writes to the shard *before* reading this flag, so a
+	// registration that reads false must have reached the shard before this
+	// store, and therefore before the snapshot below.
+	p.compDeclared.Store(true)
+
+	// One member key at a time: snapshot that key's entries under its own read
+	// lock, release, then file them. Filing under the shard lock would mean
+	// holding a shard lock and a composite lock at once, which is the single
+	// thing this design exists to avoid.
+	for pos, key := range idx.keys {
+		type entry struct {
+			id    store.NodeID
+			value string
+		}
+		var pending []entry
+		sh := p.shardFor(key)
+		sh.mu.RLock()
+		for value, ids := range sh.nodes.byKey[key] {
+			for _, id := range ids {
+				pending = append(pending, entry{id: id, value: value})
+			}
+		}
+		sh.mu.RUnlock()
+		for _, e := range pending {
+			idx.register(e.id, pos, e.value)
+		}
+	}
+	return nil
+}
+
+// DeclareCompositeEdgeKeys is DeclareCompositeNodeKeys for edge properties.
+func (p *PropertyIndex) DeclareCompositeEdgeKeys(keys []string) error {
+	if err := validateCompositeKeys(keys); err != nil {
+		return err
+	}
+	idx, created := p.edgeComposites.declare(keys)
+	if !created {
+		return nil
+	}
+	p.compDeclared.Store(true)
+	for pos, key := range idx.keys {
+		type entry struct {
+			id    store.EdgeID
+			value string
+		}
+		var pending []entry
+		sh := p.shardFor(key)
+		sh.mu.RLock()
+		for value, ids := range sh.edges.byKey[key] {
+			for _, id := range ids {
+				pending = append(pending, entry{id: id, value: value})
+			}
+		}
+		sh.mu.RUnlock()
+		for _, e := range pending {
+			idx.register(e.id, pos, e.value)
+		}
+	}
+	return nil
+}
+
+// CompositeNodeKeys returns the declared node key tuples, each in its own
+// declared order and the whole sorted, so two stores holding the same
+// declarations report them identically.
+func (p *PropertyIndex) CompositeNodeKeys() [][]string { return p.nodeComposites.tuples() }
+
+// CompositeEdgeKeys is CompositeNodeKeys for edge properties.
+func (p *PropertyIndex) CompositeEdgeKeys() [][]string { return p.edgeComposites.tuples() }
+
+// MatchNodeComposite reports the declared composite that best fits a node
+// query's equality filters, and the exact size of the set it would drive from.
+// ok is false when no declaration is fully covered by the query.
+func (p *PropertyIndex) MatchNodeComposite(filters []store.PropertyFilter, mode store.MatchMode) (CompositeMatch, bool) {
+	if !p.compDeclared.Load() {
+		return CompositeMatch{}, false
+	}
+	return matchComposite(&p.nodeComposites, filters, mode)
+}
+
+// MatchEdgeComposite is MatchNodeComposite for edge queries.
+func (p *PropertyIndex) MatchEdgeComposite(filters []store.PropertyFilter, mode store.MatchMode) (CompositeMatch, bool) {
+	if !p.compDeclared.Load() {
+		return CompositeMatch{}, false
+	}
+	return matchComposite(&p.edgeComposites, filters, mode)
+}
+
+// NodesByComposite returns the ascending node IDs filed under a match's tuple.
+// ok is false only if the declaration is gone, which nothing in the engine does.
+func (p *PropertyIndex) NodesByComposite(m CompositeMatch) ([]store.NodeID, bool) {
+	return lookupComposite(&p.nodeComposites, m)
+}
+
+// EdgesByComposite is NodesByComposite for edge properties.
+func (p *PropertyIndex) EdgesByComposite(m CompositeMatch) ([]store.EdgeID, bool) {
+	return lookupComposite(&p.edgeComposites, m)
+}
+
 // OrderedNodeKeys returns the declared ordered node keys, sorted.
 func (p *PropertyIndex) OrderedNodeKeys() []string {
 	var out []string
@@ -212,6 +348,13 @@ func (p *PropertyIndex) IndexNode(id store.NodeID, key string, value []byte) {
 		idx.add(id, vk)
 	}
 	sh.mu.Unlock()
+
+	// Composites observe the same registration, from outside the shard lock.
+	// The shard write above happens first, which is what makes a declaration
+	// racing this one unable to lose the entry — see DeclareCompositeNodeKeys.
+	if p.compDeclared.Load() {
+		p.nodeComposites.registered(id, key, vk)
+	}
 }
 
 // IndexEdge records that edgeID has property key=value. Re-registering an
@@ -225,6 +368,11 @@ func (p *PropertyIndex) IndexEdge(id store.EdgeID, key string, value []byte) {
 		idx.add(id, vk)
 	}
 	sh.mu.Unlock()
+
+	// See IndexNode for why this sits outside the shard lock.
+	if p.compDeclared.Load() {
+		p.edgeComposites.registered(id, key, vk)
+	}
 }
 
 // RemoveNode drops every indexed entry for the given node id across all keys
@@ -247,6 +395,9 @@ func (p *PropertyIndex) RemoveNode(id store.NodeID) {
 		sh.nodes.remove(id)
 		sh.mu.Unlock()
 	}
+	if p.compDeclared.Load() {
+		p.nodeComposites.removed(id)
+	}
 }
 
 // RemoveEdge drops every indexed entry for the given edge id across all keys
@@ -265,6 +416,9 @@ func (p *PropertyIndex) RemoveEdge(id store.EdgeID) {
 		}
 		sh.edges.remove(id)
 		sh.mu.Unlock()
+	}
+	if p.compDeclared.Load() {
+		p.edgeComposites.removed(id)
 	}
 }
 
@@ -564,7 +718,13 @@ func (p *PropertyIndex) Verify() error {
 			return err
 		}
 	}
-	return nil
+	// Composites are checked outside the shard loop because they are not owned
+	// by a shard, and each one re-derives itself rather than being compared
+	// against the postings it was built from — see compositeIndex.verify.
+	if err := p.nodeComposites.verifyAll("node"); err != nil {
+		return err
+	}
+	return p.edgeComposites.verifyAll("edge")
 }
 
 // verify checks one shard's invariants. Caller must hold sh.mu.

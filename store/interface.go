@@ -210,6 +210,48 @@ type OrderedIndexDeclarer interface {
 	OrderedEdgeProperties() []string
 }
 
+// CompositeIndexDeclarer is an optional extension implemented by stores that can
+// build and maintain a composite index over several property keys, so that a
+// query pinning all of them to values is answered by one lookup instead of by
+// driving from the most selective of them and eliminating against the rest.
+//
+// The win is the conjunction that is far more selective than any of its parts: a
+// case identifier with a hundred values and a bucket with ten, over a million
+// nodes, is ten thousand candidates thinned to about a thousand. A composite
+// over the pair returns the thousand directly.
+//
+// It is opt-in because it is not free. Every registration on a member key files
+// the entity into the composite as well, and the composite holds that entity's
+// values for each of its keys — so a declaration that no query matches costs
+// memory and write time for nothing.
+//
+// A composite is used only when the query pins *every* one of its keys with an
+// equality filter. The postings are keyed by the whole tuple, so there is no
+// entry for a partially specified one — a declaration over three keys does
+// nothing for a query that fixes two of them.
+type CompositeIndexDeclarer interface {
+	// DeclareCompositeNodeProperties builds and maintains a composite index over
+	// the given node property keys, absorbing entries already registered under
+	// them. Declaring the same tuple twice is a no-op.
+	//
+	// Order is part of a declaration's identity but not of its use: a query is
+	// matched against the key set, so (a, b) serves a query filtering on b and a.
+	//
+	// Returns an error for a tuple that cannot be indexed — fewer than two keys,
+	// a repeated key, an empty key, or more than 64.
+	DeclareCompositeNodeProperties(keys []string) error
+
+	// DeclareCompositeEdgeProperties is the edge-property equivalent.
+	DeclareCompositeEdgeProperties(keys []string) error
+
+	// CompositeNodeProperties returns the declared node key tuples, each in its
+	// own declared order and the whole in a stable order.
+	CompositeNodeProperties() [][]string
+
+	// CompositeEdgeProperties returns the declared edge key tuples.
+	CompositeEdgeProperties() [][]string
+}
+
 // IndexVerifier is an optional extension implemented by stores that can
 // self-check their indexes against the records those indexes describe.
 type IndexVerifier interface {

@@ -297,6 +297,66 @@ func (g *Graph) OrderedProperties() (nodeKeys, edgeKeys []string) {
 	return d.OrderedNodeProperties(), d.OrderedEdgeProperties()
 }
 
+// DeclareCompositeProperties builds and maintains a composite index over the
+// given node property keys, so that a query pinning all of them to values is
+// answered by one lookup instead of by driving from the most selective of them
+// and eliminating against the rest. Entries already registered are absorbed, so
+// this can be called at any point.
+//
+// The win is the conjunction that is far more selective than any of its parts.
+// Two keys that are individually weak — a case identifier and a bucket — pin a
+// query to a small set together while either alone leaves thousands of
+// candidates to eliminate:
+//
+//	g.DeclareCompositeProperties([]string{"case", "bucket"})
+//
+//	g.QueryNodes(store.NodeQuery{Filters: []store.PropertyFilter{
+//	    {Key: "case", Op: store.PropertyOpEqual, Value: []byte("C-17")},
+//	    {Key: "bucket", Op: store.PropertyOpEqual, Value: []byte("hot")},
+//	}})
+//
+// A composite is used only when the query pins **every** one of its keys with an
+// equality filter: the postings are keyed by the whole tuple, so a partially
+// specified one has no entry to look up. Order is part of a declaration's
+// identity but not of its use — (a, b) serves a query filtering on b and a.
+//
+// It is not free, which is why it is opt-in: every registration on a member key
+// files the entity into the composite too, and the composite holds that entity's
+// values for each of its keys. Declare the tuples your queries actually use.
+//
+// Declarations survive a compaction — they are written into the CSR image and
+// re-applied on open — but not a reopen with no compaction since. Returns an
+// error for a tuple that cannot be indexed: fewer than two keys, a repeated key,
+// an empty key, or more than 64. Backends without the extension ignore this and
+// keep intersecting.
+func (g *Graph) DeclareCompositeProperties(keys []string) error {
+	d, ok := g.GraphStore.(store.CompositeIndexDeclarer)
+	if !ok {
+		return nil
+	}
+	return d.DeclareCompositeNodeProperties(keys)
+}
+
+// DeclareCompositeEdgeProperties is DeclareCompositeProperties for edge
+// properties.
+func (g *Graph) DeclareCompositeEdgeProperties(keys []string) error {
+	d, ok := g.GraphStore.(store.CompositeIndexDeclarer)
+	if !ok {
+		return nil
+	}
+	return d.DeclareCompositeEdgeProperties(keys)
+}
+
+// CompositeProperties returns the node and edge property key tuples currently
+// backed by a composite index, each tuple in its declared order.
+func (g *Graph) CompositeProperties() (nodeKeys, edgeKeys [][]string) {
+	d, ok := g.GraphStore.(store.CompositeIndexDeclarer)
+	if !ok {
+		return nil, nil
+	}
+	return d.CompositeNodeProperties(), d.CompositeEdgeProperties()
+}
+
 // RebuildIndexes discards and recomputes every index derivable from the stored
 // records — label postings and adjacency — and drops property-index entries
 // whose entity no longer exists. Backends that do not support it return nil.

@@ -283,6 +283,8 @@ func (s *Store) compactPin() (*compactPlan, error) {
 		payload: csrPayload{
 			NodeProps:         s.propIdx.NodeEntries(),
 			EdgeProps:         s.propIdx.EdgeEntries(),
+			CompositeNodeKeys: s.propIdx.CompositeNodeKeys(),
+			CompositeEdgeKeys: s.propIdx.CompositeEdgeKeys(),
 			OrderedNodeKeys:   s.propIdx.OrderedNodeKeys(),
 			OrderedEdgeKeys:   s.propIdx.OrderedEdgeKeys(),
 			PrevSnapshotRoot:  prevRoot,

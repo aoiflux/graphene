@@ -230,6 +230,20 @@ func (g *Graph) IndexEdgeProperties(id store.EdgeID, props map[string][]byte) er
 
 // NodesByProperties returns the intersection of all NodeIDs that match every
 // key-value pair in props (AND semantics). Returns an empty slice when props is empty.
+//
+// This is the un-planned path: it resolves each pair to its own set and folds
+// them together, where QueryNodes would cost the pairs and drive from the most
+// selective one. Prefer QueryNodes with equality filters — and, for a set of
+// keys queried together often, a composite index (DeclareCompositeProperties),
+// which answers the whole conjunction from one lookup.
+//
+// The fold is store.IntersectSortedIDs, the same sorted merge the planner's
+// residual pass uses. It requires both sides ascending and duplicate-free, which
+// NodesByProperty guarantees: postings are kept sorted by ID and the liveness
+// filter preserves order. The engine used to carry a second, hash-set
+// intersection here for no reason but that this path predated the merge —
+// two implementations of one operation, which is one more than can be kept
+// correct.
 func (g *Graph) NodesByProperties(props map[string][]byte) ([]store.NodeID, error) {
 	var result []store.NodeID
 	first := true
@@ -243,7 +257,7 @@ func (g *Graph) NodesByProperties(props map[string][]byte) ([]store.NodeID, erro
 			first = false
 			continue
 		}
-		result = intersectNodeIDs(result, hits)
+		result = store.IntersectSortedIDs(result, hits)
 		if len(result) == 0 {
 			return nil, nil
 		}
@@ -252,7 +266,9 @@ func (g *Graph) NodesByProperties(props map[string][]byte) ([]store.NodeID, erro
 }
 
 // EdgesByProperties returns the intersection of all EdgeIDs that match every
-// key-value pair in props (AND semantics). Returns an empty slice when props is empty.
+// key-value pair in props (AND semantics). Returns an empty slice when props is
+// empty. See NodesByProperties for what this path costs and what it requires of
+// its inputs.
 func (g *Graph) EdgesByProperties(props map[string][]byte) ([]store.EdgeID, error) {
 	var result []store.EdgeID
 	first := true
@@ -266,7 +282,7 @@ func (g *Graph) EdgesByProperties(props map[string][]byte) ([]store.EdgeID, erro
 			first = false
 			continue
 		}
-		result = intersectEdgeIDs(result, hits)
+		result = store.IntersectSortedIDs(result, hits)
 		if len(result) == 0 {
 			return nil, nil
 		}
@@ -708,34 +724,6 @@ func FilterEdgesByLabel(es []*store.Edge, label store.EdgeType) []*store.Edge {
 }
 
 // --- Internal helpers ---
-
-func intersectNodeIDs(a, b []store.NodeID) []store.NodeID {
-	set := make(map[store.NodeID]struct{}, len(b))
-	for _, id := range b {
-		set[id] = struct{}{}
-	}
-	var out []store.NodeID
-	for _, id := range a {
-		if _, ok := set[id]; ok {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-func intersectEdgeIDs(a, b []store.EdgeID) []store.EdgeID {
-	set := make(map[store.EdgeID]struct{}, len(b))
-	for _, id := range b {
-		set[id] = struct{}{}
-	}
-	var out []store.EdgeID
-	for _, id := range a {
-		if _, ok := set[id]; ok {
-			out = append(out, id)
-		}
-	}
-	return out
-}
 
 func dedupeEdgesByID(edges []*store.Edge) []*store.Edge {
 	if len(edges) == 0 {

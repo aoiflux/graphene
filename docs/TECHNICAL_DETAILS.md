@@ -273,7 +273,7 @@ that cannot check an attestation must not present the file as though it had.
 | `GHSH` | snapshot roots | **yes** |
 | `GATT` | signed attestation | **yes** |
 | `GRDT` | redaction tombstones | **yes** |
-| `GCMP` | composite index declarations (reserved) | no |
+| `GCMP` | composite index declarations | no — losing it costs an intersection, not an answer |
 
 **Snapshot roots (`GHSH`) are themselves versioned**, because adding a component
 changes what a snapshot root *is* and a retained root must stay verifiable:
@@ -662,7 +662,8 @@ bulk read 2.05 ms → 0.48 ms. Figures in [benchmarks.md](benchmarks.md).
 | 6 | Label postings | sorted `[]ID` per label | O(log n) lookup | rebuilt at load |
 | 7 | Label postings (CSR) | sorted `[]ID` | O(1) lookup | derived at load |
 | 8 | Property index | sorted postings + reverse map | O(1) equality | **yes**, v6 |
-| 9 | Ordered index | sorted values per declared key | O(log n + k) | no — runtime |
+| 9 | Ordered index | sorted values per declared key | O(log n + k) | declarations only, v8 |
+| 10 | Composite index | tuple → sorted postings, per declared key set | O(1) conjunction | declarations only, v8 |
 
 ### 6.2 Why postings are sorted, not hashed
 
@@ -723,13 +724,22 @@ or duplicated entry.
 
 ```go
 type orderedIndex[T] struct {
-    values []orderedValue[T]   // sorted ascending by bytes.Compare, no duplicates
+    values   []orderedValue[T] // sorted ascending by bytes.Compare, no duplicates
+    totalIDs int               // sum of len(v.ids); maintained, not recomputed
 }
 type orderedValue[T] struct {
     value string   // raw encoded bytes
     ids   []T      // ascending, deduplicated
 }
 ```
+
+`totalIDs` exists for the planner, not for the reads: sizing a range against the
+whole key is a comparison the planner makes on every query, and summing it there
+would walk every distinct value — the scan this structure exists to avoid. Both
+writers already touch a value's postings, so maintaining it is one increment on
+a path that is doing an insert anyway, and `verify` recounts it (§11.4), because
+a maintained counter nobody checks is a silent wrong answer rather than a loud
+one.
 
 A range filter resolves to `[lo, hi)` positions by binary search, then walks:
 
@@ -751,6 +761,69 @@ because no successor exists.
 through the hash postings, and `Contains` cannot be bounded by any ordering.
 Both are comparator-free (`bytes.Equal`, `strings.Contains`), which is what makes
 declining them safe — see §7.4.
+
+### 6.4a Composite index
+
+An index over a *tuple* of keys, so a conjunction of equality filters is one
+lookup rather than a driving set plus an elimination pass.
+
+```go
+type compositeIndex[T] struct {
+    keys     []string             // the declared tuple, immutable
+    postings map[string][]T       // encoded tuple → ascending, deduplicated ids
+    members  map[T]*memberState   // per entity, its values at each position
+    entries  int                  // (id, tuple) pairs; maintained
+}
+type memberState struct {
+    one    []string           // the single value at each position
+    filled uint64             // which positions have one — "" is a legal value
+    more   map[int][]string   // extra values; nil for almost every entity
+}
+```
+
+**It does not live in a shard.** Shards are chosen by hashing the property key,
+and a composite spans several keys, which will generally hash to several shards.
+Putting one in a shard would create an operation needing two shard locks at once,
+and §9.1's freedom from lock ordering rests on that never happening. So a
+composite owns its state and takes exactly one lock: its own. Registration
+updates the owning shard, releases it, and only then takes the composite's lock —
+never both.
+
+**`members` is why.** A new value at one position needs the other positions'
+values to form a tuple, and those live behind the shard locks this must not take.
+So the composite keeps its own copy. That duplicates state the shards already
+hold — the objection §14.11 makes against a persisted histogram — and the answer
+is that here it is not reachable: "read it from the shards" is precisely the
+option the lock discipline removes. It is also what makes registration a single
+atomic step rather than a gather with a window in it.
+
+**Multi-valued members are filed under every tuple.** Index entries are additive
+(§6.5), so an entity whose `bucket` was registered as both `hot` and `cold`
+matches either through the single-key postings. A composite filing it under only
+one would return *fewer* rows than the intersection it replaces — silently, since
+the driver applies no residual for the keys it covers. So the entity is filed
+under the cross product of its members' values. That product is one tuple for
+essentially every entity, and when it is not, it is the caller's own
+registrations described exactly.
+
+**Tuples are length-prefixed, not delimited.** Values are arbitrary bytes, so no
+separator is unavailable, and `("a", "bc")` must not collide with `("ab", "c")`.
+
+**A composite serves a query only when every one of its keys is pinned to a
+value.** The postings are keyed by the whole tuple, so a partially specified one
+has no entry to look up: a declaration over three keys does nothing for a query
+fixing two. A B-tree over the tuple would serve prefixes; a hash map is what makes
+the full-tuple case O(1), and the full-tuple case is the one the declaration was
+made for.
+
+**Declaration order is identity, not constraint.** `(a, b)` and `(b, a)` would be
+two structures answering one question, so the tuple as declared is the key a
+declaration is stored under — but matching is by key *set*, so `(a, b)` serves a
+query filtering on `b` and `a`.
+
+`verify` re-derives the entire index from `members` and compares both directions
+(§11.4). Drift here is a wrong answer rather than a slow one, because the driver
+skips exactly the filters that would have caught it.
 
 ### 6.5 Index maintenance on update
 
@@ -793,16 +866,33 @@ The planner picks the cheapest source **guaranteed to contain the answer**:
 | 1 | explicit `IDs` | exact |
 | 2 | most selective equality postings | **exact** — postings length is a map lookup |
 | 3 | label postings | **exact** — `NodesByType` aliases CSR memory, so `len` is O(1) |
-| 4 | ordered-key range | bounded by the range |
-| 5 | incident-edge lists (edge queries) | exact — CSR offsets give degree |
-| 6 | full scan | — |
+| 4 | ordered-key range or prefix | **estimated** — exact for a narrow window, mean-based for a wide one (§7.2a) |
+| 5 | declared composite tuple | **exact** — one map lookup, no estimate to make (§7.2b) |
+| 6 | incident-edge lists (edge queries) | exact — CSR offsets give degree |
+| 7 | full scan | — |
 
-Priority is a starting order, not a decision: where costs are comparable the
-planner **compares them** rather than taking the first available. Equality and
-labels are both exact, so a selective label beats a weak filter — a 100-node
-label against a 25 000-hit filter is 58× faster driven from the label. Ties go to
-equality, which returns candidates already ascending where a label union does
-not, so equal candidate counts are not equal cost.
+Priority is a starting order, not a decision: every source that reports a cost is
+**compared**, not taken because it came first. A selective label beats a weak
+filter — a 100-node label against a 25 000-hit filter is 58× faster driven from
+the label. Ties go to whichever returns candidates already ascending: equality
+beats a range (which sorts and dedupes what it collects), and both beat a label
+union (which is unsorted), so equal candidate counts are not equal cost. A
+composite wins its ties against equality and against a range, because a tie on
+candidates is not a tie on the work after: it retires every filter it covers,
+where the others retire one and leave the rest of the conjunction to the residual
+pass.
+
+> **Ranges joined this comparison late, and their absence from it was the
+> planner's largest single misplan.** A range had no size, so it could not be
+> compared with anything — and both planners fell back to *position*. The node
+> planner tried ordered filters after equality and before labels, so any range
+> beat any label: a window over every value in a key won against a 100-node
+> label. The edge planner tried them below its switch, reachable only when
+> equality, adjacency and labels were all absent, so a range matching 50 edges
+> lost to a label carrying 10 000. Within one query the first ordered filter won
+> whatever the others matched. Measured on a 50 000-node store, giving ranges a
+> size moved those three shapes from **2.0–3.9 ms to 4–38 µs** — 110× to 420× —
+> with a control query containing no range flat across the change.
 
 Label counts are **upper bounds**: they double-count a record present in both the
 delta and the CSR, and ignore tombstones. That is the safe direction — the driver
@@ -814,11 +904,87 @@ reluctant to choose labels, never wrong.
 > planned differently per backend. `TestLabelDriverParity` now pins the two
 > together.
 
+### 7.2a Sizing a range or prefix
+
+`rangeFor` already resolves a filter to a `[lo, hi)` window over the distinct
+values with two binary searches (§6.4). The estimate is the number of *entries*
+in that window, and it is read two ways:
+
+| Window | Estimate | Why |
+|---|---|---|
+| empty | `0`, exact | It ends the query, so it must beat everything — and "few" must stay distinguishable from "none" |
+| the whole key | `totalIDs`, exact | No arithmetic, no rounding; the commonest wide case |
+| ≤ 64 distinct values | exact count | One `len()` per value over contiguous memory — a few cache lines, cheaper than the map lookup that found the index |
+| wider | `totalIDs × width / len(values)`, rounded up | O(1) |
+
+The split is not a performance compromise, it is where precision stops deciding
+anything. A narrow window is exactly the case whose size determines the plan: a
+range matching 3 of 900 000 has to beat every alternative, and rounding it to a
+mean throws away the fact that makes it win. A window covering 40% of a key
+loses to any label or equality filter whatever its true size, and the only
+comparison it can win — against a full scan — it wins on any estimate.
+
+**Where it is wrong.** The wide-window estimate assumes postings lengths are
+roughly even across the key. Near-unique values — a hash, a timestamp, an
+offset, most of what a forensic graph indexes — have a mean of about 1, so it is
+almost exact. One value holding most of a key's entries breaks the assumption,
+and a wide window containing it is under-estimated. That cannot make a result
+wrong: the driver is a superset whatever its size, and every filter is still
+applied. It can make the planner pick a worse driver, which is the trade the
+64-value threshold is placed to bound.
+
+**Cost.** Planning a query that contains a range costs ~0.3–0.5 µs more than
+before, against savings measured in milliseconds. A query with no range pays
+nothing: the estimate is only computed when an ordered driver exists.
+
 **Why `MatchAny` usually cannot be driven.** Under `MatchAll` the result is the
 intersection of every filter's set, so it is contained in each and any may drive.
 Under `MatchAny` it is the union, which no single filter's set contains.
 `store.SupersetDrivers` encodes this in one place: it returns `nil` for
 `MatchAny` with more than one filter.
+
+### 7.2b Composite drivers
+
+A composite reports an exact size — `len(postings[tuple])`, one map lookup — so
+unlike a range it has nothing for §7.2a's two regimes to decide between. It joins
+the comparison on the same terms as everything else and is not preferred: a
+10-node label beats a 33-row conjunction and the planner says so.
+
+Two things make it cheap enough to consult on every query:
+
+- **It is only consulted when the query carries at least two filters.** A
+  composite covers a tuple of two or more keys, so a shorter query cannot match
+  one however many are declared. Testing that in the planner rather than inside
+  the index is what keeps a single-filter query from touching `PropertyIndex` at
+  all — the declaration flag it would otherwise read is a cold cache line on a
+  struct that query has no other reason to load, and it measured at **~20 ns
+  against a 230 ns query**.
+- **With no composite declared, the check is one atomic load.** Matching itself —
+  which enumerates declarations and looks each tuple up — runs only past that.
+
+`QueryPlan.DriverFilters` is a bitmask rather than the single index it used to
+be, because a composite consumes its whole tuple and the residual pass must skip
+all of it. Positions at 64 and above cannot be marked, which is the safe
+direction: an unmarked filter is re-evaluated, and under `MatchAll` re-applying a
+filter the candidates already satisfy returns the same candidates. A missed mark
+costs work; marking one that was *not* applied would drop a filter, and the type
+has no way to do that.
+
+**What it is worth.** 100 000 nodes, two keys of 11 and 13 distinct values
+(coprime, so the conjunction is a real intersection), ~700 rows matching both:
+
+| | declared | undeclared | |
+|---|---|---|---|
+| the conjunction | 8.4–8.8 µs, 16 allocs | 450–512 µs, 7 allocs | **~56×** |
+| control: one of the same keys alone | 99–101 µs | 97–99 µs | flat |
+| registering both member keys, memory backend | 1.9–2.5 µs | 1.3–1.5 µs | +~45% |
+| registering both member keys, disk backend | 11.0–11.4 µs | 10.0–10.2 µs | +~10% |
+
+The undeclared arm is the plan a build without composites produces, on the same
+graph — which is what makes this an A/B of the feature rather than of the whole
+change. The write cost is the honest reason the index is opt-in: on a disk store
+it is ~10%, because the WAL append dominates and does not move; the memory
+backend's ~45% is the index maintenance with nothing else in front of it.
 
 ### 7.3 Residual evaluation
 
@@ -837,9 +1003,23 @@ Filters run **most-selective-first** so candidates die early, the pass stops the
 moment none remain, and **the driving filter is excluded outright** rather than
 re-derived from the set it just produced.
 
-The estimate is exact for equality (postings cardinality) and, for anything else,
-the number of entries under the key — which is what a scan of that key would
-visit, and therefore an upper bound.
+The estimate is exact for equality (postings cardinality), sized from the
+ordered index for a range or prefix on a declared key (§7.2a), and otherwise the
+number of entries under the key — which is what a scan of that key would visit,
+and therefore an upper bound.
+
+That last case stays a bound rather than becoming a guess. Without an ordering
+there is nothing cheaper than a scan that could tighten it, and inventing a
+selectivity would order the steps on a number with no evidence behind it.
+
+**The probe reads the stored value without copying it.** It converted the reverse
+entry's string to `[]byte` once per candidate, which made the probe path allocate
+in proportion to the candidate set it exists to *avoid* materialising — 7 700
+allocations on a query with 7 693 candidates. The predicates only read the bytes,
+which is the same contract the scan path already relies on, so the conversion is
+now the shared-memory one. Measured interleaved with a flat control: **572–671 µs
+→ 450–512 µs and 7 700 allocations → 7** on a 100 000-node two-filter query, and
+6 → 5 allocations on the small `EqualityPlusContains` case.
 
 **Why this matters.** A filter no index can serve — a `Contains`, or a range on
 an undeclared key — costs a scan of *every entry under its key*. Before residual
@@ -1560,6 +1740,7 @@ Recovery is explicit: `VerifyIndexes()` then `RebuildIndexes()`.
 | postings ordering and deduplication | that an indexed *value* still matches the entity's properties |
 | forward ↔ reverse agreement, both directions | — because values are caller-encoded and opaque |
 | `ref1`/`refN` arity invariants | |
+| a composite's postings against the member values they were derived from, both directions (§6.4a) | |
 | label postings against live labels | |
 | adjacency against edge endpoints | |
 | that no index entry outlives its entity | |
@@ -2071,6 +2252,36 @@ because it is an operator's decision about their store and not an engineering
 detail. Nothing above is speculative: the table is a measurement and the lock
 argument is what the primitive is.
 
+### 14.11 Rejected: a persisted histogram section
+
+Range selectivity was scheduled as a histogram, persisted in the v8 container
+alongside the property index. It was not built, because the structure a
+histogram would be *built from* is already in memory and already sorted.
+
+`orderedIndex.values` is the key's distinct values in ascending order, each with
+its postings. A histogram over that key is a lossy summary of a structure the
+planner can binary-search directly, so reading it costs less than consulting a
+summary of it — two binary searches and one subtraction (§7.2a) — and it can
+never be stale, because it *is* the index the query will use.
+
+Persisting one would have added a section to build, maintain, version, and
+invalidate on drift, in exchange for a worse answer. The declarations are already
+persisted (GORD, §4.1) and re-declared on open, so the ordered index is rebuilt
+before the first query runs and the estimates are correct from that moment with
+nothing written to disk.
+
+The one thing a histogram would buy is the skew case named in §7.2a: a key where
+one value holds most of the entries, queried through a wide window. If that ever
+shows up as a real misplan, a per-key distribution belongs behind
+`NodeRangeCardinality` / `EdgeRangeCardinality` — the same two calls, a different
+answer — and not in a new section that every reader has to understand. Not built
+on speculation.
+
+**Ranges on an undeclared key are deliberately still uncosted.** There is no
+ordering to size them with, and the entry count remains an honest upper bound;
+guessing a selectivity would order residual steps on a number with no evidence
+behind it (§7.3).
+
 ---
 
 ## 15. Invariants
@@ -2103,46 +2314,65 @@ Any change must preserve these. Each is enforced by tests.
 ## 16. Known limitations
 
 1. **No query language.** The planner is driven by the `NodeQuery` struct, not
-   parsed text. There *is* a cost model — exact equality cardinality, residuals
-   costed per strategy — inspectable via `ExplainNodeQuery`.
-2. **Statistics are exact but ephemeral.** Computed on demand, never persisted,
-   no histograms — so selectivity *within* a range is estimated by the key's
-   entry count rather than by distribution.
+   parsed text. There *is* a cost model — exact equality cardinality, sized
+   ranges, residuals costed per strategy — inspectable via `ExplainNodeQuery`.
+2. **Statistics are computed on demand, never persisted, and have no
+   distribution.** Everything the planner costs it reads live from the indexes,
+   so nothing can be stale and nothing is written to disk (§14.11). A range or
+   prefix on a **declared** key is sized from the ordered index — exactly for a
+   narrow window, from the mean postings length for a wide one (§7.2a) — so the
+   remaining gap is skew: a key where one value holds most of the entries,
+   queried through a wide window, is under-estimated. On an **undeclared** key
+   there is no ordering to size with and the estimate stays the key's entry
+   count, which is an upper bound rather than a distribution.
 3. **No regex or fuzzy operators.**
 4. **`Contains` always scans** the key's entries. No ordering can bound a
    substring match.
 5. **Ranges on an undeclared key use the scan rule**, which is not a total order.
    Declare the key and use `index/encoding` for ranges that must be both fast and
    well-defined.
-6. **Ordered-key declarations are not persisted.** Re-declare after reopening.
-7. **Property indexing is explicit.** The engine will not infer which fields to
+6. **Index declarations survive a compaction, not a bare reopen.** Ordered keys
+   (GORD) and composite tuples (GCMP) are written to the CSR image (§4.1) and
+   re-declared on open, so a store that has compacted since declaring reopens
+   with them intact. Anything declared on a store that has *not* compacted since
+   lives only in memory: re-declare, or compact before closing.
+   `OrderedProperties()` and `CompositeProperties()` report what is currently
+   declared — including after a reopen, where a GCMP tuple this build will not
+   accept is skipped rather than refused, since the section is optional and a
+   reader ignoring it entirely still answers every query correctly.
+7. **A composite index serves only a fully pinned tuple.** Its postings are keyed
+   by the whole tuple, so a declaration over three keys does nothing for a query
+   fixing two (§6.4a). It is also opt-in for a measured reason: on the disk
+   backend, registering a member key costs ~10% more with a composite declared
+   (§7.2b).
+8. **Property indexing is explicit.** The engine will not infer which fields to
    index, because it cannot read the blob.
-8. **A sequence of plain calls is not a transaction** (§10.1). `Snapshot()`
+9. **A sequence of plain calls is not a transaction** (§10.1). `Snapshot()`
    gives a consistent read view (§10.3); it does not make a *write* sequence
    atomic, which is what `Begin()` is for.
-9. **Pattern matching is unoptimised** (§8.3).
-10. **Memory-backend read concurrency is negative** past one core (§9.3).
-11. **Write scaling is bounded by a single WAL append point** — but no longer by
+10. **Pattern matching is unoptimised** (§8.3).
+11. **Memory-backend read concurrency is negative** past one core (§9.3).
+12. **Write scaling is bounded by a single WAL append point** — but no longer by
     a serialised fsync: concurrent committers share one (§11.1).
-12. **Delta growth is bounded only if something compacts.** `Options.AutoCompact`
+13. **Delta growth is bounded only if something compacts.** `Options.AutoCompact`
     will do it in the background (§9.5); left off, which is the default, it is
     the caller's loop around `Graph.ShouldCompact`. Nothing else caps the delta:
     everything written since the last compaction stays in memory and is replayed
     at every open.
-13. **A compaction still stalls writers for its pin and its commit** — ~17–20 ms
+14. **A compaction still stalls writers for its pin and its commit** — ~17–20 ms
     on a 100 000-record store, down from the whole rebuild (§9.4). The remainder
     is the record scan, which is under the lock because the delta layer is
     mutable while it is live.
-14. **A reader is still fixed at its own open** and must reopen to advance
+15. **A reader is still fixed at its own open** and must reopen to advance
     (§9.1b). Live readers are deferred on a measured trade, not an unknown —
     §14.10.
-15. **Recovery to a point in time cuts at commit boundaries only.** Records
+16. **Recovery to a point in time cuts at commit boundaries only.** Records
     written through the single-record mutators carry no sequence number and no
     timestamp, so a cut takes them with the commit that follows;
     `RestoreInfo.DroppedRecords` reports how many (§11.6). And no backup can be
     rewound past the `commitSeqHW` of the image it carries, because compaction is
     not reversible — `ErrRestorePointTooEarly` says so and names the figure.
-16. **A backup excludes compaction for its duration**, and a background
+17. **A backup excludes compaction for its duration**, and a background
     compactor's tick reports `ErrBackupInProgress` and retries later (§11.6).
     Writers are unaffected.
 
