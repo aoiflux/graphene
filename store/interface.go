@@ -601,6 +601,30 @@ func (p CompactionPolicy) Evaluate(s StorageStats) (bool, string) {
 	return false, ""
 }
 
+// CompactionObserver is told the outcome of each background compaction.
+//
+// A compaction the engine started has nowhere to report to — the library has no
+// logger and returns no error to anyone — so without an observer a failing one
+// fails silently and repeats on the next tick. Nil is the default and costs
+// nothing.
+//
+// Implementations are called from the background goroutine and must not block
+// on the store.
+type CompactionObserver interface {
+	// Compacted reports the policy rule that fired and what the compaction
+	// returned; err is nil when it succeeded.
+	Compacted(reason string, err error)
+}
+
+// CompactionObserverFunc adapts a plain function to CompactionObserver.
+//
+// The interface exists rather than a bare func field because the options struct
+// carrying it is a comparable value, and a struct with a func field is not.
+type CompactionObserverFunc func(reason string, err error)
+
+// Compacted calls f.
+func (f CompactionObserverFunc) Compacted(reason string, err error) { f(reason, err) }
+
 // TxOpKind identifies which operation a TxOp carries.
 type TxOpKind uint8
 

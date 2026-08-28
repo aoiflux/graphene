@@ -153,6 +153,43 @@ type Store struct {
 	// whoever happened to write last would be wrong.
 	attestActorID uint64
 
+	// compacting is set while a compaction is between its pin and its publish.
+	// Guarded by mu.
+	//
+	// Needed only because that span now has the lock released in the middle of
+	// it. Two compactions running at once would race for one temp image path and
+	// each splice the delta against the other's epoch; while the lock was held
+	// end to end, mu itself was the exclusion.
+	compacting bool
+
+	// backups counts the backups currently reading this directory. Guarded by mu.
+	//
+	// A backup is a pure read of the store's files and so does not exclude
+	// writers, other backups, or anything else — only compaction, which is the
+	// one operation that rewrites bytes already on disk. See backup.go.
+	backups int
+
+	// auto is the background compaction trigger, nil unless Options.AutoCompact
+	// asked for one. See autocompact.go for the lifecycle it owes Close.
+	auto *autoCompactor
+
+	// afterPinHook runs between a compaction's pin and its build, with no lock
+	// held. Nil in production, and reachable only from inside this package.
+	//
+	// It exists for the same reason as the WAL's writeHook: the window it opens
+	// is the whole point of the three-stage compaction, and without a seam the
+	// only way to land a commit inside it is to race one and hope. A test that
+	// hopes is a test that passes on a fast machine.
+	//
+	// Set once, before the store is used.
+	afterPinHook func()
+
+	// afterBackupPinHook is the same seam for a backup: it runs between the pin
+	// and the first file copied, with no lock held, so a test can land a
+	// compaction attempt or a write inside the window a backup opens. Nil in
+	// production.
+	afterBackupPinHook func()
+
 	// lastCompact is when Compact last completed in this process. Guarded by mu.
 	// Not persisted — a reopened store reports zero even if its image on disk was
 	// compacted a moment earlier. Persisting it needs a CSR header field and is
@@ -438,6 +475,32 @@ type Options struct {
 	// that leaks one — it does not close the snapshot, it stops it being useful,
 	// which turns a silent leak into an error at the point of use.
 	MaxSnapshotAge time.Duration
+
+	// AutoCompact runs a compaction in the background when the policy fires.
+	// Nil, the default, leaves compaction entirely to the caller — which is what
+	// the engine has always done, and what Graph.ShouldCompact is for.
+	//
+	// Set it when nothing in the application is going to call Compact on a
+	// schedule. Nothing else bounds delta growth: everything written since the
+	// last compaction stays in memory and is replayed at every open, so a store
+	// that is never compacted degrades in memory, open time and read speed at
+	// once, with no error and no warning until someone measures it.
+	//
+	// store.DefaultCompactionPolicy() is a starting point, not a tuned setting.
+	AutoCompact *store.CompactionPolicy
+
+	// AutoCompactInterval is how often the policy is evaluated. Zero means 30s.
+	// Ignored when AutoCompact is nil.
+	AutoCompactInterval time.Duration
+
+	// AutoCompactObserver is told the outcome of each background compaction:
+	// the rule that fired and whatever the compaction returned. Nil discards
+	// both, which makes a failing background compaction silent — see
+	// store.CompactionObserver.
+	//
+	// The same nil-by-default shape as Signer and Verifier, and where a metrics
+	// sink will attach. store.CompactionObserverFunc wraps a closure.
+	AutoCompactObserver store.CompactionObserver
 }
 
 // recordAudit appends an entry when auditing is enabled, and does nothing
@@ -762,6 +825,14 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	// What is left is engine bugs, which belong in tests, not in a startup scan.
 	// Callers recovering a suspect store can run Graph.VerifyIndexes() and then
 	// Graph.RebuildIndexes() explicitly.
+
+	// Last, and only once the store is fully built: the trigger evaluates
+	// StorageStats and may compact on its first tick, and neither is meaningful
+	// against a store still being assembled. A read-only store never gets one —
+	// it cannot compact, and mustWrite would refuse every tick.
+	if opts.AutoCompact != nil && !opts.ReadOnly {
+		s.startAutoCompact(*opts.AutoCompact, opts.AutoCompactInterval, opts.AutoCompactObserver)
+	}
 
 	return s, nil
 }
@@ -1469,6 +1540,13 @@ func (s *Store) EdgeCount() (uint64, error) {
 }
 
 func (s *Store) Close() error {
+	// The background compactor goes first, and Close waits for it. Everything
+	// closed below is something a compaction in flight is holding — the log it
+	// checkpoints, the audit log it records to, the directory the process lock
+	// covers — so closing them under a running one is a use-after-close, not a
+	// race that merely loses work. See autocompact.go.
+	s.stopAutoCompact()
+
 	// The WAL closes even if the audit log fails to, because a WAL left open
 	// leaks a file handle and, on Windows, leaves the file undeletable. The
 	// audit error is still returned — it is not more important than durability,

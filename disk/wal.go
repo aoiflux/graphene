@@ -9,6 +9,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -376,29 +377,82 @@ func (w *WAL) Size() int64 {
 	return fi.Size()
 }
 
+// stableSize reports the log's length with nothing in flight, so the figure
+// names a record boundary rather than wherever a concurrent append had reached.
+//
+// Size is the cheap gauge and is deliberately unsynchronised; this is the one
+// callers need when the number is going to be used as a *cut*. A backup records
+// it in a manifest and a restore truncates to it, and a figure landing inside a
+// record would make the copy's own length a lie about what it holds — replay
+// would drop the torn record silently and the backup would claim a commit it
+// did not carry.
+//
+// Read-only logs have nothing queued, so the barrier is all the quiescing they
+// need.
+func (w *WAL) stableSize() (int64, error) {
+	if w.file == nil {
+		return 0, nil
+	}
+	if err := w.beginMaintenance(); err != nil {
+		return 0, err
+	}
+	defer w.endMaintenance()
+
+	if !w.readOnly {
+		if err := w.drainQueuedLocked(); err != nil {
+			return 0, err
+		}
+	}
+	fi, err := w.file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("wal size: %w", err)
+	}
+	return fi.Size(), nil
+}
+
 // Checkpoint writes a checkpoint marker and syncs. After compaction, a
 // checkpoint signals that all records before it are durable in the CSR and
 // the WAL can be safely truncated.
 func (w *WAL) Checkpoint() error {
+	_, err := w.checkpointAt()
+	return err
+}
+
+// checkpointAt is Checkpoint, reporting the offset the marker was written at —
+// which is to say the end of every record the log held when it went down.
+//
+// Compaction needs that number and cannot take it around the call: the offset
+// is only meaningful between the ring drain and the marker append, and both of
+// those happen inside the maintenance barrier held here. Measured before the
+// call it misses whatever the drain then writes; measured after it includes the
+// marker, and a marker carried forward into a rebuilt log would stop replay at
+// the first record of the tail it was carried with.
+func (w *WAL) checkpointAt() (int64, error) {
 	if w.readOnly {
-		return errWALReadOnly
+		return 0, errWALReadOnly
 	}
 	if err := w.beginMaintenance(); err != nil {
-		return err
+		return 0, err
 	}
 	defer w.endMaintenance()
 
 	if err := w.drainQueuedLocked(); err != nil {
-		return err
+		return 0, err
 	}
+	fi, err := w.file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("wal checkpoint: stat: %w", err)
+	}
+	off := fi.Size()
+
 	if err := w.writeRecord(walRecordCheckpoint, nil); err != nil {
-		return err
+		return 0, err
 	}
 	if err := w.syncFile(); err != nil {
-		return err
+		return 0, err
 	}
 	w.gate.noteSynced(w.tail.Load())
-	return nil
+	return off, nil
 }
 
 // Truncate removes all records from the WAL (called after successful compaction).
@@ -448,6 +502,84 @@ func (w *WAL) Truncate() error {
 	}
 	w.framing = walFramingV2
 	w.dataStart = walFileHeaderSize
+	return nil
+}
+
+// truncateFrom rebuilds the log holding only the records in [keepFrom, keepTo).
+//
+// This is Truncate for a compaction that ran with the store lock released: the
+// image folded in everything the log held at keepFrom, and everything after it
+// is a commit that landed while the image was being built and exists nowhere
+// else on disk. Truncating to zero would lose those commits outright, so the
+// bytes are carried into the rebuilt log rather than discarded.
+//
+// Carrying raw bytes is sound because a record's CRC covers its type, length
+// and payload and nothing about where it sits — see recordCRC — so a record is
+// the same record at a different offset. It is *only* sound within one framing,
+// which is why the caller checks Framing first: a v1 log's records would fail
+// their CRC under the v2 header this writes.
+//
+// Unlike Truncate, this cannot rewrite the file in place. Truncate discards
+// data the image already holds, so a crash midway through costs nothing; here
+// the tail is the only durable copy of those commits, and a crash between the
+// truncation and the rewrite would take them. The new log is therefore built
+// beside the old one and renamed over it, which is the same argument compaction
+// makes for the image itself.
+func (w *WAL) truncateFrom(keepFrom, keepTo int64) error {
+	if w.readOnly {
+		return errWALReadOnly
+	}
+	if err := w.beginMaintenance(); err != nil {
+		return err
+	}
+	defer w.endMaintenance()
+
+	if err := w.drainQueuedLocked(); err != nil {
+		return err
+	}
+	if keepFrom < w.dataStart || keepTo < keepFrom {
+		return fmt.Errorf("wal truncate: nonsense range [%d,%d) in a log starting at %d",
+			keepFrom, keepTo, w.dataStart)
+	}
+
+	tail := make([]byte, keepTo-keepFrom)
+	if len(tail) > 0 {
+		if _, err := w.file.ReadAt(tail, keepFrom); err != nil {
+			return fmt.Errorf("wal truncate: read tail: %w", err)
+		}
+	}
+
+	name := w.file.Name()
+	tmp := name + ".tmp"
+	rebuilt := append(appendWALFileHeader(walFileHeader{Version: walFramingV2}), tail...)
+	if err := writeFileSync(tmp, rebuilt, 0600); err != nil {
+		return fmt.Errorf("wal truncate: write rebuilt log: %w", err)
+	}
+
+	if err := w.file.Close(); err != nil {
+		return fmt.Errorf("wal truncate: close: %w", err)
+	}
+	if err := os.Rename(tmp, name); err != nil {
+		return fmt.Errorf("wal truncate: rename: %w", err)
+	}
+	if err := syncDir(filepath.Dir(name)); err != nil {
+		return fmt.Errorf("wal truncate: %w", err)
+	}
+
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("wal truncate: reopen: %w", err)
+	}
+	w.file = f
+	w.framing = walFramingV2
+	w.dataStart = walFileHeaderSize
+
+	// Every outstanding ticket names a position in the file that has just been
+	// replaced. The bytes those tickets covered are durable — either folded into
+	// the image compaction fsynced, or carried into the log this fsynced — so
+	// releasing the waiters is telling them the truth, and nothing will ever
+	// sync the offsets they actually name.
+	w.gate.noteSynced(w.tail.Load())
 	return nil
 }
 

@@ -164,11 +164,66 @@ func (g *Graph) Forensics() (*disk.Store, bool) {
 // the delta layer into the CSR and truncates the WAL. Call it after a bulk
 // ingest is complete.
 func (g *Graph) Compact() error {
+	return g.CompactCtx(context.Background())
+}
+
+// CompactCtx is Compact, abandoned if ctx is cancelled.
+//
+// Cancellation reaches the image build, which is where the seconds are, and
+// stops there; a compaction that has begun installing its image finishes. See
+// disk.Store.CompactCtx for why that is the only correct place to stop.
+func (g *Graph) CompactCtx(ctx context.Context) error {
 	s, ok := g.GraphStore.(*disk.Store)
 	if !ok {
 		return nil // no-op for in-memory
 	}
-	return s.Compact()
+	return s.CompactCtx(ctx)
+}
+
+// --- Backup and restore ---
+
+// Backup writes a consistent copy of the store into dst, which must not already
+// hold a store or a backup. Available when the Graph is backed by a disk.Store.
+//
+// The graph stays open and writable throughout; only compaction is refused for
+// the duration. See disk.Store.Backup for what makes the copy consistent, and
+// Restore for reading one back.
+//
+// The in-memory backend has no directory to copy and returns an error rather
+// than succeeding silently — a backup that quietly did nothing is worse than one
+// that failed, because only the second is noticed before it is needed.
+func (g *Graph) Backup(dst string) (disk.BackupInfo, error) {
+	return g.BackupCtx(context.Background(), dst)
+}
+
+// BackupCtx is Backup, abandoned if ctx is cancelled. A cancelled backup leaves
+// no manifest, so what it wrote cannot be mistaken for a complete copy.
+func (g *Graph) BackupCtx(ctx context.Context, dst string) (disk.BackupInfo, error) {
+	s, ok := g.GraphStore.(*disk.Store)
+	if !ok {
+		return disk.BackupInfo{}, fmt.Errorf("Backup: %T is not backed by a directory", g.GraphStore)
+	}
+	return s.BackupCtx(ctx, dst)
+}
+
+// Restore copies the backup at src into dst and returns what it produced,
+// including how far the restored store was rewound if a recovery point was
+// asked for.
+//
+// dst must not exist or must be empty. The backup is verified against its
+// manifest before anything is copied. Open the result with graphene.Open.
+func Restore(src, dst string, opts disk.RestoreOptions) (disk.RestoreInfo, error) {
+	return disk.Restore(src, dst, opts)
+}
+
+// VerifyBackup checks a backup directory against its manifest without restoring
+// it: every file present, at the recorded length, hashing to the recorded
+// digest.
+//
+// Worth running on a schedule against an archive. The alternative is finding out
+// during a recovery, which is the one moment there is no time to react.
+func VerifyBackup(dir string) (disk.BackupInfo, error) {
+	return disk.VerifyBackup(dir)
 }
 
 // --- Index maintenance ---

@@ -99,6 +99,32 @@ func (s *Store) publishCSR(csr *CSRGraph) {
 	s.publishView(&view{csr: csr, delta: newDeltaLayer()})
 }
 
+// publishCompacted installs a rebuilt image under the delta that survived it.
+// Caller holds s.mu exclusively.
+//
+// publishCSR is the special case where nothing survived, and its zeroing of
+// csrShadowed is only right *because* nothing did. A compaction that ran with
+// the lock released leaves behind every commit that landed while it built, and
+// some of those supersede a record the new image holds — so the count has to be
+// restored to what those survivors shadow rather than cleared. Clearing it
+// would put the lock-free point read back on a path that returns the image's
+// superseded copy.
+//
+// The two stores are in the opposite order to publishView's, and the order is
+// the whole of the correctness argument. csrFastRead reads the image pointer
+// and then the count; publishView can store the view first because the count it
+// then writes is zero, so the worst a reader sees is a stale non-zero count and
+// a needless trip through the lock. Here the count is going *up*, and a reader
+// that sampled the new image before the count went up would find its record,
+// re-check against a count that is still zero and a pointer that still matches,
+// and accept a record the surviving delta supersedes. Storing the count first
+// closes that: sequential consistency means any reader that observes the new
+// image also observes the count that was stored before it.
+func (s *Store) publishCompacted(csr *CSRGraph, delta *deltaLayer, shadowed int64) {
+	s.csrShadowed.Store(shadowed)
+	s.viewPtr.Store(&view{csr: csr, delta: delta})
+}
+
 // --- snapshot registry ---
 
 // snapshotRegistry tracks open snapshots.

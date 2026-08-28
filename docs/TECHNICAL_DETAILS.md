@@ -992,7 +992,7 @@ against a brute-force oracle over five pattern shapes on both backends.
 |---|---|---|---|
 | `storeLock` (`graphene.lock`) | **process** | the whole store directory | open to close |
 | `memory.Store.mu` | goroutine | records, adjacency, label postings | every operation |
-| `disk.Store.mu` | goroutine | the delta layer's maps and the view swap | locked reads, all writes |
+| `disk.Store.mu` | goroutine | the delta layer's maps and the view swap | locked reads, all writes, a compaction's pin and commit |
 | `propertyShard.mu` × 16 | goroutine | one shard's forward and reverse maps | that shard's operations |
 | `WAL.writeMu` | goroutine | the drain pass and the fsync that follows it | a group-commit flush, overflow, maintenance |
 | `syncGate.mu` | goroutine | which goroutine is flushing, and how far the log is durable | briefly, never across the fsync itself |
@@ -1003,6 +1003,13 @@ waits for durability outside — which is what lets a second committer join the
 first one's fsync (§11.1). It is safe because a commit becomes *visible* when its
 epoch is published, not when its map write lands, and the epoch is published
 after the wait (§10.3).
+
+**`disk.Store.mu` is not held across a compaction's image build.** `Compact`
+pins the records under the lock, builds and fsyncs the image with it released,
+and retakes it to install the result (§9.4). It is also the one operation that
+excludes itself explicitly, through `Store.compacting`, rather than relying on
+`s.mu`: two compactions no longer overlap only because the lock is held
+throughout, so `ErrCompactionInProgress` says so.
 
 **No operation holds two shard locks.** This is a design constraint, not an
 accident — it is what removes deadlock from the reasoning entirely.
@@ -1078,9 +1085,11 @@ So the shared lock exists for readers running alongside *other readers*, and the
 exclusive lock is what keeps a writer from being one of them. Reopening is how a
 reader advances.
 
-Making readers live is a reader-refresh protocol — replay-from-offset, a CSR
-generation marker, incremental property-index apply, and a torn-refresh story —
-and not a locking change. It is **not built**.
+Making readers live needs a reader-refresh protocol — replay-from-offset, a CSR
+generation marker, incremental property-index apply, and a torn-refresh story.
+It is **not built**, and the sentence that used to stand here — "and not a
+locking change" — was wrong: it is *also* a locking change, and on Windows a
+change to how the writer replaces the log. §14.10 has the measurement.
 
 Note that this is a different thing from §10.3's snapshots, which are about
 consistency *within* one open store and are built. A snapshot fixes what one
@@ -1183,6 +1192,99 @@ readers as defence in depth, but the correctness argument rests on the design.
 
 The memory backend is the reference implementation, not the production path, and
 is deliberately left unsharded — see §14.
+
+### 9.4 Compaction with the lock released
+
+Compaction used to hold `s.mu` from its first map read to its last publish. That
+put an O(V+E) scan, a sort, a Merkle pass over every record, index entry and
+tombstone, a whole-image serialisation and a whole-image fsync inside every
+writer's critical section — a single stall that grows with the size of the
+store. Measured on a 100 000-record store, the worst commit during a compaction
+took **91–93 ms**, which is the compaction's own wall time: one writer, blocked
+for all of it, and **2** commits got through.
+
+The work splits at the point where it stops reading the store:
+
+| Stage | Lock | Does |
+|---|---|---|
+| `compactPin` | `s.mu` | collect the records, the property entries, the redaction ledger and the log offset, all at one epoch |
+| `build` | none | sort, hash, serialise, write and fsync the temp image |
+| `compactCommit` | `s.mu` | checkpoint, rename, retire the log, splice the delta, publish |
+
+The middle stage is safe unlocked because the plan shares nothing mutable with
+the store: the record slices are freshly built, a `*store.Node` in the delta is
+*replaced* rather than edited when it changes, a `CSRGraph` is immutable once
+published, and the property entries and ledger are copies taken under the lock.
+Same store, same measurement: worst commit **17–20 ms**, and **132–148** commits
+got through. The compaction itself takes ~15% longer, which is the writers now
+actually running.
+
+**The released lock costs two things, and both are mechanisms rather than
+caveats.**
+
+*Commits land during the build.* They are in the log and in the delta and
+nowhere else on disk — not in the image, which was built from an older epoch. So
+the log cannot be emptied behind them. `compactCommit` knows where the log stood
+at the pin, and rebuilds it holding only the bytes after that offset. Carrying
+raw bytes is sound because a record's CRC covers its type, length and payload
+and nothing about its position; it is sound *only within one framing*, so a
+pre-container v1 log is left alone instead. A log being rotated to a retained
+segment is left alone too: replay reads only the active log, so carrying the
+tail forward would open a window between two renames in which a crash leaves it
+in neither. Leaving the log is always safe — its records are in the image as
+well, so replay applies them a second time as upserts — and costs only that this
+compaction reclaims no log space. The audit entry says which happened.
+
+*The delta holds both generations.* Publishing an empty layer, which is what
+compaction always did, would drop them. `deltaLayer.since` keeps exactly the
+chains whose head is newer than the pinned epoch and drops the rest, which is
+what preserves compaction as the point where a delete stops costing memory. Only
+the head is carried: the new view is published under the lock together with the
+epoch, so nothing can pin it at an older one. Surviving heads are *copied*, never
+relinked, because an open snapshot is still reading the layer they came from.
+
+**The invariant this buys** is the one the rest of the engine reads as obvious:
+*the image holds every epoch up to the pin, the log holds every epoch after it,
+and neither holds both.* Backup and PITR need it to mean one thing.
+
+**One correctness subtlety worth naming.** A commit in the window may supersede a
+record the new image holds — a node created before the pin, folded into the
+image, and updated during the build. The store's shadow counter never saw it
+(`nodeInCSR` was false against the *old* image when the update was applied), so
+publishing the new view has to *restore* `csrShadowed` from the surviving layer
+rather than clear it, and has to store the count **before** the view pointer.
+Clearing it, or storing it after, lets a lock-free point read find the image's
+superseded copy, re-check against a count that is still zero and a pointer that
+already matches, and return it. See §9.2 for why that class of bug is a
+two-word problem and how it is avoided elsewhere.
+
+### 9.5 Background compaction
+
+Off by default. `disk.Options.AutoCompact` takes a `store.CompactionPolicy` and
+starts **the only goroutine in engine code**, which evaluates the policy on a
+ticker and compacts when a rule fires.
+
+`CompactionPolicy.Evaluate` has always been able to say "this store is due" and
+nothing acted on it. That was right while a compaction froze every writer for the
+length of a whole-image rebuild — when to pay that is genuinely the caller's
+decision. §9.4 is what changed the cost of saying yes; it did not change who gets
+to say it, which is why the default is still off and `Graph.ShouldCompact`
+remains the documented shape.
+
+The goroutine means a lifecycle, and it is short:
+
+- Started by `Open`, last, once the store is fully built. Never on a read-only
+  store, which cannot compact and would refuse on every tick.
+- `Close` cancels it and then **waits**. A compaction in its commit stage ignores
+  cancellation, so the wait is what stops `Close` pulling the log, the audit log
+  and the process lock out from under a rename in progress. That is a
+  use-after-close, not a lost compaction.
+- The wait is bounded by one commit stage, not one compaction: `CompactCtx`
+  checks the context around the build and abandons it.
+
+`Options.AutoCompactObserver` is told the rule that fired and what the compaction
+returned. Without it a failing background compaction fails silently and repeats,
+because the library has no logger and there is no caller to return an error to.
 
 ---
 
@@ -1503,6 +1605,77 @@ megabyte on every open, including compacted stores that replay almost nothing.
 
 ---
 
+### 11.6 Backup, restore, and recovery to a point in time
+
+`Store.Backup(dst)` writes a consistent copy of a store that is **still open and
+still being written**. `disk.Restore(src, dst, opts)` reads one back, optionally
+rewound to a commit sequence number or a wall-clock instant.
+
+**What makes a copy consistent.** §9.4's invariant, restated as a property of the
+directory: the image holds every commit up to the compaction's pin, the log holds
+every commit after it, and neither holds both. A copy of the pair is a whole
+store exactly when both halves come from the same side of a compaction — so
+compaction is the only operation a backup has to exclude, and the two refuse each
+other with `ErrBackupInProgress` and `ErrCompactionInProgress`. Everything else
+under `dir` is append-only, and a prefix of an append-only file is a valid
+shorter version of itself.
+
+**Writers are not stopped.** The store lock is held only to note where the log
+stands and to list what to copy; the copy itself runs with no lock at all.
+Measured on a 100 000-record store, one writer committing throughout: the worst
+single commit during a backup is **1.0–1.6 ms** against a control worst of
+**1.0–1.2 ms** with nothing else running — the same figure, inside its own noise.
+The copy costs a few percent of write throughput (**0.92–0.98** of idle, one
+outlier at 0.77), which is I/O contention rather than blocking.
+
+**The log is cut to an offset; nothing else is.** `WAL.stableSize` takes the
+maintenance barrier so the recorded length names a record boundary. That figure
+has to be exact, because it is what a recovery point is later measured against;
+the ledgers carry no such promise and are copied whole. The process lock is not
+copied — it names the pid holding the *source* — and neither is any `.tmp`.
+
+**The manifest is the backup.** `graphene.backup.json` commits to every file's
+length and SHA-256, and is written **last**, so a directory without one is not a
+backup however complete it looks. Digests are computed from the bytes actually
+written, and the image is additionally checked against the digest in its own
+header, so "the backup succeeded" is a statement about the copy rather than about
+the original. `VerifyBackup(dir)` re-checks the lot without restoring — the
+question an archive has no answer to until someone asks it, and the worst moment
+to first ask is during a recovery. A restore verifies before copying a byte and
+hashes again as it writes.
+
+**Recovery to a point is a truncation.** Replay applies a batch only when it
+reaches the commit record closing it, so recovering to a point is cutting the
+copied log at the end of the last commit at or below it. The restored directory
+*is* the store as it stood then — there is no "stop early" flag anywhere for a
+later open to ignore. The cut is placed by driving `replayRecords`, the same
+parser the store replays through and the one `FuzzWALReplay` covers, so the cut
+and the meaning of the truncated log cannot drift apart.
+
+Two limits follow from that being the mechanism, and both are reported rather
+than hidden:
+
+- **Only commits are boundaries.** The single-record mutators append a bare
+  record with no sequence number and no timestamp, because they have never been
+  transactions (§11.1). They are restored with the commit that follows them and
+  dropped with it otherwise, and a store written entirely through them has no
+  boundaries at all. `RestoreInfo.DroppedRecords` counts what a cut discarded, so
+  the pitfall shows up as a number.
+- **A point inside the image cannot be reached.** Compaction folds commits into
+  the image and is not reversible, so the earliest point a backup can be rewound
+  to is the image's own `commitSeqHW`. Asking for less returns
+  `ErrRestorePointTooEarly` naming that figure — read from the image's header
+  rather than from the manifest, because that is the file it is a property of.
+  Going further back needs an older backup, which is the reason to keep more than
+  one.
+
+**What a restore leaves.** An ordinary store, opened with `disk.Open`. Its commit
+numbering resumes past what it holds rather than colliding with it, because the
+counter's high-water mark is in the image header (v8) and in the log it kept. If
+the backup carried an audit log, the restore appends an `AuditRestore` entry to
+it, continuing the chain rather than starting one — and a store that was never
+audited does not acquire a chain here, because a first entry claiming to describe
+a history it has none of would be worse than no entry.
 
 ---
 
@@ -1711,6 +1884,35 @@ nothing after a compaction.
 **What survives:** mmap'ing the *flat adjacency arrays*, which stay fixed-width
 and directly indexable, so it costs the read path nothing.
 
+**Measured, and the survivor does not pay for itself.** `disk/mmap_spike_test.go`
+(`-tags=stress -run TestMmapSpike`) breaks a reopened 50 000-node / 150 000-edge
+store's heap down by what a mapping could actually displace — bytes on disk that
+are contiguous, pointer-free and usable without decoding:
+
+| Property blob | Heap | Flat arrays (mappable) | Record arrays + payloads (needs the rejected design) |
+|---|---|---|---|
+| none | 19.4 MiB | 3.1 MiB — **15.8%** | 14.5 MiB — 74.9% |
+| 64 B | 31.6 MiB | 3.1 MiB — **9.7%** | 26.7 MiB — 84.6% |
+| 512 B | 117.0 MiB | 3.1 MiB — **2.6%** | 112.1 MiB — 95.9% |
+
+The mappable share is fixed at 3.1 MiB and everything else grows, so the prize
+*shrinks* as a store gets more realistic. **No-go**: reinstating a format section
+v7 deleted as dead bytes, plus a platform-specific mapping path, to save 2.6% of
+a store carrying real payloads is not a trade worth making. The 90%+ figure is
+real but it is the column that requires exactly the design rejected above — an
+offset table and a decode on every `GetNode`.
+
+**What the spike found instead.** With no property blobs at all, 19.4 MiB of heap
+sits over a 5.7 MiB image, and 14.1 MiB of that is the `nodes[]`/`edges[]`
+backing arrays — 56 bytes per `nodeRecord` and 80 per `rawEdge`, of which 48 are
+two slice headers pointing at two bytes of labels. The amplification is not the
+image being in the heap; it is each record carrying pointers to tiny separate
+allocations. Packing labels and properties into one arena addressed by offsets
+would reclaim most of it **without** mapping anything and **without** putting a
+decode on the read path — the flat fields stay directly indexable. That is a
+format change and belongs with §4's version work, but it is the measurement's
+actual finding and it is a better lead than mmap.
+
 ### 14.4 Rejected: bulk index loading
 
 Built, tested for equivalence, and **reverted**. One lock per shard, parallel
@@ -1821,6 +2023,54 @@ Correctness here is invisible to functional tests — a content-equal string
 changes nothing observable — so `index/interning_test.go` asserts on
 backing-pointer identity instead.
 
+### 14.10 Deferred: live readers, and what they would actually cost
+
+§9.1b says a reader is fixed at its own open and has to reopen to advance, and
+attributes that to the missing refresh protocol. Building the protocol was
+scoped and the blocking constraint turned out to be somewhere else, so the price
+is recorded here rather than discovered later.
+
+**Two processes, one open file.** A live reader has the writer's log open while
+the writer is replacing it. Compaction replaces the log three ways — `os.Truncate`
+after closing, `os.Rename` away (`Rotate`), `os.Rename` over (`truncateFrom`) —
+and each has to survive a foreign read handle. Measured on Windows 11:
+
+| operation | plain `os.Open` reader | reader granting `FILE_SHARE_DELETE` |
+|---|---|---|
+| `os.Rename` **away** — `Rotate` | Access denied | **OK** |
+| `os.Rename` **over** — `truncateFrom` | Access denied | Access denied |
+| `ReplaceFileW` over | — | **OK** |
+| `os.Truncate` | OK | OK |
+| append, then read through the old handle | — | sees the append |
+
+Go's `os.Open` asks for `FILE_SHARE_READ|FILE_SHARE_WRITE` and not `DELETE`, and
+`os.Rename` is `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`, which is refused
+either way. So live readers on Windows need **both** a platform-specific open on
+the reader and a platform-specific replace on the writer.
+
+**Three costs, and none of them is the protocol.**
+
+1. **The process lock has to give.** A shared lock and an exclusive lock cannot
+   coexist — that is what the OS primitive means — so either the writer stops
+   taking an exclusive lock, or readers stop taking a shared one. Both give up an
+   guarantee `OpenReadOnly` documents today.
+2. **`truncateFrom` would have to use `ReplaceFileW`.** It exists precisely
+   because the window tail is the only durable copy of those commits (§9.4), and
+   `MoveFileEx`'s replace is the atomicity that argument rests on. `ReplaceFileW`
+   is not documented with the same guarantee.
+3. **A generation marker is needed anyway.** The WAL container header's 50 bytes
+   are fully used and CRC-covered, but `SegmentSeq` is already there and is only
+   informational for the active log — `Truncate` and `truncateFrom` write zero
+   into it. Making them increment it is a one-line, backward-compatible marker.
+   This is the cheap part.
+
+So the honest shape is a third, opt-in open mode that trades `OpenReadOnly`'s
+"no writer is running" guarantee for the ability to advance — not a change to
+what `OpenReadOnly` already promises. **Deferred until that trade is chosen**,
+because it is an operator's decision about their store and not an engineering
+detail. Nothing above is speculative: the table is a measurement and the lock
+argument is what the primitive is.
+
 ---
 
 ## 15. Invariants
@@ -1874,6 +2124,27 @@ Any change must preserve these. Each is enforced by tests.
 10. **Memory-backend read concurrency is negative** past one core (§9.3).
 11. **Write scaling is bounded by a single WAL append point** — but no longer by
     a serialised fsync: concurrent committers share one (§11.1).
+12. **Delta growth is bounded only if something compacts.** `Options.AutoCompact`
+    will do it in the background (§9.5); left off, which is the default, it is
+    the caller's loop around `Graph.ShouldCompact`. Nothing else caps the delta:
+    everything written since the last compaction stays in memory and is replayed
+    at every open.
+13. **A compaction still stalls writers for its pin and its commit** — ~17–20 ms
+    on a 100 000-record store, down from the whole rebuild (§9.4). The remainder
+    is the record scan, which is under the lock because the delta layer is
+    mutable while it is live.
+14. **A reader is still fixed at its own open** and must reopen to advance
+    (§9.1b). Live readers are deferred on a measured trade, not an unknown —
+    §14.10.
+15. **Recovery to a point in time cuts at commit boundaries only.** Records
+    written through the single-record mutators carry no sequence number and no
+    timestamp, so a cut takes them with the commit that follows;
+    `RestoreInfo.DroppedRecords` reports how many (§11.6). And no backup can be
+    rewound past the `commitSeqHW` of the image it carries, because compaction is
+    not reversible — `ErrRestorePointTooEarly` says so and names the figure.
+16. **A backup excludes compaction for its duration**, and a background
+    compactor's tick reports `ErrBackupInProgress` and retries later (§11.6).
+    Writers are unaffected.
 
 ---
 

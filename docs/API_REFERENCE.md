@@ -341,6 +341,7 @@ func (g *Graph) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.
 func (g *Graph) NodeCount() (uint64, error)
 func (g *Graph) EdgeCount() (uint64, error)
 func (g *Graph) Stats() (*GraphStats, error) // {NodeCount, EdgeCount}
+func (g *Graph) StorageStats() (store.StorageStats, bool) // operational figures; false if unsupported
 ```
 
 **A missing ID is not an error.** It is returned in `missing`; `err` is reserved
@@ -878,8 +879,15 @@ func FilterEdgesByLabel(es []*store.Edge, label store.EdgeType) []*store.Edge
 ## 14. Persistence lifecycle
 
 ```go
-func (g *Graph) Compact() error   // disk only; no-op in memory
+func (g *Graph) Compact() error                          // disk only; no-op in memory
+func (g *Graph) CompactCtx(ctx context.Context) error    // the same, cancellable
+func (g *Graph) ShouldCompact(p store.CompactionPolicy) (bool, string)
+func (g *Graph) Backup(dst string) (disk.BackupInfo, error)          // disk only
+func (g *Graph) BackupCtx(ctx context.Context, dst string) (disk.BackupInfo, error)
 func (g *Graph) Close() error
+
+func graphene.Restore(src, dst string, opts disk.RestoreOptions) (disk.RestoreInfo, error)
+func graphene.VerifyBackup(dir string) (disk.BackupInfo, error)
 ```
 
 Disk write model: **WAL (append-only) + in-memory delta overlay + CSR snapshot.**
@@ -912,7 +920,128 @@ _ = g.Compact() // rebuild CSR, truncate WAL, reclaim deleted space
 _ = g.Close()
 ```
 
+### What a compaction blocks, and for how long
+
+`Compact` pins its records under the store lock, builds and fsyncs the new image
+with the lock **released**, and retakes it to install the result. Writers wait
+for the pin and the commit, not for the build — ~17–20 ms on a 100 000-record
+store rather than the whole rebuild. Readers are never blocked beyond the instant
+the new view is published, and a `Snapshot()` opened before a compaction goes on
+reading the graph it was opened against.
+
+Commits that land while the image is building are not lost: they stay in the
+delta and in the log, which is rebuilt around them rather than emptied.
+
+`CompactCtx` cancels the build. Once the commit begins the compaction finishes
+whatever the context says, because those steps are the ordering that makes a
+crash recoverable. A cancelled compaction leaves the store exactly as it found
+it. Calling `Compact` while one is already running returns
+`disk.ErrCompactionInProgress` rather than queueing.
+
+### Compacting automatically
+
+Nothing bounds delta growth on its own: everything written since the last
+compaction stays in memory and is replayed at every open, degrading memory, open
+time and read speed at once with no error and no warning.
+
+The documented shape is your own loop:
+
+```go
+if due, why := g.ShouldCompact(store.DefaultCompactionPolicy()); due {
+    log.Printf("compacting: %s", why)
+    _ = g.Compact()
+}
+```
+
+Or hand it to the engine, which is off by default:
+
+```go
+policy := store.DefaultCompactionPolicy()
+s, _ := disk.OpenWithOptions(dir, disk.Options{
+    AutoCompact:         &policy,
+    AutoCompactInterval: time.Minute, // zero means 30s
+    AutoCompactObserver: store.CompactionObserverFunc(func(reason string, err error) {
+        log.Printf("background compaction (%s): %v", reason, err)
+    }),
+})
+```
+
+This starts a background goroutine, which `Close` cancels and waits for. Set the
+observer: a background compaction has no caller to return an error to, so without
+one a failing compaction fails silently and repeats.
+
+`store.DefaultCompactionPolicy()` is a starting point, not a tuned setting.
+
 `Close()` flushes and releases the backend. Always defer it.
+
+### Backing up a store that is still running
+
+```go
+func (g *Graph) Backup(dst string) (disk.BackupInfo, error)                      // disk only
+func (g *Graph) BackupCtx(ctx context.Context, dst string) (disk.BackupInfo, error)
+func graphene.Restore(src, dst string, opts disk.RestoreOptions) (disk.RestoreInfo, error)
+func graphene.VerifyBackup(dir string) (disk.BackupInfo, error)
+```
+
+`Backup` writes a consistent copy of the store into `dst`, which must not already
+hold a store or a backup. The graph stays open and writable throughout — only
+compaction is refused for the duration, and a background compactor reports
+`disk.ErrBackupInProgress` and retries on its next tick. Writers are not blocked
+beyond what a commit already costs itself; the copy costs a few percent of write
+throughput.
+
+```go
+info, err := g.Backup("/archive/case-1183/2026-08-28")
+// info.CommitSeq      — the newest commit the copy holds
+// info.ImageCommitSeq — the earliest point it can be rewound to
+// info.Files          — every file, with its length and SHA-256
+```
+
+The copy is hashed as it is written and the manifest — `graphene.backup.json` —
+is written **last**, so a directory without one is not a backup however complete
+it looks. A cancelled `BackupCtx` therefore cannot be mistaken for a finished one.
+
+`VerifyBackup` re-checks an archived backup against its manifest without
+restoring it. Run it on a schedule: the alternative is finding out during a
+recovery.
+
+```go
+out, err := graphene.Restore(backupDir, newStoreDir, disk.RestoreOptions{})
+g2, err := graphene.Open(out.Dir)
+```
+
+`dst` must not exist or must be empty — a restore never merges into a directory
+that already holds a store. The backup is verified before a byte is copied.
+
+### Recovering to a point in time
+
+```go
+out, err := graphene.Restore(backupDir, newStoreDir, disk.RestoreOptions{
+    AtCommitSeq: 41_207,        // or AtTime: someInstant, or both
+    ActorID:     operatorID,    // recorded in the restored audit log
+})
+// out.CommitSeq      — where it actually landed
+// out.DroppedRecords — records the cut discarded
+```
+
+The restored directory *is* the store as it stood at that point; the log is
+truncated at the end of the last qualifying commit. Two limits, both reported
+rather than silent:
+
+- **Only commits are boundaries.** `AddNode`, `AddEdge`, `DeleteNode` and the
+  other single-record calls append a record with no sequence number and no
+  timestamp — they have never been transactions. They are restored with the
+  commit that follows them and dropped with it otherwise, so
+  `out.DroppedRecords` being large on a small rewind means the store was written
+  through those calls rather than through `Begin()`. Use transactions for ingest
+  you may want to rewind.
+- **A point inside the image cannot be reached.** Compaction is not reversible,
+  so a backup can only be rewound as far as the log it carries.
+  `disk.ErrRestorePointTooEarly` names the earliest reachable commit. Going
+  further back needs an older backup — which is the reason to keep more than one.
+
+The in-memory backend has no directory to copy: `Backup` returns an error rather
+than succeeding silently.
 
 ---
 
@@ -1745,6 +1874,21 @@ Every entry below is **opt-in** and lives on `disk.Store`, not `graphene.Graph`.
 This section is a lookup table; [FORENSICS.md](FORENSICS.md) is the working
 guide and [SECURITY.md](../SECURITY.md) is the authority on what each mechanism
 proves and what it does not.
+
+```go
+func (g *Graph) Forensics() (*disk.Store, bool)
+```
+
+is the supported way to reach it — the store itself, not a copy, and `false` on
+the in-memory backend, which supports none of this. Forwarding fifty methods
+through the façade would double the API surface and give every one of them
+somewhere to drift.
+
+```go
+if s, ok := g.Forensics(); ok {
+    proof, err := s.ProveNode(id)
+}
+```
 
 ### Configuration
 

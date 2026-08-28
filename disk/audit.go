@@ -75,6 +75,16 @@ const (
 	// audit entry that carries it. Every existing chain would stop verifying.
 	AuditUncleanRestart
 
+	// AuditBackup records that a consistent copy of this store was taken, and
+	// AuditRestore that this directory *is* one — written by the restored store
+	// at its first open, naming where it came from and where it was cut.
+	//
+	// Appended at the end for the same reason AuditUncleanRestart was: a kind's
+	// number is hashed into every entry that carries it, so renumbering would
+	// stop every existing chain verifying.
+	AuditBackup
+	AuditRestore
+
 	// AuditCustom is the caller's, whose meaning the engine does not interpret.
 	AuditCustom AuditKind = 1000
 )
@@ -101,6 +111,10 @@ func (k AuditKind) String() string {
 		return "role-grant"
 	case AuditUncleanRestart:
 		return "unclean-restart"
+	case AuditBackup:
+		return "backup"
+	case AuditRestore:
+		return "restore"
 	case AuditCustom:
 		return "custom"
 	default:

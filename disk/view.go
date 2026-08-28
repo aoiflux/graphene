@@ -41,6 +41,8 @@ package disk
 // words and a registry entry.
 
 import (
+	"slices"
+
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -170,6 +172,130 @@ func newDeltaLayer() *deltaLayer {
 		adj:         make(map[store.NodeID]*deltaAdj),
 		nodesByType: make(map[store.NodeType][]store.NodeID),
 		edgesByType: make(map[store.EdgeType][]store.EdgeID),
+	}
+}
+
+// since builds the layer that survives a compaction: everything this layer
+// holds that the new image does not, and nothing else.
+//
+// epoch is the newest epoch folded into csr, so a chain whose head is at or
+// before it has been fully absorbed and is dropped — which is what makes
+// compaction the point where a delete stops costing memory, exactly as an
+// emptied layer used to.
+//
+// Only the head of a surviving chain is carried. The versions beneath it are
+// not reachable through this layer: the new view is published under the store
+// lock together with the epoch, so nothing can pin it at an epoch older than
+// the compaction, and every read of it therefore resolves to the head. Older
+// readers hold the *previous* view, whose chains this does not touch — which is
+// also why the surviving heads are copied rather than relinked.
+//
+// The returned count is how many image records the surviving layer supersedes,
+// for csrShadowed. It is not the same figure as maskedNodes+maskedEdges: a
+// tombstone and an update both shadow, only a tombstone masks.
+func (l *deltaLayer) since(epoch uint64, csr *CSRGraph) (*deltaLayer, int64) {
+	out := newDeltaLayer()
+	var shadowed int64
+
+	hasNode := func(id store.NodeID) bool {
+		if csr == nil {
+			return false
+		}
+		_, found := csr.GetNode(id)
+		return found
+	}
+	hasEdge := func(id store.EdgeID) bool {
+		if csr == nil {
+			return false
+		}
+		_, found := csr.GetEdge(id)
+		return found
+	}
+
+	for id, ver := range l.nodes {
+		if ver.epoch <= epoch {
+			continue
+		}
+		out.nodes[id] = &nodeVersion{epoch: ver.epoch, node: ver.node}
+		if hasNode(id) {
+			shadowed++
+		}
+		if ver.node == nil {
+			if hasNode(id) {
+				out.maskedNodes++
+			}
+			continue
+		}
+		out.liveNodes++
+		appendNodeLabels(out, id, ver.node.Labels)
+		ensureAdj(out, id)
+	}
+
+	for id, ver := range l.edges {
+		if ver.epoch <= epoch {
+			continue
+		}
+		out.edges[id] = &edgeVersion{epoch: ver.epoch, edge: ver.edge}
+		inCSR := hasEdge(id)
+		if inCSR {
+			shadowed++
+		}
+		if ver.edge == nil {
+			if inCSR {
+				out.maskedEdges++
+			}
+			continue
+		}
+		out.liveEdges++
+		appendEdgeLabels(out, id, ver.edge.Labels)
+		// The same rule putEdge applies: delta adjacency lists only edges the
+		// image does not hold, so the two never name the same edge and the
+		// degree counts add. An edge created before the compaction and updated
+		// after it is in the rebuilt image, so its adjacency is there too.
+		if !inCSR {
+			ensureAdj(out, ver.edge.Src).out = append(ensureAdj(out, ver.edge.Src).out, id)
+			ensureAdj(out, ver.edge.Dst).in = append(ensureAdj(out, ver.edge.Dst).in, id)
+		}
+	}
+
+	// Postings are built by appending in map order and sorted once, rather than
+	// through indexNodeLabels' sorted insert: this runs over the whole surviving
+	// layer at once, where the insert is quadratic and this is not. Sortedness
+	// itself is not optional — the query paths merge these lists, and
+	// VerifyIndexes checks it.
+	for t, ids := range out.nodesByType {
+		slices.Sort(ids)
+		out.nodesByType[t] = ids
+	}
+	for t, ids := range out.edgesByType {
+		slices.Sort(ids)
+		out.edgesByType[t] = ids
+	}
+	for _, a := range out.adj {
+		slices.Sort(a.out)
+		slices.Sort(a.in)
+	}
+
+	return out, shadowed
+}
+
+// appendNodeLabels adds id to each distinct label posting without maintaining
+// order; since sorts once at the end.
+func appendNodeLabels(d *deltaLayer, id store.NodeID, labels []store.NodeType) {
+	for i, lbl := range labels {
+		if containsNodeTypeValue(labels[:i], lbl) {
+			continue
+		}
+		d.nodesByType[lbl] = append(d.nodesByType[lbl], id)
+	}
+}
+
+func appendEdgeLabels(d *deltaLayer, id store.EdgeID, labels []store.EdgeType) {
+	for i, lbl := range labels {
+		if containsEdgeTypeValue(labels[:i], lbl) {
+			continue
+		}
+		d.edgesByType[lbl] = append(d.edgesByType[lbl], id)
 	}
 }
 
