@@ -1,0 +1,173 @@
+package store
+
+// Telling someone else what the engine is doing.
+//
+// There is no logging and no metrics anywhere in library code, and that is a
+// deliberate position rather than an omission: an embedded engine that writes to
+// a logger of its choosing has made a decision that belongs to the program
+// embedding it. What it can do is offer a place to attach one.
+//
+// # Why one method and one struct
+//
+// The alternative shapes were a method per event and a stringly-typed
+// counter/gauge pair. A method per event makes every new measurement a breaking
+// change to an exported interface, which is the wrong trade for something whose
+// whole purpose is to grow. A string-keyed sink allocates on the hot path and
+// pushes the meaning of every number into documentation that nothing checks.
+//
+// One method taking a concrete struct is neither: adding a MetricKind is
+// additive, the struct is passed by value so nothing escapes to the heap, and
+// what each field means for each kind is written down below where a caller
+// reading the type can see it.
+//
+// # What it costs when unset
+//
+// Nothing. Every call site is inside `if m != nil`, and the fields that cost
+// something to compute — the clock reads, above all — are computed inside that
+// branch. A store with no sink runs the code it ran before this existed.
+//
+// # What is deliberately not measured
+//
+// GetNode and the other point reads. That path is ~6 ns and lock-free; two clock
+// reads would be an order of magnitude more than the work, and a measurement
+// that dominates the thing it measures is not an observation. Query, commit,
+// sync, compaction and replay are all far enough above the noise floor to carry
+// a timer, and between them they account for where a store's time actually goes.
+
+import (
+	"time"
+)
+
+// MetricKind identifies what a Metric describes.
+//
+// New kinds are added to the end. A sink that does not recognise one should
+// ignore it rather than fail: the engine will emit kinds a caller compiled
+// against an older version has never heard of.
+type MetricKind uint8
+
+const (
+	// MetricCommit is one committed batch, recorded after the epoch carrying it
+	// becomes visible — so the duration includes the wait for the group's fsync
+	// and is what a caller actually experienced.
+	MetricCommit MetricKind = iota + 1
+
+	// MetricSync is one fsync of the write-ahead log.
+	//
+	// Count is how many commits it made durable, which is the number that says
+	// whether group commit is working: one sync per commit means it is not.
+	MetricSync
+
+	// MetricCompaction is one completed compaction, successful or not.
+	MetricCompaction
+
+	// MetricQuery is one resolved QueryNodeIDs or QueryEdgeIDs, including the
+	// planning, the driving step and the residual pass.
+	MetricQuery
+
+	// MetricReplay is the write-ahead log replay one Open performed. Emitted
+	// once per open, and the best single indicator of how overdue a compaction
+	// is: the log is bounded only by compaction, so its size is also how long
+	// the next open will take.
+	//
+	// Count is epochs advanced rather than records, because that is what the
+	// replay actually applied — a torn tail contributes bytes and no epoch,
+	// which is the distinction worth being able to see.
+	MetricReplay
+
+	// MetricSnapshotOpen and MetricSnapshotClose bracket a snapshot's life.
+	// Count on the close is how long it was held, in nanoseconds, so a sink can
+	// find the leaked one without keeping state of its own.
+	MetricSnapshotOpen
+	MetricSnapshotClose
+
+	// MetricBackup is one completed Backup, successful or not.
+	MetricBackup
+
+	// MetricRefresh is one live reader's Refresh. Count is epochs advanced and
+	// Bytes is how much log it applied — a reload, which re-reads the log from
+	// the start, shows up as a large one.
+	MetricRefresh
+)
+
+// String names the kind, for a sink that labels its output.
+func (k MetricKind) String() string {
+	switch k {
+	case MetricCommit:
+		return "commit"
+	case MetricSync:
+		return "sync"
+	case MetricCompaction:
+		return "compaction"
+	case MetricQuery:
+		return "query"
+	case MetricReplay:
+		return "replay"
+	case MetricSnapshotOpen:
+		return "snapshot-open"
+	case MetricSnapshotClose:
+		return "snapshot-close"
+	case MetricBackup:
+		return "backup"
+	case MetricRefresh:
+		return "refresh"
+	default:
+		return "unknown"
+	}
+}
+
+// Metric is one thing the engine did.
+//
+// The numeric fields mean something different per kind, and the table is the
+// contract. A field not listed for a kind is zero.
+//
+//	kind             Count                    Examined                 Bytes
+//	---------------------------------------------------------------------------------
+//	commit           records in the batch     —                        framed log bytes
+//	sync             commits made durable     —                        log bytes synced
+//	compaction       records in the image     records scanned          image size
+//	query            IDs returned             candidates examined      —
+//	replay           epochs advanced          —                        log bytes read
+//	snapshot-open    —                        —                        —
+//	snapshot-close   nanoseconds held         —                        —
+//	backup           files copied             —                        bytes copied
+//	refresh          epochs advanced          —                        log bytes applied
+//
+// Duration is wall-clock for the operation, measured around the work rather than
+// around the whole call, and is zero for the two snapshot kinds. Err is non-nil
+// when the operation failed, and a failed operation is still recorded — an error
+// rate is a metric, and a sink that only ever hears about successes cannot
+// compute one.
+type Metric struct {
+	Kind     MetricKind
+	Duration time.Duration
+	Count    int64
+	Examined int64
+	Bytes    int64
+	Err      error
+}
+
+// Metrics receives what the engine did. Nil is the default and costs nothing.
+//
+// Record is called from whichever goroutine performed the work, several at once.
+// An implementation must be cheap, must not block, and must never call back into
+// the store — doing so from inside a commit deadlocks the store against itself.
+//
+// Every emission but one happens with no store lock held, because a sink is
+// caller code and holding a lock across it would let a slow one stall the
+// writers it is meant to be measuring. The exception is MetricSync, which is
+// emitted inside the log's write lock: the duration of an fsync is only knowable
+// where the fsync happens, and that is the one place a committer's own bytes are
+// being written. A sink that blocks there blocks every commit in flight.
+type Metrics interface {
+	Record(m Metric)
+}
+
+// MetricsFunc adapts a plain function to Metrics.
+//
+// The interface exists rather than a bare func field for the same reason
+// CompactionObserver does: disk.Options is a comparable value, and a struct with
+// a func field is not.
+type MetricsFunc func(m Metric)
+
+// Record calls f.
+func (f MetricsFunc) Record(m Metric) { f(m) }

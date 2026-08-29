@@ -123,8 +123,17 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 		return err
 	}
 
+	var started time.Time
+	if s.metricsOn() {
+		started = time.Now()
+	}
+
 	plan, err := s.compactPin()
 	if err != nil {
+		// Deliberately unrecorded. ErrCompactionInProgress and
+		// ErrBackupInProgress mean no compaction happened, not that one failed,
+		// and a background compactor that reports a refusal as a failure gives
+		// an operator an error rate made entirely of the trigger working.
 		return err
 	}
 	defer s.compactRelease()
@@ -134,11 +143,42 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 	}
 
 	newCSR, tmpPath, err := plan.build(ctx, s.dir)
-	if err != nil {
-		return err
+	if err == nil {
+		err = s.compactCommit(plan, newCSR, tmpPath)
 	}
+	if s.metricsOn() {
+		s.record(store.Metric{
+			Kind:     store.MetricCompaction,
+			Duration: time.Since(started),
+			Count:    int64(compactedRecords(newCSR)),
+			Examined: int64(len(plan.nodes) + len(plan.edges)),
+			Bytes:    s.imageBytes(),
+			Err:      err,
+		})
+	}
+	return err
+}
 
-	return s.compactCommit(plan, newCSR, tmpPath)
+// compactedRecords describes the image a compaction produced,
+// and answer nothing when it produced none — a build cancelled part way returns
+// a nil CSR, and a metric reporting zero records for it is more honest than one
+// reporting the plan's intent as though it had happened.
+func compactedRecords(csr *CSRGraph) int {
+	if csr == nil {
+		return 0
+	}
+	return csr.NodeCount() + csr.EdgeCount()
+}
+
+// imageBytes is the compacted image's size on disk, or zero if it cannot be
+// read. One stat per compaction, which is nothing beside the compaction, and it
+// reports the file that now exists rather than the size the build intended.
+func (s *Store) imageBytes() int64 {
+	fi, err := os.Stat(filepath.Join(s.dir, csrFileName))
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
 }
 
 // compactPin captures the image's inputs at one epoch.

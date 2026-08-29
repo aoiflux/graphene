@@ -116,6 +116,11 @@ type Store struct {
 	// unlimited. Set once at Open. See Options.MaxSnapshotAge.
 	maxSnapshotAge time.Duration
 
+	// metrics receives what the store did, nil when Options.Metrics was unset.
+	// Set once at Open and never changed, so no lock guards it. Read through
+	// Store.record, which is where the nil check lives.
+	metrics store.Metrics
+
 	// signer signs each batch commit; nil leaves commits unsigned. Set through
 	// Open's options and not changed afterwards, so a log never contains a
 	// signing policy that shifted underneath it mid-run.
@@ -539,6 +544,21 @@ type Options struct {
 	// The same nil-by-default shape as Signer and Verifier, and where a metrics
 	// sink will attach. store.CompactionObserverFunc wraps a closure.
 	AutoCompactObserver store.CompactionObserver
+
+	// Metrics receives what the store did: commits, fsyncs, compactions,
+	// queries, the replay each open performs. Nil, the default, records
+	// nothing and costs nothing — every call site is inside a nil check, and
+	// the clock reads that a measurement needs happen inside that branch too.
+	//
+	// The same nil-by-default shape as Signer and AutoCompactObserver, and for
+	// the same reason: an embedded engine that logs or exports on its own
+	// behalf has taken a decision belonging to the program embedding it. What
+	// it can offer is somewhere to attach one.
+	//
+	// Record is called from whichever goroutine did the work and sometimes with
+	// a store lock held, so an implementation must not block and must never
+	// call back into the store. See store.Metrics.
+	Metrics store.Metrics
 }
 
 // recordAudit appends an entry when auditing is enabled, and does nothing
@@ -759,6 +779,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		propIdx:        index.NewPropertyIndex(),
 		maxSnapshotAge: opts.MaxSnapshotAge,
 		syncOnCommit:   true,
+		metrics:        opts.Metrics,
 		signer:         opts.Signer,
 		verifier:       opts.Verifier,
 		requireSigned:  opts.RequireSignedCommits,
@@ -875,6 +896,20 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	}
 
 	// Replay WAL into delta.
+	// Attached after the store exists so the closure has somewhere to report to,
+	// and only when a sink is listening: a nil observer is what keeps the fsync
+	// path free of a clock read.
+	if s.metrics != nil {
+		wal.syncObserver = func(covered uint64, d time.Duration, serr error) {
+			s.record(store.Metric{
+				Kind:     store.MetricSync,
+				Duration: d,
+				Count:    int64(covered),
+				Err:      serr,
+			})
+		}
+	}
+
 	if err := s.replayWAL(); err != nil {
 		return fail("disk.Open: replay WAL: %w", err)
 	}
@@ -990,6 +1025,10 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 	if err != nil {
 		return nil, err
 	}
+	var started time.Time
+	if s.metricsOn() {
+		started = time.Now()
+	}
 	ticket, err := s.wal.QueueBatch(framed)
 	if err != nil {
 		// Apply nothing. The commit marker never reached the file, so replay will
@@ -1004,21 +1043,35 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 	sync := s.syncOnCommit
 	unlock()
 
+	// One branch and one error, so the commit is measured once however it ends.
+	// A failed commit is still a commit that happened, and an error rate is a
+	// metric a sink hearing only about successes cannot compute.
+	var cerr error
 	if sync {
-		if err := s.wal.AwaitSync(ticket); err != nil {
-			// Not published. The records are in the delta but no reader can see
-			// them, because visibility is the epoch — so a failed fsync cannot
-			// hand anyone a commit the disk never took. A later commit whose
-			// sync succeeds covers these bytes too and will publish past them,
-			// which is correct: at that point they are durable.
-			return nil, fmt.Errorf("AddNodesBatch: wal: %w", err)
-		}
-	} else if err := s.wal.FlushQueued(); err != nil {
+		// A failure here leaves the batch unpublished. The records are in the
+		// delta but no reader can see them, because visibility is the epoch — so
+		// a failed fsync cannot hand anyone a commit the disk never took. A later
+		// commit whose sync succeeds covers these bytes too and will publish past
+		// them, which is correct: at that point they are durable.
+		cerr = s.wal.AwaitSync(ticket)
+	} else {
 		// Not waiting for durability does not mean leaving the bytes in a
 		// queue. syncOnCommit off is documented as "durable at the next Sync,
 		// Compact or Close", and bytes still in the ring would not survive even
 		// a process kill, which the page cache does.
-		return nil, fmt.Errorf("AddNodesBatch: wal: %w", err)
+		cerr = s.wal.FlushQueued()
+	}
+	if s.metricsOn() {
+		s.record(store.Metric{
+			Kind:     store.MetricCommit,
+			Duration: time.Since(started),
+			Count:    int64(len(stored)),
+			Bytes:    int64(len(framed)),
+			Err:      cerr,
+		})
+	}
+	if cerr != nil {
+		return nil, fmt.Errorf("AddNodesBatch: wal: %w", cerr)
 	}
 	s.publishEpoch(epoch)
 	return ids, nil
@@ -1127,6 +1180,10 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	if err != nil {
 		return nil, err
 	}
+	var started time.Time
+	if s.metricsOn() {
+		started = time.Now()
+	}
 	ticket, err := s.wal.QueueBatch(framed)
 	if err != nil {
 		return nil, fmt.Errorf("AddEdgesBatch: wal: %w", err)
@@ -1137,16 +1194,27 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	sync := s.syncOnCommit
 	unlock()
 
+	var cerr error
 	if sync {
-		if err := s.wal.AwaitSync(ticket); err != nil {
-			return nil, fmt.Errorf("AddEdgesBatch: wal: %w", err)
-		}
-	} else if err := s.wal.FlushQueued(); err != nil {
+		cerr = s.wal.AwaitSync(ticket)
+	} else {
 		// Not waiting for durability does not mean leaving the bytes in a
 		// queue. syncOnCommit off is documented as "durable at the next Sync,
 		// Compact or Close", and bytes still in the ring would not survive even
 		// a process kill, which the page cache does.
-		return nil, fmt.Errorf("AddEdgesBatch: wal: %w", err)
+		cerr = s.wal.FlushQueued()
+	}
+	if s.metricsOn() {
+		s.record(store.Metric{
+			Kind:     store.MetricCommit,
+			Duration: time.Since(started),
+			Count:    int64(len(stored)),
+			Bytes:    int64(len(framed)),
+			Err:      cerr,
+		})
+	}
+	if cerr != nil {
+		return nil, fmt.Errorf("AddEdgesBatch: wal: %w", cerr)
 	}
 	s.publishEpoch(epoch)
 	return ids, nil
@@ -1852,8 +1920,29 @@ func (s *Store) replayWAL() error {
 	// to avoid, and there is nothing a reader could usefully do with it.
 	defer func() { s.publishEpoch(s.mutEpoch.Load()) }()
 
+	var started time.Time
+	if s.metricsOn() {
+		started = time.Now()
+	}
+	before := s.mutEpoch.Load()
+
 	off, err := s.wal.replayFrom(0, s.replayCallbacks())
 	s.replayOff = off
+
+	// Emitted once per open, and the single best indicator of how overdue a
+	// compaction is: the log is bounded only by compaction, so its size is also
+	// how long the next open will take. Count is epochs advanced rather than
+	// records, because that is what the replay actually applied — a torn tail
+	// contributes bytes and no epoch, which is the distinction worth seeing.
+	if s.metricsOn() {
+		s.record(store.Metric{
+			Kind:     store.MetricReplay,
+			Duration: time.Since(started),
+			Count:    int64(s.mutEpoch.Load() - before),
+			Bytes:    off,
+			Err:      err,
+		})
+	}
 	return err
 }
 

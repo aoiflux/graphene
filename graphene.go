@@ -292,6 +292,20 @@ func VerifyBackup(dir string) (disk.BackupInfo, error) {
 // Intended for tests, for CI, and after recovering a store whose indexes may
 // have been rebuilt from a partial log.
 func (g *Graph) VerifyIndexes() error {
+	return g.VerifyIndexesCtx(context.Background())
+}
+
+// VerifyIndexesCtx is VerifyIndexes, abandoned if ctx is cancelled. A backend
+// that supports verification but not cancellation runs to completion, which is
+// the same answer a caller would have got before asking.
+//
+// Worth reaching for on a large store: the check walks every posting and every
+// record with the store's lock held, so a caller that has given up on the
+// answer is otherwise holding writers up for a result nobody will read.
+func (g *Graph) VerifyIndexesCtx(ctx context.Context) error {
+	if v, ok := g.GraphStore.(store.IndexVerifierCtx); ok {
+		return v.VerifyIndexesCtx(ctx)
+	}
 	v, ok := g.GraphStore.(store.IndexVerifier)
 	if !ok {
 		return nil
@@ -418,6 +432,17 @@ func (g *Graph) CompositeProperties() (nodeKeys, edgeKeys [][]string) {
 // are left as they are. The disk backend runs this automatically on Open when
 // its own verification fails, so calling it by hand is normally unnecessary.
 func (g *Graph) RebuildIndexes() error {
+	return g.RebuildIndexesCtx(context.Background())
+}
+
+// RebuildIndexesCtx is RebuildIndexes, abandoned if ctx is cancelled at the
+// points where abandoning it is safe — which is before the structural rebuild
+// and during the sweep after it, and nowhere in between. See
+// store.IndexRebuilderCtx for why a rebuild cannot simply stop where it is.
+func (g *Graph) RebuildIndexesCtx(ctx context.Context) error {
+	if r, ok := g.GraphStore.(store.IndexRebuilderCtx); ok {
+		return r.RebuildIndexesCtx(ctx)
+	}
 	r, ok := g.GraphStore.(store.IndexRebuilder)
 	if !ok {
 		return nil
@@ -617,4 +642,33 @@ func (g *Graph) ShortestPathCtx(ctx context.Context, src, dst store.NodeID, edge
 // ctx.
 func (g *Graph) FindPatternsCtx(ctx context.Context, pattern *traversal.Pattern, scope []store.NodeID, maxMatches int, budget store.Budget) ([]traversal.SubgraphMatch, error) {
 	return traversal.FindSubgraphMatchesCtx(ctx, g.GraphStore, pattern, scope, maxMatches, budget)
+}
+
+// --- Bulk export support ---
+
+// ForEachNodeProperty implements store.PropertyEnumerator, so a Graph can be
+// handed straight to the bulk package.
+//
+// Explicit rather than inherited, and that is the whole point of it existing.
+// Graph embeds store.GraphStore, and an embedded interface promotes only the
+// methods in its own set — so without this a Graph would not satisfy
+// PropertyEnumerator, and `bulk.ExportJSONL(w, g, ...)` would have compiled,
+// run, and produced a dump with every indexed property entry silently missing.
+// The bulk package refuses that case rather than exporting it, and this is what
+// keeps the obvious call from hitting the refusal.
+//
+// A backend that cannot enumerate is a no-op here, which is the same answer the
+// other optional capabilities give.
+func (g *Graph) ForEachNodeProperty(fn func(id store.NodeID, key string, value []byte) bool) {
+	if pe, ok := g.GraphStore.(store.PropertyEnumerator); ok {
+		pe.ForEachNodeProperty(fn)
+	}
+}
+
+// ForEachEdgeProperty implements store.PropertyEnumerator. See
+// ForEachNodeProperty for why it is written out rather than inherited.
+func (g *Graph) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value []byte) bool) {
+	if pe, ok := g.GraphStore.(store.PropertyEnumerator); ok {
+		pe.ForEachEdgeProperty(fn)
+	}
 }

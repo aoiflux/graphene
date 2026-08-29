@@ -134,18 +134,11 @@ func (g *guard) enter() error {
 	return nil
 }
 
-// maxRecursion bounds how deep a recursive walk may go.
-//
-// DFS, provenance and subgraph matching all recurse once per hop, and a
-// goroutine stack that runs out is a crash rather than an error — the one
-// failure a caller cannot handle. Depth limits usually bound this, but
-// ProvenanceChain's default depth is generous and FindSubgraphMatches recurses
-// per pattern node with no depth argument at all.
-//
-// 100 000 frames is far past any real traversal and far short of the default
-// 1 GB goroutine stack limit, so it converts the crash into ErrBudgetExceeded
-// without getting in the way of legitimate work.
-const maxRecursion = 100_000
+// maxRecursion is store.MaxRecursionDepth, kept as a local name so the checks
+// below read as they did. The number and the argument for it are in
+// store/budget.go, beside Budget and ErrBudgetExceeded, because HasCycle is
+// outside this package and needs the same limit.
+const maxRecursion = store.MaxRecursionDepth
 
 // descend charges one stack frame.
 func (g *guard) descend(depth int) error {

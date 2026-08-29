@@ -50,6 +50,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/aoiflux/graphene/store"
 )
 
 // backupManifestName holds the manifest inside a backup directory.
@@ -144,6 +146,25 @@ func (s *Store) BackupCtx(ctx context.Context, dst string) (BackupInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return BackupInfo{}, err
 	}
+	if s.metricsOn() {
+		// Wrapped rather than instrumented inline: a backup has a dozen return
+		// paths and each one is a real outcome worth counting, so recording at
+		// each would be a dozen chances to miss one.
+		started := time.Now()
+		info, err := s.backupCtx(ctx, dst)
+		s.record(store.Metric{
+			Kind:     store.MetricBackup,
+			Duration: time.Since(started),
+			Count:    int64(len(info.Files)),
+			Bytes:    info.Bytes(),
+			Err:      err,
+		})
+		return info, err
+	}
+	return s.backupCtx(ctx, dst)
+}
+
+func (s *Store) backupCtx(ctx context.Context, dst string) (BackupInfo, error) {
 
 	src, err := filepath.Abs(s.dir)
 	if err != nil {

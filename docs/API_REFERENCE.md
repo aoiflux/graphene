@@ -720,6 +720,37 @@ func (g *Graph) QueryRelationIDs(q store.RelationQuery) ([]store.EdgeID, error)
 func (g *Graph) QueryRelations(q store.RelationQuery) ([]*store.Edge, error)
 ```
 
+### Cancelling a query
+
+```go
+func (g *Graph) QueryNodeIDsCtx(ctx context.Context, q store.NodeQuery) ([]store.NodeID, error)
+func (g *Graph) QueryNodesCtx(ctx context.Context, q store.NodeQuery) ([]*store.Node, error)
+func (g *Graph) QueryEdgeIDsCtx(ctx context.Context, q store.EdgeQuery) ([]store.EdgeID, error)
+func (g *Graph) QueryEdgesCtx(ctx context.Context, q store.EdgeQuery) ([]*store.Edge, error)
+```
+
+Each is the call above it, abandoned if `ctx` is cancelled. Passing
+`context.Background()` is exactly the uncancellable call, so these are additive:
+nothing that does not pass a context changes.
+
+**Nothing partial comes back with the error.** A query stopped part way holds a
+candidate set that some filters have been applied to and others have not — a
+superset of the answer, shaped exactly like the answer. Returning it would be
+the one result worse than none, so the error comes with a nil slice.
+
+**What cancellation is actually for here.** The query's own time is the smaller
+half. A query over a large candidate set holds the store's read lock for its
+whole duration, so a caller that has stopped wanting the answer is holding up
+every writer behind it; cancelling returns the lock. The first check happens
+*before* the lock is taken, so a caller handing over an already-dead context
+never makes a writer wait at all.
+
+The checks inside the loops are amortised — one per 256 candidates, the same
+interval `traversal`'s budget guard uses — so an uncancelled query pays a
+predictable branch and nothing else. Measured interleaved against the same tree
+with the checks stripped out, with `PointLookupNode_Memory` as the control: every
+arm overlaps, control included.
+
 ### Query structs
 ```go
 type NodeQuery struct {
@@ -942,7 +973,165 @@ func NodeIDsFromBFS(r *traversal.BFSResult) []store.NodeID
 func NodeIDsFromPath(r *traversal.PathResult) []store.NodeID
 func FilterNodesByLabel(ns []*store.Node, label store.NodeType) []*store.Node
 func FilterEdgesByLabel(es []*store.Edge, label store.EdgeType) []*store.Edge
+
+// store.PropertyEnumerator, so a Graph can be handed straight to the bulk package.
+func (g *Graph) ForEachNodeProperty(fn func(id store.NodeID, key string, value []byte) bool)
+func (g *Graph) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value []byte) bool)
 ```
+
+`ForEachNodeProperty` and `ForEachEdgeProperty` are written out on `Graph`
+rather than inherited, and that is the point of them. `Graph` embeds
+`store.GraphStore`, and an embedded interface promotes only the methods in its
+own set — so without them a `Graph` would not satisfy `store.PropertyEnumerator`,
+and `bulk.ExportJSONL(w, g, ...)` would compile, run, and produce a dump with
+every indexed property entry silently missing.
+
+`HasCycle` recurses once per hop, so its depth is the caller's `maxDepth` — and
+a large one against a deep graph would overflow the goroutine stack, which is a
+crash rather than an error, and the one failure an embedded engine has no
+business handing its host. A walk deeper than `store.MaxRecursionDepth`
+(100 000 frames) now returns `store.ErrBudgetExceeded` instead. The `traversal`
+package's walks have been guarded this way since Phase 1; `HasCycle` is not in
+that package, which is why it needed its own check and why the limit lives in
+`store` beside `Budget` rather than in either.
+
+---
+
+## 13a. Metrics
+
+```go
+// disk.Options
+Metrics store.Metrics   // nil by default
+
+type store.Metrics interface{ Record(m store.Metric) }
+type store.MetricsFunc func(store.Metric)   // adapter for a closure
+```
+
+There is no logging and no metrics anywhere in library code, which is a
+deliberate position for an embedded engine: writing to a logger of its own
+choosing is a decision belonging to the program embedding it. What it offers
+instead is somewhere to attach one.
+
+```go
+g, _ := graphene.OpenWithOptions(dir, disk.Options{
+    Metrics: store.MetricsFunc(func(m store.Metric) {
+        prom.WithLabelValues(m.Kind.String()).Observe(m.Duration.Seconds())
+    }),
+})
+```
+
+One method taking a concrete struct, rather than a method per event or a
+string-keyed counter. A method per event makes every new measurement a breaking
+change to an exported interface; a string-keyed sink allocates on the hot path
+and puts the meaning of every number in documentation nothing checks. Adding a
+`MetricKind` is additive, and the struct is passed by value so nothing escapes.
+
+### What is reported
+
+| kind | Count | Examined | Bytes |
+|---|---|---|---|
+| `commit` | records in the batch | — | framed log bytes |
+| `sync` | **commits made durable by this fsync** | — | — |
+| `compaction` | records in the image | records scanned | image size on disk |
+| `query` | IDs returned | candidates examined | — |
+| `replay` | epochs advanced | — | log bytes read |
+| `snapshot-open` | — | — | — |
+| `snapshot-close` | nanoseconds held | — | — |
+| `backup` | files copied | — | bytes copied |
+| `refresh` | epochs advanced | — | log bytes applied |
+
+`Count` on a **sync** is the number group commit exists to move: one fsync per
+commit means it is not working. `Examined` against `Count` on a **query** is the
+planner's selectivity. **replay** is emitted once per open and is the best
+single indicator of how overdue a compaction is.
+
+`Err` is non-nil when the operation failed, **and a failed operation is still
+recorded** — an error rate is a metric, and a sink that only ever hears about
+successes cannot compute one. A refusal is not a failure: a compaction that
+returns `ErrCompactionInProgress` never ran and is not reported, or a background
+compactor's error rate would be made entirely of the trigger working. Likewise a
+query refused before it takes the lock, which is not a query that failed.
+
+### What it costs, and where it is not measured
+
+Nothing when unset. Every call site is inside a nil check and the clock reads
+happen inside that branch, so a store with no sink runs the code it ran before
+this existed.
+
+`GetNode` and the other point reads are deliberately **not** measured. That path
+is ~6 ns and lock-free; two clock reads would be an order of magnitude more than
+the work, and a measurement that dominates the thing it measures is not an
+observation.
+
+`Record` is called from whichever goroutine did the work, several at once. It
+must be cheap, must not block, and **must never call back into the store** —
+doing so from inside a commit deadlocks the store against itself. Every emission
+but one happens with no store lock held, because a slow sink would otherwise
+stall the writers it is measuring. The exception is `sync`, emitted inside the
+log's write lock: the duration of an fsync is only knowable where the fsync
+happens.
+
+---
+
+## 13b. Bulk import and export
+
+```go
+func bulk.ExportJSONL(w io.Writer, src bulk.Source, opts bulk.Options) (bulk.Summary, error)
+func bulk.ExportDump(w io.Writer, src bulk.Source, opts bulk.Options) (bulk.Summary, error)
+func bulk.ExportCSV(dir string, src bulk.Source, opts bulk.Options) (bulk.Summary, error)
+
+func bulk.ImportJSONL(r io.Reader, dst bulk.Dest, opts bulk.Options) (bulk.Summary, error)
+func bulk.ImportDump(r io.Reader, dst bulk.Dest, opts bulk.Options) (bulk.Summary, error)
+func bulk.ImportCSV(dir string, dst bulk.Dest, opts bulk.Options) (bulk.Summary, error)
+```
+
+A `*graphene.Graph` satisfies both `Source` and `Dest`.
+
+| format | shape | for |
+|---|---|---|
+| **JSONL** | one stream, one JSON object per line | interchange; greppable, splittable, editable by hand |
+| **graphene_dump** | one binary stream, WAL-style framing with CRCs | this engine reading its own data, exactly and quickly |
+| **CSV** | a directory of tables plus `manifest.csv` | spreadsheets, notebooks, ETL — anything that is not this engine |
+
+### What travels, and what does not
+
+Nodes, edges, **and the indexed property entries** — the third is the one that
+is easy to omit and impossible to recover. A record's `Properties` blob is
+opaque to the engine, and the values in the property index were handed to
+`IndexNodeProperty` separately by a caller who knew how to derive them. A dump
+carrying only the records restores a graph that looks complete and answers
+nothing; `RebuildIndexes` cannot fix it, because it repairs structure and not
+content. A source that cannot enumerate them is **refused** with
+`bulk.ErrNoPropertyEntries` rather than exported without them.
+
+Index declarations travel too — ordered keys and composite tuples. They change
+plans, not answers, so leaving them out would make an imported store quietly
+slower than the one it came from.
+
+**IDs do not travel.** A store assigns them and nothing can ask it for a
+particular one, so an import allocates fresh IDs and rewrites every reference —
+edge endpoints and property entries alike — through a map built as the nodes
+arrive. The result is isomorphic to the original, not identical to it. That is
+why records must arrive **nodes, then edges, then properties**; a stream in any
+other order is refused with `bulk.ErrOutOfOrder` rather than buffered.
+
+**History does not travel.** No WAL, no audit log, no redaction ledger, no
+custody chain, no signatures. Anything needing those needs `Backup`, which
+copies the store rather than describing it.
+
+### Truncation, and the trailer
+
+Every format ends with a trailer carrying the counts (CSV puts them in
+`manifest.csv`, written last). A dump cut *mid-record* is caught by the decoder;
+one cut *between* records is not, because every record that arrived is well
+formed — only the trailer's absence says the rest is missing, and only its counts
+catch a data file that lost rows from the middle. Same argument as
+`graphene.backup.json` being written last.
+
+**An import is not a transaction**, and cannot be: there is no API that could
+make one span a million records, and buffering to pretend otherwise would move
+the failure from "half imported" to "out of memory". Import into an empty store
+and discard the directory if it fails.
 
 ---
 
@@ -1453,6 +1642,8 @@ values.
 ```go
 func (g *Graph) VerifyIndexes() error
 func (g *Graph) RebuildIndexes() error
+func (g *Graph) VerifyIndexesCtx(ctx context.Context) error
+func (g *Graph) RebuildIndexesCtx(ctx context.Context) error
 ```
 
 `VerifyIndexes` cross-checks every index against the records it describes —
@@ -1470,6 +1661,31 @@ repairs structure, not content.
 on a 100k-node store — and a damaged index section is already rejected while the
 file is parsed, so the scan would be a startup tax for little gain. Run them
 explicitly in tests, in CI, or when recovering a suspect store.
+
+#### Cancelling them, and why only one of them cancels properly
+
+`VerifyIndexesCtx` is interruptible throughout. It is read-only, so there is no
+point at which stopping leaves anything behind, and a cancelled check means only
+that the question went unanswered — `errors.Is(err, context.Canceled)`
+distinguishes that from an inconsistency, which matters, because a caller that
+treats every non-nil error here as corruption would otherwise take a timeout as
+a reason to restore from backup.
+
+`RebuildIndexesCtx` is **not** interruptible through the part that does the
+repair, and this is deliberate rather than an omission. A rebuild clears the
+label postings and the adjacency and repopulates them from the records; stopping
+half way leaves postings naming only some of the records that carry a label,
+which is the fault that costs a query *result* rather than a query. So it
+cancels before the rebuild and during the dead-entry sweep that follows it, and
+nowhere in between.
+
+What that buys is stated exactly: a cancelled rebuild leaves the store **no worse
+than it found it** — the sweep it interrupted was removing entries that were
+already there — but it does not leave it repaired. `VerifyIndexes` will still
+report whatever the sweep did not reach. A cancelled rebuild is one to run again.
+
+Same shape as `CompactCtx`, and for the same reason: cancellation reaches the
+part that can be thrown away and stops at the part that cannot.
 
 ---
 

@@ -27,6 +27,16 @@ import (
 	"github.com/aoiflux/graphene/merkle"
 )
 
+// CSRVersionCurrent is the container version this build writes.
+//
+// Exported for one caller: `graphene migrate` has to say whether an image is
+// already current, and comparing CSRInfo.Version against a number the operator
+// typed is not an answer. Reading it is not a licence to switch on it — the
+// reader accepts every version from v2 by additive gating, and a caller that
+// refuses anything older has reimplemented a compatibility decision the engine
+// already made.
+const CSRVersionCurrent = csrVersionCurrent
+
 // CSRInfo describes a graphene.csr file without loading the graph it holds.
 type CSRInfo struct {
 	Path      string

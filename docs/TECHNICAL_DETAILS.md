@@ -1769,6 +1769,77 @@ The recursive walks (`DFS`, `ProvenanceChain`, `FindSubgraphMatches`) also carry
 a hard recursion limit of 100 000 frames. A goroutine stack that runs out is a
 crash rather than an error, which is the one failure a caller cannot handle.
 
+`helpers.go`'s `HasCycle` recurses the same way and was outside that guard,
+because it is not in the `traversal` package. It now checks the same limit,
+which moved to `store.MaxRecursionDepth` so the two cannot drift — two copies of
+a limit are two limits.
+
+### 10.5 Cancelling what is not a traversal
+
+Four calls walk something proportional to the whole store while holding a lock,
+and none of them is a walk: `VerifyIndexes`, `RebuildIndexes`, `QueryNodes` and
+`QueryEdges`. Each has a `*Ctx` variant. They take no `Budget` — there is no
+frontier to bound and no depth to cap; what they take is a context.
+
+**The lock is the reason, more than the time.** A query over a large candidate
+set holds `s.mu.RLock` for its whole duration and a verification holds it for
+seconds on a large store, so a caller that has given up is not merely spending
+its own time — it is holding up every writer queued behind it. The first check
+therefore happens *before* the lock is taken: a caller handing over an
+already-dead context never makes a writer wait at all.
+
+**`store.CancelCheck` is the shared rule.** `traversal/guard.go` already
+amortises `ctx.Err()` at one check per 256 steps, but it is bound up with
+`Budget` accounting and lives in a package the index and the backends cannot
+import. `CancelCheck` is the same rule with the budget taken out, in `store`
+where everything can reach it. A context that can never be cancelled sets a
+flag and every check becomes one predictable branch.
+
+Measured, interleaved against the same tree with all 26 checks stripped out,
+`PointLookupNode_Memory` as the control:
+
+| benchmark | with the checks | checks stripped |
+|---|---|---|
+| `PointLookupNode_Memory` — **control** | 24.1–25.5 ns | 24.3–25.0 ns |
+| `QueryNodes_PropertyEqual_Disk` | 298–339 ns | 296–346 ns |
+| `QueryNodes_EqualityPlusContains_Disk` | 608–749 ns | 615–675 ns |
+| `QueryNodes_EqualityPlusContains_Memory` | 626–745 ns | 612–637 ns |
+| `QueryNodes_PropertyRange_Ordered_Disk` | 616–688 µs | 662–725 µs |
+
+Every arm overlaps, control included, which is the answer: on the uncancelled
+path the checks cost nothing measurable. (An earlier run at `-benchtime 300x`
+moved the control by 10% and was discarded — a control that moves means there is
+no result, however good the headline looks.)
+
+**Where the checks go, and where they deliberately do not.** Inside the loops
+that are proportional to the store — the candidate loops, the residual probe,
+the per-value merge, every pass of a verification, including the property
+index's own, which is most of a verification and is behind its own call. Not
+inside `RebuildIndexes`'s structural rebuild.
+
+That exception is the whole of the rebuild's contract. A rebuild clears the
+label postings and the adjacency and repopulates them; stopping half way leaves
+postings naming only some of the records that carry a label, which §11.4 calls
+the fault that matters — a missing posting costs a query *result*, silently, and
+an extra one costs a candidate the read path filters out anyway. So the rebuild
+either finishes or does not begin, and cancellation is honoured before it and
+during the dead-entry sweep after it. A cancelled rebuild leaves the store **no
+worse than it found it** and not repaired; `VerifyIndexes` still reports
+whatever the sweep did not reach. Same shape as `CompactCtx` — cancellation
+reaches the part that can be thrown away and stops at the part that cannot.
+
+**Nothing partial comes back.** A query stopped part way holds a candidate set
+some filters have been applied to and others have not: a superset of the answer
+shaped exactly like the answer. Both the residual pass and the planner drop it
+independently, which is belt and braces — the planner's guard makes a mutation
+of the index's invisible, so the index's own contract is pinned by a test in
+that package rather than through a store.
+
+**A cancellation is not an inconsistency.** `VerifyIndexesCtx` returns
+`ctx.Err()`, distinguishable with `errors.Is`, because a caller that reads every
+non-nil error from a verification as corruption would otherwise treat a timeout
+as a reason to restore from backup.
+
 ## 11. Failure and recovery
 
 ### 11.1 Durability boundary
@@ -2077,6 +2148,158 @@ leaving a record — an invariant that holds by construction rather than by
 checking, which is the only way it could hold here.
 
 ---
+
+## 11b. Operations
+
+### 11b.1 The metrics sink
+
+There was no logging and no metrics anywhere in library code. That is a
+defensible position for an embedded engine — writing to a logger of its own
+choosing is a decision belonging to the program embedding it — and a useless one
+for anybody operating a store. `Options.Metrics` is the place to attach one, nil
+by default, the same shape as `Signer` and `AutoCompactObserver`.
+
+**One method taking a concrete struct.** The alternatives were a method per event
+and a stringly-typed counter/gauge pair. A method per event makes every new
+measurement a breaking change to an exported interface, which is the wrong trade
+for something whose purpose is to grow. A string-keyed sink allocates on the hot
+path and pushes the meaning of every number into documentation nothing checks.
+One method is neither: adding a `MetricKind` is additive, the struct passes by
+value so nothing escapes, and the per-kind meaning of each field is a table in
+the type's own doc comment.
+
+**Where the emissions are, and where they are not.** Commit, sync, compaction,
+query, open-replay, snapshot open/close, backup, refresh. Not `GetNode` and the
+other point reads: that path is ~6 ns and lock-free, two clock reads are an
+order of magnitude more than the work, and a measurement that dominates the
+thing it measures is not an observation.
+
+**Every emission but one is outside the store lock.** A sink is caller code, and
+holding a lock across it lets a slow implementation stall exactly the writers it
+was attached to measure — so the query metric is recorded after `RUnlock`, the
+commit metric after the store lock is released for the durability wait, and the
+snapshot-open metric after the write lock. `TestMetrics_TheSinkIsNeverCalledUnderAStoreLock`
+pins that by giving the sink a store read to perform, which deadlocks if any of
+them is emitted under the write lock. The exception is `MetricSync`, emitted
+inside the log's `writeMu`: the duration of an fsync is only knowable where the
+fsync happens.
+
+**What it costs when unset, measured.** Interleaved A/B against a copy of the
+same tree with the guards on the commit and query paths stripped out entirely,
+four rounds, warm-up discarded, `PointLookupNode_Memory` as the control:
+
+| benchmark | with the guards | guards stripped |
+|---|---|---|
+| `PointLookupNode_Memory` — **control** | 19.6–24.4 ns | 19.1–24.5 ns |
+| `QueryNodes_PropertyEqual_Disk` | 206–285 ns | 196–273 ns |
+| `QueryNodes_EqualityPlusContains_Disk` | 412–579 ns | 381–531 ns |
+| `QueryNodes_EqualityPlusContains_Memory` | 418–529 ns | 401–566 ns |
+| `Ingest_AddNodes_Batch1000` | 630–811 µs | 685–835 µs |
+| `BulkWrite_AddNodes_Disk_NoSync/n=10000` | 3.44–5.92 ms | 3.82–5.92 ms |
+
+Every pair of ranges overlaps, and so does the control's — which is the answer,
+with a caveat worth stating rather than burying. The control is byte-identical
+between the arms and still moves 2.3% between their minima, with a spread of
+about 25% of its own; that is this host's noise floor, and a cost smaller than
+it would not be visible here. What the run establishes is that the guards cost
+nothing this machine can measure, not that they cost nothing.
+
+An earlier attempt at 300 iterations per benchmark moved the control by **10%**
+and was discarded rather than reported. A control that moves is not a result,
+however good the headline looks.
+
+**A refusal is not a failure.** A compaction returning `ErrCompactionInProgress`
+or `ErrBackupInProgress` never ran, and reporting it would give a background
+compactor an error rate made entirely of its trigger working. A query refused
+before it takes the lock is not a query that failed. Everything that *did* run
+is recorded whatever its outcome, on one code path shared by both, because a
+sink hearing only about successes cannot compute an error rate.
+
+### 11b.2 Bulk import and export
+
+Three formats over one walk. `bulk/walk.go` decides what records exist and in
+what order; each format decides only how a record is spelled. A bug in the
+enumeration is then one bug rather than three.
+
+**What makes a dump complete is the property entries**, and they are the part
+easiest to leave out. A record's `Properties` blob is opaque — the engine never
+parses it — and the values in the property index arrived separately through
+`IndexNodeProperty`, from a caller who knew how to derive them. A dump of the
+records alone restores a graph that looks complete and answers nothing, and
+§11.4's point applies exactly: `RebuildIndexes` repairs structure, not content.
+So `store.PropertyEnumerator` was added as its own capability, and an export
+whose source does not implement it is **refused** rather than written without
+them.
+
+That refusal is not theoretical. `*graphene.Graph` embeds `store.GraphStore`,
+and an embedded interface promotes only its own method set — so a `Graph` does
+not satisfy `PropertyEnumerator` by inheritance, and an exporter treating a
+missing enumerator as "nothing to export" would have compiled, run, and produced
+a silently incomplete dump. `Graph` now implements the two methods explicitly,
+and the bulk package refuses the case anyway.
+
+**IDs are not preserved, and the ordering rule follows from that.** A store
+assigns IDs; nothing can ask it for a particular one, and adding a way to would
+break the monotonic-and-never-reused property the WAL, the CSR and every ledger
+depend on. An import therefore allocates fresh IDs and rewrites every reference
+through a map built as the nodes arrive — which only works if nodes arrive
+before the edges that name them and the entries filed against them. Every
+exporter writes that order; every importer checks it and refuses
+(`ErrOutOfOrder`) rather than buffering the whole graph to reorder a stream no
+exporter here produces.
+
+**The trailer is what makes truncation detectable.** Counts live at the end, not
+the head: a header count could only come from asking the store how many records
+it thinks it has, which is a second source that can disagree with the walk and
+would fail a perfectly good dump. Counted as they are written, they are what was
+written by construction. A dump cut mid-record is caught by the decoder; one cut
+between records holds nothing but well-formed records, and only the trailer's
+absence and its counts can tell. Same argument as `graphene.backup.json` being
+written last — and CSV, whose four tables are separate files, puts them in
+`manifest.csv` and writes that last for the same reason.
+
+**graphene_dump reuses the WAL's framing** — `[type][length][payload][crc32]`
+with the CRC over all three — rather than inventing one. A checksum over the
+payload alone leaves the framing unprotected, so a corrupted length reads as a
+valid length and takes the reader somewhere arbitrary before anything notices.
+Every length is bounded against the bytes available before it sizes an
+allocation, which is `readOrderedKeySection`'s rule in the CSR reader.
+
+**It has no fuzz target, and that is what the deferral cost.** A hand-rolled
+binary reader over attacker-controllable lengths is precisely what CONTRIBUTING
+§2 points at. The bounds and the CRC are an argument, not evidence. Together
+with `readCompositeSection` it is the first thing to fuzz when new fuzz work is
+un-deferred.
+
+### 11b.3 The CLI's writing subcommands
+
+`cmd/graphene` states "no repair, no truncate, no compact": a tool safe to point
+at production is worth more than one that can also fix things. Five subcommands
+now write, and each is argued rather than admitted as a group.
+
+`backup`, `verify-backup` and `export` never touch the store they are pointed
+at — they take the shared lock and write to a destination that must not already
+exist. `import` refuses any destination that is not empty or absent, so it
+creates a store rather than adding to one. None of the four can lose data that
+is already there, which is the property the policy protects.
+
+`migrate` is the real exception: it opens for writing, compacts, and leaves a new
+image. It exists because a store written by an older build reads fine and stays
+at its old format until something compacts it, so an operator upgrading a fleet
+has no way to say "bring these up to date" except by writing a program — and a
+migration that requires writing a program is one that does not happen, leaving
+stores read by compatibility paths years after they stopped being exercised.
+What makes it acceptable is that it adds nothing: it is Open, Compact, verify,
+in the order the engine already takes, and a compaction that fails leaves the old
+image in place because the new one is renamed in only once complete and fsynced.
+It reads the version back and re-verifies the indexes afterwards, because a
+migration reporting success without reading back what it wrote fails silently.
+
+`migrate -check` reads the image header without opening the store, so surveying
+a fleet does not mean taking the exclusive lock on every one of them. It
+distinguishes "there is no image" — an ordinary state for a store that has never
+compacted — from "the image will not parse", because collapsing the two sends an
+operator looking for corruption that is not there.
 
 ## 12. Worked examples
 
@@ -2565,6 +2788,26 @@ Any change must preserve these. Each is enforced by tests.
 17. **A backup excludes compaction for its duration**, and a background
     compactor's tick reports `ErrBackupInProgress` and retries later (§11.6).
     Writers are unaffected.
+18. **A bulk import does not preserve IDs, and is not a transaction.** A store
+    assigns IDs and nothing can ask it for a particular one, so an import
+    allocates fresh ones and rewrites every reference through a map: the result
+    is isomorphic to the original, not identical (§11b.2). And it writes as it
+    reads, so a failure part way leaves a partial graph — import into an empty
+    directory and discard it if it fails.
+19. **A dump carries the graph, not its history.** No WAL, no audit log, no
+    redaction or grant ledger, no custody chain, no signatures. Use `Backup` for
+    those: it copies the store rather than describing it.
+20. **`graphene_dump`'s parser has no fuzz target** (§11b.2), along with
+    `readCompositeSection`. Both are hand-rolled binary readers over
+    attacker-controllable lengths, both bound every length before allocating,
+    and neither has been fuzzed — the two items to take first when new fuzz work
+    is un-deferred.
+21. **A cancelled `RebuildIndexes` is one to run again, not one that partly
+    ran.** Cancellation is honoured before the structural rebuild and during the
+    dead-entry sweep after it, and nowhere in between, because a half-rebuilt
+    index omits records it should name (§10.5). What a cancelled rebuild
+    guarantees is that the store is no worse than it was, not that it is
+    repaired.
 
 ---
 

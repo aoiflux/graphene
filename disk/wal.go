@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/aoiflux/graphene/store"
 )
@@ -140,6 +141,24 @@ type WAL struct {
 	// Set once, before the WAL is used.
 	writeHook func([]byte) (int, error)
 	syncHook  func() error
+
+	// syncObserver, when set, is told about each fsync the *commit path*
+	// performs: how many queued entries it covered, how long the syscall took,
+	// and whether it failed.
+	//
+	// Only flushAndSync reports. The other sync sites — Sync, Checkpoint,
+	// Truncate, Close — are maintenance rather than commits, and counting them
+	// here would blur the one number this exists to expose: fsyncs per commit,
+	// which is whether group commit is working at all.
+	//
+	// Set once at Open, before the log is used, and nil unless a metrics sink is
+	// attached — so an uninstrumented store does not even read the clock.
+	syncObserver func(covered uint64, d time.Duration, err error)
+
+	// lastSyncTail is the ring sequence the previous commit-path fsync reached.
+	// Guarded by writeMu, which flushAndSync holds across both the drain and the
+	// sync, so the subtraction below cannot race another leader.
+	lastSyncTail uint64
 
 	// readOnly refuses every path that writes. Fixed at open and never changed.
 	//
@@ -1369,7 +1388,22 @@ func (w *WAL) flushAndSync() (uint64, error) {
 	// covered by the sync about to happen, and anything queued after this point
 	// is not.
 	done := w.tail.Load()
-	if err := w.syncFile(); err != nil {
+	if w.syncObserver == nil {
+		if err := w.syncFile(); err != nil {
+			return 0, fmt.Errorf("wal append batch: sync: %w", err)
+		}
+		return done, nil
+	}
+	// Instrumented form, kept separate rather than folded together with a
+	// conditional clock read: the uninstrumented path above is the one that runs
+	// in production for a store with no sink, and it should read the file and
+	// nothing else.
+	started := time.Now()
+	err := w.syncFile()
+	covered := done - w.lastSyncTail
+	w.lastSyncTail = done
+	w.syncObserver(covered, time.Since(started), err)
+	if err != nil {
 		return 0, fmt.Errorf("wal append batch: sync: %w", err)
 	}
 	return done, nil

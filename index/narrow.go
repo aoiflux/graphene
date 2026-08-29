@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"sort"
 
 	"github.com/aoiflux/graphene/store"
@@ -39,44 +40,92 @@ import (
 // This implements MatchAll only. Under MatchAny a candidate set driven by one
 // filter is not a superset of the answer, so there is nothing to narrow.
 func (p *PropertyIndex) NarrowNodesByFilters(candidates []store.NodeID, filters []store.PropertyFilter, skip store.FilterMask) []store.NodeID {
+	out, _ := p.NarrowNodesByFiltersCtx(context.Background(), candidates, filters, skip)
+	return out
+}
+
+// NarrowNodesByFiltersCtx is NarrowNodesByFilters, abandoned if ctx is
+// cancelled. It returns no candidates alongside the error: a residual pass
+// stopped part way has applied some filters and not others, so what it holds is
+// a superset of the answer that looks exactly like the answer.
+func (p *PropertyIndex) NarrowNodesByFiltersCtx(ctx context.Context, candidates []store.NodeID, filters []store.PropertyFilter, skip store.FilterMask) ([]store.NodeID, error) {
 	if noResiduals(filters, skip) {
-		return candidates
+		return candidates, nil
+	}
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return nil, err
 	}
 	plan := p.planResiduals(filters, skip, p.nodeCosts())
 	for _, step := range plan {
 		if len(candidates) == 0 {
-			return candidates
+			return candidates, nil
+		}
+		// Checked unamortised between steps as well as inside them: one step is a
+		// pass over every candidate or a scan of a whole key, so it is expensive
+		// enough to be worth not starting.
+		if err := cc.Check(); err != nil {
+			return nil, err
 		}
 		// Decided here rather than when the plan was built: each step shrinks the
 		// candidate set, so a filter that was not worth probing against the
 		// original count often is against what survived the step before it.
 		if probeIsCheaper(len(candidates), step.step.Cost) {
-			candidates = p.probeNodes(candidates, step.filter)
+			var err error
+			candidates, err = p.probeNodes(candidates, step.filter, &cc)
+			if err != nil {
+				return nil, err
+			}
 			continue
 		}
-		candidates = store.IntersectSortedIDs(candidates, p.matchNodes(step.filter))
+		matched, err := p.matchNodes(step.filter, &cc)
+		if err != nil {
+			return nil, err
+		}
+		candidates = store.IntersectSortedIDs(candidates, matched)
 	}
-	return candidates
+	return candidates, nil
 }
 
 // NarrowEdgesByFilters is NarrowNodesByFilters for edge properties, and consumes
 // its candidates slice in the same way.
 func (p *PropertyIndex) NarrowEdgesByFilters(candidates []store.EdgeID, filters []store.PropertyFilter, skip store.FilterMask) []store.EdgeID {
+	out, _ := p.NarrowEdgesByFiltersCtx(context.Background(), candidates, filters, skip)
+	return out
+}
+
+// NarrowEdgesByFiltersCtx is NarrowNodesByFiltersCtx for edge properties.
+func (p *PropertyIndex) NarrowEdgesByFiltersCtx(ctx context.Context, candidates []store.EdgeID, filters []store.PropertyFilter, skip store.FilterMask) ([]store.EdgeID, error) {
 	if noResiduals(filters, skip) {
-		return candidates
+		return candidates, nil
+	}
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return nil, err
 	}
 	plan := p.planResiduals(filters, skip, p.edgeCosts())
 	for _, step := range plan {
 		if len(candidates) == 0 {
-			return candidates
+			return candidates, nil
+		}
+		if err := cc.Check(); err != nil {
+			return nil, err
 		}
 		if probeIsCheaper(len(candidates), step.step.Cost) {
-			candidates = p.probeEdges(candidates, step.filter)
+			var err error
+			candidates, err = p.probeEdges(candidates, step.filter, &cc)
+			if err != nil {
+				return nil, err
+			}
 			continue
 		}
-		candidates = store.IntersectSortedIDs(candidates, p.matchEdges(step.filter))
+		matched, err := p.matchEdges(step.filter, &cc)
+		if err != nil {
+			return nil, err
+		}
+		candidates = store.IntersectSortedIDs(candidates, matched)
 	}
-	return candidates
+	return candidates, nil
 }
 
 // residualStep is one filter plus how it was decided to be applied.
@@ -187,33 +236,39 @@ func (p *PropertyIndex) planResiduals(
 
 // probeNodes keeps the candidates whose own registered values satisfy f,
 // preserving order.
-func (p *PropertyIndex) probeNodes(candidates []store.NodeID, f store.PropertyFilter) []store.NodeID {
+func (p *PropertyIndex) probeNodes(candidates []store.NodeID, f store.PropertyFilter, cc *store.CancelCheck) ([]store.NodeID, error) {
 	sh := p.shardFor(f.Key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	ordered := sh.orderedNodeKeys[f.Key] != nil
 	out := candidates[:0]
 	for _, id := range candidates {
+		if err := cc.Step(); err != nil {
+			return nil, err
+		}
 		if postingsMatch(&sh.nodes, id, f, ordered) {
 			out = append(out, id)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // probeEdges is probeNodes for edge properties.
-func (p *PropertyIndex) probeEdges(candidates []store.EdgeID, f store.PropertyFilter) []store.EdgeID {
+func (p *PropertyIndex) probeEdges(candidates []store.EdgeID, f store.PropertyFilter, cc *store.CancelCheck) ([]store.EdgeID, error) {
 	sh := p.shardFor(f.Key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	ordered := sh.orderedEdgeKeys[f.Key] != nil
 	out := candidates[:0]
 	for _, id := range candidates {
+		if err := cc.Step(); err != nil {
+			return nil, err
+		}
 		if postingsMatch(&sh.edges, id, f, ordered) {
 			out = append(out, id)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // refsMatch reports whether any value registered under f.Key satisfies f.
@@ -253,41 +308,55 @@ func postingsMatch[T entityID](p *postings[T], id T, f store.PropertyFilter, ord
 }
 
 // matchNodes resolves one filter to its own ascending, deduplicated set.
-func (p *PropertyIndex) matchNodes(f store.PropertyFilter) []store.NodeID {
+func (p *PropertyIndex) matchNodes(f store.PropertyFilter, cc *store.CancelCheck) ([]store.NodeID, error) {
 	if f.Op == store.PropertyOpEqual {
-		return p.NodesByProperty(f.Key, f.Value)
+		return p.NodesByProperty(f.Key, f.Value), nil
 	}
 	if ids, served := p.NodesMatchingOrdered(nil, f); served {
-		return store.SortDedupeIDs(ids)
+		return store.SortDedupeIDs(ids), nil
 	}
 	// One comparison per distinct value, not per entry: the predicate reads only
 	// the value, so every id sharing it gets the same answer.
 	var out []store.NodeID
+	var cerr error
 	p.ForEachNodeValue(f.Key, func(value []byte, ids []store.NodeID) bool {
+		if cerr = cc.Step(); cerr != nil {
+			return false
+		}
 		if store.PropertyFilterMatches(f, value) {
 			out = append(out, ids...)
 		}
 		return true
 	})
-	return store.SortDedupeIDs(out)
+	if cerr != nil {
+		return nil, cerr
+	}
+	return store.SortDedupeIDs(out), nil
 }
 
 // matchEdges is matchNodes for edge properties.
-func (p *PropertyIndex) matchEdges(f store.PropertyFilter) []store.EdgeID {
+func (p *PropertyIndex) matchEdges(f store.PropertyFilter, cc *store.CancelCheck) ([]store.EdgeID, error) {
 	if f.Op == store.PropertyOpEqual {
-		return p.EdgesByProperty(f.Key, f.Value)
+		return p.EdgesByProperty(f.Key, f.Value), nil
 	}
 	if ids, served := p.EdgesMatchingOrdered(nil, f); served {
-		return store.SortDedupeIDs(ids)
+		return store.SortDedupeIDs(ids), nil
 	}
 	var out []store.EdgeID
+	var cerr error
 	p.ForEachEdgeValue(f.Key, func(value []byte, ids []store.EdgeID) bool {
+		if cerr = cc.Step(); cerr != nil {
+			return false
+		}
 		if store.PropertyFilterMatches(f, value) {
 			out = append(out, ids...)
 		}
 		return true
 	})
-	return store.SortDedupeIDs(out)
+	if cerr != nil {
+		return nil, cerr
+	}
+	return store.SortDedupeIDs(out), nil
 }
 
 func (p *PropertyIndex) nodeCardinality(key string, value []byte) int {

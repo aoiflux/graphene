@@ -3,6 +3,7 @@ package disk
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/aoiflux/graphene/store"
 )
@@ -277,6 +278,10 @@ func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error 
 	if err != nil {
 		return fmt.Errorf("ApplyTransaction: %w", err)
 	}
+	var started time.Time
+	if s.metricsOn() {
+		started = time.Now()
+	}
 	ticket, err := s.wal.QueueBatch(framed)
 	if err != nil {
 		return fmt.Errorf("ApplyTransaction: wal: %w", err)
@@ -305,19 +310,34 @@ func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error 
 	sync := s.syncOnCommit
 	unlock()
 
+	// One branch and one error, so the commit is measured once however it
+	// ends. A failed commit is still a commit that happened, and an error rate
+	// is a metric a sink hearing only about successes cannot compute.
+	var cerr error
 	if sync {
-		if err := s.wal.AwaitSync(ticket); err != nil {
-			// Deliberately unpublished: the records are staged in the delta but
-			// no reader can reach them, because visibility is the epoch. A
-			// transaction the disk did not take is not a transaction.
-			return fmt.Errorf("ApplyTransaction: wal: %w", err)
-		}
-	} else if err := s.wal.FlushQueued(); err != nil {
+		// A failed sync leaves the records deliberately unpublished: they are
+		// staged in the delta but no reader can reach them, because visibility
+		// is the epoch. A transaction the disk did not take is not a
+		// transaction.
+		cerr = s.wal.AwaitSync(ticket)
+	} else {
 		// Not waiting for durability does not mean leaving the bytes in a
 		// queue. syncOnCommit off is documented as "durable at the next Sync,
 		// Compact or Close", and bytes still in the ring would not survive even
 		// a process kill, which the page cache does.
-		return fmt.Errorf("ApplyTransaction: wal: %w", err)
+		cerr = s.wal.FlushQueued()
+	}
+	if s.metricsOn() {
+		s.record(store.Metric{
+			Kind:     store.MetricCommit,
+			Duration: time.Since(started),
+			Count:    int64(len(actions)),
+			Bytes:    int64(len(framed)),
+			Err:      cerr,
+		})
+	}
+	if cerr != nil {
+		return fmt.Errorf("ApplyTransaction: wal: %w", cerr)
 	}
 	s.publishEpoch(epoch)
 	return nil

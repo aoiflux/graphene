@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"sort"
@@ -709,10 +710,23 @@ func (p *PropertyIndex) edgeEntryCount() int {
 // properties — values are caller-encoded opaque bytes, so only the caller knows
 // that. See store.ReindexPolicy for how that staleness is managed.
 func (p *PropertyIndex) Verify() error {
+	return p.VerifyCtx(context.Background())
+}
+
+// VerifyCtx is Verify, abandoned if ctx is cancelled.
+//
+// Verify is read-only, so there is nothing a cancelled one leaves behind and no
+// point at which stopping is unsafe. That is the whole reason it is cancellable
+// where RebuildIndexes largely is not.
+func (p *PropertyIndex) VerifyCtx(ctx context.Context) error {
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return err
+	}
 	for i := range p.shards {
 		sh := &p.shards[i]
 		sh.mu.RLock()
-		err := sh.verify()
+		err := sh.verify(&cc)
 		sh.mu.RUnlock()
 		if err != nil {
 			return err
@@ -721,28 +735,28 @@ func (p *PropertyIndex) Verify() error {
 	// Composites are checked outside the shard loop because they are not owned
 	// by a shard, and each one re-derives itself rather than being compared
 	// against the postings it was built from — see compositeIndex.verify.
-	if err := p.nodeComposites.verifyAll("node"); err != nil {
+	if err := p.nodeComposites.verifyAll("node", &cc); err != nil {
 		return err
 	}
-	return p.edgeComposites.verifyAll("edge")
+	return p.edgeComposites.verifyAll("edge", &cc)
 }
 
 // verify checks one shard's invariants. Caller must hold sh.mu.
-func (sh *propertyShard) verify() error {
-	if err := sh.nodes.verify("node"); err != nil {
+func (sh *propertyShard) verify(cc *store.CancelCheck) error {
+	if err := sh.nodes.verify("node", cc); err != nil {
 		return err
 	}
-	if err := sh.edges.verify("edge"); err != nil {
+	if err := sh.edges.verify("edge", cc); err != nil {
 		return err
 	}
 	// Each ordered index must mirror the hash postings for its key exactly.
 	for key, idx := range sh.orderedNodeKeys {
-		if err := idx.verify("node", key, sh.nodes.byKey[key]); err != nil {
+		if err := idx.verify("node", key, sh.nodes.byKey[key], cc); err != nil {
 			return err
 		}
 	}
 	for key, idx := range sh.orderedEdgeKeys {
-		if err := idx.verify("edge", key, sh.edges.byKey[key]); err != nil {
+		if err := idx.verify("edge", key, sh.edges.byKey[key], cc); err != nil {
 			return err
 		}
 	}
@@ -1103,7 +1117,7 @@ func unsafeBytes(s string) []byte {
 }
 
 // verify walks the postings and the reverse map and cross-checks them.
-func (p *postings[T]) verify(kind string) error {
+func (p *postings[T]) verify(kind string, cc *store.CancelCheck) error {
 	seen := make(map[T]map[propRef]int)
 	total := 0
 
@@ -1112,6 +1126,9 @@ func (p *postings[T]) verify(kind string) error {
 			return fmt.Errorf("%s index: key %q has an empty bucket map", kind, key)
 		}
 		for value, ids := range bucket {
+			if err := cc.Step(); err != nil {
+				return err
+			}
 			if len(ids) == 0 {
 				return fmt.Errorf("%s index: key %q value %q has an empty postings list", kind, key, value)
 			}
@@ -1211,4 +1228,47 @@ func deleteSorted[T entityID](ids []T, id T) ([]T, bool) {
 		return ids, false
 	}
 	return append(ids[:pos], ids[pos+1:]...), true
+}
+
+// ForEachNodeProperty calls fn for every indexed (id, key, value) triple, in
+// the same (key, value, id) order NodeEntries produces. Return false from fn to
+// stop early.
+//
+// The streaming counterpart to NodeEntries, and the one a bulk export wants:
+// NodeEntries materialises every triple in the index at once, which on a large
+// store is a slice proportional to everything that was ever indexed. This walks
+// the same triples one key at a time and allocates only the key list.
+//
+// The value slice is owned by the index: read it, do not retain or mutate it.
+func (p *PropertyIndex) ForEachNodeProperty(fn func(id store.NodeID, key string, value []byte) bool) {
+	for _, key := range p.nodePropKeys() {
+		stop := false
+		p.ForEachNodeEntry(key, func(id store.NodeID, value []byte) bool {
+			if !fn(id, key, value) {
+				stop = true
+				return false
+			}
+			return true
+		})
+		if stop {
+			return
+		}
+	}
+}
+
+// ForEachEdgeProperty is ForEachNodeProperty for edge properties.
+func (p *PropertyIndex) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value []byte) bool) {
+	for _, key := range p.edgePropKeys() {
+		stop := false
+		p.ForEachEdgeEntry(key, func(id store.EdgeID, value []byte) bool {
+			if !fn(id, key, value) {
+				stop = true
+				return false
+			}
+			return true
+		})
+		if stop {
+			return
+		}
+	}
 }

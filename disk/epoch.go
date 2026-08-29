@@ -226,11 +226,16 @@ func (s *Store) Snapshot() (store.Snapshot, error) {
 	// a delta layer rather than extending it, and it holds the write lock, so
 	// this is what stops a snapshot pairing a new layer with an old epoch.
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	now := s.now()
 	r := reader{v: s.viewPtr.Load(), epoch: s.visibleEpoch.Load()}
 	s.snaps.add(r.epoch, now)
+	s.mu.Unlock()
+
+	// Outside the lock, deliberately, and the reason is the same one that keeps
+	// the query metric outside its read lock: a sink is caller code, and this
+	// one runs under the *write* lock, so a slow implementation would stall
+	// every writer in the process for as long as it took.
+	s.record(store.Metric{Kind: store.MetricSnapshotOpen})
 	return &snapshot{s: s, r: r, opened: now, maxAge: s.maxSnapshotAge}, nil
 }
 
@@ -270,8 +275,16 @@ func (sn *snapshot) Close() error {
 		return nil
 	}
 	sn.s.mu.Lock()
-	sn.s.snaps.remove(sn.r.epoch, sn.s.now())
+	closed := sn.s.now()
+	sn.s.snaps.remove(sn.r.epoch, closed)
 	sn.s.mu.Unlock()
+	// How long it was held, so a sink can find the leaked one without keeping
+	// state of its own. Taken from the store's clock rather than time.Now, which
+	// is what lets a test pin it — the same indirection nowUnixNano exists for.
+	sn.s.record(store.Metric{
+		Kind:  store.MetricSnapshotClose,
+		Count: closed.Sub(sn.opened).Nanoseconds(),
+	})
 	return nil
 }
 

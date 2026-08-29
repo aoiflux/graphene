@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
@@ -319,6 +320,83 @@ type IndexRebuilder interface {
 	// caller and are not recoverable from the records. RebuildIndexes therefore
 	// repairs structure, not content.
 	RebuildIndexes() error
+}
+
+// IndexVerifierCtx is IndexVerifier for a store whose check can be abandoned.
+//
+// Separate interfaces rather than one with both methods, matching how every
+// other capability here is discovered: a backend that can verify but not
+// cancel stays usable through IndexVerifier, and nothing that already
+// implements it has to grow a method to keep working.
+type IndexVerifierCtx interface {
+	// VerifyIndexesCtx is VerifyIndexes, abandoned if ctx is cancelled. It
+	// reports ctx.Err() in that case, which is distinguishable from an
+	// inconsistency: a cancelled check found nothing, it stopped looking.
+	VerifyIndexesCtx(ctx context.Context) error
+}
+
+// IndexRebuilderCtx is IndexRebuilder for a store whose repair can be
+// abandoned.
+type IndexRebuilderCtx interface {
+	// RebuildIndexesCtx is RebuildIndexes, abandoned if ctx is cancelled where
+	// abandoning it is safe.
+	//
+	// That qualification is the whole contract. A rebuild replaces derived state
+	// wholesale, and half a replacement is an index that omits records it should
+	// name — the failure that costs a query result rather than a query. An
+	// implementation must therefore either finish the structural rebuild or not
+	// begin it, and may only honour a cancellation at points where what it
+	// leaves behind is a superset of the truth. Both bundled backends cancel
+	// before the rebuild and during the sweep that follows it, and nowhere in
+	// between.
+	//
+	// A cancelled rebuild is one to run again. It leaves the store no worse than
+	// it found it — the sweep it interrupted was removing entries that were
+	// already there — but it does not leave it repaired, and VerifyIndexes will
+	// still report whatever the sweep did not reach.
+	RebuildIndexesCtx(ctx context.Context) error
+}
+
+// QuerierCtx is an optional extension implemented by stores whose queries can
+// be abandoned part way.
+//
+// Worth having separately from the traversal budgets: a query is not a walk,
+// it has no frontier to bound, and what makes it worth stopping is usually not
+// its own cost but the read lock it holds while a writer waits.
+type QuerierCtx interface {
+	// QueryNodeIDsCtx is QueryNodeIDs, abandoned if ctx is cancelled.
+	//
+	// Nothing partial is returned with the error. A query stopped part way holds
+	// a candidate set that some filters have been applied to and others have
+	// not — a superset of the answer that is shaped exactly like the answer, and
+	// the one result worse than none.
+	QueryNodeIDsCtx(ctx context.Context, query NodeQuery) ([]NodeID, error)
+
+	// QueryEdgeIDsCtx is QueryEdgeIDs, abandoned if ctx is cancelled.
+	QueryEdgeIDsCtx(ctx context.Context, query EdgeQuery) ([]EdgeID, error)
+}
+
+// PropertyEnumerator is an optional extension implemented by stores that can
+// walk every indexed property entry.
+//
+// It exists for bulk export, and it exists as its own capability because those
+// entries cannot be recovered from anything else the store exposes. A node's
+// Properties blob is opaque to the engine — the values in the index were handed
+// to IndexNodeProperty separately, by a caller who knew how to derive them — so
+// a dump that carried only the records would restore a graph whose queries
+// answered nothing. RebuildIndexes says the same thing from the other side: it
+// repairs structure, not content.
+type PropertyEnumerator interface {
+	// ForEachNodeProperty calls fn for every indexed (id, key, value) triple.
+	// Return false from fn to stop early.
+	//
+	// The value slice belongs to the store: read it, do not retain or mutate it.
+	// A caller keeping one must copy it, which is what a bulk export does as it
+	// encodes.
+	ForEachNodeProperty(fn func(id NodeID, key string, value []byte) bool)
+
+	// ForEachEdgeProperty is ForEachNodeProperty for edge properties.
+	ForEachEdgeProperty(fn func(id EdgeID, key string, value []byte) bool)
 }
 
 // AdjacencyReader is an optional extension for allocation-free traversal.

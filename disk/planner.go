@@ -5,8 +5,10 @@ package disk
 // plan. Split out of store.go, unchanged.
 
 import (
+	"context"
 	"math"
 	"slices"
+	"time"
 
 	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
@@ -21,16 +23,69 @@ import (
 // ID for a node deleted halfway through it. Holding the lock once costs writers
 // a longer wait and buys the query an answer that was true at one instant.
 func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
+	return s.QueryNodeIDsCtx(context.Background(), query)
+}
+
+// QueryNodeIDsCtx is QueryNodeIDs, abandoned if ctx is cancelled.
+//
+// The read lock is what makes this worth having. A query over a large candidate
+// set holds s.mu.RLock for its whole duration, so a caller who has stopped
+// wanting the answer is not just spending its own time — it is holding the lock
+// a writer is waiting behind. Cancellation returns the lock early.
+//
+// Nothing partial comes back with the error, for the reason
+// PropertyIndex.NarrowNodesByFiltersCtx gives: a residual pass stopped part way
+// holds a superset of the answer, indistinguishable from the answer.
+func (s *Store) QueryNodeIDsCtx(ctx context.Context, query store.NodeQuery) ([]store.NodeID, error) {
+	cc := store.NewCancelCheck(ctx)
+	// Before the lock, deliberately: a caller handing over a dead context should
+	// not make a writer wait for a query that will not be returned.
+	if err := cc.Check(); err != nil {
+		return nil, err
+	}
+	var started time.Time
+	if s.metricsOn() {
+		started = time.Now()
+	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.queryNodeIDs(s.readerLocked(), query)
+	ids, examined, err := s.queryNodeIDsCtx(ctx, s.readerLocked(), query)
+	s.mu.RUnlock()
+	// Recorded after the lock is released, not under it. A sink is caller code
+	// running on this goroutine, and holding the read lock across it would let a
+	// slow one block every writer — the failure the cancellation above exists to
+	// avoid, reintroduced by the thing measuring it.
+	if s.metricsOn() {
+		s.record(store.Metric{
+			Kind:     store.MetricQuery,
+			Duration: time.Since(started),
+			Count:    int64(len(ids)),
+			Examined: int64(examined),
+			Err:      err,
+		})
+	}
+	return ids, err
 }
 
 // queryNodeIDs is the body, resolved against a caller-supplied reader so a
 // snapshot runs the identical plan over its own pinned state. Caller holds
 // whatever lock that reader requires.
 func (s *Store) queryNodeIDs(r reader, query store.NodeQuery) ([]store.NodeID, error) {
+	ids, _, err := s.queryNodeIDsCtx(context.Background(), r, query)
+	return ids, err
+}
+
+// queryNodeIDsCtx also reports how many candidates the driving step produced.
+//
+// That number is what makes a query metric worth having: duration alone cannot
+// distinguish a slow query from a large one, and the ratio of candidates to
+// results is exactly the planner's selectivity. It is returned rather than
+// recorded here because the emission belongs outside the read lock, and this
+// function runs inside it — including for a snapshot, which holds no lock at
+// all and has no store to report to.
+func (s *Store) queryNodeIDsCtx(ctx context.Context, r reader, query store.NodeQuery) ([]store.NodeID, int, error) {
+	cc := store.NewCancelCheck(ctx)
 	candidates, sortedAsc, plan := s.driveNodeCandidates(r, query)
+	examined := len(candidates)
 
 	if len(query.Types) > 0 {
 		typeSet := make(map[store.NodeType]struct{}, len(query.Types))
@@ -39,6 +94,9 @@ func (s *Store) queryNodeIDs(r reader, query store.NodeQuery) ([]store.NodeID, e
 		}
 		filtered := make([]store.NodeID, 0, len(candidates))
 		for _, id := range candidates {
+			if err := cc.Step(); err != nil {
+				return nil, examined, err
+			}
 			n, ok := r.node(id)
 			if !ok {
 				continue
@@ -62,9 +120,16 @@ func (s *Store) queryNodeIDs(r reader, query store.NodeQuery) ([]store.NodeID, e
 			// Every filter's own set contains the answer, so the residual pass
 			// can narrow the candidates directly and skip the driving filter
 			// entirely rather than re-deriving a set it was already built from.
-			candidates = r.index().NarrowNodesByFilters(candidates, query.Filters, plan.DriverFilters)
+			var err error
+			candidates, err = r.index().NarrowNodesByFiltersCtx(ctx, candidates, query.Filters, plan.DriverFilters)
+			if err != nil {
+				return nil, examined, err
+			}
 		} else {
-			matched := s.matchNodeIDsByFilters(r, query.Filters, store.MatchAny)
+			matched, err := s.matchNodeIDsByFilters(r, query.Filters, store.MatchAny, &cc)
+			if err != nil {
+				return nil, examined, err
+			}
 			candidates = store.IntersectSortedIDs(candidates, matched)
 		}
 	}
@@ -80,19 +145,51 @@ func (s *Store) queryNodeIDs(r reader, query store.NodeQuery) ([]store.NodeID, e
 	default:
 		store.SortIDsForOrder(candidates, order)
 	}
-	return store.ApplyNodeQueryWindow(candidates, query.Offset, query.Limit), nil
+	return store.ApplyNodeQueryWindow(candidates, query.Offset, query.Limit), examined, nil
 }
 
 // QueryEdgeIDs resolves query against the newest visible state. See
 // QueryNodeIDs for why one lock covers the whole of it.
 func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
+	return s.QueryEdgeIDsCtx(context.Background(), query)
+}
+
+// QueryEdgeIDsCtx is QueryEdgeIDs, abandoned if ctx is cancelled. See
+// QueryNodeIDsCtx for why the first check happens before the lock.
+func (s *Store) QueryEdgeIDsCtx(ctx context.Context, query store.EdgeQuery) ([]store.EdgeID, error) {
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return nil, err
+	}
+	var started time.Time
+	if s.metricsOn() {
+		started = time.Now()
+	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.queryEdgeIDs(s.readerLocked(), query)
+	ids, examined, err := s.queryEdgeIDsCtx(ctx, s.readerLocked(), query)
+	s.mu.RUnlock()
+	if s.metricsOn() {
+		s.record(store.Metric{
+			Kind:     store.MetricQuery,
+			Duration: time.Since(started),
+			Count:    int64(len(ids)),
+			Examined: int64(examined),
+			Err:      err,
+		})
+	}
+	return ids, err
 }
 
 func (s *Store) queryEdgeIDs(r reader, query store.EdgeQuery) ([]store.EdgeID, error) {
+	ids, _, err := s.queryEdgeIDsCtx(context.Background(), r, query)
+	return ids, err
+}
+
+// queryEdgeIDsCtx also reports the driving set's size. See queryNodeIDsCtx.
+func (s *Store) queryEdgeIDsCtx(ctx context.Context, r reader, query store.EdgeQuery) ([]store.EdgeID, int, error) {
+	cc := store.NewCancelCheck(ctx)
 	candidates, sortedAsc, plan := s.driveEdgeCandidates(r, query)
+	examined := len(candidates)
 
 	if len(query.Types) > 0 || len(query.SrcIDs) > 0 || len(query.DstIDs) > 0 {
 		typeSet := make(map[store.EdgeType]struct{}, len(query.Types))
@@ -104,6 +201,9 @@ func (s *Store) queryEdgeIDs(r reader, query store.EdgeQuery) ([]store.EdgeID, e
 
 		filtered := make([]store.EdgeID, 0, len(candidates))
 		for _, id := range candidates {
+			if err := cc.Step(); err != nil {
+				return nil, examined, err
+			}
 			e, ok := r.edge(id)
 			if !ok {
 				continue
@@ -132,9 +232,16 @@ func (s *Store) queryEdgeIDs(r reader, query store.EdgeQuery) ([]store.EdgeID, e
 			sortedAsc = true
 		}
 		if store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
-			candidates = r.index().NarrowEdgesByFilters(candidates, query.Filters, plan.DriverFilters)
+			var err error
+			candidates, err = r.index().NarrowEdgesByFiltersCtx(ctx, candidates, query.Filters, plan.DriverFilters)
+			if err != nil {
+				return nil, examined, err
+			}
 		} else {
-			matched := s.matchEdgeIDsByFilters(r, query.Filters, store.MatchAny)
+			matched, err := s.matchEdgeIDsByFilters(r, query.Filters, store.MatchAny, &cc)
+			if err != nil {
+				return nil, examined, err
+			}
 			candidates = store.IntersectSortedIDs(candidates, matched)
 		}
 	}
@@ -148,7 +255,7 @@ func (s *Store) queryEdgeIDs(r reader, query store.EdgeQuery) ([]store.EdgeID, e
 	default:
 		store.SortIDsForOrder(candidates, order)
 	}
-	return store.ApplyEdgeQueryWindow(candidates, query.Offset, query.Limit), nil
+	return store.ApplyEdgeQueryWindow(candidates, query.Offset, query.Limit), examined, nil
 }
 
 // sortDedupeNodeIDs sorts ids ascending and removes duplicates, in place.
@@ -612,12 +719,18 @@ func collectCandidateEdgeIDs(r reader, ids []store.EdgeID) []store.EdgeID {
 // than each being built into a map and the maps intersected. Merging is one pass
 // per side with no hashing, the output stays sorted so the query path can skip
 // its final sort, and an empty intersection under MatchAll can stop early.
-func (s *Store) matchNodeIDsByFilters(r reader, filters []store.PropertyFilter, mode store.MatchMode) []store.NodeID {
+func (s *Store) matchNodeIDsByFilters(r reader, filters []store.PropertyFilter, mode store.MatchMode, cc *store.CancelCheck) ([]store.NodeID, error) {
 	if len(filters) == 0 {
-		return nil
+		return nil, nil
 	}
 	var acc []store.NodeID
 	for i, f := range filters {
+		// Unamortised, per filter: resolving one filter to its own set is a scan
+		// of everything registered under its key, so this loop is short and each
+		// iteration is long — the opposite shape to the candidate loops above.
+		if err := cc.Check(); err != nil {
+			return nil, err
+		}
 		set := s.matchOneNodeFilter(r, f)
 		if i == 0 {
 			acc = set
@@ -630,10 +743,10 @@ func (s *Store) matchNodeIDsByFilters(r reader, filters []store.PropertyFilter, 
 		acc = store.IntersectSortedIDs(acc, set)
 		if len(acc) == 0 {
 			// Nothing can re-enter an empty intersection.
-			return acc
+			return acc, nil
 		}
 	}
-	return acc
+	return acc, nil
 }
 
 // matchOneNodeFilter resolves a single filter to an ascending, deduplicated set.
@@ -661,12 +774,15 @@ func (s *Store) matchOneNodeFilter(r reader, f store.PropertyFilter) []store.Nod
 }
 
 // matchEdgeIDsByFilters is matchNodeIDsByFilters for edge properties.
-func (s *Store) matchEdgeIDsByFilters(r reader, filters []store.PropertyFilter, mode store.MatchMode) []store.EdgeID {
+func (s *Store) matchEdgeIDsByFilters(r reader, filters []store.PropertyFilter, mode store.MatchMode, cc *store.CancelCheck) ([]store.EdgeID, error) {
 	if len(filters) == 0 {
-		return nil
+		return nil, nil
 	}
 	var acc []store.EdgeID
 	for i, f := range filters {
+		if err := cc.Check(); err != nil {
+			return nil, err
+		}
 		set := s.matchOneEdgeFilter(r, f)
 		if i == 0 {
 			acc = set
@@ -678,10 +794,10 @@ func (s *Store) matchEdgeIDsByFilters(r reader, filters []store.PropertyFilter, 
 		}
 		acc = store.IntersectSortedIDs(acc, set)
 		if len(acc) == 0 {
-			return acc
+			return acc, nil
 		}
 	}
-	return acc
+	return acc, nil
 }
 
 func (s *Store) matchOneEdgeFilter(r reader, f store.PropertyFilter) []store.EdgeID {

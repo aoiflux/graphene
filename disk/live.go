@@ -74,6 +74,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
@@ -118,7 +119,23 @@ func (s *Store) Refresh() (store.RefreshInfo, error) {
 	if !s.live {
 		return store.RefreshInfo{}, ErrNotLiveReader
 	}
+	if s.metricsOn() {
+		started := time.Now()
+		before := s.visibleEpoch.Load()
+		info, err := s.refresh()
+		s.record(store.Metric{
+			Kind:     store.MetricRefresh,
+			Duration: time.Since(started),
+			Count:    int64(s.visibleEpoch.Load() - before),
+			Bytes:    info.Bytes,
+			Err:      err,
+		})
+		return info, err
+	}
+	return s.refresh()
+}
 
+func (s *Store) refresh() (store.RefreshInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

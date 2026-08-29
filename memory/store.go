@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"slices"
@@ -832,6 +833,16 @@ func (s *Store) EdgesByProperty(key string, value []byte) ([]store.EdgeID, error
 }
 
 func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
+	return s.QueryNodeIDsCtx(context.Background(), query)
+}
+
+// QueryNodeIDsCtx is QueryNodeIDs, abandoned if ctx is cancelled. Parity with
+// disk.Store.QueryNodeIDsCtx, which is where the reasoning is written down.
+func (s *Store) QueryNodeIDsCtx(ctx context.Context, query store.NodeQuery) ([]store.NodeID, error) {
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return nil, err
+	}
 	candidates, sortedAsc, plan := s.driveNodeCandidates(query)
 
 	if len(query.Types) > 0 {
@@ -841,6 +852,9 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 		}
 		filtered := make([]store.NodeID, 0, len(candidates))
 		for _, id := range candidates {
+			if err := cc.Step(); err != nil {
+				return nil, err
+			}
 			n, err := s.GetNode(id)
 			if err != nil {
 				continue
@@ -864,9 +878,16 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 			// Every filter's own set contains the answer, so the residual pass
 			// can narrow the candidates directly and skip the driving filter
 			// entirely rather than re-deriving a set it was already built from.
-			candidates = s.propIdx.NarrowNodesByFilters(candidates, query.Filters, plan.DriverFilters)
+			var err error
+			candidates, err = s.propIdx.NarrowNodesByFiltersCtx(ctx, candidates, query.Filters, plan.DriverFilters)
+			if err != nil {
+				return nil, err
+			}
 		} else {
-			matched := s.matchNodeIDsByFilters(query.Filters, store.MatchAny)
+			matched, err := s.matchNodeIDsByFilters(query.Filters, store.MatchAny, &cc)
+			if err != nil {
+				return nil, err
+			}
 			candidates = store.IntersectSortedIDs(candidates, matched)
 		}
 	}
@@ -886,6 +907,15 @@ func (s *Store) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 }
 
 func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
+	return s.QueryEdgeIDsCtx(context.Background(), query)
+}
+
+// QueryEdgeIDsCtx is QueryEdgeIDs, abandoned if ctx is cancelled.
+func (s *Store) QueryEdgeIDsCtx(ctx context.Context, query store.EdgeQuery) ([]store.EdgeID, error) {
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return nil, err
+	}
 	candidates, sortedAsc, plan := s.driveEdgeCandidates(query)
 
 	if len(query.Types) > 0 || len(query.SrcIDs) > 0 || len(query.DstIDs) > 0 {
@@ -898,6 +928,9 @@ func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 
 		filtered := make([]store.EdgeID, 0, len(candidates))
 		for _, id := range candidates {
+			if err := cc.Step(); err != nil {
+				return nil, err
+			}
 			e, err := s.GetEdge(id)
 			if err != nil {
 				continue
@@ -926,9 +959,16 @@ func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 			sortedAsc = true
 		}
 		if store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
-			candidates = s.propIdx.NarrowEdgesByFilters(candidates, query.Filters, plan.DriverFilters)
+			var err error
+			candidates, err = s.propIdx.NarrowEdgesByFiltersCtx(ctx, candidates, query.Filters, plan.DriverFilters)
+			if err != nil {
+				return nil, err
+			}
 		} else {
-			matched := s.matchEdgeIDsByFilters(query.Filters, store.MatchAny)
+			matched, err := s.matchEdgeIDsByFilters(query.Filters, store.MatchAny, &cc)
+			if err != nil {
+				return nil, err
+			}
 			candidates = store.IntersectSortedIDs(candidates, matched)
 		}
 	}
@@ -949,7 +989,18 @@ func (s *Store) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 // postings, the adjacency lists, and the property index against the live node
 // and edge records, returning the first inconsistency found.
 func (s *Store) VerifyIndexes() error {
-	if err := s.propIdx.Verify(); err != nil {
+	return s.VerifyIndexesCtx(context.Background())
+}
+
+// VerifyIndexesCtx is VerifyIndexes, abandoned if ctx is cancelled. Parity with
+// disk.Store.VerifyIndexesCtx: read-only throughout, so every pass is
+// interruptible and a cancelled check leaves nothing behind.
+func (s *Store) VerifyIndexesCtx(ctx context.Context) error {
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return err
+	}
+	if err := s.propIdx.VerifyCtx(ctx); err != nil {
 		return err
 	}
 
@@ -963,6 +1014,9 @@ func (s *Store) VerifyIndexes() error {
 	// make verification quadratic in the size of the largest label.
 	nodeMembers := make(map[store.NodeType]map[store.NodeID]struct{}, len(s.nodesByType))
 	for lbl, ids := range s.nodesByType {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if !store.IsSortedIDs(ids) {
 			return fmt.Errorf("node label index: %v postings are not strictly ascending", lbl)
 		}
@@ -983,6 +1037,9 @@ func (s *Store) VerifyIndexes() error {
 		nodeMembers[lbl] = seen
 	}
 	for id, n := range s.nodes {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		for _, lbl := range n.Labels {
 			if _, ok := nodeMembers[lbl][id]; !ok {
 				return fmt.Errorf("node label index: node %d carries %v but is missing from the postings", id, lbl)
@@ -992,6 +1049,9 @@ func (s *Store) VerifyIndexes() error {
 
 	edgeMembers := make(map[store.EdgeType]map[store.EdgeID]struct{}, len(s.edgesByType))
 	for lbl, ids := range s.edgesByType {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if !store.IsSortedIDs(ids) {
 			return fmt.Errorf("edge label index: %v postings are not strictly ascending", lbl)
 		}
@@ -1012,6 +1072,9 @@ func (s *Store) VerifyIndexes() error {
 		edgeMembers[lbl] = seen
 	}
 	for id, e := range s.edges {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		for _, lbl := range e.Labels {
 			if _, ok := edgeMembers[lbl][id]; !ok {
 				return fmt.Errorf("edge label index: edge %d carries %v but is missing from the postings", id, lbl)
@@ -1028,6 +1091,9 @@ func (s *Store) VerifyIndexes() error {
 	outCount := make(map[store.NodeID]int, len(s.adj))
 	inCount := make(map[store.NodeID]int, len(s.adj))
 	for nodeID, a := range s.adj {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if _, ok := s.nodes[nodeID]; !ok {
 			return fmt.Errorf("adjacency: entry for node %d, which does not exist", nodeID)
 		}
@@ -1084,11 +1150,17 @@ func (s *Store) VerifyIndexes() error {
 
 	// The property index must not outlive the entities it describes.
 	for _, id := range s.propIdx.IndexedNodeIDs() {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if _, ok := s.nodes[id]; !ok {
 			return fmt.Errorf("property index: node %d has entries but does not exist", id)
 		}
 	}
 	for _, id := range s.propIdx.IndexedEdgeIDs() {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if _, ok := s.edges[id]; !ok {
 			return fmt.Errorf("property index: edge %d has entries but does not exist", id)
 		}
@@ -1100,6 +1172,21 @@ func (s *Store) VerifyIndexes() error {
 // postings and the adjacency lists from the node and edge records, then drops
 // property-index entries belonging to entities that no longer exist.
 func (s *Store) RebuildIndexes() error {
+	return s.RebuildIndexesCtx(context.Background())
+}
+
+// RebuildIndexesCtx is RebuildIndexes, abandoned if ctx is cancelled — but only
+// where abandoning it is safe. Parity with disk.Store.RebuildIndexesCtx: the
+// rebuild proper clears the postings and the adjacency before repopulating
+// them, so stopping part way through leaves entities missing from postings they
+// belong in, which is a silently wrong query rather than a slow one. Only the
+// dead-entry sweep afterwards is interruptible, and leaves the store no worse
+// than it found it rather than consistent — see disk.Store.RebuildIndexesCtx.
+func (s *Store) RebuildIndexesCtx(ctx context.Context) error {
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.version.Add(1)
 
@@ -1120,23 +1207,41 @@ func (s *Store) RebuildIndexes() error {
 	// Collect dangling property-index owners while we still hold the lock, but
 	// purge after releasing it: the property index has its own lock.
 	var deadNodes []store.NodeID
+	var cerr error
 	for _, id := range s.propIdx.IndexedNodeIDs() {
+		if cerr = cc.Step(); cerr != nil {
+			break
+		}
 		if _, ok := s.nodes[id]; !ok {
 			deadNodes = append(deadNodes, id)
 		}
 	}
 	var deadEdges []store.EdgeID
-	for _, id := range s.propIdx.IndexedEdgeIDs() {
-		if _, ok := s.edges[id]; !ok {
-			deadEdges = append(deadEdges, id)
+	if cerr == nil {
+		for _, id := range s.propIdx.IndexedEdgeIDs() {
+			if cerr = cc.Step(); cerr != nil {
+				break
+			}
+			if _, ok := s.edges[id]; !ok {
+				deadEdges = append(deadEdges, id)
+			}
 		}
 	}
 	s.mu.Unlock()
+	if cerr != nil {
+		return cerr
+	}
 
 	for _, id := range deadNodes {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		s.propIdx.RemoveNode(id)
 	}
 	for _, id := range deadEdges {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		s.propIdx.RemoveEdge(id)
 	}
 	return nil
@@ -1598,12 +1703,15 @@ func (s *Store) edgeIDsForTypes(types []store.EdgeType) []store.EdgeID {
 // than each being built into a map and the maps intersected. Merging is one pass
 // per side with no hashing, the output stays sorted so the query path can skip
 // its final sort, and an empty intersection under MatchAll can stop early.
-func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) []store.NodeID {
+func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode, cc *store.CancelCheck) ([]store.NodeID, error) {
 	if len(filters) == 0 {
-		return nil
+		return nil, nil
 	}
 	var acc []store.NodeID
 	for i, f := range filters {
+		if err := cc.Check(); err != nil {
+			return nil, err
+		}
 		set := s.matchOneNodeFilter(f)
 		if i == 0 {
 			acc = set
@@ -1616,10 +1724,10 @@ func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store
 		acc = store.IntersectSortedIDs(acc, set)
 		if len(acc) == 0 {
 			// Nothing can re-enter an empty intersection.
-			return acc
+			return acc, nil
 		}
 	}
-	return acc
+	return acc, nil
 }
 
 // matchOneNodeFilter resolves a single filter to an ascending, deduplicated set.
@@ -1647,12 +1755,15 @@ func (s *Store) matchOneNodeFilter(f store.PropertyFilter) []store.NodeID {
 }
 
 // matchEdgeIDsByFilters is matchNodeIDsByFilters for edge properties.
-func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) []store.EdgeID {
+func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode, cc *store.CancelCheck) ([]store.EdgeID, error) {
 	if len(filters) == 0 {
-		return nil
+		return nil, nil
 	}
 	var acc []store.EdgeID
 	for i, f := range filters {
+		if err := cc.Check(); err != nil {
+			return nil, err
+		}
 		set := s.matchOneEdgeFilter(f)
 		if i == 0 {
 			acc = set
@@ -1664,10 +1775,10 @@ func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store
 		}
 		acc = store.IntersectSortedIDs(acc, set)
 		if len(acc) == 0 {
-			return acc
+			return acc, nil
 		}
 	}
-	return acc
+	return acc, nil
 }
 
 func (s *Store) matchOneEdgeFilter(f store.PropertyFilter) []store.EdgeID {
@@ -1835,4 +1946,14 @@ func (s *Store) GetEdgesBatch(ids []store.EdgeID) ([]*store.Edge, []store.EdgeID
 	}
 	s.mu.RUnlock()
 	return found, missing
+}
+
+// ForEachNodeProperty implements store.PropertyEnumerator.
+func (s *Store) ForEachNodeProperty(fn func(id store.NodeID, key string, value []byte) bool) {
+	s.propIdx.ForEachNodeProperty(fn)
+}
+
+// ForEachEdgeProperty implements store.PropertyEnumerator.
+func (s *Store) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value []byte) bool) {
+	s.propIdx.ForEachEdgeProperty(fn)
 }

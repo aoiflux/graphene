@@ -20,6 +20,7 @@ package disk
 // second is a bug, and only the second is checked.
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/aoiflux/graphene/store"
@@ -29,7 +30,27 @@ import (
 // postings, the CSR adjacency arrays, the delta label postings, and the property
 // index against the live records, returning the first inconsistency found.
 func (s *Store) VerifyIndexes() error {
-	if err := s.propIdx.Verify(); err != nil {
+	return s.VerifyIndexesCtx(context.Background())
+}
+
+// VerifyIndexesCtx is VerifyIndexes, abandoned if ctx is cancelled.
+//
+// Every pass here is read-only, so there is no point at which stopping leaves
+// anything behind, and a cancelled verification means only that the question
+// was not answered. That is what separates it from RebuildIndexesCtx, where
+// most of the work cannot be abandoned safely.
+//
+// The read lock is the reason to bother. This walks every retained version,
+// every posting and every property entry in the store with s.mu held; on a
+// large store that is seconds during which no writer runs. A caller that has
+// given up — a CI step past its deadline, an operator who cancelled — gets the
+// lock back rather than waiting out a check nobody will read.
+func (s *Store) VerifyIndexesCtx(ctx context.Context) error {
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return err
+	}
+	if err := s.propIdx.VerifyCtx(ctx); err != nil {
 		return err
 	}
 
@@ -51,6 +72,9 @@ func (s *Store) VerifyIndexes() error {
 	// Postings must be strictly ascending and free of duplicates — the merge and
 	// binary-search paths depend on both — and must name IDs the delta knows.
 	for lbl, ids := range d.nodesByType {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if !store.IsSortedIDs(ids) {
 			return fmt.Errorf("delta node label index: %v postings are not strictly ascending", lbl)
 		}
@@ -61,6 +85,9 @@ func (s *Store) VerifyIndexes() error {
 		}
 	}
 	for lbl, ids := range d.edgesByType {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if !store.IsSortedIDs(ids) {
 			return fmt.Errorf("delta edge label index: %v postings are not strictly ascending", lbl)
 		}
@@ -75,6 +102,9 @@ func (s *Store) VerifyIndexes() error {
 	// version still retained is reachable by some reader, so every version's
 	// labels must be posted, not just the newest one's.
 	for id, ver := range d.nodes {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		for cur := ver; cur != nil; cur = cur.prev {
 			if cur.node == nil {
 				continue
@@ -88,6 +118,9 @@ func (s *Store) VerifyIndexes() error {
 		}
 	}
 	for id, ver := range d.edges {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		for cur := ver; cur != nil; cur = cur.prev {
 			if cur.edge == nil {
 				continue
@@ -139,6 +172,9 @@ func (s *Store) VerifyIndexes() error {
 	// delta has never heard of, or a record whose endpoint disagrees — endpoints
 	// are immutable, so any retained version answers for all of them.
 	for nodeID, a := range d.adj {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		for _, eid := range a.out {
 			ver, known := d.edges[eid]
 			if !known {
@@ -161,11 +197,17 @@ func (s *Store) VerifyIndexes() error {
 
 	// The property index must not outlive the entities it describes.
 	for _, id := range s.propIdx.IndexedNodeIDs() {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if !r.nodeExists(id) {
 			return fmt.Errorf("property index: node %d has entries but is not live", id)
 		}
 	}
 	for _, id := range s.propIdx.IndexedEdgeIDs() {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if !r.edgeExists(id) {
 			return fmt.Errorf("property index: edge %d has entries but is not live", id)
 		}
@@ -230,7 +272,38 @@ func containsSortedEdgeID(ids []store.EdgeID, target store.EdgeID) bool {
 // disk and needs no WAL records. Use it after recovering a store whose indexes
 // may not match its records; a following Compact persists the repaired state.
 func (s *Store) RebuildIndexes() error {
+	return s.RebuildIndexesCtx(context.Background())
+}
+
+// RebuildIndexesCtx is RebuildIndexes, abandoned if ctx is cancelled — but only
+// where abandoning it is safe, which is not most of it.
+//
+// The rebuild proper clears the delta label postings and the delta adjacency
+// and repopulates them from the records. Stopping half way through that leaves
+// postings that name only some of the records carrying a label, which is
+// precisely the fault this file's header calls the one that matters: a missing
+// posting costs a query result, silently. So the rebuild is not interruptible,
+// and the check before it is what makes cancellation useful — a caller with a
+// dead context does not start.
+//
+// The dead-entry sweep afterwards is interruptible, and the guarantee it gives
+// is not "the store is consistent" but "the store is no worse than this call
+// found it". Those entries were already there; the sweep removes a prefix of
+// them and stopping early leaves the rest, which is exactly the state the
+// caller had before it asked. VerifyIndexes will still name them — an entry
+// outliving its entity is a fault it reports — so a cancelled rebuild is a
+// rebuild to run again, not a rebuild that succeeded. What it is not is a new
+// fault: reads filter those candidates out, and the structural half, the half
+// whose failure loses results silently, is whole.
+//
+// Same shape as CompactCtx, and for the same reason: cancellation reaches the
+// part that can be thrown away and stops at the part that cannot.
+func (s *Store) RebuildIndexesCtx(ctx context.Context) error {
 	if err := s.mustWrite(); err != nil {
+		return err
+	}
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -269,25 +342,62 @@ func (s *Store) RebuildIndexes() error {
 		}
 	}
 
+	// From here on the structure is whole again, so cancelling costs only the
+	// sweep. The scan runs under the lock and the removals do not, which is why
+	// the two loops are separate; both are interruptible.
 	var deadNodes []store.NodeID
+	var cerr error
 	for _, id := range s.propIdx.IndexedNodeIDs() {
+		if cerr = cc.Step(); cerr != nil {
+			break
+		}
 		if !r.nodeExists(id) {
 			deadNodes = append(deadNodes, id)
 		}
 	}
 	var deadEdges []store.EdgeID
-	for _, id := range s.propIdx.IndexedEdgeIDs() {
-		if !r.edgeExists(id) {
-			deadEdges = append(deadEdges, id)
+	if cerr == nil {
+		for _, id := range s.propIdx.IndexedEdgeIDs() {
+			if cerr = cc.Step(); cerr != nil {
+				break
+			}
+			if !r.edgeExists(id) {
+				deadEdges = append(deadEdges, id)
+			}
 		}
 	}
 	s.mu.Unlock()
+	if cerr != nil {
+		return cerr
+	}
 
 	for _, id := range deadNodes {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		s.propIdx.RemoveNode(id)
 	}
 	for _, id := range deadEdges {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		s.propIdx.RemoveEdge(id)
 	}
 	return nil
+}
+
+// ForEachNodeProperty implements store.PropertyEnumerator.
+//
+// It reads the property index directly rather than through the view, which is
+// correct for what it is for: an export wants every entry the index holds, and
+// the index is not versioned — an entry removed by a later epoch is gone from
+// it, and one added is present. A caller needing a consistent pair of records
+// and entries should take a Snapshot and export from that instead.
+func (s *Store) ForEachNodeProperty(fn func(id store.NodeID, key string, value []byte) bool) {
+	s.propIdx.ForEachNodeProperty(fn)
+}
+
+// ForEachEdgeProperty implements store.PropertyEnumerator.
+func (s *Store) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value []byte) bool) {
+	s.propIdx.ForEachEdgeProperty(fn)
 }

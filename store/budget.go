@@ -61,3 +61,21 @@ func (b Budget) Unlimited() bool {
 // the error almost always handles all three the same way — the walk was too big
 // for what it was given.
 var ErrBudgetExceeded = errors.New("graphene: traversal budget exceeded")
+
+// MaxRecursionDepth bounds how deep a recursive walk may go.
+//
+// The recursive walks — DFS, provenance, subgraph matching, and HasCycle —
+// recurse once per hop, and a goroutine stack that runs out is a crash rather
+// than an error: the one failure a caller cannot handle, and the one an
+// embedded engine has no business inflicting on its host. Depth limits usually
+// bound this, but ProvenanceChain's default depth is generous,
+// FindSubgraphMatches recurses per pattern node with no depth argument at all,
+// and HasCycle recurses to whatever maxDepth the caller passed.
+//
+// 100 000 frames is far past any real traversal and far short of the default
+// 1 GB goroutine stack limit, so it converts the crash into ErrBudgetExceeded
+// without getting in the way of legitimate work.
+//
+// It lives here rather than in traversal because HasCycle is not in traversal,
+// and two copies of a limit are two limits.
+const MaxRecursionDepth = 100_000

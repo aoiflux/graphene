@@ -87,6 +87,16 @@ func main() {
 		err = cmdProve(args)
 	case "verify-proof":
 		err = cmdVerifyProof(args)
+	case "backup":
+		err = cmdBackup(args)
+	case "verify-backup":
+		err = cmdVerifyBackup(args)
+	case "export":
+		err = cmdExport(args)
+	case "import":
+		err = cmdImport(args)
+	case "migrate":
+		err = cmdMigrate(args)
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -126,21 +136,32 @@ Usage:
   graphene grants  <dir>        role grants, and the capabilities they imply
   graphene prove   <dir>        export a proof to hand to someone else (opens read-only)
   graphene verify-proof <file>  check a proof against a root you retained (no store needed)
+  graphene backup  <dir>        consistent copy into -to (opens read-only)
+  graphene verify-backup <dir>  check a backup against its manifest (no store needed)
+  graphene export  <dir>        the whole graph as jsonl, csv or a native dump (opens read-only)
+  graphene import  <dir>        build a store from a dump, into an empty directory
+  graphene migrate <dir>        bring the image up to the current format (opens exclusively)
 
 info, csr, wal, redactions and grants read the files directly and are safe to run
 against a store another process is using — including one being written to.
 
-verify, custody and prove open the store, which replays the log. They take a
-shared lock: any number of them run at once, and all are refused while a writer
-holds the store. anchor takes the exclusive lock and is refused if anything else
-has it. A refusal names the holder's process ID and means the store is busy, not
-broken.
+verify, custody, prove, backup and export open the store, which replays the log.
+They take a shared lock: any number of them run at once, and all are refused
+while a writer holds the store. anchor, import and migrate take the exclusive
+lock and are refused if anything else has it. A refusal names the holder's
+process ID and means the store is busy, not broken.
 
 verify-proof touches nothing but the file you give it. That is the point: a
 proof checked against the root inside it proves nothing, because whoever wrote
 the file chose both.
 
-'anchor -publish' is the only subcommand that writes, and it only appends.
+Five subcommands write, and none of them can lose what is already there.
+'anchor -publish' only appends. 'backup' and 'export' write somewhere else
+entirely and never touch the store. 'import' refuses any destination that is not
+empty. 'migrate' rewrites the store's own image — it is Open, Compact, verify,
+which is what the library does on its own schedule — and a compaction that fails
+leaves the old image in place, because the new one is renamed in only once it is
+complete and fsynced. There is still no repair and no truncate.
 
 Flags:
   wal      -limit N     stop after N records (0 = all, default 50)
@@ -151,6 +172,15 @@ Flags:
   redactions -node ID   show only records for one entity
              -edge ID   show only records for one relationship
   grants   -actor ID    show only records concerning one actor
+  backup   -to DIR      where to write the copy (required)
+  export   -to PATH     file, or directory for csv (required)
+           -format F    jsonl (default) | dump | csv
+           -no-properties  omit the indexed property entries
+  import   -from PATH   file, or directory for csv (required)
+           -format F    jsonl (default) | dump | csv
+           -batch N     records committed together (0 = default)
+           -compact     compact once at the end (default true)
+  migrate  -check       report what would happen and change nothing
   redactions, grants, custody also take:
            -pubkey ID:HEX  verify signatures with this key (repeatable)
   prove    -node ID     the entity to prove something about

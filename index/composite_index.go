@@ -342,7 +342,7 @@ func (c *compositeIndex[T]) cardinality(values []string) int {
 // no residual filter for the keys they cover, so a missing entry is a row the
 // query silently does not return. Both directions are therefore checked — every
 // tuple a member state implies is filed, and every filed entry is implied by one.
-func (c *compositeIndex[T]) verify(kind string) error {
+func (c *compositeIndex[T]) verify(kind string, cc *store.CancelCheck) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -352,6 +352,9 @@ func (c *compositeIndex[T]) verify(kind string) error {
 	implied := make(map[string]map[T]struct{})
 	counted := 0
 	for id, m := range c.members {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if len(m.one) != width {
 			return errIndexf("%s composite index (%s): entity %v holds %d positions, want %d",
 				kind, name, id, len(m.one), width)
@@ -373,6 +376,9 @@ func (c *compositeIndex[T]) verify(kind string) error {
 	}
 
 	for tuple, ids := range c.postings {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		if len(ids) == 0 {
 			return errIndexf("%s composite index (%s): an empty postings list was retained", kind, name)
 		}
@@ -519,9 +525,9 @@ func (c *compositeSet[T]) find(keys []string) (*compositeIndex[T], bool) {
 }
 
 // verifyAll checks every declared composite.
-func (c *compositeSet[T]) verifyAll(kind string) error {
+func (c *compositeSet[T]) verifyAll(kind string, cc *store.CancelCheck) error {
 	for _, idx := range c.all() {
-		if err := idx.verify(kind); err != nil {
+		if err := idx.verify(kind, cc); err != nil {
 			return err
 		}
 	}

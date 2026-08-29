@@ -171,13 +171,16 @@ func prefixUpperBound(prefix []byte) ([]byte, bool) {
 }
 
 // verify checks the ordered index against the hash postings it mirrors.
-func (o *orderedIndex[T]) verify(kind, key string, bucket map[string][]T) error {
+func (o *orderedIndex[T]) verify(kind, key string, bucket map[string][]T, cc *store.CancelCheck) error {
 	if len(o.values) != len(bucket) {
 		return errIndexf("%s ordered index %q: holds %d values but the postings hold %d",
 			kind, key, len(o.values), len(bucket))
 	}
 	counted := 0
 	for i, ov := range o.values {
+		if err := cc.Step(); err != nil {
+			return err
+		}
 		counted += len(ov.ids)
 		if i > 0 && o.values[i-1].value >= ov.value {
 			return errIndexf("%s ordered index %q: values not strictly ascending at %d", kind, key, i)

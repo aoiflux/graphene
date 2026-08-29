@@ -1,6 +1,7 @@
 package graphene
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -315,9 +316,35 @@ func (g *Graph) QueryNodeIDs(query store.NodeQuery) ([]store.NodeID, error) {
 	return g.GraphStore.QueryNodeIDs(query)
 }
 
+// QueryNodeIDsCtx is QueryNodeIDs, abandoned if ctx is cancelled. A backend
+// that cannot cancel runs the query to completion.
+//
+// Nothing partial is returned with the error: a query stopped part way holds a
+// superset of the answer shaped exactly like the answer. See store.QuerierCtx.
+func (g *Graph) QueryNodeIDsCtx(ctx context.Context, query store.NodeQuery) ([]store.NodeID, error) {
+	if q, ok := g.GraphStore.(store.QuerierCtx); ok {
+		return q.QueryNodeIDsCtx(ctx, query)
+	}
+	return g.GraphStore.QueryNodeIDs(query)
+}
+
 // QueryNodes returns hydrated nodes that satisfy query constraints.
 func (g *Graph) QueryNodes(query store.NodeQuery) ([]*store.Node, error) {
 	ids, err := g.QueryNodeIDs(query)
+	if err != nil {
+		return nil, err
+	}
+	found, _, err := g.GetNodes(ids)
+	return found, err
+}
+
+// QueryNodesCtx is QueryNodes, abandoned if ctx is cancelled.
+//
+// Cancellation reaches the query; the hydration that follows is a lookup per
+// surviving ID and is left alone, because by then the expensive part is done
+// and the result is about to be complete.
+func (g *Graph) QueryNodesCtx(ctx context.Context, query store.NodeQuery) ([]*store.Node, error) {
+	ids, err := g.QueryNodeIDsCtx(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -330,9 +357,27 @@ func (g *Graph) QueryEdgeIDs(query store.EdgeQuery) ([]store.EdgeID, error) {
 	return g.GraphStore.QueryEdgeIDs(query)
 }
 
+// QueryEdgeIDsCtx is QueryEdgeIDs, abandoned if ctx is cancelled.
+func (g *Graph) QueryEdgeIDsCtx(ctx context.Context, query store.EdgeQuery) ([]store.EdgeID, error) {
+	if q, ok := g.GraphStore.(store.QuerierCtx); ok {
+		return q.QueryEdgeIDsCtx(ctx, query)
+	}
+	return g.GraphStore.QueryEdgeIDs(query)
+}
+
 // QueryEdges returns hydrated edges that satisfy query constraints.
 func (g *Graph) QueryEdges(query store.EdgeQuery) ([]*store.Edge, error) {
 	ids, err := g.QueryEdgeIDs(query)
+	if err != nil {
+		return nil, err
+	}
+	found, _, err := g.GetEdges(ids)
+	return found, err
+}
+
+// QueryEdgesCtx is QueryEdges, abandoned if ctx is cancelled.
+func (g *Graph) QueryEdgesCtx(ctx context.Context, query store.EdgeQuery) ([]*store.Edge, error) {
+	ids, err := g.QueryEdgeIDsCtx(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -623,6 +668,14 @@ func (g *Graph) InducedSubgraph(nodeIDs []store.NodeID) ([]*store.Node, []*store
 // HasCycle reports whether any cycle is reachable from origin within maxDepth
 // hops following outbound edges. It uses DFS and detects back-edges in the
 // recursion stack. Pass nil edgeTypes to follow all edge types.
+//
+// A walk deeper than store.MaxRecursionDepth returns ErrBudgetExceeded rather
+// than recursing further. maxDepth normally bounds this, but it is the
+// caller's number and a large one against a deep graph would otherwise
+// overflow the goroutine stack, which is a crash and not something a caller
+// can handle. The traversal package's walks are guarded the same way; this one
+// is not in that package, which is why it needed its own check and why the
+// limit lives in store rather than in either.
 func (g *Graph) HasCycle(origin store.NodeID, maxDepth int, edgeTypes []store.EdgeType) (bool, error) {
 	visited := make(map[store.NodeID]bool) // true = on current stack
 	found := false
@@ -631,6 +684,9 @@ func (g *Graph) HasCycle(origin store.NodeID, maxDepth int, edgeTypes []store.Ed
 	dfs = func(id store.NodeID, depth int) error {
 		if found || depth > maxDepth {
 			return nil
+		}
+		if depth > store.MaxRecursionDepth {
+			return fmt.Errorf("%w: recursed more than %d levels", store.ErrBudgetExceeded, store.MaxRecursionDepth)
 		}
 		if onStack, seen := visited[id]; seen {
 			if onStack {
