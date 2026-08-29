@@ -46,52 +46,28 @@ func (r reader) csrEdgeIDs(id store.NodeID, dir store.Direction) (first, second 
 	}
 }
 
-// edgesOf collects the live edges incident to id.
-func (r reader) edgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) []*store.Edge {
-	var result []*store.Edge
-
-	// Delta layer. The adjacency lists are append-only, so an entry here may
-	// name an edge this reader cannot see — one deleted at or before its epoch,
-	// or one created after it. Resolving each ID through the version chain is
-	// what filters both out.
-	dOut, dIn := r.deltaEdgeIDs(id, dir)
-	collectDelta := func(eids []store.EdgeID) {
-		for _, eid := range eids {
-			e, known := r.deltaEdge(eid)
-			if !known || e == nil {
-				continue
-			}
-			if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, e) {
-				continue
-			}
-			result = append(result, e)
+// collectDeltaEdges appends the live delta edges named by eids to dst.
+//
+// The adjacency lists are append-only, so an entry here may name an edge this
+// reader cannot see — one deleted at or before its epoch, or one created after
+// it. Resolving each ID through the version chain is what filters both out.
+func (r reader) collectDeltaEdges(dst []*store.Edge, eids []store.EdgeID, edgeTypes []store.EdgeType) []*store.Edge {
+	for _, eid := range eids {
+		e, known := r.deltaEdge(eid)
+		if !known || e == nil {
+			continue
 		}
-	}
-	collectDelta(dOut)
-	collectDelta(dIn)
-
-	if r.v.csr == nil {
-		return result
-	}
-
-	// Image layer.
-	var rawEdges []rawEdge
-	switch dir {
-	case store.DirectionOutbound:
-		rawEdges, _ = r.v.csr.OutboundEdges(id)
-	case store.DirectionInbound:
-		rawEdges, _ = r.v.csr.InboundEdges(id)
-	default:
-		out, e1 := r.v.csr.OutboundEdges(id)
-		in, e2 := r.v.csr.InboundEdges(id)
-		if e1 == nil {
-			rawEdges = append(rawEdges, out...)
+		if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, e) {
+			continue
 		}
-		if e2 == nil {
-			rawEdges = append(rawEdges, in...)
-		}
+		dst = append(dst, e)
 	}
-	for _, re := range rawEdges {
+	return dst
+}
+
+// collectCSREdges appends the live image edges in raw to dst.
+func (r reader) collectCSREdges(dst []*store.Edge, raw []rawEdge, edgeTypes []store.EdgeType) []*store.Edge {
+	for _, re := range raw {
 		// A CSR edge the delta has an opinion about is answered from the delta:
 		// updated (emit that copy, whose labels may differ), deleted (skip), or
 		// not yet created at this epoch (fall through to the image copy, which
@@ -104,13 +80,49 @@ func (r reader) edgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.
 			if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, de) {
 				continue
 			}
-			result = append(result, de)
+			dst = append(dst, de)
 			continue
 		}
 		if edgeTypes != nil && !rawEdgeMatchesFilter(edgeTypes, re.Labels) {
 			continue
 		}
-		result = append(result, rawEdgeToStore(re))
+		dst = append(dst, rawEdgeToStore(re))
+	}
+	return dst
+}
+
+// edgesOf collects the live edges incident to id.
+func (r reader) edgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) []*store.Edge {
+	var result []*store.Edge
+
+	dOut, dIn := r.deltaEdgeIDs(id, dir)
+	result = r.collectDeltaEdges(result, dOut, edgeTypes)
+	result = r.collectDeltaEdges(result, dIn, edgeTypes)
+
+	if r.v.csr == nil {
+		return result
+	}
+
+	// Image layer. Each direction is collected in its own pass rather than
+	// concatenated into one slice first: the concatenation existed only so a
+	// single loop could be written, and it copied every incident edge record to
+	// buy that.
+	switch dir {
+	case store.DirectionOutbound:
+		out, _ := r.v.csr.OutboundEdges(id)
+		result = r.collectCSREdges(result, out, edgeTypes)
+	case store.DirectionInbound:
+		in, _ := r.v.csr.InboundEdges(id)
+		result = r.collectCSREdges(result, in, edgeTypes)
+	default:
+		out, e1 := r.v.csr.OutboundEdges(id)
+		in, e2 := r.v.csr.InboundEdges(id)
+		if e1 == nil {
+			result = r.collectCSREdges(result, out, edgeTypes)
+		}
+		if e2 == nil {
+			result = r.collectCSREdges(result, in, edgeTypes)
+		}
 	}
 	return result
 }
@@ -173,20 +185,59 @@ func (r reader) incidentEdges(dst []store.IncidentEdge, id store.NodeID, dir sto
 	return dst
 }
 
+// neighbourDedupeLinear is the neighbour count up to which the dedupe is a
+// linear scan of a stack array rather than a map.
+//
+// A map costs an allocation (plus its buckets) on every call, and the reader is
+// per-call, so walker.beginExpansion's trick of reusing one map and clearing it
+// has nothing here to hang off — and a reader value is used concurrently, so a
+// Store field would be a data race. A linear scan needs no allocation at all,
+// which for the degrees this path actually sees is not a compromise but simply
+// the faster answer: at 32 entries the scan is a handful of cache-resident
+// comparisons against a map's hash, probe and bucket walk.
+const neighbourDedupeLinear = 32
+
 // neighbours resolves edgesOf into distinct neighbouring nodes.
 func (r reader) neighbours(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) []store.NeighbourResult {
 	edges := r.edgesOf(id, dir, edgeTypes)
-	seen := make(map[store.NodeID]struct{}, len(edges))
+
+	// Above the threshold the scan's O(n^2) would overtake the map it saves, so
+	// the map comes back. Sized from the edge count, which bounds the distinct
+	// neighbours exactly.
+	var seen map[store.NodeID]struct{}
+	var scratch [neighbourDedupeLinear]store.NodeID
+	linear := scratch[:0]
+	if len(edges) > neighbourDedupeLinear {
+		seen = make(map[store.NodeID]struct{}, len(edges))
+	}
+
 	var results []store.NeighbourResult
+	if len(edges) > 0 {
+		results = make([]store.NeighbourResult, 0, len(edges))
+	}
 	for _, e := range edges {
 		nbID := e.Dst
 		if e.Src != id {
 			nbID = e.Src
 		}
-		if _, already := seen[nbID]; already {
-			continue
+		if seen != nil {
+			if _, already := seen[nbID]; already {
+				continue
+			}
+			seen[nbID] = struct{}{}
+		} else {
+			already := false
+			for _, s := range linear {
+				if s == nbID {
+					already = true
+					break
+				}
+			}
+			if already {
+				continue
+			}
+			linear = append(linear, nbID)
 		}
-		seen[nbID] = struct{}{}
 		n, ok := r.node(nbID)
 		if !ok {
 			continue

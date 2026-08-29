@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -102,5 +103,52 @@ func TestAppendMarshalledPropMatchesAllocating(t *testing.T) {
 	}
 	if got, want := appendMarshalledProp(nil, 42, key, val), marshalEdgeProp(42, key, val); !bytes.Equal(got, want) {
 		t.Errorf("edge prop: append form differs: want %v, got %v", want, got)
+	}
+}
+
+// TestPropReplayValueAliasesItsBuffer pins 7.1c's contract in both directions:
+// the decoder aliases its input, and the one consumer on the replay path copies
+// what it is given, so aliasing is safe there.
+//
+// The copy the decoder used to make was a copy feeding a copy —
+// PropertyIndex.IndexNode's first act is string(value) — and removing it costs
+// no resident bytes precisely because neither side was retaining the slice. If
+// a future caller starts keeping the value, this test is what says it must copy
+// first.
+func TestPropReplayValueAliasesItsBuffer(t *testing.T) {
+	buf := marshalNodeProp(7, "sha256", []byte("original"))
+
+	id, key, value, err := unmarshalNodeProp(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 7 || key != "sha256" || string(value) != "original" {
+		t.Fatalf("decoded (%d, %q, %q), want (7, \"sha256\", \"original\")", id, key, value)
+	}
+
+	// The aliasing itself. Writing through the buffer must be visible in the
+	// value, or the decoder is copying again and this test has stopped
+	// describing it.
+	copy(buf[len(buf)-len("original"):], "OVERWRIT")
+	if string(value) != "OVERWRIT" {
+		t.Fatalf("value is %q after overwriting its buffer; it no longer aliases", value)
+	}
+
+	// And the safety half: the replay consumer must not retain what it is
+	// handed. Index a value, scribble over the buffer it came from, and the
+	// index must still answer with what was indexed.
+	idx := index.NewPropertyIndex()
+	buf2 := marshalNodeProp(9, "kind", []byte("report"))
+	_, k2, v2, err := unmarshalNodeProp(buf2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.IndexNode(9, k2, v2)
+	for i := range buf2 {
+		buf2[i] = 0xFF
+	}
+	ids := idx.NodesByProperty("kind", []byte("report"))
+	if len(ids) != 1 || ids[0] != 9 {
+		t.Fatalf("index returned %v after its source buffer was overwritten, want [9]", ids)
 	}
 }

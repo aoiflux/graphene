@@ -45,9 +45,9 @@ func ProvenanceChainCtx(ctx context.Context, g store.GraphReader, origin store.N
 	}
 
 	result := &DFSResult{}
-	visited := make(map[store.NodeID]struct{})
+	var visited idSet
 
-	if err := dfsInbound(g, &guard, 0, origin, maxDepth, edgeTypes, visited, result); err != nil {
+	if err := dfsInbound(g, &guard, 0, origin, maxDepth, edgeTypes, &visited, result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -62,16 +62,16 @@ func dfsInbound(
 	id store.NodeID,
 	remaining int,
 	edgeTypes []store.EdgeType,
-	visited map[store.NodeID]struct{},
+	visited *idSet,
 	result *DFSResult,
 ) error {
 	if err := guard.descend(depth); err != nil {
 		return err
 	}
-	if _, seen := visited[id]; seen {
+	if visited.has(uint64(id)) {
 		return nil
 	}
-	visited[id] = struct{}{}
+	visited.add(uint64(id))
 
 	node, err := g.GetNode(id)
 	if err != nil {
@@ -95,7 +95,7 @@ func dfsInbound(
 	// chain, not a DAG; for DAG provenance, callers should use BFS instead)
 	for _, e := range edges {
 		parentID := e.Src
-		if _, seen := visited[parentID]; seen {
+		if visited.has(uint64(parentID)) {
 			continue
 		}
 		if err := guard.crossEdge(); err != nil {
@@ -139,10 +139,10 @@ func DFSCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDe
 	// bestRemaining records the largest remaining budget each node has been
 	// expanded with — not merely whether it has been seen. See dfsGeneral.
 	bestRemaining := make(map[store.NodeID]int)
-	seenEdges := make(map[store.EdgeID]struct{})
+	var seenEdges idSet
 	result := &BFSResult{}
 
-	if err := dfsGeneral(newWalker(g), &guard, 0, origin, maxDepth, dir, edgeTypes, bestRemaining, seenEdges, result); err != nil {
+	if err := dfsGeneral(newWalker(g), &guard, 0, origin, maxDepth, dir, edgeTypes, bestRemaining, &seenEdges, result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -179,7 +179,7 @@ func dfsGeneral(
 	dir store.Direction,
 	edgeTypes []store.EdgeType,
 	bestRemaining map[store.NodeID]int,
-	seenEdges map[store.EdgeID]struct{},
+	seenEdges *idSet,
 	result *BFSResult,
 ) error {
 	if err := guard.descend(depth); err != nil {
@@ -234,7 +234,7 @@ func dfsGeneral(
 			continue
 		}
 
-		if _, edgeSeen := seenEdges[eid]; !edgeSeen {
+		if !seenEdges.has(uint64(eid)) {
 			edge, err := w.g.GetEdge(eid)
 			if err != nil {
 				continue
@@ -242,7 +242,7 @@ func dfsGeneral(
 			if err := guard.crossEdge(); err != nil {
 				return err
 			}
-			seenEdges[eid] = struct{}{}
+			seenEdges.add(uint64(eid))
 			result.Edges = append(result.Edges, edge)
 		}
 		if err := dfsGeneral(w, guard, depth+1, nbID, remaining-1, dir, edgeTypes, bestRemaining, seenEdges, result); err != nil {

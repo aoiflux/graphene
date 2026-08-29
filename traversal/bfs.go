@@ -58,8 +58,11 @@ func BFSCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDe
 	}
 
 	result := &BFSResult{Nodes: []*store.Node{originNode}}
-	visited := map[store.NodeID]struct{}{origin: {}}
-	seenEdges := make(map[store.EdgeID]struct{})
+
+	// Both sets are idSets rather than maps: see traversal/idset.go for the
+	// profile that decided it.
+	var visited, seenEdges idSet
+	visited.add(uint64(origin))
 
 	// Two buffers holding one level each, swapped at every depth, rather than one
 	// growing queue.
@@ -100,7 +103,7 @@ func BFSCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDe
 				// need not be fetched again. An unvisited one is fetched now, and a
 				// node that cannot be resolved drops its edge too — Neighbours omits
 				// such pairs entirely, and BFS must not diverge from that.
-				_, alreadyVisited := visited[nbID]
+				alreadyVisited := visited.has(uint64(nbID))
 				var nbNode *store.Node
 				if !alreadyVisited {
 					nbNode, err = g.GetNode(nbID)
@@ -109,7 +112,7 @@ func BFSCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDe
 					}
 				}
 
-				if _, edgeSeen := seenEdges[eid]; !edgeSeen {
+				if !seenEdges.has(uint64(eid)) {
 					edge, err := g.GetEdge(eid)
 					if err != nil {
 						continue
@@ -117,7 +120,7 @@ func BFSCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDe
 					if err := guard.crossEdge(); err != nil {
 						return nil, err
 					}
-					seenEdges[eid] = struct{}{}
+					seenEdges.add(uint64(eid))
 					result.Edges = append(result.Edges, edge)
 				}
 
@@ -127,7 +130,7 @@ func BFSCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, maxDe
 				if err := guard.visitNode(); err != nil {
 					return nil, err
 				}
-				visited[nbID] = struct{}{}
+				visited.add(uint64(nbID))
 				result.Nodes = append(result.Nodes, nbNode)
 				next = append(next, nbID)
 			}
@@ -171,7 +174,8 @@ func BFSIDsCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, ma
 	}
 
 	out := []store.NodeID{origin}
-	visited := map[store.NodeID]struct{}{origin: {}}
+	var visited idSet
+	visited.add(uint64(origin))
 
 	// Level-synchronous walk: `out` doubles as the queue, so no separate
 	// allocation is needed. levelEnd marks where the current depth stops.
@@ -189,7 +193,7 @@ func BFSIDsCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, ma
 				if err := guard.crossEdge(); err != nil {
 					return nil, err
 				}
-				if _, seen := visited[nbID]; seen {
+				if visited.has(uint64(nbID)) {
 					continue
 				}
 				if !w.nodeExists(nbID) {
@@ -198,7 +202,7 @@ func BFSIDsCtx(ctx context.Context, g store.GraphReader, origin store.NodeID, ma
 				if err := guard.visitNode(); err != nil {
 					return nil, err
 				}
-				visited[nbID] = struct{}{}
+				visited.add(uint64(nbID))
 				out = append(out, nbID)
 			}
 		}

@@ -311,6 +311,15 @@ func marshalNodeProp(id store.NodeID, key string, value []byte) []byte {
 	return buf
 }
 
+// unmarshalNodeProp decodes a node property index entry.
+//
+// The returned value ALIASES b; it is not a copy. The only caller is WAL
+// replay, which hands each record a payload buffer it then drops, and the only
+// consumer is PropertyIndex.IndexNode, whose first act is string(value) — so
+// the copy this used to make was a copy feeding a copy, and removing it costs
+// no resident bytes because nothing was retaining either one. A caller that
+// wants to keep the value past the call must copy it itself.
+// TestPropReplayValueAliasesItsBuffer pins the contract.
 func unmarshalNodeProp(b []byte) (id store.NodeID, key string, value []byte, err error) {
 	if len(b) < 14 {
 		return 0, "", nil, fmt.Errorf("unmarshalNodeProp: too short")
@@ -325,9 +334,7 @@ func unmarshalNodeProp(b []byte) (id store.NodeID, key string, value []byte, err
 	if len(b) < 14+kl+vl {
 		return 0, "", nil, fmt.Errorf("unmarshalNodeProp: truncated value")
 	}
-	value = make([]byte, vl)
-	copy(value, b[14+kl:])
-	return id, key, value, nil
+	return id, key, b[14+kl : 14+kl+vl], nil
 }
 
 // marshalEdgeProp encodes an edge property index entry:
@@ -344,6 +351,8 @@ func marshalEdgeProp(id store.EdgeID, key string, value []byte) []byte {
 	return buf
 }
 
+// unmarshalEdgeProp decodes an edge property index entry. As with
+// unmarshalNodeProp, the returned value aliases b.
 func unmarshalEdgeProp(b []byte) (id store.EdgeID, key string, value []byte, err error) {
 	if len(b) < 14 {
 		return 0, "", nil, fmt.Errorf("unmarshalEdgeProp: too short")
@@ -358,7 +367,5 @@ func unmarshalEdgeProp(b []byte) (id store.EdgeID, key string, value []byte, err
 	if len(b) < 14+kl+vl {
 		return 0, "", nil, fmt.Errorf("unmarshalEdgeProp: truncated value")
 	}
-	value = make([]byte, vl)
-	copy(value, b[14+kl:])
-	return id, key, value, nil
+	return id, key, b[14+kl : 14+kl+vl], nil
 }
