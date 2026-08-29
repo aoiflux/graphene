@@ -20,16 +20,24 @@ package disk
 //
 // # What is not
 //
-// A reader's view is fixed at Open. The store materialises itself into memory
-// once — the delta maps and property index come from a WAL replay, the CSR from
-// one os.ReadFile — and nothing re-reads afterwards. So a reader running
-// alongside a writer would see a permanently stale graph with no indication that
-// it was stale, which is worse than being refused. The shared lock exists for
-// readers running alongside *other readers*; the exclusive lock is what keeps a
-// writer from being one of them. Reopen to advance.
+// An OpenReadOnly reader's view is fixed at Open. The store materialises itself
+// into memory once — the delta maps and property index come from a WAL replay,
+// the CSR from one os.ReadFile — and nothing re-reads afterwards. So a reader
+// running alongside a writer would see a permanently stale graph with no
+// indication that it was stale, which is worse than being refused. The shared
+// lock exists for readers running alongside *other readers*; the exclusive lock
+// is what keeps a writer from being one of them. Reopen to advance.
 //
-// Making readers live is a reader-refresh protocol — replay-from-offset, a CSR
-// generation marker, incremental index apply — and not a locking change.
+// # The third mode
+//
+// Making readers live turned out to be a locking change as well as a protocol —
+// this comment used to say it was not, and it was wrong. A shared lock and an
+// exclusive lock cannot coexist, so a reader that runs beside the writer cannot
+// hold a shared lock, whatever protocol it speaks. OpenLive therefore takes
+// LockNone: it neither excludes the writer nor is excluded by it, and gives up
+// the "no writer is running" guarantee to do so. The writer's exclusive lock is
+// untouched, so "one writer" still holds. See live.go for the trade and the
+// protocol.
 
 import (
 	"encoding/binary"
@@ -70,6 +78,24 @@ const (
 	// LockShared admits any number of holders and excludes every exclusive one.
 	// OpenReadOnly takes it.
 	LockShared
+
+	// LockNone takes no operating-system lock at all. OpenLive takes it.
+	//
+	// This is not "locking is unavailable here" — that is what
+	// lock_unsupported.go is for, and it is a property of the platform. This is a
+	// caller asking, on a platform that locks perfectly well, not to participate:
+	// a live reader has to run alongside the writer's exclusive lock, and a
+	// shared lock cannot. The writer's exclusive lock is deliberately left as it
+	// is, so what is given up is the reader's "no writer is running" guarantee
+	// and nothing on the writing side. See live.go.
+	//
+	// The lock file is not opened either. This comment used to say it was, so
+	// that a live reader could report who holds the store — but the owner record
+	// is read only for a writer's unclean-shutdown check, and a live reader is
+	// read-only by construction, so nothing ever consumed it. What opening it did
+	// do was create a file in a directory this mode promises not to write to, and
+	// hold a handle that on Windows stops anyone deleting it.
+	LockNone
 )
 
 func (m LockMode) String() string {
@@ -78,6 +104,8 @@ func (m LockMode) String() string {
 		return "exclusive"
 	case LockShared:
 		return "shared"
+	case LockNone:
+		return "none"
 	default:
 		return fmt.Sprintf("LockMode(%d)", uint8(m))
 	}
@@ -256,13 +284,24 @@ type storeLock struct {
 func acquireStoreLock(dir string, mode LockMode) (*storeLock, lockOwner, error) {
 	path := filepath.Join(dir, lockFileName)
 
-	// O_RDWR|O_CREATE in both modes. A shared holder writes nothing, but it does
-	// need the file to exist in order to lock it, and a store that has only ever
-	// been read has no lock file yet. Creating one is not a write to any *store*
-	// file — graphene.lock holds no graph data — but it does mean read-only mode
-	// needs a writable directory. A genuinely read-only medium is out of reach
-	// for this design, and failing there is better than pretending the lock was
-	// taken.
+	// LockNone does not open the file at all. It is the one mode with nothing to
+	// lock, so the file would exist only to be held: the previous-holder record
+	// is read for a writer's unclean-shutdown check and nowhere else, and a live
+	// reader is read-only by construction. Opening it would mean creating a file
+	// in a directory this mode promises not to write to, and — on Windows —
+	// holding a handle that stops anyone deleting it, which is a foothold in the
+	// store for a mode that is supposed to leave no trace.
+	if mode == LockNone {
+		return &storeLock{mode: mode}, lockOwner{}, nil
+	}
+
+	// O_RDWR|O_CREATE in both remaining modes. A shared holder writes nothing,
+	// but it does need the file to exist in order to lock it, and a store that
+	// has only ever been read has no lock file yet. Creating one is not a write
+	// to any *store* file — graphene.lock holds no graph data — but it does mean
+	// read-only mode needs a writable directory. A genuinely read-only medium is
+	// out of reach for this design, and failing there is better than pretending
+	// the lock was taken.
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, lockOwner{}, fmt.Errorf("disk: lock file: %w", err)
@@ -324,6 +363,10 @@ func (l *storeLock) markClean() error {
 // would otherwise turn a harmless double Close into an error.
 func (l *storeLock) release() error {
 	if l == nil || l.released.Swap(true) {
+		return nil
+	}
+	if l.mode == LockNone {
+		// Nothing was locked and nothing was opened, so there is nothing to undo.
 		return nil
 	}
 	err := unlockFile(l.file)

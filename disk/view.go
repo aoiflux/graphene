@@ -43,6 +43,7 @@ package disk
 import (
 	"slices"
 
+	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -304,6 +305,21 @@ func appendEdgeLabels(d *deltaLayer, id store.EdgeID, labels []store.EdgeType) {
 type view struct {
 	csr   *CSRGraph // nil until the first compaction
 	delta *deltaLayer
+
+	// idx is the property index over both halves. It is here, rather than on
+	// Store, for the reason the two words above are here: the three are not
+	// independent. An index describes exactly one (image, delta) pair, and a
+	// reader that sampled a new pair against an old index would answer from
+	// postings that describe a graph it is not reading — §9.2's torn pair in a
+	// third place.
+	//
+	// For a writer the pointer never changes after Open: entries are added and
+	// removed in place, under the index's own locks, and compaction carries the
+	// same index onto the new view. Only a live reader's Refresh replaces it,
+	// and that is the case this exists for — a reload swaps image, delta and
+	// index in one store, so a query either sees all three before or all three
+	// after.
+	idx *index.PropertyIndex
 }
 
 // reader is a resolved read context — a pinned view at a fixed epoch.
@@ -316,6 +332,11 @@ type reader struct {
 	v     *view
 	epoch uint64
 }
+
+// index returns the property index this read is resolved against. Every read
+// path goes through it rather than through Store.propIdx, so the postings and
+// the records they are filtered against come from one pointer load.
+func (r reader) index() *index.PropertyIndex { return r.v.idx }
 
 // node resolves the record visible to r, delta first and then the image.
 func (r reader) node(id store.NodeID) (*store.Node, bool) {

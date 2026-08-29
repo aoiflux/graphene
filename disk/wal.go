@@ -103,6 +103,19 @@ type WAL struct {
 	framing   uint16
 	dataStart int64
 
+	// logGen is the container header's SegmentSeq: how many times the file at
+	// this path has been replaced. Every operation that ends the current file —
+	// Truncate, truncateFrom, Rotate — writes the next value into the header of
+	// the file it starts, so a reader that saw generation g and now sees
+	// anything else knows its byte offsets name nothing.
+	//
+	// It is the marker TECHNICAL_DETAILS §9.1b asks for, and it costs a field
+	// rather than a format change because the container already carried the
+	// number and nothing read it. Zero for a headerless v1 log, which never
+	// changes generation: the branches that would bump it either give the file a
+	// v2 header or leave it alone.
+	logGen uint64
+
 	ringMask uint64
 	ring     []walSlot
 	head     atomic.Uint64 // next sequence to reserve
@@ -203,7 +216,7 @@ func openWALFor(path string, readOnly bool) (*WAL, error) {
 func openWALReadOnly(path string) (*WAL, error) {
 	w := &WAL{readOnly: true, gate: newSyncGate()}
 
-	f, err := os.Open(path)
+	f, err := openSharedRead(path)
 	switch {
 	case os.IsNotExist(err):
 		// No log. Nothing to replay, and nothing to create. Every method that
@@ -227,6 +240,7 @@ func openWALReadOnly(path string) (*WAL, error) {
 	w.file = f
 	w.framing = header.Version
 	w.dataStart = dataStart
+	w.logGen = header.SegmentSeq
 	return w, nil
 }
 
@@ -269,6 +283,7 @@ func openWALWithCapacity(path string, capacity int) (*WAL, error) {
 		file:      f,
 		framing:   header.Version,
 		dataStart: dataStart,
+		logGen:    header.SegmentSeq,
 		ring:      make([]walSlot, capPow2),
 		ringMask:  uint64(capPow2 - 1),
 		gate:      newSyncGate(),
@@ -418,6 +433,42 @@ func (w *WAL) Checkpoint() error {
 	return err
 }
 
+// drainedEnd flushes everything queued and reports the offset one byte past the
+// last record. It writes no marker and issues no fsync.
+//
+// This is checkpointAt's first half. Compaction needs the number before it can
+// decide whether the log is going to be retired at all, and the marker means
+// "replay stops here": writing one into a log that then goes on being appended
+// to strands every record written after it. See retireLog, whose third branch
+// keeps the log and must therefore leave no marker in it.
+//
+// **Durability is the caller's, not this call's**, so that a compaction still
+// costs exactly one fsync. Two of the three retire branches go on to call
+// checkpointAt, which syncs; the third syncs explicitly. Syncing here as well
+// would add a second fsync per compaction to pay for a number.
+//
+// The offset is only meaningful between the ring drain and the next append, and
+// this and anything that follows it run with s.mu held, so nothing can be
+// appended in between and every branch agrees on the number.
+func (w *WAL) drainedEnd() (int64, error) {
+	if w.readOnly {
+		return 0, errWALReadOnly
+	}
+	if err := w.beginMaintenance(); err != nil {
+		return 0, err
+	}
+	defer w.endMaintenance()
+
+	if err := w.drainQueuedLocked(); err != nil {
+		return 0, err
+	}
+	fi, err := w.file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("wal drained end: stat: %w", err)
+	}
+	return fi.Size(), nil
+}
+
 // checkpointAt is Checkpoint, reporting the offset the marker was written at —
 // which is to say the end of every record the log held when it went down.
 //
@@ -497,11 +548,14 @@ func (w *WAL) Truncate() error {
 	// This is also the migration path: a store whose log predates the container
 	// adopts the stronger framing here, at its first compaction, without an
 	// explicit step and without any file ever holding two framings.
-	if _, err := f.Write(appendWALFileHeader(walFileHeader{Version: walFramingV2})); err != nil {
+	if _, err := f.Write(appendWALFileHeader(walFileHeader{
+		Version: walFramingV2, SegmentSeq: w.logGen + 1,
+	})); err != nil {
 		return fmt.Errorf("wal truncate: write header: %w", err)
 	}
 	w.framing = walFramingV2
 	w.dataStart = walFileHeaderSize
+	w.logGen++
 	return nil
 }
 
@@ -550,8 +604,10 @@ func (w *WAL) truncateFrom(keepFrom, keepTo int64) error {
 	}
 
 	name := w.file.Name()
-	tmp := name + ".tmp"
-	rebuilt := append(appendWALFileHeader(walFileHeader{Version: walFramingV2}), tail...)
+	tmp := name + walTmpSuffix
+	rebuilt := append(appendWALFileHeader(walFileHeader{
+		Version: walFramingV2, SegmentSeq: w.logGen + 1,
+	}), tail...)
 	if err := writeFileSync(tmp, rebuilt, 0600); err != nil {
 		return fmt.Errorf("wal truncate: write rebuilt log: %w", err)
 	}
@@ -559,8 +615,13 @@ func (w *WAL) truncateFrom(keepFrom, keepTo int64) error {
 	if err := w.file.Close(); err != nil {
 		return fmt.Errorf("wal truncate: close: %w", err)
 	}
-	if err := os.Rename(tmp, name); err != nil {
-		return fmt.Errorf("wal truncate: rename: %w", err)
+	// replaceFile, not os.Rename: a live reader holding the log open makes a
+	// replacing rename fail on Windows, and a compaction that fails because
+	// someone is *reading* the store would be a reader breaking a writer. See
+	// fileshare.go for the contract and for why the tmp above is written and
+	// fsynced before this point.
+	if err := replaceFile(tmp, name); err != nil {
+		return fmt.Errorf("wal truncate: replace: %w", err)
 	}
 	if err := syncDir(filepath.Dir(name)); err != nil {
 		return fmt.Errorf("wal truncate: %w", err)
@@ -573,6 +634,7 @@ func (w *WAL) truncateFrom(keepFrom, keepTo int64) error {
 	w.file = f
 	w.framing = walFramingV2
 	w.dataStart = walFileHeaderSize
+	w.logGen++
 
 	// Every outstanding ticket names a position in the file that has just been
 	// replaced. The bytes those tickets covered are durable — either folded into
@@ -638,27 +700,44 @@ type ReplayCallbacks struct {
 // to the matching callback in cb. It stops at EOF or a checkpoint record.
 // Partial/corrupted records at the tail are silently ignored (crash-safe).
 func (w *WAL) Replay(cb ReplayCallbacks) error {
+	_, err := w.replayFrom(0, cb)
+	return err
+}
+
+// replayFrom is Replay resuming at off bytes into the records region, reporting
+// how far into that region the replay reached.
+//
+// The offset is relative to dataStart rather than to the file, so it survives a
+// log that gains a container header it did not have — and, more to the point, it
+// is the same number whichever of the two framings the file uses, which is what
+// lets a live reader compare it against a generation rather than against a file
+// size.
+//
+// Both numbers are only meaningful against a log that has not been replaced
+// since; see WAL.logGen and Store.Refresh, which is the only caller that passes
+// a non-zero offset.
+func (w *WAL) replayFrom(off int64, cb ReplayCallbacks) (int64, error) {
 	// A read-only store whose log does not exist: an empty log, replayed as no
 	// records rather than as an error.
 	if w.file == nil {
-		return nil
+		return off, nil
 	}
 
 	if err := w.beginMaintenance(); err != nil {
-		return err
+		return off, err
 	}
 	defer w.endMaintenance()
 
 	// Nothing is ever queued on a read-only log, and draining writes.
 	if !w.readOnly {
 		if err := w.drainQueuedLocked(); err != nil {
-			return err
+			return off, err
 		}
 	}
 
 	// Records begin past the container header, if there is one.
-	if _, err := w.file.Seek(w.dataStart, io.SeekStart); err != nil {
-		return err
+	if _, err := w.file.Seek(w.dataStart+off, io.SeekStart); err != nil {
+		return off, err
 	}
 
 	// Replay used to read straight from the file handle: three ReadFull calls per
@@ -678,9 +757,17 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 	// cannot be longer than the file that contains it, and without that check a
 	// corrupt or hostile 5-byte header claiming 0xFFFFFFFF makes replay allocate
 	// 4 GiB before reading a single byte of it.
+	//
+	// It is the size of what remains to be read, not of the file: a resumed
+	// replay that passed the whole file would let a record claim a length
+	// covering bytes it cannot reach, which is the allocation this bound exists
+	// to refuse.
 	var logSize int64
 	if fi, err := w.file.Stat(); err == nil {
-		logSize = fi.Size()
+		logSize = fi.Size() - (w.dataStart + off)
+		if logSize < 0 {
+			logSize = 0
+		}
 		if logSize < int64(bufSize) {
 			bufSize = int(logSize)
 		}
@@ -688,12 +775,36 @@ func (w *WAL) Replay(cb ReplayCallbacks) error {
 	if bufSize < walMinReplayBuffer {
 		bufSize = walMinReplayBuffer
 	}
-	return replayRecords(bufio.NewReaderSize(w.file, bufSize), logSize, w.framing, cb)
+	read, err := replayRecordsFrom(bufio.NewReaderSize(w.file, bufSize), logSize, w.framing, cb)
+	return off + read, err
 }
 
 // Framing reports which record framing this log uses. Callers building a batch
 // for it must match, or the records they frame will not verify on replay.
 func (w *WAL) Framing() uint16 { return w.framing }
+
+// generation reports which file this log is, in the sequence of files that have
+// held the active log at this path. See the logGen field.
+func (w *WAL) generation() uint64 { return w.logGen }
+
+// peekWALHeader reads a log's container header without opening it as a log.
+//
+// This is what a live reader polls: the generation and the framing are the two
+// things it must agree with the writer about before a byte offset into the file
+// means anything, and both are in the first 50 bytes. A missing file is not an
+// error — a store compacted to completion and then reopened has no log yet, and
+// that is an empty log rather than a broken one.
+func peekWALHeader(path string) (walFileHeader, int64, error) {
+	f, err := openSharedRead(path)
+	if os.IsNotExist(err) {
+		return walFileHeader{Version: walFramingV2}, walFileHeaderSize, nil
+	}
+	if err != nil {
+		return walFileHeader{}, 0, fmt.Errorf("wal peek: %w", err)
+	}
+	defer f.Close()
+	return readWALFileHeader(f)
+}
 
 // replayRecords is Replay's parser, separated from the file handling around it.
 //
@@ -707,6 +818,24 @@ func (w *WAL) Framing() uint16 { return w.framing }
 // logSize bounds each record's declared payload length; pass 0 when the total is
 // not known and the check is skipped.
 func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallbacks) error {
+	_, err := replayRecordsFrom(r, logSize, framing, cb)
+	return err
+}
+
+// replayRecordsFrom is replayRecords reporting how many bytes it consumed up to
+// the last point it could safely be resumed from.
+//
+// "Safely" is the whole content of the number. It is not how far the parser
+// read: it is the offset of the last boundary at which no batch was open, so a
+// caller that starts again there sees a begin marker before any of the records
+// that marker governs. Resuming from the parser's actual position instead would
+// take a batch that was still being written when the reader caught up and apply
+// its second half alone — the torn read the begin/commit markers exist to stop.
+//
+// A torn tail therefore rewinds: bytes read past the last clean boundary are
+// deliberately not counted, because the writer will complete those records and
+// the reader must read them whole.
+func replayRecordsFrom(r io.Reader, logSize int64, framing uint16, cb ReplayCallbacks) (int64, error) {
 	header := make([]byte, walHeaderSize)
 	footer := make([]byte, walFooterSize)
 
@@ -715,12 +844,16 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 	var pending []pendingRecord
 	var body []byte
 
+	// consumed counts whole, verified records. safe is consumed as of the last
+	// moment no batch was open.
+	var consumed, safe int64
+
 	for {
 		if _, err := io.ReadFull(r, header); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
 			}
-			return err
+			return safe, err
 		}
 
 		recType := header[0]
@@ -755,13 +888,17 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 			break // corrupted tail record
 		}
 
+		// Past every check: this record is whole and verified, so its bytes are
+		// consumed whatever the switch below decides to do with it.
+		consumed += int64(walHeaderSize) + int64(length) + int64(walFooterSize)
+
 		switch recType {
 		case walRecordBatchBegin:
 			if pending != nil {
-				return fmt.Errorf("wal replay: nested batch begin")
+				return safe, fmt.Errorf("wal replay: nested batch begin")
 			}
 			if len(payload) != walBatchBeginPayload {
-				return fmt.Errorf("wal replay: malformed batch begin")
+				return safe, fmt.Errorf("wal replay: malformed batch begin")
 			}
 			// The declared count sizes an allocation, so it is bounded by what the
 			// log could actually contain: every batched record costs at least a
@@ -775,7 +912,7 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 			// truncated, which is the same class as the length check above it.
 			batchCount := binary.LittleEndian.Uint32(payload)
 			if logSize > 0 && int64(batchCount) > logSize/walRecordOverhead {
-				return fmt.Errorf("wal replay: batch begin declares %d records, more than %d bytes can hold",
+				return safe, fmt.Errorf("wal replay: batch begin declares %d records, more than %d bytes can hold",
 					batchCount, logSize)
 			}
 			pending = make([]pendingRecord, 0, batchCount)
@@ -784,14 +921,14 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 
 		case walRecordBatchCommit:
 			if pending == nil {
-				return fmt.Errorf("wal replay: batch commit without begin")
+				return safe, fmt.Errorf("wal replay: batch commit without begin")
 			}
 			// Three accepted lengths: older logs must still replay after an
 			// upgrade, so the length is the discriminator — see walbatch.go.
 			switch len(payload) {
 			case walBatchCommitPayloadV1, walBatchCommitPayloadV2, walBatchCommitPayloadV3:
 			default:
-				return fmt.Errorf("wal replay: malformed batch commit: payload %d bytes, expected %d, %d or %d",
+				return safe, fmt.Errorf("wal replay: malformed batch commit: payload %d bytes, expected %d, %d or %d",
 					len(payload), walBatchCommitPayloadV1, walBatchCommitPayloadV2, walBatchCommitPayloadV3)
 			}
 			wantCount := binary.LittleEndian.Uint32(payload[0:4])
@@ -802,6 +939,7 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 				// applying a batch that does not match its own commit record.
 				pending = nil
 				body = body[:0]
+				safe = consumed
 				continue
 			}
 			// Only now, past validation. A batch that failed the check above was
@@ -819,7 +957,7 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 				meta.KeyID = binary.LittleEndian.Uint64(payload[32:40])
 				sigLen := int(binary.LittleEndian.Uint16(payload[40:42]))
 				if sigLen > walSignatureSize {
-					return fmt.Errorf("wal replay: commit %d declares a %d-byte signature, maximum %d",
+					return safe, fmt.Errorf("wal replay: commit %d declares a %d-byte signature, maximum %d",
 						meta.CommitSeq, sigLen, walSignatureSize)
 				}
 				meta.Signature = payload[42 : 42+sigLen]
@@ -829,7 +967,7 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 			// reason the signature sits in the commit payload rather than in a
 			// record after it: a batch must not be applied and then found forged.
 			if err := verifyCommitSignature(cb, meta, body); err != nil {
-				return err
+				return safe, err
 			}
 
 			if cb.CommitFunc != nil && len(payload) >= walBatchCommitPayloadV2 {
@@ -837,23 +975,30 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 			}
 			for _, rec := range pending {
 				if err := applyWALRecord(cb, rec.recType, rec.payload); err != nil {
-					return err
+					return safe, err
 				}
 			}
 			pending = nil
 			body = body[:0]
+			safe = consumed
 			continue
 
 		case walRecordCheckpoint:
 			// A checkpoint inside an open batch means the batch never committed.
-			return nil // replay complete up to last checkpoint
+			//
+			// safe, not consumed: the marker itself is not applied, and a live
+			// reader that resumes here re-reads it and stops again for nothing,
+			// which is what should happen — a marker is only ever written
+			// immediately before the log is retired, and the retire is what tells
+			// the reader to start over.
+			return safe, nil // replay complete up to last checkpoint
 		}
 
 		if !knownWALRecord(recType) {
 			// Deliberately an error, not a skip. Silently ignoring an unknown type
 			// would let an older binary apply a *rolled back* batch by ignoring the
 			// markers that were supposed to suppress it.
-			return fmt.Errorf("wal replay: unknown record type 0x%02X", recType)
+			return safe, fmt.Errorf("wal replay: unknown record type 0x%02X", recType)
 		}
 
 		if pending != nil {
@@ -869,10 +1014,11 @@ func replayRecords(r io.Reader, logSize int64, framing uint16, cb ReplayCallback
 		}
 
 		if err := applyWALRecord(cb, recType, payload); err != nil {
-			return err
+			return safe, err
 		}
+		safe = consumed
 	}
-	return nil
+	return safe, nil
 }
 
 // Close closes the underlying file.

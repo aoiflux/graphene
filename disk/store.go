@@ -83,6 +83,13 @@ type Store struct {
 	// Property index (in-memory; rebuilt from WAL on restart).
 	propIdx *index.PropertyIndex
 
+	// live, and the three numbers a live reader advances over. Guarded by mu;
+	// zero and unused on every other kind of store. See live.go.
+	live      bool
+	logPath   string
+	logGen    uint64
+	replayOff int64
+
 	// syncOnCommit forces an fsync at each batch commit. Guarded by mu.
 	syncOnCommit bool
 
@@ -275,9 +282,18 @@ func (s *Store) StorageStats() store.StorageStats {
 		st.CSRNodes = csr.NodeCount()
 		st.CSREdges = csr.EdgeCount()
 	}
-	st.PropertyNodeEntries, st.PropertyEdgeEntries = s.propIdx.EntryCounts()
+	st.PropertyNodeEntries, st.PropertyEdgeEntries = s.index().EntryCounts()
 	return st
 }
+
+// index returns the property index the store is currently serving from.
+//
+// Read paths that hold no reader use this rather than the propIdx field. The
+// field is what a *writer* files into; this is what a reader answers from, and
+// Refresh is the one operation that makes them briefly different — it builds a
+// replacement index and publishes it with the image and delta it belongs to, so
+// a reader that has not seen the new view must not see the new index either.
+func (s *Store) index() *index.PropertyIndex { return s.cur().idx }
 
 // observeCommitMeta advances the commit counter past a value read back from the
 // log, so a reopened store does not reissue sequence numbers the log already
@@ -464,7 +480,29 @@ type Options struct {
 	//
 	// Use it for the read-only work the CLI does — verify, custody, prove — and
 	// for any consumer querying a store another process might want to write.
+	//
+	// See LiveReader for the mode that does advance, and what it gives up to.
 	ReadOnly bool
+
+	// LiveReader opens a read-only store that can be advanced with Refresh,
+	// taking **no process lock at all**. It implies ReadOnly.
+	//
+	// This is the third open mode, not a variation on the second, and the
+	// difference is a guarantee rather than a feature. ReadOnly promises that no
+	// writer is running, and that promise is exactly what makes its view safe to
+	// fix at Open. A reader that follows a writer cannot make that promise: a
+	// shared lock and the writer's exclusive lock cannot coexist. So this mode
+	// gives it up.
+	//
+	// What is *not* given up is anything on the writing side. The writer still
+	// takes an exclusive lock, so two writers are still impossible, and a store
+	// with live readers attached is written exactly as it was before.
+	//
+	// What a live reader gets in exchange is Refresh: it replays whatever the
+	// writer has made durable since the last call, and rebuilds from the image
+	// when a compaction has replaced the log underneath it. It advances only when
+	// Refresh is called. See live.go.
+	LiveReader bool
 
 	// MaxSnapshotAge bounds how long a Snapshot may be held before its reads
 	// start returning ErrSnapshotExpired. Zero, the default, is unlimited.
@@ -649,6 +687,12 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	// Creating the directory is a write, so a read-only open does not do it. A
 	// missing directory is then a real error rather than an empty store, which
 	// is the honest answer: there is nothing there to read.
+	// LiveReader implies ReadOnly. A live *writer* is not a thing: the mode
+	// exists so a reader can follow a writer, and a writer already sees its own
+	// commits.
+	if opts.LiveReader {
+		opts.ReadOnly = true
+	}
 	if opts.ReadOnly {
 		if fi, err := os.Stat(dir); err != nil {
 			return nil, fmt.Errorf("disk.Open: read-only open of %s: %w", dir, err)
@@ -662,8 +706,14 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	// The process lock comes before every other file in the directory. Opening
 	// the WAL first would append a container header to a log another process is
 	// mid-write on, which is the corruption this exists to prevent.
+	// A live reader is a read-only store that takes no lock. The writer's
+	// exclusive lock is deliberately unchanged: see live.go for why the reader is
+	// the side that gives.
 	mode := LockExclusive
-	if opts.ReadOnly {
+	switch {
+	case opts.LiveReader:
+		mode = LockNone
+	case opts.ReadOnly:
 		mode = LockShared
 	}
 	lock, prevOwner, err := acquireStoreLock(dir, mode)
@@ -671,7 +721,23 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		return nil, fmt.Errorf("disk.Open: %w", err)
 	}
 
-	wal, err := openWALFor(filepath.Join(dir, walFileName), opts.ReadOnly)
+	// A rebuilt log left stranded beside the one it was meant to replace is
+	// recovered here, before anything opens either. Only a writer does it:
+	// adoption is a rename, and a read-only store does not write to the
+	// directory. See adoptOrphanedLog for why the state is unambiguous.
+	walPath := filepath.Join(dir, walFileName)
+	if opts.LiveReader {
+		// Possibly the rebuilt log under its temporary name; see liveLogPath.
+		walPath = liveLogPath(dir)
+	}
+	if !opts.ReadOnly {
+		if err := adoptOrphanedLog(walPath); err != nil {
+			lock.release()
+			return nil, fmt.Errorf("disk.Open: %w", err)
+		}
+	}
+
+	wal, err := openWALFor(walPath, opts.ReadOnly)
 	if err != nil {
 		lock.release()
 		return nil, err
@@ -688,6 +754,8 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		// — and a reader reporting a recovery it did not perform would be a claim
 		// about a directory it does not own.
 		unclean:        !opts.ReadOnly && prevOwner.Present && !prevOwner.Clean,
+		live:           opts.LiveReader,
+		logPath:        walPath,
 		propIdx:        index.NewPropertyIndex(),
 		maxSnapshotAge: opts.MaxSnapshotAge,
 		syncOnCommit:   true,
@@ -1125,10 +1193,10 @@ func (s *Store) DeclareOrderedEdgeProperty(key string) error {
 }
 
 // OrderedNodeProperties implements store.OrderedIndexDeclarer.
-func (s *Store) OrderedNodeProperties() []string { return s.propIdx.OrderedNodeKeys() }
+func (s *Store) OrderedNodeProperties() []string { return s.index().OrderedNodeKeys() }
 
 // OrderedEdgeProperties implements store.OrderedIndexDeclarer.
-func (s *Store) OrderedEdgeProperties() []string { return s.propIdx.OrderedEdgeKeys() }
+func (s *Store) OrderedEdgeProperties() []string { return s.index().OrderedEdgeKeys() }
 
 // DeclareCompositeNodeProperties implements store.CompositeIndexDeclarer.
 func (s *Store) DeclareCompositeNodeProperties(keys []string) error {
@@ -1147,10 +1215,10 @@ func (s *Store) DeclareCompositeEdgeProperties(keys []string) error {
 }
 
 // CompositeNodeProperties implements store.CompositeIndexDeclarer.
-func (s *Store) CompositeNodeProperties() [][]string { return s.propIdx.CompositeNodeKeys() }
+func (s *Store) CompositeNodeProperties() [][]string { return s.index().CompositeNodeKeys() }
 
 // CompositeEdgeProperties implements store.CompositeIndexDeclarer.
-func (s *Store) CompositeEdgeProperties() [][]string { return s.propIdx.CompositeEdgeKeys() }
+func (s *Store) CompositeEdgeProperties() [][]string { return s.index().CompositeEdgeKeys() }
 
 // PurgeNodeIndex implements store.Reindexer. The purge is journalled so replay
 // does not resurrect the superseded entries.
@@ -1707,25 +1775,32 @@ func (s *Store) IndexEdgeProperty(id store.EdgeID, key string, value []byte) err
 // while it is used should take a Snapshot and query through that, which fixes
 // the records the postings resolve against.
 func (s *Store) NodesByProperty(key string, value []byte) ([]store.NodeID, error) {
-	ids := s.propIdx.NodesByProperty(key, value)
-	if len(ids) == 0 {
-		return ids, nil // a miss should not pay for the lock
-	}
+	// The lock is taken before the postings are read, not after. A miss
+	// therefore pays for it, which it used to avoid — the trade is that the
+	// index and the records it is resolved against now come from one reader, so
+	// a Refresh that replaces both cannot land between them and leave this
+	// filtering the new graph's postings through the old graph's records.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return liveNodeIDs(s.readerLocked(), ids), nil
+	r := s.readerLocked()
+	ids := r.index().NodesByProperty(key, value)
+	if len(ids) == 0 {
+		return ids, nil
+	}
+	return liveNodeIDs(r, ids), nil
 }
 
 // EdgesByProperty returns the edges indexed under key with exactly value. It
 // resolves postings against the records for the reason given on NodesByProperty.
 func (s *Store) EdgesByProperty(key string, value []byte) ([]store.EdgeID, error) {
-	ids := s.propIdx.EdgesByProperty(key, value)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r := s.readerLocked()
+	ids := r.index().EdgesByProperty(key, value)
 	if len(ids) == 0 {
 		return ids, nil
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return liveEdgeIDs(s.readerLocked(), ids), nil
+	return liveEdgeIDs(r, ids), nil
 }
 
 // DegreeOf implements store.DegreeCounter. With no edge-type filter it answers
@@ -1777,7 +1852,19 @@ func (s *Store) replayWAL() error {
 	// to avoid, and there is nothing a reader could usefully do with it.
 	defer func() { s.publishEpoch(s.mutEpoch.Load()) }()
 
-	return s.wal.Replay(ReplayCallbacks{
+	off, err := s.wal.replayFrom(0, s.replayCallbacks())
+	s.replayOff = off
+	return err
+}
+
+// replayCallbacks is the handler set a replay applies through.
+//
+// Separated from replayWAL because a live reader replays the same records from
+// an offset rather than from the start, and applying them through a second,
+// parallel set of handlers is how the two paths would drift apart. There is one
+// definition of what a log record does to the store.
+func (s *Store) replayCallbacks() ReplayCallbacks {
+	return ReplayCallbacks{
 		Verifier:             s.verifier,
 		RequireSignedCommits: s.requireSigned,
 		CommitFunc:           s.observeCommitMeta,
@@ -1866,7 +1953,7 @@ func (s *Store) replayWAL() error {
 			s.propIdx.RemoveEdge(store.EdgeID(id))
 			return nil
 		},
-	})
+	}
 }
 
 // storeEdgeMatchesFilter returns true if the edge carries any label in the filter (OR semantics).

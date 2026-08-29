@@ -89,6 +89,12 @@ func (s *Store) publishEpoch(e uint64) {
 // reader that trusts a zero count is re-checking against an image pointer that
 // has already moved, and bails out.
 func (s *Store) publishView(v *view) {
+	// A view always names an index. Callers build the pair they mean and leave
+	// this field alone; defaulting it here is for the ones that are only
+	// replacing the image or the delta, which is all of them but Refresh.
+	if v.idx == nil {
+		v.idx = s.propIdx
+	}
 	s.viewPtr.Store(v)
 	s.csrShadowed.Store(0)
 }
@@ -122,7 +128,11 @@ func (s *Store) publishCSR(csr *CSRGraph) {
 // image also observes the count that was stored before it.
 func (s *Store) publishCompacted(csr *CSRGraph, delta *deltaLayer, shadowed int64) {
 	s.csrShadowed.Store(shadowed)
-	s.viewPtr.Store(&view{csr: csr, delta: delta})
+	// Compaction rebuilds the image and splices the delta; it does not rebuild
+	// the index, which already describes both halves and goes on describing
+	// them. Carrying the same pointer is what makes that explicit rather than
+	// implicit in a field nobody reassigned.
+	s.viewPtr.Store(&view{csr: csr, delta: delta, idx: s.propIdx})
 }
 
 // --- snapshot registry ---
@@ -420,7 +430,7 @@ func (sn *snapshot) NodesByProperty(key string, value []byte) ([]store.NodeID, e
 	if err != nil {
 		return nil, err
 	}
-	ids := sn.s.propIdx.NodesByProperty(key, value)
+	ids := r.index().NodesByProperty(key, value)
 	if len(ids) == 0 {
 		return ids, nil
 	}
@@ -443,7 +453,7 @@ func (sn *snapshot) EdgesByProperty(key string, value []byte) ([]store.EdgeID, e
 	if err != nil {
 		return nil, err
 	}
-	ids := sn.s.propIdx.EdgesByProperty(key, value)
+	ids := r.index().EdgesByProperty(key, value)
 	if len(ids) == 0 {
 		return ids, nil
 	}

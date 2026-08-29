@@ -3,10 +3,12 @@ package disk
 // Compaction: merging the delta layer into a freshly built CSR image and
 // truncating the WAL behind it.
 //
-// Crash safety rests on the ordering here — write a temp file, checkpoint the
-// WAL, rename atomically, then retire the log — so the steps are not
-// independent and should not be reordered without rereading why each sits where
-// it does.
+// Crash safety rests on the ordering here — write and fsync a temp image, flush
+// the WAL, rename atomically, then retire the log behind a checkpoint marker —
+// so the steps are not independent and should not be reordered without
+// rereading why each sits where it does. The marker in particular is written by
+// retireLog, not before it: it means "replay stops here", which is true only of
+// a log that is about to be retired.
 //
 // # Why this is three functions
 //
@@ -22,8 +24,8 @@ package disk
 //	compactPin     under s.mu — collect the records and everything else the
 //	               image is built from, at one epoch
 //	build          no lock    — sort, hash, serialise, write, fsync
-//	compactCommit  under s.mu — checkpoint, rename, retire the log, splice the
-//	               delta, publish
+//	compactCommit  under s.mu — flush, rename, retire the log, splice the delta,
+//	               publish
 //
 // The middle stage is safe outside the lock because compactPlan shares nothing
 // mutable with the store. The record slices are freshly built; a *store.Node in
@@ -104,15 +106,15 @@ func (s *Store) Compact() error {
 // CompactCtx is Compact, abandoned if ctx is cancelled.
 //
 // Cancellation reaches the build and stops there. Once the commit begins —
-// the checkpoint, the rename, the retire — the compaction runs to completion
+// the flush, the rename, the retire — the compaction runs to completion
 // whatever ctx says, because those steps are the ordering that makes a crash
 // recoverable and there is no correct place to stop in the middle of them. A
 // cancelled compaction therefore leaves the store exactly as it found it, minus
 // a temp file the open path already ignores.
 //
 // This is the whole of what cancellation can usefully mean here, and it is not
-// a compromise: the build is where the seconds are. The commit is a checkpoint
-// fsync, two renames and a pass over the delta.
+// a compromise: the build is where the seconds are. The commit is an fsync, two
+// renames and a pass over the delta.
 func (s *Store) CompactCtx(ctx context.Context) error {
 	if err := s.mustWrite(); err != nil {
 		return err
@@ -355,12 +357,20 @@ func (s *Store) compactCommit(p *compactPlan, newCSR *CSRGraph, tmpPath string) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Checkpoint WAL then atomic rename. The offset the marker went down at is
-	// the end of every record the log held, which is what the retire branches
-	// below need in order to tell the image's records from the tail's.
-	markerOff, err := s.wal.checkpointAt()
+	// Flush the log and take its end offset, then rename. The offset is the end
+	// of every record the log held, which is what the retire branches below need
+	// in order to tell the image's records from the tail's.
+	//
+	// Neither the *checkpoint marker* nor the fsync happens here; both belong to
+	// the branch. The marker says "replay stops at this point", and one branch
+	// keeps the log and goes on appending to it — writing it up front stranded
+	// every record committed after any compaction that took that branch. The
+	// fsync follows the marker for the two branches that write one, and is
+	// explicit in the third, which keeps a compaction at one fsync rather than
+	// two.
+	endOff, err := s.wal.drainedEnd()
 	if err != nil {
-		return fmt.Errorf("compact: wal checkpoint: %w", err)
+		return fmt.Errorf("compact: wal flush: %w", err)
 	}
 
 	csrPath := filepath.Join(s.dir, csrFileName)
@@ -376,7 +386,7 @@ func (s *Store) compactCommit(p *compactPlan, newCSR *CSRGraph, tmpPath string) 
 		return fmt.Errorf("compact: %w", err)
 	}
 
-	if err := s.retireLog(p, newCSR, markerOff); err != nil {
+	if err := s.retireLog(p, newCSR, endOff); err != nil {
 		return err
 	}
 
@@ -406,15 +416,23 @@ func (s *Store) compactCommit(p *compactPlan, newCSR *CSRGraph, tmpPath string) 
 // already contains. Replaying it again is harmless; losing it would not be.
 //
 // The three branches are about the tail — the bytes written between the pin and
-// the checkpoint, which are commits the image does not hold and which exist
-// nowhere else on disk.
-func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, markerOff int64) error {
-	tail := markerOff - p.walOff
+// endOff, which are commits the image does not hold and which exist nowhere
+// else on disk.
+//
+// Each branch is also responsible for its own checkpoint marker, and the third
+// deliberately writes none. A marker means "replay stops here", which is only
+// true of a log about to be retired; left in a log that keeps being appended
+// to, it silently discards every record written after this compaction.
+func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error {
+	tail := endOff - p.walOff
 
 	switch {
 	// Nothing landed during the build. The log holds exactly what the image
 	// holds, so it is retired whole, exactly as it always was.
 	case tail <= 0:
+		if _, err := s.wal.checkpointAt(); err != nil {
+			return fmt.Errorf("compact: wal checkpoint: %w", err)
+		}
 		if s.retention.Keeps() {
 			return s.rotateLog(newCSR, len(p.nodes), len(p.edges))
 		}
@@ -439,6 +457,10 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, markerOff int64) err
 	// obvious — the image holds every epoch up to the pin, the log holds every
 	// epoch after it, and neither holds both.
 	case !s.retention.Keeps() && p.walFraming == walFramingV2:
+		markerOff, err := s.wal.checkpointAt()
+		if err != nil {
+			return fmt.Errorf("compact: wal checkpoint: %w", err)
+		}
 		if err := s.wal.truncateFrom(p.walOff, markerOff); err != nil {
 			return fmt.Errorf("compact: %w", err)
 		}
@@ -468,7 +490,18 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, markerOff int64) err
 	// compaction reclaims no log space, which the next one does once the store
 	// is quiet. Recorded in the audit because an operator watching the log fail
 	// to shrink deserves the reason.
+	//
+	// And no checkpoint marker, which is the whole reason the marker moved out
+	// of compactCommit. This log outlives the compaction and goes on being
+	// appended to; a marker in the middle of it means replay stops there, so
+	// every record written after this compaction would be read back as though
+	// it had never been committed. The fsync the marker used to bring with it is
+	// still needed and is issued on its own: the tail commits have to be durable
+	// before the epoch covering them is published.
 	default:
+		if err := s.wal.Sync(); err != nil {
+			return fmt.Errorf("compact: wal sync: %w", err)
+		}
 		if aerr := s.recordAudit(AuditCompact, s.attestActorID,
 			fmt.Sprintf("log kept, %d bytes committed during the build could not be carried; %d nodes, %d edges; snapshot %x",
 				tail, len(p.nodes), len(p.edges), newCSR.roots.Snapshot[:8])); aerr != nil {

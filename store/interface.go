@@ -210,6 +210,54 @@ type OrderedIndexDeclarer interface {
 	OrderedEdgeProperties() []string
 }
 
+// RefreshInfo reports what one Refresher.Refresh call did.
+type RefreshInfo struct {
+	// Epoch is the newest commit visible after the refresh.
+	Epoch uint64
+
+	// LogGeneration identifies the log file the reader is now reading. A change
+	// between two refreshes means the writer compacted.
+	LogGeneration uint64
+
+	// Reloaded is true when the log had been replaced and the reader was rebuilt
+	// from the image and the new log, rather than advanced over appended bytes.
+	Reloaded bool
+
+	// Bytes is how many bytes of the log this call applied.
+	Bytes int64
+}
+
+// Advanced reports whether the refresh changed anything.
+func (r RefreshInfo) Advanced() bool { return r.Reloaded || r.Bytes > 0 }
+
+// Refresher is a store that can be advanced to whatever another process has
+// since made durable.
+//
+// It is not what an ordinary read-only store does, and the distinction is a
+// guarantee rather than a feature. A store opened read-only promises that no
+// writer is running — that is what its shared process lock buys — and that
+// promise is exactly what makes fixing its view at open the right behaviour. A
+// reader that follows a writer cannot make it: a shared lock and the writer's
+// exclusive lock cannot coexist. So a Refresher gives it up, takes no process
+// lock, and offers this instead. The writer's exclusive lock is untouched.
+//
+// Implemented only by a disk store opened with disk.Options.LiveReader. The
+// memory backend does not implement it, and correctly so: there is no second
+// process to follow, and nothing for a refresh to read.
+type Refresher interface {
+	// Refresh advances the store to the newest durable state on disk.
+	//
+	// Safe to call concurrently with reads. A failed refresh leaves the store
+	// serving exactly what it was serving before the call.
+	Refresh() (RefreshInfo, error)
+
+	// IsLiveReader reports whether this store can actually be advanced. A store
+	// that answers false returns an error from Refresh rather than silently
+	// succeeding, because a caller refreshing a store that cannot advance is
+	// reading stale data believing it is fresh.
+	IsLiveReader() bool
+}
+
 // CompositeIndexDeclarer is an optional extension implemented by stores that can
 // build and maintain a composite index over several property keys, so that a
 // query pinning all of them to values is answered by one lookup instead of by

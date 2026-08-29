@@ -106,6 +106,58 @@ func OpenReadOnly(dir string) (*Graph, error) {
 	return &Graph{GraphStore: s}, nil
 }
 
+// OpenLive opens dir for reading by a Graph that can follow a writer.
+//
+// It takes **no process lock**, so unlike OpenReadOnly it is neither refused
+// alongside a writer nor refuses one. That is the trade, and it is worth
+// understanding before choosing this over OpenReadOnly: what is given up is the
+// "no writer is running" guarantee, which is the whole reason OpenReadOnly may
+// fix its view at open. Nothing on the writing side changes — a writer still
+// takes an exclusive lock, so two writers remain impossible.
+//
+// The view is still fixed between calls to Refresh; there is no polling
+// goroutine, because how often to look is the caller's decision. Every mutating
+// call returns disk.ErrReadOnly and nothing under dir is modified.
+//
+//	g, err := graphene.OpenLive(dir)
+//	...
+//	for range time.Tick(time.Second) {
+//	    if info, err := g.Refresh(); err == nil && info.Advanced() {
+//	        // the graph moved; re-run whatever depends on it
+//	    }
+//	}
+//
+// See docs/TECHNICAL_DETAILS.md §9.1b for the protocol and §14.10 for the
+// measurement that shaped it.
+func OpenLive(dir string) (*Graph, error) {
+	s, err := disk.OpenLive(dir)
+	if err != nil {
+		return nil, err
+	}
+	return &Graph{GraphStore: s}, nil
+}
+
+// Refresh advances a graph opened with OpenLive to the newest state the writer
+// has made durable, and reports what it applied.
+//
+// Backends that cannot advance return an error rather than nil. A no-op would
+// leave a caller believing a stale graph is fresh, which is precisely the
+// failure OpenLive exists to remove.
+func (g *Graph) Refresh() (store.RefreshInfo, error) {
+	r, ok := g.GraphStore.(store.Refresher)
+	if !ok {
+		return store.RefreshInfo{}, disk.ErrNotLiveReader
+	}
+	return r.Refresh()
+}
+
+// IsLive reports whether this graph can be advanced with Refresh — that is,
+// whether it was opened with OpenLive.
+func (g *Graph) IsLive() bool {
+	r, ok := g.GraphStore.(store.Refresher)
+	return ok && r.IsLiveReader()
+}
+
 // OpenWithOptions returns a Graph backed by a disk store opened with opts.
 //
 // Open gives you the historical defaults: unsigned commits, no verification on

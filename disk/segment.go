@@ -234,7 +234,15 @@ func (w *WAL) Rotate(dir string, seq uint64) (SegmentInfo, error) {
 	if err != nil {
 		return SegmentInfo{}, fmt.Errorf("wal rotate: create active log: %w", err)
 	}
-	header := walFileHeader{Version: walFramingV2, SegmentSeq: seq + 1, PrevDigest: digest}
+	// The generation goes up here for the same reason it does in Truncate: the
+	// file a reader had open is not the file at this path any more, so every
+	// offset into it has to be thrown away. It advances past both counters, so
+	// a store that has both rotated and truncated never reissues a number.
+	gen := seq + 1
+	if w.logGen >= gen {
+		gen = w.logGen + 1
+	}
+	header := walFileHeader{Version: walFramingV2, SegmentSeq: gen, PrevDigest: digest}
 	if _, err := f.Write(appendWALFileHeader(header)); err != nil {
 		f.Close()
 		return SegmentInfo{}, fmt.Errorf("wal rotate: write header: %w", err)
@@ -243,6 +251,7 @@ func (w *WAL) Rotate(dir string, seq uint64) (SegmentInfo, error) {
 	w.file = f
 	w.framing = walFramingV2
 	w.dataStart = walFileHeaderSize
+	w.logGen = gen
 
 	// The retired log has been written out and closed, so every outstanding
 	// ticket names bytes that are now on the medium in a file nothing will write

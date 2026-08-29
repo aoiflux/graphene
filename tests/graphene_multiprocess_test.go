@@ -33,6 +33,7 @@ const (
 	childModeEnv = "GRAPHENE_LOCK_CHILD_MODE"
 	childReady   = "CHILD-HOLDING"
 	childFailed  = "CHILD-FAILED"
+	childCount   = "CHILD-COUNT"
 )
 
 // TestLockChildProcess is the child. Under `go test` it is skipped; re-invoked
@@ -46,12 +47,16 @@ func TestLockChildProcess(t *testing.T) {
 	}
 
 	var (
-		g   *graphene.Graph
-		err error
+		g    *graphene.Graph
+		err  error
+		mode = os.Getenv(childModeEnv)
 	)
-	if os.Getenv(childModeEnv) == "read" {
+	switch mode {
+	case "read":
 		g, err = graphene.OpenReadOnly(dir)
-	} else {
+	case "live":
+		g, err = graphene.OpenLive(dir)
+	default:
 		g, err = graphene.Open(dir)
 	}
 	if err != nil {
@@ -66,7 +71,38 @@ func TestLockChildProcess(t *testing.T) {
 	os.Stdout.Sync()
 
 	in := bufio.NewReader(os.Stdin)
-	_, _ = in.ReadString('\n')
+	if mode != "live" {
+		_, _ = in.ReadString('\n')
+		return
+	}
+
+	// A live child answers questions instead of just waiting: each line the
+	// parent sends is "refresh and tell me what you can see now". That is what
+	// makes the cross-process test a test of *following* a writer rather than of
+	// merely coexisting with one.
+	for {
+		line, rerr := in.ReadString('\n')
+		if strings.TrimSpace(line) == "" && rerr != nil {
+			return
+		}
+		info, ferr := g.Refresh()
+		if ferr != nil {
+			fmt.Printf("%s refresh: %v\n", childFailed, ferr)
+			os.Stdout.Sync()
+			return
+		}
+		n, cerr := g.NodeCount()
+		if cerr != nil {
+			fmt.Printf("%s count: %v\n", childFailed, cerr)
+			os.Stdout.Sync()
+			return
+		}
+		fmt.Printf("%s %d reloaded=%v\n", childCount, n, info.Reloaded)
+		os.Stdout.Sync()
+		if rerr != nil {
+			return
+		}
+	}
 }
 
 // holdStore starts a child holding dir, and returns a function that stops it.

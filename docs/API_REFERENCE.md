@@ -72,12 +72,18 @@ All methods below are on `*graphene.Graph` unless noted. `Graph` embeds
 ```go
 func NewInMemory() *Graph
 func Open(dir string) (*Graph, error)
+func OpenReadOnly(dir string) (*Graph, error)
+func OpenLive(dir string) (*Graph, error)
 ```
 
 - `NewInMemory()` — volatile, thread-safe store. Best for tests, prototyping,
   and small in-process graphs.
 - `Open(dir)` — durable on-disk store rooted at `dir` (created if absent). On
   restart the WAL is replayed automatically. Call `Compact()` after bulk work.
+- `OpenReadOnly(dir)` — read-only, under a shared lock: any number coexist, none
+  runs alongside a writer. The view is fixed at open.
+- `OpenLive(dir)` — read-only, under **no lock**: runs alongside a writer and
+  advances when you call `Refresh()`. See §16 for what it gives up.
 
 ```go
 g := graphene.NewInMemory()
@@ -1218,10 +1224,11 @@ Everything above is about goroutines. Across processes the disk backend enforces
 (`flock` on Linux/macOS/BSD, `LockFileEx` on Windows). This is not advice you
 have to follow — a conflicting open is refused.
 
-| Call | Lock | Coexists with |
-|---|---|---|
-| `graphene.Open` / `disk.Open` | exclusive | nothing |
-| `graphene.OpenReadOnly` / `disk.OpenReadOnly` | shared | other readers only |
+| Call | Lock | Coexists with | View |
+|---|---|---|---|
+| `graphene.Open` / `disk.Open` | exclusive | nothing | current, including its own writes |
+| `graphene.OpenReadOnly` / `disk.OpenReadOnly` | shared | other readers only | fixed at open |
+| `graphene.OpenLive` / `disk.OpenLive` | **none** | anything, writers included | fixed until `Refresh()` |
 
 ```go
 g, err := graphene.OpenReadOnly(dir)
@@ -1238,23 +1245,91 @@ refuses immediately and leaves the policy to you.
 The lock is held by the OS, so a process that crashes releases it. There is no
 stale lock to clear and no recovery step.
 
-#### A read-only store is a snapshot, and this is the part to understand
+#### An `OpenReadOnly` store is a snapshot, and this is the part to understand
 
-**A reader's view is fixed at `Open` and never advances.** The engine
-materialises a store into memory once — the delta layer and property index from
-a WAL replay, the CSR from a single read — and nothing re-reads afterwards.
-Reopen to see later writes.
+**Its view is fixed at `Open` and never advances.** The engine materialises a
+store into memory once — the delta layer and property index from a WAL replay,
+the CSR from a single read — and nothing re-reads afterwards. Reopen to see later
+writes.
 
-That is also why a reader is *refused* alongside a writer rather than admitted.
-Admitting it would produce a permanently stale view with nothing to signal it had
-gone stale, which is a worse failure than being told no. Making readers live is a
-reader-refresh protocol, not a locking change, and it is not built.
+That is also why such a reader is *refused* alongside a writer rather than
+admitted. Admitting it would produce a permanently stale view with nothing to
+signal it had gone stale, which is a worse failure than being told no.
 
 What `ReadOnly` additionally guarantees is that nothing under `dir` is modified.
 That took work: `OpenWAL` creates the log if it is missing and writes a container
 header into an empty one, and the audit, redaction and grant ledgers all open for
 append. A read-only store opens none of them, and every mutating method returns
 `disk.ErrReadOnly` — including `Compact`.
+
+#### `OpenLive` — a reader that follows a writer
+
+```go
+func OpenLive(dir string) (*Graph, error)
+func (g *Graph) Refresh() (store.RefreshInfo, error)
+func (g *Graph) IsLive() bool
+```
+
+`OpenLive` takes **no process lock at all**, so it neither excludes a writer nor
+is excluded by one. That is the trade, and it is worth naming before you choose
+it: what you give up is `OpenReadOnly`'s "no writer is running" guarantee, which
+is the whole reason that mode may fix its view at open. Nothing on the *writing*
+side changes — a writer still takes an exclusive lock, so two writers remain
+impossible, and a store with live readers attached is written exactly as before.
+
+```go
+g, err := graphene.OpenLive(dir)
+if err != nil { /* ... */ }
+defer g.Close()
+
+for range time.Tick(time.Second) {
+    info, err := g.Refresh()
+    if err != nil { /* ... */ }
+    if info.Advanced() {
+        // the graph moved; re-run whatever depends on it
+    }
+}
+```
+
+`Refresh` reports what it did:
+
+| Field | Meaning |
+|---|---|
+| `Epoch` | the newest commit now visible |
+| `LogGeneration` | which log file the reader is reading; a change means the writer compacted |
+| `Reloaded` | true when the reader rebuilt from the image rather than advancing over appended bytes — because the log was replaced (the writer compacted) or because it is shorter than the reader had already read, which is what a restored directory put in place under a follower looks like |
+| `Bytes` | how many bytes of log this call applied |
+| `Advanced()` | `Reloaded || Bytes > 0` |
+
+**Four things to hold on to.**
+
+- **It advances only when you call `Refresh`.** There is no polling goroutine,
+  because how often to look depends on what you are — the same reason a busy
+  store is refused immediately rather than waited on. Between calls a live reader
+  is exactly as fixed as `OpenReadOnly`, which is what makes its answers stable
+  while you use them.
+- **It trails the writer by at most one fsync.** A commit still inside the
+  writer's group-commit gate is not in the log yet, so it is not visible. That is
+  the durability boundary doing its job: a live reader never shows you a write
+  that a crash would take back.
+- **A reload is not free.** When the writer compacts, the log is replaced and the
+  reader rebuilds its whole in-memory state from the image and the new log —
+  roughly the cost of a reopen. Appends between compactions are cheap; the
+  compaction is not.
+- **Still read-only, and that includes the lock file.** Every mutating method
+  returns `disk.ErrReadOnly`, and nothing under `dir` is created or modified —
+  not by `Open`, not by `Refresh`. `OpenReadOnly` will create an empty
+  `graphene.lock` if the directory has none, because it needs a file to take a
+  shared lock on; `OpenLive` takes no lock, so it does not open that file either.
+
+`Refresh` is safe to call while other goroutines read: the image, the delta and
+the property index are published as one value, so a query sees all of the new
+state or all of the old. A failed refresh leaves the reader serving exactly what
+it was serving before.
+
+Backends that cannot follow a writer — the memory store, and any disk store not
+opened with `OpenLive` — return `disk.ErrNotLiveReader` from `Refresh` rather
+than reporting a refresh they did not perform. Check with `IsLive()`.
 
 #### Unclean shutdown
 

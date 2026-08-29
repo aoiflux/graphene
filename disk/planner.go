@@ -62,9 +62,9 @@ func (s *Store) queryNodeIDs(r reader, query store.NodeQuery) ([]store.NodeID, e
 			// Every filter's own set contains the answer, so the residual pass
 			// can narrow the candidates directly and skip the driving filter
 			// entirely rather than re-deriving a set it was already built from.
-			candidates = s.propIdx.NarrowNodesByFilters(candidates, query.Filters, plan.DriverFilters)
+			candidates = r.index().NarrowNodesByFilters(candidates, query.Filters, plan.DriverFilters)
 		} else {
-			matched := s.matchNodeIDsByFilters(query.Filters, store.MatchAny)
+			matched := s.matchNodeIDsByFilters(r, query.Filters, store.MatchAny)
 			candidates = store.IntersectSortedIDs(candidates, matched)
 		}
 	}
@@ -132,9 +132,9 @@ func (s *Store) queryEdgeIDs(r reader, query store.EdgeQuery) ([]store.EdgeID, e
 			sortedAsc = true
 		}
 		if store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
-			candidates = s.propIdx.NarrowEdgesByFilters(candidates, query.Filters, plan.DriverFilters)
+			candidates = r.index().NarrowEdgesByFilters(candidates, query.Filters, plan.DriverFilters)
 		} else {
-			matched := s.matchEdgeIDsByFilters(query.Filters, store.MatchAny)
+			matched := s.matchEdgeIDsByFilters(r, query.Filters, store.MatchAny)
 			candidates = store.IntersectSortedIDs(candidates, matched)
 		}
 	}
@@ -203,11 +203,11 @@ const driverUnavailable = math.MaxInt
 // "Most selective" is new. This used to be "the first one in the query", because
 // a range had no size and so could not be compared with anything — including
 // with the other ranges in the same query. See index/stats.go.
-func (s *Store) bestOrderedNodeDriver(query store.NodeQuery) (*store.PropertyFilter, int) {
+func (s *Store) bestOrderedNodeDriver(r reader, query store.NodeQuery) (*store.PropertyFilter, int) {
 	var best *store.PropertyFilter
 	bestSize := 0
 	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
-		size, served := s.propIdx.NodeRangeCardinality(f)
+		size, served := r.index().NodeRangeCardinality(f)
 		if !served {
 			continue
 		}
@@ -221,11 +221,11 @@ func (s *Store) bestOrderedNodeDriver(query store.NodeQuery) (*store.PropertyFil
 }
 
 // bestOrderedEdgeDriver is bestOrderedNodeDriver for edge queries.
-func (s *Store) bestOrderedEdgeDriver(query store.EdgeQuery) (*store.PropertyFilter, int) {
+func (s *Store) bestOrderedEdgeDriver(r reader, query store.EdgeQuery) (*store.PropertyFilter, int) {
 	var best *store.PropertyFilter
 	bestSize := 0
 	for _, f := range store.OrderedDrivers(query.Filters, query.FilterMode) {
-		size, served := s.propIdx.EdgeRangeCardinality(f)
+		size, served := r.index().EdgeRangeCardinality(f)
 		if !served {
 			continue
 		}
@@ -265,7 +265,7 @@ func (s *Store) driveNodeCandidates(r reader, query store.NodeQuery) ([]store.No
 	var bestFilter *store.PropertyFilter
 	bestSize := 0
 	for _, f := range store.EqualityDrivers(query.Filters, query.FilterMode) {
-		size := s.propIdx.NodeCardinality(f.Key, f.Value)
+		size := r.index().NodeCardinality(f.Key, f.Value)
 		if bestFilter == nil || size < bestSize {
 			filter := f
 			bestFilter = &filter
@@ -275,7 +275,7 @@ func (s *Store) driveNodeCandidates(r reader, query store.NodeQuery) ([]store.No
 	// A range or prefix filter on a key declared ordered bounds the result too,
 	// and the ordered index can now say by how much, so it competes rather than
 	// being tried in query order once everything else has been ruled out.
-	bestOrdered, orderedSize := s.bestOrderedNodeDriver(query)
+	bestOrdered, orderedSize := s.bestOrderedNodeDriver(r, query)
 
 	// A declared composite whose keys the query pins to values answers the whole
 	// conjunction at once, and reports the exact size of what it would return.
@@ -288,7 +288,7 @@ func (s *Store) driveNodeCandidates(r reader, query store.NodeQuery) ([]store.No
 	var comp index.CompositeMatch
 	hasComposite := false
 	if len(query.Filters) > 1 {
-		comp, hasComposite = s.propIdx.MatchNodeComposite(query.Filters, query.FilterMode)
+		comp, hasComposite = r.index().MatchNodeComposite(query.Filters, query.FilterMode)
 	}
 
 	// Labels bound the result too, and their posting sizes are known in O(1)
@@ -337,7 +337,7 @@ func (s *Store) driveNodeCandidates(r reader, query store.NodeQuery) ([]store.No
 		// matching and lookup, which nothing in the engine does — kept because
 		// the contract permits it and a planner that silently drove from an
 		// empty set would return too few rows rather than too many.
-		if ids, served := s.propIdx.NodesByComposite(comp); served {
+		if ids, served := r.index().NodesByComposite(comp); served {
 			return liveNodeIDs(r, ids), true, store.QueryPlan{
 				Driver:        store.DriverComposite,
 				DriverKey:     comp.Name(),
@@ -348,7 +348,7 @@ func (s *Store) driveNodeCandidates(r reader, query store.NodeQuery) ([]store.No
 	// Equality wins ties against a range: both yield ascending candidates, but
 	// the ordered path pays a sort-and-dedupe that the postings do not.
 	case bestFilter != nil && eqCost <= orderedCost:
-		return liveNodeIDs(r, s.propIdx.NodesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
+		return liveNodeIDs(r, r.index().NodesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
 			Driver:        store.DriverEquality,
 			DriverKey:     bestFilter.Key,
 			DriverFilters: store.FilterMaskOf(query.Filters, *bestFilter),
@@ -360,7 +360,7 @@ func (s *Store) driveNodeCandidates(r reader, query store.NodeQuery) ([]store.No
 		// because NodesMatchingOrdered's contract allows it and a planner that
 		// silently returned the wrong candidate set would be worse than one that
 		// scans.
-		if ids, served := s.propIdx.NodesMatchingOrdered(nil, *bestOrdered); served {
+		if ids, served := r.index().NodesMatchingOrdered(nil, *bestOrdered); served {
 			return liveNodeIDs(r, sortDedupeNodeIDs(ids)), true, store.QueryPlan{
 				Driver:        store.DriverOrdered,
 				DriverKey:     bestOrdered.Key,
@@ -444,7 +444,7 @@ func (s *Store) driveEdgeCandidates(r reader, query store.EdgeQuery) ([]store.Ed
 	var bestFilter *store.PropertyFilter
 	bestSize := 0
 	for _, f := range store.EqualityDrivers(query.Filters, query.FilterMode) {
-		size := s.propIdx.EdgeCardinality(f.Key, f.Value)
+		size := r.index().EdgeCardinality(f.Key, f.Value)
 		if bestFilter == nil || size < bestSize {
 			filter := f
 			bestFilter = &filter
@@ -469,12 +469,12 @@ func (s *Store) driveEdgeCandidates(r reader, query store.EdgeQuery) ([]store.Ed
 		}
 	}
 
-	bestOrdered, orderedSize := s.bestOrderedEdgeDriver(query)
+	bestOrdered, orderedSize := s.bestOrderedEdgeDriver(r, query)
 	// See driveNodeCandidates for why the filter count is tested here.
 	var comp index.CompositeMatch
 	hasComposite := false
 	if len(query.Filters) > 1 {
-		comp, hasComposite = s.propIdx.MatchEdgeComposite(query.Filters, query.FilterMode)
+		comp, hasComposite = r.index().MatchEdgeComposite(query.Filters, query.FilterMode)
 	}
 
 	// Four possible drivers, costed on the same scale. An unavailable driver is
@@ -516,7 +516,7 @@ func (s *Store) driveEdgeCandidates(r reader, query store.EdgeQuery) ([]store.Ed
 	// Ties go to the composite, for the reason given in driveNodeCandidates.
 	case hasComposite && compositeCost <= eqCost && compositeCost <= anchorCost &&
 		compositeCost <= orderedCost:
-		if ids, served := s.propIdx.EdgesByComposite(comp); served {
+		if ids, served := r.index().EdgesByComposite(comp); served {
 			return liveEdgeIDs(r, ids), true, store.QueryPlan{
 				Driver:        store.DriverComposite,
 				DriverKey:     comp.Name(),
@@ -524,7 +524,7 @@ func (s *Store) driveEdgeCandidates(r reader, query store.EdgeQuery) ([]store.Ed
 			}
 		}
 	case bestFilter != nil && eqCost <= anchorCost && eqCost <= orderedCost:
-		return liveEdgeIDs(r, s.propIdx.EdgesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
+		return liveEdgeIDs(r, r.index().EdgesByProperty(bestFilter.Key, bestFilter.Value)), true, store.QueryPlan{
 			Driver:        store.DriverEquality,
 			DriverKey:     bestFilter.Key,
 			DriverFilters: store.FilterMaskOf(query.Filters, *bestFilter),
@@ -537,7 +537,7 @@ func (s *Store) driveEdgeCandidates(r reader, query store.EdgeQuery) ([]store.Ed
 		// See driveNodeCandidates: served was established when this driver was
 		// costed, so the fallback is unreachable and kept only because the
 		// contract permits it.
-		if ids, served := s.propIdx.EdgesMatchingOrdered(nil, *bestOrdered); served {
+		if ids, served := r.index().EdgesMatchingOrdered(nil, *bestOrdered); served {
 			return liveEdgeIDs(r, sortDedupeEdgeIDs(ids)), true, store.QueryPlan{
 				Driver:        store.DriverOrdered,
 				DriverKey:     bestOrdered.Key,
@@ -612,13 +612,13 @@ func collectCandidateEdgeIDs(r reader, ids []store.EdgeID) []store.EdgeID {
 // than each being built into a map and the maps intersected. Merging is one pass
 // per side with no hashing, the output stays sorted so the query path can skip
 // its final sort, and an empty intersection under MatchAll can stop early.
-func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) []store.NodeID {
+func (s *Store) matchNodeIDsByFilters(r reader, filters []store.PropertyFilter, mode store.MatchMode) []store.NodeID {
 	if len(filters) == 0 {
 		return nil
 	}
 	var acc []store.NodeID
 	for i, f := range filters {
-		set := s.matchOneNodeFilter(f)
+		set := s.matchOneNodeFilter(r, f)
 		if i == 0 {
 			acc = set
 			continue
@@ -637,21 +637,21 @@ func (s *Store) matchNodeIDsByFilters(filters []store.PropertyFilter, mode store
 }
 
 // matchOneNodeFilter resolves a single filter to an ascending, deduplicated set.
-func (s *Store) matchOneNodeFilter(f store.PropertyFilter) []store.NodeID {
+func (s *Store) matchOneNodeFilter(r reader, f store.PropertyFilter) []store.NodeID {
 	if f.Op == store.PropertyOpEqual {
 		// Postings are already ascending and deduplicated.
-		return s.propIdx.NodesByProperty(f.Key, f.Value)
+		return r.index().NodesByProperty(f.Key, f.Value)
 	}
 	// A key declared ordered answers ranges and prefixes by binary search. Its
 	// comparison is byte-wise, so the whole predicate is resolved there — mixing
 	// it with the scan matcher below would apply two orderings to one key.
-	if ids, served := s.propIdx.NodesMatchingOrdered(nil, f); served {
+	if ids, served := r.index().NodesMatchingOrdered(nil, f); served {
 		return store.SortDedupeIDs(ids)
 	}
 	// Otherwise scan only the buckets belonging to this key, never the whole index.
 	// One comparison per distinct value, not per entry.
 	var out []store.NodeID
-	s.propIdx.ForEachNodeValue(f.Key, func(value []byte, ids []store.NodeID) bool {
+	r.index().ForEachNodeValue(f.Key, func(value []byte, ids []store.NodeID) bool {
 		if store.PropertyFilterMatches(f, value) {
 			out = append(out, ids...)
 		}
@@ -661,13 +661,13 @@ func (s *Store) matchOneNodeFilter(f store.PropertyFilter) []store.NodeID {
 }
 
 // matchEdgeIDsByFilters is matchNodeIDsByFilters for edge properties.
-func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store.MatchMode) []store.EdgeID {
+func (s *Store) matchEdgeIDsByFilters(r reader, filters []store.PropertyFilter, mode store.MatchMode) []store.EdgeID {
 	if len(filters) == 0 {
 		return nil
 	}
 	var acc []store.EdgeID
 	for i, f := range filters {
-		set := s.matchOneEdgeFilter(f)
+		set := s.matchOneEdgeFilter(r, f)
 		if i == 0 {
 			acc = set
 			continue
@@ -684,15 +684,15 @@ func (s *Store) matchEdgeIDsByFilters(filters []store.PropertyFilter, mode store
 	return acc
 }
 
-func (s *Store) matchOneEdgeFilter(f store.PropertyFilter) []store.EdgeID {
+func (s *Store) matchOneEdgeFilter(r reader, f store.PropertyFilter) []store.EdgeID {
 	if f.Op == store.PropertyOpEqual {
-		return s.propIdx.EdgesByProperty(f.Key, f.Value)
+		return r.index().EdgesByProperty(f.Key, f.Value)
 	}
-	if ids, served := s.propIdx.EdgesMatchingOrdered(nil, f); served {
+	if ids, served := r.index().EdgesMatchingOrdered(nil, f); served {
 		return store.SortDedupeIDs(ids)
 	}
 	var out []store.EdgeID
-	s.propIdx.ForEachEdgeValue(f.Key, func(value []byte, ids []store.EdgeID) bool {
+	r.index().ForEachEdgeValue(f.Key, func(value []byte, ids []store.EdgeID) bool {
 		if store.PropertyFilterMatches(f, value) {
 			out = append(out, ids...)
 		}
@@ -752,7 +752,7 @@ func (s *Store) ExplainNodeQuery(query store.NodeQuery) (store.QueryPlan, error)
 	candidates, _, plan := s.driveNodeCandidates(r, query)
 	plan.Candidates = len(candidates)
 	if len(query.Filters) > 0 && store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
-		plan.Residuals = s.propIdx.PlanNodeResiduals(query.Filters, plan.DriverFilters, len(candidates))
+		plan.Residuals = r.index().PlanNodeResiduals(query.Filters, plan.DriverFilters, len(candidates))
 	}
 	ids, err := s.queryNodeIDs(r, query)
 	if err != nil {
@@ -771,7 +771,7 @@ func (s *Store) ExplainEdgeQuery(query store.EdgeQuery) (store.QueryPlan, error)
 	candidates, _, plan := s.driveEdgeCandidates(r, query)
 	plan.Candidates = len(candidates)
 	if len(query.Filters) > 0 && store.NormalizedFilterMode(query.FilterMode) == store.MatchAll {
-		plan.Residuals = s.propIdx.PlanEdgeResiduals(query.Filters, plan.DriverFilters, len(candidates))
+		plan.Residuals = r.index().PlanEdgeResiduals(query.Filters, plan.DriverFilters, len(candidates))
 	}
 	ids, err := s.queryEdgeIDs(r, query)
 	if err != nil {

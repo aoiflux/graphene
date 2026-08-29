@@ -1206,6 +1206,21 @@ releasing and reacquiring, and the window in between is one where another proces
 can take the store — so the API does not offer it, and a caller who needs to
 write reopens and handles `ErrStoreLocked` like any other opener.
 
+**Three modes, and only one of them gives anything up.**
+
+| Open | Process lock | Excludes | Is excluded by | View |
+|---|---|---|---|---|
+| `Open` | exclusive | every other opener | any other opener | current, its own writes |
+| `OpenReadOnly` | shared | writers | writers | fixed at open |
+| `OpenLive` | **none** | nothing | nothing | fixed until `Refresh` |
+
+`OpenLive` takes no OS lock at all — not because the platform cannot lock, which
+is what `lock_unsupported.go` is for, but because a shared lock and the writer's
+exclusive lock cannot coexist and a reader that follows a writer has to run
+beside one. The reader is the side that gives: **the writer's exclusive lock is
+unchanged, so "one writer" still holds**, and what is surrendered is the
+reader's "no writer is running". §9.1c.
+
 ### 9.1a The process lock
 
 Before this existed, nothing stopped two processes opening one directory. The
@@ -1248,11 +1263,11 @@ Neither platform has a portable timed wait, so a timeout would be a polling loop
 and the right interval depends on what the caller is. `ErrStoreLocked` comes back
 immediately, naming the holder's PID, and the caller decides.
 
-### 9.1b Why readers are snapshots
+### 9.1b Why an OpenReadOnly reader is a snapshot
 
-The lock admits many readers alongside each other and none alongside a writer.
-That second half is not a limitation of file locking — it follows from how the
-store loads.
+The shared lock admits many readers alongside each other and none alongside a
+writer. That second half is not a limitation of file locking — it follows from
+how the store loads.
 
 `Open` materialises everything once: the delta maps and property index from a WAL
 replay (`store.go`), the CSR from a single `os.ReadFile` (`csr_io.go`). Nothing
@@ -1262,22 +1277,18 @@ that it had gone stale — a wrong answer delivered confidently, which is worse
 than a refusal.
 
 So the shared lock exists for readers running alongside *other readers*, and the
-exclusive lock is what keeps a writer from being one of them. Reopening is how a
-reader advances.
+exclusive lock is what keeps a writer from being one of them. Reopening is how an
+`OpenReadOnly` reader advances, and that has not changed.
 
-Making readers live needs a reader-refresh protocol — replay-from-offset, a CSR
-generation marker, incremental property-index apply, and a torn-refresh story.
-It is **not built**, and the sentence that used to stand here — "and not a
-locking change" — was wrong: it is *also* a locking change, and on Windows a
-change to how the writer replaces the log. §14.10 has the measurement.
+What has changed is that there is now a third mode for callers who want the other
+trade — §9.1c.
 
-Note that this is a different thing from §10.3's snapshots, which are about
-consistency *within* one open store and are built. A snapshot fixes what one
-process sees while it reads; reader refresh would let a second process see what
-the first has written since. The version machinery §10.3 describes is the
-foundation the refresh protocol needs — a refreshed view is a new view published
-at a new epoch, and the "torn refresh" problem is the one that single atomic
-publish already solves — but the replay-from-offset half does not exist.
+Note that all of this is a different thing from §10.3's snapshots, which are
+about consistency *within* one open store. A snapshot fixes what one process sees
+while it reads; a live reader lets a second process see what the first has
+written since. The version machinery §10.3 describes is the foundation the second
+is built on — a refreshed view is a new view published at a new epoch, and the
+"torn refresh" problem is the one that single atomic publish already solves.
 
 Read-only mode also has to leave the directory alone, which took more than
 withholding the mutators. `OpenWAL` creates the log if missing and writes a
@@ -1287,6 +1298,115 @@ read-only path and opens no ledger at all — their read paths were already
 directory-based (`ReadAuditLog(dir)` and friends), and every write path already
 refused on a nil ledger, so "the option is off" and "the store is read-only"
 reach the same check.
+
+### 9.1c Live readers
+
+`OpenLive` is a read-only store that can be told to advance. It is the mode
+§14.10 costed and deferred; the trade it named was taken, and this is what got
+built.
+
+**What it gives up, exactly.** A shared lock and an exclusive lock cannot
+coexist, so one side has to yield. The reader does: `OpenLive` takes `LockNone`
+and claims nothing. The writer's exclusive lock is untouched, so two writers
+remain impossible and every guarantee on the writing side survives. `OpenReadOnly`
+is untouched too — a caller who wants "no writer is running" gets exactly that by
+not asking for this.
+
+`LockNone` does not open `graphene.lock` either, which is the one place this mode
+is *stricter* than `OpenReadOnly`. A shared holder must open the file because it
+has to have something to lock, and on a store that has only ever been read that
+means creating it; `LockNone` has nothing to lock. The owner record it would have
+read is consumed only by a writer's unclean-shutdown check, so nothing was using
+it — and opening it created a file in a directory this mode promises not to write
+to and, on Windows, held a handle that stopped anyone deleting it.
+
+**Two numbers make it a resumable read rather than a reopen.**
+
+*The log generation* is the WAL container header's `SegmentSeq`. The field was
+already there, already CRC-covered, and read by nothing — the plan's cheap part.
+Every operation that ends the current log file now increments it: `Truncate`,
+`truncateFrom`, `Rotate`. It answers the only question a byte offset depends on:
+*is the file I have offsets into still the file at this path?*
+
+*The replay offset* is how far into the records region the reader has applied, as
+reported by `replayRecordsFrom`. That number **rewinds to the last point at which
+no batch was open**, which is the whole of its correctness: resuming from where
+the parser actually stopped would take a transaction the writer had not finished
+and apply its second half alone, which is precisely what the begin/commit markers
+exist to prevent. A torn record at the tail rewinds for the same reason.
+
+**So a refresh is one of two things.** Same generation: replay the appended bytes
+and publish the epoch they reach. Different generation: the log was truncated,
+rebuilt or rotated, so every offset into it is meaningless — rebuild from the
+files as they now are.
+
+**A log shorter than the reader's offset is also a different log**, and the
+generation does not catch it. The case is an operator putting a restored
+directory in place under a follower: the file that lands there is a real log with
+a real header, and its generation is whatever it had when the backup was taken —
+which the reader may well have seen already. Left undetected, the reader resumes
+past the end of a file, reads nothing, and reports every refresh as a successful
+no-op while serving a store that no longer exists. Shrinking is the one thing a
+log never does on its own — every writer path appends, and the three that do make
+it shorter all change the generation — so a log shorter than the reader's offset
+is by construction not the log those bytes came from, and a reload is the answer.
+The check is one `Stat`, and a `Stat` that fails is *not* read as a shrink: the
+header was read from that path a moment earlier, so a failure there is a
+transient error rather than evidence, and throwing away the reader's whole state
+over it would be the wrong trade.
+
+**A changed image alone does not need a reload**, which is worth stating because
+it looks like an oversight. `retireLog`'s third branch replaces the image and
+leaves the log alone (§9.4), so a compaction can happen with no generation
+change. A reader that keeps its old image is still correct there: the log was not
+truncated, so it still holds every record the new image folded in, and the reader
+has already applied them. *Old image plus every record ever seen* is the same
+graph as *new image plus the same records*. The cost is a larger delta until some
+generation does change, which is memory rather than correctness.
+
+**The property index had to move into the view.** A reload replaces the image,
+the delta and the index, and the index used to be a field on `Store` read by
+unlocked paths. Swapping it beside a view swap is §9.2's two-word problem in a
+third place: a query could pair new records with an old index. So `view` is now
+`(csr, delta, idx)` and every read path resolves postings through the view it is
+reading — one pointer load for all three. For a writer nothing changes; the
+pointer never moves and entries are added and removed in place as before.
+
+**Two filesystem primitives, and neither is a Windows-only feature.** §14.10's
+table is the measurement: on Windows an open read handle blocks a rename of the
+file, and `os.Rename` over a held destination is refused even with
+`FILE_SHARE_DELETE`. Both are behind one contract with a per-platform half, the
+same shape as `lockFile` and `syncDir`:
+
+| Contract | Unix | Windows |
+|---|---|---|
+| `openSharedRead` — read without blocking a rename or unlink of the file | `os.Open`; a descriptor names an inode, not a name | `CreateFileW` with `FILE_SHARE_DELETE` |
+| `replaceFile` — atomically replace a path, even if someone holds the destination open | `os.Rename`; `rename(2)` is unaffected by open descriptors | `os.Rename`, falling back to `ReplaceFileW` on a sharing violation |
+
+**`ReplaceFileW`'s weaker atomicity is not imposed on anyone who is not using
+it.** `MoveFileEx` is one metadata operation; `ReplaceFileW` removes the
+destination and moves the replacement in, so there is a window in which the
+destination does not exist — and §9.4's tail-carrying argument rests on that
+window not existing. Two things keep the guarantee: the fallback is reached only
+when a plain rename is *refused* because someone holds the file, so a store with
+no live reader takes the path it always took; and the window is covered rather
+than accepted, because the replacement is written and fsynced under its `.tmp`
+name before the destination is touched. A crash inside the window therefore
+leaves a complete, durable log at that name and nothing at the log's own, which
+is a state only that window can produce — `adoptOrphanedLog` recovers it on the
+next writer open, and a live reader reads through the temporary name meanwhile so
+its view never loses content.
+
+**What a live reader still does not promise.** It advances when `Refresh` is
+called and at no other time — there is no polling goroutine, because how often to
+look is the caller's decision for the same reason waiting for a lock is. And it
+reads only what the writer has made durable, so it trails the writer by at most
+one fsync: the durability boundary doing its job, not a limitation of the mode.
+It also does not detect a directory replaced by a *different* store whose log
+happens to match on both generation and length; the two checks above cover
+replacement and truncation, and going further would mean hashing the image on
+every refresh, which is a cost every caller would pay for a case only an operator
+can create.
 
 ### 9.2 The lock-free CSR read path
 
@@ -1414,6 +1534,40 @@ tail forward would open a window between two renames in which a crash leaves it
 in neither. Leaving the log is always safe — its records are in the image as
 well, so replay applies them a second time as upserts — and costs only that this
 compaction reclaims no log space. The audit entry says which happened.
+
+**The checkpoint marker belongs to the branch, not to the commit stage — and
+putting it in the wrong place lost data.** A checkpoint record means "replay
+stops here". `compactCommit` used to write one before it knew which retire branch
+it would take, which is right for the two that then empty or rebuild the log and
+wrong for the third, which keeps the log and goes on appending to it. Every
+record committed after such a compaction sat in the log *after* a stop marker,
+and replay discarded it — silently, on the next open, with no error anywhere. The
+branch is reachable whenever segment retention is configured and a commit lands
+during a build, which is the steady state for a retained-segment store under
+load. The commit stage now only flushes the log and takes its end offset
+(`drainedEnd`); each retiring branch writes its own marker, and the keep branch
+writes none. `TestRetiredLogKeepsWritesMadeAfterACompaction` is the regression.
+
+*The durability moved with the marker, and this is what keeps a compaction at one
+fsync.* `drainedEnd` drains the queue and stats the file; it does **not** sync.
+The two branches that write a marker sync as part of writing it, and the keep
+branch, which writes no marker, issues the sync on its own — the tail commits
+still have to be durable before the epoch covering them is published. Syncing in
+`drainedEnd` as well is the obvious way to write it and costs a second fsync per
+compaction; measured through the WAL's `syncHook`, every branch went from two
+syncs of the active log to one.
+
+*What the marker is worth now, stated honestly.* After this change no correct
+store can hold a record after a marker: every branch that writes one goes on to
+empty the log, rebuild it excluding the marker, or rotate the whole file away. A
+marker can therefore only sit at EOF, where stopping at it and stopping at EOF are
+the same stop — the record is **inert**. It is still written, because removing it
+would drop a record type from the durable format and change what `graphene
+inspect` renders, which wants its own change and its own review. The consequence
+for testing is that "a retiring branch stops writing its marker" is an *equivalent
+mutant* rather than a test gap, and `TestRetiringBranchesReplayWhole` — which was
+written to assert the marker and cannot — says so in place of a claim it cannot
+support.
 
 *The delta holds both generations.* Publishing an empty layer, which is what
 compaction always did, would drop them. `deltaLayer.since` keeps exactly the
@@ -2204,12 +2358,17 @@ Correctness here is invisible to functional tests — a content-equal string
 changes nothing observable — so `index/interning_test.go` asserts on
 backing-pointer identity instead.
 
-### 14.10 Deferred: live readers, and what they would actually cost
+### 14.10 Live readers: what they cost, measured before they were built
 
-§9.1b says a reader is fixed at its own open and has to reopen to advance, and
-attributes that to the missing refresh protocol. Building the protocol was
+This section costed the feature while it was deferred. It is kept as the record
+of what the decision was actually about — the trade was accepted and §9.1c is
+what got built — because every number below is still the reason the design has
+the shape it does.
+
+§9.1b used to say a reader is fixed at its own open and has to reopen to advance,
+and attributed that to a missing refresh protocol. Building the protocol was
 scoped and the blocking constraint turned out to be somewhere else, so the price
-is recorded here rather than discovered later.
+was recorded here rather than discovered later.
 
 **Two processes, one open file.** A live reader has the writer's log open while
 the writer is replacing it. Compaction replaces the log three ways — `os.Truncate`
@@ -2247,10 +2406,37 @@ the reader and a platform-specific replace on the writer.
 
 So the honest shape is a third, opt-in open mode that trades `OpenReadOnly`'s
 "no writer is running" guarantee for the ability to advance — not a change to
-what `OpenReadOnly` already promises. **Deferred until that trade is chosen**,
-because it is an operator's decision about their store and not an engineering
-detail. Nothing above is speculative: the table is a measurement and the lock
-argument is what the primitive is.
+what `OpenReadOnly` already promises. That is the shape that was chosen, and how
+each of the three costs was actually paid:
+
+1. **The reader gives, not the writer.** `OpenLive` takes `LockNone`. The
+   writer's exclusive lock is untouched, so "one writer" — the guarantee that
+   stops two processes replaying and rewriting the same store — is exactly as
+   strong as it was. What a live reader surrenders is its own "no writer is
+   running", which is the guarantee it cannot have and go on advancing.
+2. **`ReplaceFileW` is a fallback, not the path.** `truncateFrom` tries
+   `os.Rename` and reaches `ReplaceFileW` only when the rename is refused because
+   someone holds the destination open, so a store with no live reader attached
+   never takes the weaker call. The window it opens is covered rather than
+   accepted: the replacement is fsynced under its `.tmp` name before the
+   destination is touched, so a crash inside the window leaves a complete log at
+   that name and `adoptOrphanedLog` installs it on the next open. Both halves of
+   the contract have Unix implementations that are the ordinary system call —
+   `rename(2)` is already atomic and already unaffected by open descriptors — so
+   nothing here is a Windows feature the other platforms do without.
+3. **The generation marker cost the one line it was costed at.** `SegmentSeq`
+   now increments in `Truncate`, `truncateFrom` and `Rotate`, and a reader reads
+   the first 50 bytes of the log to see it.
+
+**One thing the costing missed**, and it was the largest piece of the work: the
+property index was a field on `Store`, read by paths that hold no lock. A reload
+replaces it along with the image and the delta, so leaving it there would have
+recreated §9.2's torn-pair bug in a third place — new records, old postings. It
+moved into `view`, so all three are one pointer load (§9.1c). That is a change
+every read path touches, and none of it is visible in the table above.
+
+Nothing above is speculative: the table is a measurement and the lock argument is
+what the primitive is.
 
 ### 14.11 Rejected: a persisted histogram section
 
@@ -2363,9 +2549,13 @@ Any change must preserve these. Each is enforced by tests.
     on a 100 000-record store, down from the whole rebuild (§9.4). The remainder
     is the record scan, which is under the lock because the delta layer is
     mutable while it is live.
-15. **A reader is still fixed at its own open** and must reopen to advance
-    (§9.1b). Live readers are deferred on a measured trade, not an unknown —
-    §14.10.
+15. **An `OpenReadOnly` reader is fixed at its own open** and must reopen to
+    advance (§9.1b). `OpenLive` is the mode that advances, and it costs the
+    reader's process lock — it neither excludes a writer nor is excluded by one,
+    so it gives up "no writer is running" (§9.1c). It advances only when
+    `Refresh` is called, and trails the writer by at most one fsync. A live
+    reader that never sees a generation change keeps growing its delta, because
+    only a replaced log makes it reload.
 16. **Recovery to a point in time cuts at commit boundaries only.** Records
     written through the single-record mutators carry no sequence number and no
     timestamp, so a cut takes them with the commit that follows;
