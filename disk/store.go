@@ -965,7 +965,7 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 	stored.ID = id
 
 	// Serialise to WAL payload: id(8) + labelCount(1) + labels(2*N) + propLen(4) + props
-	if err := s.wal.AppendNode(marshalNode(stored)); err != nil {
+	if err := s.wal.appendNodeOwned(stored); err != nil {
 		return store.InvalidNodeID, fmt.Errorf("AddNode: wal: %w", err)
 	}
 
@@ -1111,7 +1111,7 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 	id := store.EdgeID(s.edgeSeq.Add(1))
 	stored.ID = id
 
-	if err := s.wal.AppendEdge(marshalEdge(stored)); err != nil {
+	if err := s.wal.appendEdgeOwned(stored); err != nil {
 		return store.InvalidEdgeID, fmt.Errorf("AddEdge: wal: %w", err)
 	}
 
@@ -1352,7 +1352,7 @@ func (s *Store) UpdateNode(n *store.Node) error {
 	}
 	// An edit is a fresh node record re-appended with the same ID; replay applies
 	// it as an upsert (last write wins).
-	if err := s.wal.AppendNode(marshalNode(stored)); err != nil {
+	if err := s.wal.appendNodeOwned(stored); err != nil {
 		return fmt.Errorf("UpdateNode: wal: %w", err)
 	}
 	if s.reindexPolicy == store.ReindexPurge {
@@ -1396,7 +1396,7 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 		copy(stored.Properties, e.Properties)
 	}
 
-	if err := s.wal.AppendEdge(marshalEdge(stored)); err != nil {
+	if err := s.wal.appendEdgeOwned(stored); err != nil {
 		return fmt.Errorf("UpdateEdge: wal: %w", err)
 	}
 	if s.reindexPolicy == store.ReindexPurge {
@@ -1809,8 +1809,7 @@ func (s *Store) IndexNodeProperty(id store.NodeID, key string, value []byte) err
 		return err
 	}
 	s.propIdx.IndexNode(id, key, value)
-	payload := marshalNodeProp(id, key, value)
-	if err := s.wal.AppendNodeProp(payload); err != nil {
+	if err := s.wal.appendNodePropOwned(id, key, value); err != nil {
 		return fmt.Errorf("IndexNodeProperty: wal: %w", err)
 	}
 	return nil
@@ -1821,8 +1820,7 @@ func (s *Store) IndexEdgeProperty(id store.EdgeID, key string, value []byte) err
 		return err
 	}
 	s.propIdx.IndexEdge(id, key, value)
-	payload := marshalEdgeProp(id, key, value)
-	if err := s.wal.AppendEdgeProp(payload); err != nil {
+	if err := s.wal.appendEdgePropOwned(id, key, value); err != nil {
 		return fmt.Errorf("IndexEdgeProperty: wal: %w", err)
 	}
 	return nil

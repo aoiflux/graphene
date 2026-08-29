@@ -49,7 +49,13 @@ func (s *Store) putNode(epoch uint64, n *store.Node) {
 	d.nodes[n.ID] = head
 
 	s.indexNodeLabels(d, n.ID, n.Labels)
-	ensureAdj(d, n.ID)
+	// No adjacency entry is created here. An empty one is indistinguishable from
+	// an absent one to every reader — deltaEdgeIDs and degree both treat a nil
+	// entry as no edges, and the two passes that iterate d.adj only ever read
+	// a.out and a.in — so seeding one per node bought an allocation and a map
+	// insert on every write in exchange for nothing observable. The edge paths
+	// create the entry when there is an edge to put in it, which is the only
+	// moment it carries information.
 }
 
 // putEdge stacks a live version of e at epoch.

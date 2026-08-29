@@ -786,7 +786,7 @@ func (s *Store) RedactNodeProperties(id store.NodeID, req RedactionRequest) (Red
 		return RedactionRecord{}, err
 	}
 
-	if err := s.wal.AppendNode(marshalNode(stripped)); err != nil {
+	if err := s.wal.appendNodeOwned(stripped); err != nil {
 		return rec, fmt.Errorf("disk: redaction %d was recorded but the rewrite failed: %w", rec.Seq, err)
 	}
 
@@ -866,7 +866,7 @@ func (s *Store) RedactEdgeProperties(id store.EdgeID, req RedactionRequest) (Red
 		return RedactionRecord{}, err
 	}
 
-	if err := s.wal.AppendEdge(marshalEdge(stripped)); err != nil {
+	if err := s.wal.appendEdgeOwned(stripped); err != nil {
 		return rec, fmt.Errorf("disk: redaction %d was recorded but the rewrite failed: %w", rec.Seq, err)
 	}
 	// Unconditional, for the same reason as the node form: the property index

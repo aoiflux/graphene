@@ -45,6 +45,48 @@ func appendMarshalledNode(dst []byte, n *store.Node) []byte {
 	return dst
 }
 
+// marshalledNodeSize is the exact byte count appendMarshalledNode will write.
+//
+// It sits next to that function on purpose, and TestMarshalledSizesAreExact
+// pins the pair: a size that under-reports costs a reallocation, but one that
+// silently drifts from the encoding would size every WAL buffer wrongly, and
+// the two are edited together or not at all.
+func marshalledNodeSize(n *store.Node) int {
+	return nodePayloadLabelStart +
+		currentLabelBytesPerValue*len(n.Labels) +
+		nodePayloadPropLenBytes +
+		len(n.Properties)
+}
+
+// marshalledEdgeSize is marshalledNodeSize for edges.
+func marshalledEdgeSize(e *store.Edge) int {
+	return edgePayloadLabelStart +
+		currentLabelBytesPerValue*len(e.Labels) +
+		edgePayloadTailFixedSize +
+		len(e.Properties)
+}
+
+// marshalledPropSize is the exact byte count marshalNodeProp and
+// marshalEdgeProp write; the two encodings are identical in shape.
+func marshalledPropSize(key string, value []byte) int {
+	return 8 + 2 + len(key) + 4 + len(value)
+}
+
+// appendMarshalledProp writes a property index entry onto dst:
+// id(8) keyLen(2) key valLen(4) val. This is marshalNodeProp and
+// marshalEdgeProp without the intermediate buffer.
+func appendMarshalledProp(dst []byte, id uint64, key string, value []byte) []byte {
+	var hdr [10]byte
+	binary.LittleEndian.PutUint64(hdr[0:8], id)
+	binary.LittleEndian.PutUint16(hdr[8:10], uint16(len(key)))
+	dst = append(dst, hdr[:]...)
+	dst = append(dst, key...)
+	var vl [4]byte
+	binary.LittleEndian.PutUint32(vl[:], uint32(len(value)))
+	dst = append(dst, vl[:]...)
+	return append(dst, value...)
+}
+
 // appendMarshalledEdge is appendMarshalledNode for edges.
 func appendMarshalledEdge(dst []byte, e *store.Edge) []byte {
 	labelCount := len(e.Labels)

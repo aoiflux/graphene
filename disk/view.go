@@ -229,7 +229,7 @@ func (l *deltaLayer) since(epoch uint64, csr *CSRGraph) (*deltaLayer, int64) {
 		}
 		out.liveNodes++
 		appendNodeLabels(out, id, ver.node.Labels)
-		ensureAdj(out, id)
+		// No adjacency entry for a bare node; see putNode.
 	}
 
 	for id, ver := range l.edges {

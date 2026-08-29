@@ -1121,6 +1121,118 @@ func (w *WAL) append(recType byte, payload []byte) error {
 	return nil
 }
 
+// The owned-frame append path: one allocation to write one record.
+//
+// The ordinary append path allocates three times. The caller marshals a payload
+// into a fresh buffer; append copies it, because a caller may reuse the slice it
+// passed; and writeRecord allocates the framed buffer and copies into that
+// again. Every single-record call site in this package marshals a temporary and
+// drops it immediately, so two of those three allocations defend against a
+// caller that does not exist.
+//
+// These methods frame straight into one buffer and hand the ring sole ownership
+// of it. The bytes are identical to writeRecord's — same header, same payload,
+// same CRC over the same bytes — and the record is enqueued raw because it is
+// already framed, which is the path QueueBatch has always taken for batches.
+//
+// They are written out one per record type rather than sharing a marshalling
+// callback. That is a readability choice, not a measured one: the callback form
+// was written first and profiled identically, because the marshalling closure
+// does not escape here. An earlier version of this comment claimed the callback
+// cost an allocation. It does not, and the claim is removed rather than left to
+// be inherited by whoever next tries to share these four bodies.
+
+// beginAppend runs the preconditions every append shares and joins the
+// in-flight set. On a nil error the caller must pair it with
+// defer w.inFlight.Add(-1).
+func (w *WAL) beginAppend() error {
+	if w.readOnly {
+		return errWALReadOnly
+	}
+	if w.closed.Load() != 0 {
+		return fmt.Errorf("wal append: closed")
+	}
+	if !w.enterAppend() {
+		return fmt.Errorf("wal append: closed")
+	}
+	return nil
+}
+
+// beginFrame opens a record frame sized for its payload in one allocation. The
+// length field is left zero and patched by finishFrame from the bytes actually
+// written, so a wrong size costs a growth and never a wrong header.
+func (w *WAL) beginFrame(recType byte, payloadSize int) []byte {
+	buf := make([]byte, walHeaderSize, walHeaderSize+payloadSize+walFooterSize)
+	buf[0] = recType
+	return buf
+}
+
+// finishFrame patches the length and appends the CRC footer.
+func (w *WAL) finishFrame(recType byte, buf []byte) []byte {
+	payload := buf[walHeaderSize:]
+	binary.LittleEndian.PutUint32(buf[1:walHeaderSize], uint32(len(payload)))
+	var crc [walFooterSize]byte
+	binary.LittleEndian.PutUint32(crc[:], recordCRC(w.framing, recType, payload))
+	return append(buf, crc[:]...)
+}
+
+// enqueueFrame hands an already-framed, caller-owned record to the ring.
+func (w *WAL) enqueueFrame(recType byte, frame []byte) error {
+	if _, err := w.enqueue(recType, true, frame); err != nil {
+		return err
+	}
+	if w.writeMu.TryLock() {
+		err := w.drainQueuedLocked()
+		w.writeMu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// appendNodeOwned writes n as a single framed record with no intermediate
+// payload buffer and no defensive copy.
+func (w *WAL) appendNodeOwned(n *store.Node) error {
+	if err := w.beginAppend(); err != nil {
+		return err
+	}
+	defer w.inFlight.Add(-1)
+	buf := appendMarshalledNode(w.beginFrame(walRecordNode, marshalledNodeSize(n)), n)
+	return w.enqueueFrame(walRecordNode, w.finishFrame(walRecordNode, buf))
+}
+
+// appendEdgeOwned is appendNodeOwned for edges.
+func (w *WAL) appendEdgeOwned(e *store.Edge) error {
+	if err := w.beginAppend(); err != nil {
+		return err
+	}
+	defer w.inFlight.Add(-1)
+	buf := appendMarshalledEdge(w.beginFrame(walRecordEdge, marshalledEdgeSize(e)), e)
+	return w.enqueueFrame(walRecordEdge, w.finishFrame(walRecordEdge, buf))
+}
+
+// appendNodePropOwned writes a node property index entry with no intermediate
+// payload buffer.
+func (w *WAL) appendNodePropOwned(id store.NodeID, key string, value []byte) error {
+	if err := w.beginAppend(); err != nil {
+		return err
+	}
+	defer w.inFlight.Add(-1)
+	buf := appendMarshalledProp(w.beginFrame(walRecordNodeProp, marshalledPropSize(key, value)), uint64(id), key, value)
+	return w.enqueueFrame(walRecordNodeProp, w.finishFrame(walRecordNodeProp, buf))
+}
+
+// appendEdgePropOwned is appendNodePropOwned for edges.
+func (w *WAL) appendEdgePropOwned(id store.EdgeID, key string, value []byte) error {
+	if err := w.beginAppend(); err != nil {
+		return err
+	}
+	defer w.inFlight.Add(-1)
+	buf := appendMarshalledProp(w.beginFrame(walRecordEdgeProp, marshalledPropSize(key, value)), uint64(id), key, value)
+	return w.enqueueFrame(walRecordEdgeProp, w.finishFrame(walRecordEdgeProp, buf))
+}
+
 // writeRecord serialises and writes one WAL record. Must hold w.mu.
 func (w *WAL) writeRecord(recType byte, payload []byte) error {
 	length := uint32(len(payload))

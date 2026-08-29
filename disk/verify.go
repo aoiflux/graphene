@@ -320,7 +320,8 @@ func (s *Store) RebuildIndexesCtx(ctx context.Context) error {
 	d.adj = make(map[store.NodeID]*deltaAdj, len(d.adj))
 
 	for id, ver := range d.nodes {
-		ensureAdj(d, id)
+		// No adjacency entry for a bare node; see putNode. The edge pass below
+		// creates one wherever an edge needs it.
 		for cur := ver; cur != nil; cur = cur.prev {
 			if cur.node != nil {
 				s.indexNodeLabels(d, id, cur.node.Labels)

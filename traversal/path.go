@@ -69,29 +69,41 @@ func ShortestPathCtx(ctx context.Context, g store.GraphReader, src, dst store.No
 	fwdFrontier := []store.NodeID{src}
 	bwdFrontier := []store.NodeID{dst}
 
+	// Two buffers per direction, swapped at every level, rather than a fresh
+	// slice grown from nil per level — the same shape BFSCtx uses and for the
+	// same reason. expandAndAdvance appends into the spare and returns it; the
+	// frontier it just consumed becomes the next spare, so after the widest
+	// level neither buffer allocates again. Growing from nil instead made this
+	// the single largest allocation site in the engine: 590k of the 789k
+	// allocations in BenchmarkShortestPath, 75% of the whole benchmark.
+	//
+	// The two directions keep separate spares. Sharing one would alias the
+	// frontier the other half is still reading.
+	var fwdSpare, bwdSpare []store.NodeID
+
 	meetNode := store.InvalidNodeID
 
 	for len(fwdFrontier) > 0 && len(bwdFrontier) > 0 {
 		var nextFwd []store.NodeID
 		var err error
-		meetNode, nextFwd, err = expandAndAdvance(w, &guard, fwdFrontier, fwdVisited, bwdVisited, edgeTypes)
+		meetNode, nextFwd, err = expandAndAdvance(w, &guard, fwdSpare[:0], fwdFrontier, fwdVisited, bwdVisited, edgeTypes)
 		if err != nil {
 			return nil, err
 		}
 		if meetNode != store.InvalidNodeID {
 			break
 		}
-		fwdFrontier = nextFwd
+		fwdFrontier, fwdSpare = nextFwd, fwdFrontier
 
 		var nextBwd []store.NodeID
-		meetNode, nextBwd, err = expandAndAdvance(w, &guard, bwdFrontier, bwdVisited, fwdVisited, edgeTypes)
+		meetNode, nextBwd, err = expandAndAdvance(w, &guard, bwdSpare[:0], bwdFrontier, bwdVisited, fwdVisited, edgeTypes)
 		if err != nil {
 			return nil, err
 		}
 		if meetNode != store.InvalidNodeID {
 			break
 		}
-		bwdFrontier = nextBwd
+		bwdFrontier, bwdSpare = nextBwd, bwdFrontier
 	}
 
 	if meetNode == store.InvalidNodeID {
@@ -104,15 +116,20 @@ func ShortestPathCtx(ctx context.Context, g store.GraphReader, src, dst store.No
 // expandAndAdvance advances the BFS frontier by one level, records newly-visited
 // nodes in myVisited (with parent/edge provenance), and checks for intersection
 // with otherVisited. Returns the meeting node (or InvalidNodeID) and the next frontier.
+//
+// next is the caller's buffer, already truncated to zero length, and must not
+// alias frontier — this level's output is written while this level's input is
+// still being read. The returned slice is the caller's to keep; see the swap in
+// ShortestPathCtx.
 func expandAndAdvance(
 	w *walker,
 	guard *guard,
+	next []store.NodeID,
 	frontier []store.NodeID,
 	myVisited map[store.NodeID]visitEntry,
 	otherVisited map[store.NodeID]visitEntry,
 	edgeTypes []store.EdgeType,
 ) (store.NodeID, []store.NodeID, error) {
-	var next []store.NodeID
 	for _, id := range frontier {
 		if err := guard.step(); err != nil {
 			return store.InvalidNodeID, nil, err
@@ -155,38 +172,51 @@ func reconstructPath(
 	meet store.NodeID,
 	fwd, bwd map[store.NodeID]visitEntry,
 ) (*PathResult, error) {
-	// Walk fwd from meet back to src, then reverse.
-	var fwdIDs []store.NodeID
-	var fwdEdges []store.EdgeID
+	// Both chains are walked twice: once to count, once to fill. A parent-chain
+	// walk is map lookups over a path that is short by construction — the search
+	// stopped the moment the two frontiers met — so counting costs far less than
+	// the growth it removes. This assembled six slices by appending to nil and
+	// then concatenated two of them; it now allocates each exactly once.
+	//
+	// The counting loops mirror the filling loops condition for condition, which
+	// is the point: a count derived some other way could disagree with the walk,
+	// and the failure would be a silently truncated path rather than an error.
+	fwdN, fwdE := fwdChainLen(fwd, meet)
+	bwdN := bwdChainLen(bwd, meet)
+
+	allIDs := make([]store.NodeID, fwdN, fwdN+bwdN)
+	allEdges := make([]store.EdgeID, fwdE, fwdE+bwdN)
+
+	// Forward half: meet back to src, written back-to-front so the result is in
+	// src→meet order without a separate reversing pass.
+	i, j := fwdN, fwdE
 	for cur := meet; cur != store.InvalidNodeID; {
-		fwdIDs = append(fwdIDs, cur)
+		i--
+		allIDs[i] = cur
 		v := fwd[cur]
 		if v.edge != store.InvalidEdgeID {
-			fwdEdges = append(fwdEdges, v.edge)
+			j--
+			allEdges[j] = v.edge
 		}
 		cur = v.parent
 	}
-	reverseNodeIDs(fwdIDs)
-	reverseEdgeIDs(fwdEdges)
 
-	// Walk bwd from meet to dst (skip meet itself).
-	var bwdIDs []store.NodeID
-	var bwdEdges []store.EdgeID
+	// Backward half: meet to dst, already in order, skipping meet itself.
 	for cur := meet; cur != store.InvalidNodeID; {
 		v := bwd[cur]
 		if v.edge != store.InvalidEdgeID {
-			bwdEdges = append(bwdEdges, v.edge)
-			bwdIDs = append(bwdIDs, v.parent)
+			allEdges = append(allEdges, v.edge)
+			allIDs = append(allIDs, v.parent)
 		}
 		cur = v.parent
 	}
 
-	allIDs := append(fwdIDs, bwdIDs...)
-	allEdges := append(fwdEdges, bwdEdges...)
-
 	// Records are materialised only now, for the path itself — not for the far
 	// larger set of nodes the bidirectional search had to touch to find it.
-	result := &PathResult{}
+	result := &PathResult{
+		Nodes: make([]*store.Node, 0, len(allIDs)),
+		Edges: make([]*store.Edge, 0, len(allEdges)),
+	}
 	for _, id := range allIDs {
 		n, err := g.GetNode(id)
 		if err != nil {
@@ -204,14 +234,31 @@ func reconstructPath(
 	return result, nil
 }
 
-func reverseNodeIDs(s []store.NodeID) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
+// fwdChainLen counts what reconstructPath's forward walk will emit. Its loop is
+// that walk's loop with the appends removed — deliberately, so the two cannot
+// drift into disagreeing about the length of the same chain.
+func fwdChainLen(m map[store.NodeID]visitEntry, meet store.NodeID) (nodes, edges int) {
+	for cur := meet; cur != store.InvalidNodeID; {
+		nodes++
+		v := m[cur]
+		if v.edge != store.InvalidEdgeID {
+			edges++
+		}
+		cur = v.parent
 	}
+	return nodes, edges
 }
 
-func reverseEdgeIDs(s []store.EdgeID) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
+// bwdChainLen is fwdChainLen for the backward walk, which contributes a node
+// only where it contributes an edge — so one count serves for both.
+func bwdChainLen(m map[store.NodeID]visitEntry, meet store.NodeID) int {
+	n := 0
+	for cur := meet; cur != store.InvalidNodeID; {
+		v := m[cur]
+		if v.edge != store.InvalidEdgeID {
+			n++
+		}
+		cur = v.parent
 	}
+	return n
 }
