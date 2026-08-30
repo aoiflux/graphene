@@ -744,7 +744,6 @@ func (tx *Tx) commitFallback() error {
 			// tells a caller which backends take this path.
 			err = fmt.Errorf("%s is not supported on %T, which does not implement store.Transactor",
 				op.Kind, tx.g.GraphStore)
-		
 
 		default:
 			err = fmt.Errorf("unknown op kind %d", op.Kind)

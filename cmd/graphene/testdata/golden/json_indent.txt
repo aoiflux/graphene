@@ -9,7 +9,7 @@ exit 0
   "target": "fx",
   "data": {
     "detail": {
-      "file": "fx/\graphene.csr",
+      "file": "fx/graphene.csr",
       "size": "663 bytes",
       "format": "v8",
       "nodes": 5,

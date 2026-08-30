@@ -1,0 +1,18 @@
+# Line endings, stated rather than left to each contributor's git config.
+#
+# Without this file git translates text to CRLF on a Windows checkout, and the
+# golden corpus in cmd/graphene/testdata/golden is compared byte for byte
+# against output the CLI writes with LF. Every case in TestGoldenOutput then
+# fails on windows-latest with a diff that looks identical when printed, which
+# is the worst kind of red: correct code, unreadable failure.
+#
+# text=auto still detects binary content and leaves it alone, so fixtures and
+# fuzz corpora are unaffected.
+* text=auto eol=lf
+
+# Shell scripts must keep LF wherever they run: a CRLF shebang line makes the
+# kernel look for an interpreter named "sh\r".
+*.sh text eol=lf
+
+# PowerShell is content either way; pinned so the two runners match.
+*.ps1 text eol=lf

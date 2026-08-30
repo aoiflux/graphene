@@ -181,7 +181,13 @@ jobs:
           cache: true
 
       - name: Build every target
-        run: ./build.sh
+        # Invoked through `sh` rather than as ./build.sh. The script carries the
+        # executable bit in the index, but a Windows checkout cannot represent
+        # one on disk, so a commit made there can silently drop it — and the job
+        # then fails with "Permission denied" for a reason that has nothing to
+        # do with the build. Naming the interpreter costs nothing and cannot
+        # regress.
+        run: sh ./build.sh
 
       # Two builds of one commit must produce identical bytes. -trimpath and
       # -buildvcs=false are what make that true, and this is what proves they
@@ -189,7 +195,7 @@ jobs:
       # not a claim.
       - name: Reproducible
         run: |
-          DIST=dist2 ./build.sh >/dev/null
+          DIST=dist2 sh ./build.sh >/dev/null
           if ! diff dist/SHA256SUMS dist2/SHA256SUMS; then
             echo "the same commit built twice produced different binaries"
             exit 1

@@ -161,7 +161,14 @@ func TestGoldenOutput(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%v\nrun `go test ./cmd/graphene/ -run TestGoldenOutput -update` to create it", err)
 			}
-			if want := string(wantB); got != want {
+			// The corpus is recorded with LF, and the commands write LF on
+			// every platform. A checkout that translated the files to CRLF —
+			// which is what git does on Windows unless .gitattributes says
+			// otherwise — would fail every case in this file with a diff that
+			// looks byte-identical when printed. Normalising the golden costs
+			// nothing the corpus is here to protect: column alignment lives
+			// within a line, not at its end.
+			if want := strings.ReplaceAll(string(wantB), "\r\n", "\n"); got != want {
 				t.Errorf("output changed.\n"+
 					"If the change is intended, accept it with:\n"+
 					"  go test ./cmd/graphene/ -run TestGoldenOutput -update\n\n"+
@@ -235,8 +242,14 @@ func scrub(s string) string {
 	// Windows renders the operand with a backslash where POSIX renders a
 	// forward slash. The corpus is recorded with forward slashes so one set of
 	// files serves every platform in the CI matrix.
-	s = strings.ReplaceAll(s, `fx\`, "fx/")
+	//
+	// The escaped form has to go first. JSON renders the Windows separator as
+	// `fx\\`, so replacing `fx\` before it consumed the first backslash and
+	// left the second behind: the corpus was recorded holding `fx/\graphene.csr`,
+	// which no POSIX run can produce. Ordering the general case after the
+	// special one is what makes both platforms scrub to the same string.
 	s = strings.ReplaceAll(s, `fx\\`, "fx/")
+	s = strings.ReplaceAll(s, `fx\`, "fx/")
 	return s
 }
 
