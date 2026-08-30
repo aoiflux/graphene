@@ -44,6 +44,7 @@ var registry = []*Command{
 	nodeExplain,
 	nodeVerify,
 	nodeCreate,
+	nodeUpsert,
 	nodeDelete,
 
 	edgeGet,
@@ -54,6 +55,7 @@ var registry = []*Command{
 	edgeVerify,
 	edgeProvenance,
 	edgeCreate,
+	edgeUpsert,
 	edgeDelete,
 
 	// What shape it is.
@@ -115,6 +117,7 @@ var registry = []*Command{
 	debugHashCheck,
 	debugSignatureCheck,
 	debugIndexes,
+	debugUnique,
 	debugStats,
 	debugIntegrity,
 

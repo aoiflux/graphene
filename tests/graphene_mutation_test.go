@@ -72,6 +72,10 @@ func buildMutationFixture(t *testing.T, g *graphene.Graph) mutationIDs {
 // applyMutations runs an update/delete sequence exercised across all stores.
 func applyMutations(t *testing.T, g *graphene.Graph, ids mutationIDs) {
 	t.Helper()
+	// What this measures is that the two backends agree about what an update and
+	// a delete leave behind, index entries included. Under the v0.5.0 default the
+	// update is refused, which is agreement about something else.
+	g.SetReindexPolicy(store.ReindexKeep)
 
 	// Update a node's labels + properties.
 	if err := g.UpdateNode(&store.Node{ID: ids.art2, Labels: []store.NodeType{store.NodeTypeTag}, Properties: []byte("art-2-updated")}); err != nil {
@@ -307,6 +311,9 @@ func TestMutateCSRResidentEntities(t *testing.T) {
 	if err := g.Compact(); err != nil { // everything now lives in the CSR
 		t.Fatalf("compact: %v", err)
 	}
+	// The overlay paths are what this exercises, not index maintenance, so the
+	// update below stays a plain one under the pre-v0.5.0 policy.
+	g.SetReindexPolicy(store.ReindexKeep)
 
 	// Update a CSR-resident edge that is NOT incident to the node we delete, so we
 	// can assert the update survives. Then delete a CSR-resident node (cascades to

@@ -223,8 +223,10 @@ Scale validation covered by stress tests:
 ## Showcased Features
 
 - Full CRUD: add, get, update, and delete nodes and edges (cascade delete).
-- **Transactions**: `Begin()` commits creates, updates and deletes together —
-  atomic and durable, including a delete's edge cascade.
+- **Transactions**: `Begin()` commits creates, updates, deletes **and property-index
+  registrations** together — atomic and durable, including a delete's edge cascade.
+- **Idempotent ingest**: declare a property key unique, then `UpsertNode` on it.
+  Re-ingesting a source produces the same graph rather than a second copy of it.
 - Traversal toolkit: BFS, DFS, provenance chain, shortest path.
 - Query primitives: type lookups, property lookups, degree/connectivity checks.
 - Pattern discovery: scoped VF2-inspired subgraph matching.
@@ -429,8 +431,12 @@ res, _ := traversal.BFS(snap, origin, 3, store.DirectionBoth, nil)
 ```
 
 That fixes *reads*. `Begin()` is the other half: a multi-write transaction that
-is atomic and durable, but read-decide-write across a concurrent writer still
-needs your own serialisation.
+is atomic and durable. Read-decide-write across a concurrent writer still needs
+your own serialisation in general — with one exception that covers the case most
+callers actually hit. An upsert's key is resolved when you buffer it and
+**re-checked under the write lock at commit**, so two writers racing to create
+the same entity do not both succeed: the loser gets `store.ErrWriteConflict` and
+retries against what the winner wrote.
 
 Holding that line needed one fix worth naming: property lookups consulted the
 index without consulting the records, and the two are separate structures under
@@ -474,18 +480,30 @@ the storage layer. So updating an indexed entity needs a choice, and the API
 makes it explicit rather than silent:
 
 ```go
-// Preferred: update and re-register in one call. No stale entry for the old
-// value, no lost entry for the untouched ones.
+// Since v0.5.0 plain UpdateNode on an entity carrying index entries is REFUSED,
+// rather than silently leaving the index describing something the node is not:
+err := g.UpdateNode(n)   // *store.ErrIndexedPropertiesRequired
+
+// Say what happened to the entries instead. Either the whole set:
 _ = g.UpdateNodeIndexed(
     &store.Node{ID: artID, Labels: []store.NodeType{store.NodeTypeTag}},
-    map[string][]byte{"sha256": newHash},
+    map[string][]byte{"sha256": newHash},   // keys not listed are DROPPED
 )
 
-// Or pick a policy for plain UpdateNode / UpdateEdge:
-//   ReindexKeep  (default) — entries are kept, and therefore go stale
-//   ReindexPurge           — entries are dropped, including still-valid ones
-g.SetReindexPolicy(store.ReindexPurge)
+// ...or only the keys that moved, leaving everything else untouched:
+_ = g.UpdateNodePartialIndex(n, map[string][]byte{"state": []byte("analyzed")})
+
+// The old behaviours are still available, explicitly:
+//   ReindexKeep   — entries are kept, and therefore go stale (the pre-0.5.0 default)
+//   ReindexPurge  — entries are dropped, including still-valid ones
+g.SetReindexPolicy(store.ReindexKeep)
 ```
+
+Note that `ReindexPurge` was never the safe option — it drops the entity's
+*untouched* keys along with the stale one, trading a stale-entry bug for a
+missing-entry bug. Refusing is the only choice that loses nothing, and an entity
+with no index entries updates normally, so it costs nothing on a graph it could
+not hurt.
 
 Two maintenance calls back this up. `g.VerifyIndexes()` cross-checks every index
 against the records it describes — postings ordering, reverse-map agreement,
@@ -539,6 +557,27 @@ graphene node explain -prop size'>'1000 <dir>   how the planner resolves a query
 
 Property filters take seven operators: `k=v` equals, `k~v` contains, `k^v`
 prefix, `k>v`, `k>=v`, `k<v`, `k<=v`, and `k[lo:hi]` between-inclusive.
+
+**What goes into it, idempotently**
+
+```
+graphene node upsert -confirm -key k -value ver:9f3a -label EvidenceFile \
+    -index state=extracted <dir>
+graphene edge upsert -confirm -key ek -value 1:2:contains -src 1 -dst 2 \
+    -label Contains <dir>
+graphene debug unique -key k <dir>              can this key be a key?
+```
+
+`node create` run twice adds two nodes. `node upsert` run twice leaves one: it
+names the entity by a value under a unique property key rather than by an ID, so
+the second run finds the first run's node and replaces it — record and index
+entries in one transaction. `-index` keys not named keep the entries they had,
+so a state field can move without listing everything else to preserve it.
+
+`debug unique` is the declaration, run for its answer rather than its effect. A
+unique constraint is not persisted — it lives in the index of the process that
+declared it — but declaring *validates*, so this reports every value under the
+key that is held by more than one entity, which is the list a repair works from.
 
 **What shape it is**
 
@@ -656,6 +695,7 @@ arm64, static and reproducible:
 
 ## Docs
 
+- Release notes, including breaking changes: [CHANGELOG.md](CHANGELOG.md)
 - Easy usage guide: [USER_GUIDE.md](docs/USER_GUIDE.md)
 - Complete API reference: [API_REFERENCE.md](docs/API_REFERENCE.md)
 - Deep technical architecture and LLD:

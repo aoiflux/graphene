@@ -946,11 +946,12 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 	if err := s.mustWrite(); err != nil {
 		return store.InvalidNodeID, err
 	}
-	stored := &store.Node{}
-	if len(n.Labels) > 0 {
-		stored.Labels = make([]store.NodeType, len(n.Labels))
-		copy(stored.Labels, n.Labels)
+	if len(n.Labels) == 0 {
+		return store.InvalidNodeID, fmt.Errorf("AddNode: %w", store.ErrNoLabels)
 	}
+	stored := &store.Node{}
+	stored.Labels = make([]store.NodeType, len(n.Labels))
+	copy(stored.Labels, n.Labels)
 	if len(n.Properties) > 0 {
 		stored.Properties = make([]byte, len(n.Properties))
 		copy(stored.Properties, n.Properties)
@@ -984,6 +985,15 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 	if err := s.mustWrite(); err != nil {
 		return nil, err
+	}
+	// Labels are validated before the lock, and before any ID is taken. A
+	// rejection partway through the loop below would burn the IDs of the prefix
+	// it had already reached — permitted by the ID invariant, but pointless for
+	// a check that needs nothing from the store.
+	for i, n := range nodes {
+		if len(n.Labels) == 0 {
+			return nil, fmt.Errorf("AddNodesBatch: node %d: %w", i, store.ErrNoLabels)
+		}
 	}
 	ids := make([]store.NodeID, len(nodes))
 	stored := make([]*store.Node, len(nodes))
@@ -1081,15 +1091,16 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 	if err := s.mustWrite(); err != nil {
 		return store.InvalidEdgeID, err
 	}
+	if len(e.Labels) == 0 {
+		return store.InvalidEdgeID, fmt.Errorf("AddEdge: %w", store.ErrNoLabels)
+	}
 	stored := &store.Edge{
 		Src:    e.Src,
 		Dst:    e.Dst,
 		Weight: e.Weight,
 	}
-	if len(e.Labels) > 0 {
-		stored.Labels = make([]store.EdgeType, len(e.Labels))
-		copy(stored.Labels, e.Labels)
-	}
+	stored.Labels = make([]store.EdgeType, len(e.Labels))
+	copy(stored.Labels, e.Labels)
 	if len(e.Properties) > 0 {
 		stored.Properties = make([]byte, len(e.Properties))
 		copy(stored.Properties, e.Properties)
@@ -1127,6 +1138,14 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	if err := s.mustWrite(); err != nil {
 		return nil, err
+	}
+	// Labels first, outside the lock: unlike endpoint validity, an empty label
+	// set is a property of the argument and cannot change under a concurrent
+	// writer, so there is nothing to gain by checking it under the lock.
+	for i, e := range edges {
+		if len(e.Labels) == 0 {
+			return nil, fmt.Errorf("AddEdgesBatch: edge %d: %w", i, store.ErrNoLabels)
+		}
 	}
 	ids := make([]store.EdgeID, len(edges))
 	stored := make([]*store.Edge, len(edges))
@@ -1266,6 +1285,72 @@ func (s *Store) OrderedNodeProperties() []string { return s.index().OrderedNodeK
 // OrderedEdgeProperties implements store.OrderedIndexDeclarer.
 func (s *Store) OrderedEdgeProperties() []string { return s.index().OrderedEdgeKeys() }
 
+// DeclareUniqueNodeProperty implements store.UniqueIndexDeclarer.
+//
+// The store lock is held across the whole validation, so nothing can create a
+// second holder of a value between the check finding one and the declaration
+// taking effect.
+func (s *Store) DeclareUniqueNodeProperty(key string) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conflicts := s.propIdx.DeclareUniqueNodeKey(key, s.nodeExistsLocked)
+	if len(conflicts) > 0 {
+		return &store.UniqueViolationsError{Kind: "node", Key: key, Conflicts: conflicts}
+	}
+	return nil
+}
+
+// DeclareUniqueEdgeProperty implements store.UniqueIndexDeclarer.
+func (s *Store) DeclareUniqueEdgeProperty(key string) error {
+	if err := s.mustWrite(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conflicts := s.propIdx.DeclareUniqueEdgeKey(key, s.edgeExistsLocked)
+	if len(conflicts) > 0 {
+		return &store.UniqueViolationsError{Kind: "edge", Key: key, Conflicts: conflicts}
+	}
+	return nil
+}
+
+// UniqueNodeProperties implements store.UniqueIndexDeclarer.
+func (s *Store) UniqueNodeProperties() []string { return s.index().UniqueNodeKeys() }
+
+// UniqueEdgeProperties implements store.UniqueIndexDeclarer.
+func (s *Store) UniqueEdgeProperties() []string { return s.index().UniqueEdgeKeys() }
+
+// UniqueNodeOwner implements store.UniqueIndexDeclarer.
+func (s *Store) UniqueNodeOwner(key string, value []byte) (store.NodeID, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.propIdx.IsUniqueNodeKey(key) {
+		return store.InvalidNodeID, false, fmt.Errorf("%w: %q", store.ErrKeyNotUnique, key)
+	}
+	owner, held := s.propIdx.NodeUniqueOwner(key, value)
+	if !held || !s.nodeExistsLocked(owner) {
+		return store.InvalidNodeID, false, nil
+	}
+	return owner, true, nil
+}
+
+// UniqueEdgeOwner implements store.UniqueIndexDeclarer.
+func (s *Store) UniqueEdgeOwner(key string, value []byte) (store.EdgeID, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.propIdx.IsUniqueEdgeKey(key) {
+		return store.InvalidEdgeID, false, fmt.Errorf("%w: %q", store.ErrKeyNotUnique, key)
+	}
+	owner, held := s.propIdx.EdgeUniqueOwner(key, value)
+	if !held || !s.edgeExistsLocked(owner) {
+		return store.InvalidEdgeID, false, nil
+	}
+	return owner, true, nil
+}
+
 // DeclareCompositeNodeProperties implements store.CompositeIndexDeclarer.
 func (s *Store) DeclareCompositeNodeProperties(keys []string) error {
 	if err := s.mustWrite(); err != nil {
@@ -1334,7 +1419,7 @@ func (s *Store) UpdateNode(n *store.Node) error {
 		return err
 	}
 	if len(n.Labels) == 0 {
-		return fmt.Errorf("UpdateNode: node %d must carry at least one label", n.ID)
+		return fmt.Errorf("UpdateNode: node %d: %w", n.ID, store.ErrNoLabels)
 	}
 
 	stored := &store.Node{ID: n.ID}
@@ -1349,6 +1434,11 @@ func (s *Store) UpdateNode(n *store.Node) error {
 	defer s.mu.Unlock()
 	if !s.nodeExistsLocked(n.ID) {
 		return &store.ErrNotFound{Kind: "node", ID: uint64(n.ID)}
+	}
+	// The refusal has to happen before the log is touched: an update whose
+	// record is already appended cannot be taken back by returning an error.
+	if s.reindexPolicy == store.ReindexReject && s.propIdx.NodeHasEntries(n.ID) {
+		return fmt.Errorf("UpdateNode: node %d: %w", n.ID, store.ErrIndexedPropertiesRequired)
 	}
 	// An edit is a fresh node record re-appended with the same ID; replay applies
 	// it as an upsert (last write wins).
@@ -1371,7 +1461,7 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 		return err
 	}
 	if len(e.Labels) == 0 {
-		return fmt.Errorf("UpdateEdge: edge %d must carry at least one label", e.ID)
+		return fmt.Errorf("UpdateEdge: edge %d: %w", e.ID, store.ErrNoLabels)
 	}
 
 	s.mu.Lock()
@@ -1396,6 +1486,11 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 		copy(stored.Properties, e.Properties)
 	}
 
+	// The refusal has to happen before the log is touched: an update whose
+	// record is already appended cannot be taken back by returning an error.
+	if s.reindexPolicy == store.ReindexReject && s.propIdx.EdgeHasEntries(e.ID) {
+		return fmt.Errorf("UpdateEdge: edge %d: %w", e.ID, store.ErrIndexedPropertiesRequired)
+	}
 	if err := s.wal.appendEdgeOwned(stored); err != nil {
 		return fmt.Errorf("UpdateEdge: wal: %w", err)
 	}
@@ -1804,24 +1899,88 @@ func (s *Store) SetSyncOnCommit(v bool) {
 	s.mu.Unlock()
 }
 
+// checkPropKey rejects a key the record encoding cannot round-trip.
+//
+// A property-index record stores the key length in a uint16, so a longer key is
+// truncated on the way out and replays under a *different* key on the way back
+// in — the index and the log disagreeing about what was registered, which is the
+// one failure a journal exists to rule out. The bound is on the key only: value
+// lengths are a uint32 and are caller-encoded bytes by contract.
+func checkPropKey(key string) error {
+	if len(key) > maxPropKeyLen {
+		return fmt.Errorf("property key is %d bytes, limit is %d", len(key), maxPropKeyLen)
+	}
+	return nil
+}
+
 func (s *Store) IndexNodeProperty(id store.NodeID, key string, value []byte) error {
 	if err := s.mustWrite(); err != nil {
 		return err
 	}
-	s.propIdx.IndexNode(id, key, value)
-	if err := s.wal.appendNodePropOwned(id, key, value); err != nil {
-		return fmt.Errorf("IndexNodeProperty: wal: %w", err)
+	if err := checkPropKey(key); err != nil {
+		return fmt.Errorf("IndexNodeProperty: %w", err)
 	}
-	return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.indexNodePropertyLocked(id, key, value)
 }
 
 func (s *Store) IndexEdgeProperty(id store.EdgeID, key string, value []byte) error {
 	if err := s.mustWrite(); err != nil {
 		return err
 	}
-	s.propIdx.IndexEdge(id, key, value)
+	if err := checkPropKey(key); err != nil {
+		return fmt.Errorf("IndexEdgeProperty: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.indexEdgePropertyLocked(id, key, value)
+}
+
+// indexNodePropertyLocked journals then applies one property-index entry. Caller
+// must hold s.mu.
+//
+// Both halves of that sentence used to be false here: registration took no lock
+// at all, and applied to the index *before* appending to the log. A failed
+// append then returned an error having already registered the entry, leaving the
+// index holding something the log has never heard of — which the next open
+// silently drops. The four record mutators have always held s.mu across both
+// steps precisely so that WAL order matches apply order; index registration is
+// not exempt, and cannot be once a unique constraint has to decide whether a
+// value is already taken.
+func (s *Store) indexNodePropertyLocked(id store.NodeID, key string, value []byte) error {
+	// Uniqueness is checked before the append, not after: a refused entry must
+	// leave no record behind, and a record already in the log is not something a
+	// returned error can take back.
+	if s.propIdx.IsUniqueNodeKey(key) {
+		if owner, held := s.propIdx.NodeUniqueOwner(key, value); held && owner != id {
+			return &index.ErrUniqueTaken{Key: key, Value: value, Owner: uint64(owner)}
+		}
+	}
+	if err := s.wal.appendNodePropOwned(id, key, value); err != nil {
+		return fmt.Errorf("IndexNodeProperty: wal: %w", err)
+	}
+	// The checked form re-tests under the shard lock. The probe above is not
+	// redundant with it: this one runs before the log is touched, that one
+	// closes the window a probe cannot.
+	if err := s.propIdx.IndexNodeUnique(id, key, value); err != nil {
+		return err
+	}
+	return nil
+}
+
+// indexEdgePropertyLocked is indexNodePropertyLocked for edges.
+func (s *Store) indexEdgePropertyLocked(id store.EdgeID, key string, value []byte) error {
+	if s.propIdx.IsUniqueEdgeKey(key) {
+		if owner, held := s.propIdx.EdgeUniqueOwner(key, value); held && owner != id {
+			return &index.ErrUniqueTaken{Key: key, Value: value, Owner: uint64(owner)}
+		}
+	}
 	if err := s.wal.appendEdgePropOwned(id, key, value); err != nil {
 		return fmt.Errorf("IndexEdgeProperty: wal: %w", err)
+	}
+	if err := s.propIdx.IndexEdgeUnique(id, key, value); err != nil {
+		return err
 	}
 	return nil
 }

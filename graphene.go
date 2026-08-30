@@ -45,6 +45,7 @@ package graphene
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/memory"
@@ -363,6 +364,193 @@ func (g *Graph) OrderedProperties() (nodeKeys, edgeKeys []string) {
 	return d.OrderedNodeProperties(), d.OrderedEdgeProperties()
 }
 
+// DeclareUniqueProperty enforces that at most one live node holds any given
+// value under key, and validates that the graph already satisfies it.
+//
+// This is what turns an indexed value into a name. Without it, a natural key —
+// "ver:<sha256>", "perm:android.permission.INTERNET" — resolves to a set, and
+// re-ingesting the same source appends to that set instead of finding what is
+// already there. With it, NodeByProperty is total: a key names one node or none,
+// and UpsertNode can be written at all.
+//
+//	if err := g.DeclareUniqueProperty("k"); err != nil {
+//	    var v *store.UniqueViolationsError
+//	    if errors.As(err, &v) {
+//	        // v.Conflicts names every value held more than once
+//	    }
+//	}
+//
+// **Existing data is validated first, and every violation is reported**, not the
+// first — a caller declaring a constraint on a graph that has been running
+// without one is about to repair it, and one duplicate per pass is not a repair
+// a person can finish. Nothing is declared when the graph does not satisfy it.
+//
+// Declaring a key already declared is a no-op, so this belongs at every Open.
+// Declarations live in memory: unlike an ordered key, which is written into the
+// image at compaction, a unique key must be re-declared by each process that
+// opens the store. Declaring at Open is therefore not a convenience but the
+// contract.
+//
+// **Unlike the ordered and composite declarations, this returns an error on a
+// backend that cannot enforce it.** Those two are optimisations, and a store
+// that ignores one still answers every query correctly. This one is a promise
+// about what the graph can contain, and a store that quietly does not keep it
+// has given the caller the guarantee and none of the behaviour.
+func (g *Graph) DeclareUniqueProperty(key string) error {
+	d, ok := g.GraphStore.(store.UniqueIndexDeclarer)
+	if !ok {
+		return fmt.Errorf("DeclareUniqueProperty: %T cannot enforce unique properties", g.GraphStore)
+	}
+	return d.DeclareUniqueNodeProperty(key)
+}
+
+// DeclareUniqueEdgeProperty is DeclareUniqueProperty for edge properties.
+func (g *Graph) DeclareUniqueEdgeProperty(key string) error {
+	d, ok := g.GraphStore.(store.UniqueIndexDeclarer)
+	if !ok {
+		return fmt.Errorf("DeclareUniqueEdgeProperty: %T cannot enforce unique properties", g.GraphStore)
+	}
+	return d.DeclareUniqueEdgeProperty(key)
+}
+
+// UniqueProperties returns the node and edge property keys currently under a
+// unique constraint, each sorted.
+func (g *Graph) UniqueProperties() (nodeKeys, edgeKeys []string) {
+	d, ok := g.GraphStore.(store.UniqueIndexDeclarer)
+	if !ok {
+		return nil, nil
+	}
+	return d.UniqueNodeProperties(), d.UniqueEdgeProperties()
+}
+
+// UpsertNode creates or replaces the node identified by value under the
+// declared-unique property key, and reports whether it was created.
+//
+// This is the operation that makes re-ingesting a source safe. Run twice over
+// the same input it produces the same graph, where AddNode would produce two of
+// everything:
+//
+//	g.DeclareUniqueProperty("k")
+//	id, created, err := g.UpsertNode("k", []byte("ver:9f3a"),
+//	    &store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}, Properties: blob},
+//	    map[string][]byte{"state": []byte("extracted")})
+//
+// On a hit the node's labels and properties are replaced by n, and each key
+// named in props is *replaced* rather than added to: the superseded value stops
+// matching, which is what a field used as a pipeline work queue depends on.
+// Keys props does not name keep the entries they had, and the key entry is
+// registered for you, so props need not repeat it.
+//
+// An upsert therefore states what happens to the index, which is why the
+// ReindexPolicy — whose job is to decide that for an update that cannot know —
+// does not apply to it.
+//
+// The record and its index entries become durable together: this is one
+// transaction, so a crash cannot leave a node that its own key cannot find.
+//
+// key must be declared unique, or this returns store.ErrKeyNotUnique. For
+// several upserts and the edges between them, use Begin and Tx.UpsertNode, which
+// commits the lot as one unit.
+func (g *Graph) UpsertNode(key string, value []byte, n *store.Node, props map[string][]byte) (store.NodeID, bool, error) {
+	tx := g.Begin()
+	id, created := tx.UpsertNode(key, value, n, props)
+	if err := tx.Commit(); err != nil {
+		return store.InvalidNodeID, false, err
+	}
+	return id, created, nil
+}
+
+// UpsertEdge is UpsertNode for edges, keyed on a declared-unique edge property.
+//
+// Endpoints are immutable, so on a hit the existing edge keeps the Src and Dst
+// it was created with. An edge's unique value should therefore identify the pair
+// it connects — "<srcKey>:<dstKey>:<relation>" is the usual shape — because a
+// key that is stable while its endpoints are meant to move names two different
+// edges rather than one.
+func (g *Graph) UpsertEdge(key string, value []byte, e *store.Edge, props map[string][]byte) (store.EdgeID, bool, error) {
+	tx := g.Begin()
+	id, created := tx.UpsertEdge(key, value, e, props)
+	if err := tx.Commit(); err != nil {
+		return store.InvalidEdgeID, false, err
+	}
+	return id, created, nil
+}
+
+// NodeByProperty returns the single node holding value under key.
+//
+// It is NodesByProperty with the plural removed, which is only meaningful once
+// the key is unique — so it refuses on a key that is not declared, rather than
+// returning the first of several and letting the caller believe a constraint is
+// in force. A value no node holds is *store.ErrNotFound.
+func (g *Graph) NodeByProperty(key string, value []byte) (*store.Node, error) {
+	d, ok := g.GraphStore.(store.UniqueIndexDeclarer)
+	if !ok {
+		return nil, fmt.Errorf("NodeByProperty: %T cannot enforce unique properties", g.GraphStore)
+	}
+	if !slices.Contains(d.UniqueNodeProperties(), key) {
+		return nil, fmt.Errorf("NodeByProperty: node property %q is not declared unique", key)
+	}
+	ids, err := g.NodesByProperty(key, value)
+	if err != nil {
+		return nil, err
+	}
+	switch len(ids) {
+	case 0:
+		return nil, &store.ErrNotFound{Kind: "node", ID: 0}
+	case 1:
+		return g.GetNode(ids[0])
+	default:
+		// Reachable only if the constraint was declared and then violated, which
+		// no write path permits — so saying so is more useful than picking one.
+		return nil, &store.UniqueViolationsError{
+			Kind: "node", Key: key,
+			Conflicts: []store.UniqueConflict{{Value: value, IDs: nodeIDsToUint64(ids)}},
+		}
+	}
+}
+
+// EdgeByProperty is NodeByProperty for edges.
+func (g *Graph) EdgeByProperty(key string, value []byte) (*store.Edge, error) {
+	d, ok := g.GraphStore.(store.UniqueIndexDeclarer)
+	if !ok {
+		return nil, fmt.Errorf("EdgeByProperty: %T cannot enforce unique properties", g.GraphStore)
+	}
+	if !slices.Contains(d.UniqueEdgeProperties(), key) {
+		return nil, fmt.Errorf("EdgeByProperty: edge property %q is not declared unique", key)
+	}
+	ids, err := g.EdgesByProperty(key, value)
+	if err != nil {
+		return nil, err
+	}
+	switch len(ids) {
+	case 0:
+		return nil, &store.ErrNotFound{Kind: "edge", ID: 0}
+	case 1:
+		return g.GetEdge(ids[0])
+	default:
+		return nil, &store.UniqueViolationsError{
+			Kind: "edge", Key: key,
+			Conflicts: []store.UniqueConflict{{Value: value, IDs: edgeIDsToUint64(ids)}},
+		}
+	}
+}
+
+func nodeIDsToUint64(ids []store.NodeID) []uint64 {
+	out := make([]uint64, len(ids))
+	for i, id := range ids {
+		out[i] = uint64(id)
+	}
+	return out
+}
+
+func edgeIDsToUint64(ids []store.EdgeID) []uint64 {
+	out := make([]uint64, len(ids))
+	for i, id := range ids {
+		out[i] = uint64(id)
+	}
+	return out
+}
+
 // DeclareCompositeProperties builds and maintains a composite index over the
 // given node property keys, so that a query pinning all of them to values is
 // answered by one lookup instead of by driving from the most selective of them
@@ -463,13 +651,16 @@ func (g *Graph) SetReindexPolicy(p store.ReindexPolicy) {
 	}
 }
 
-// ReindexPolicy returns the configured policy, or store.ReindexKeep if the
-// backend does not support configuring one.
+// ReindexPolicy returns the configured policy, or the default if the backend
+// does not support configuring one.
+//
+// It used to report ReindexKeep for such a backend — naming a policy that was in
+// force nowhere, since a store with no Reindexer does not consult one.
 func (g *Graph) ReindexPolicy() store.ReindexPolicy {
 	if r, ok := g.GraphStore.(store.Reindexer); ok {
 		return r.ReindexPolicy()
 	}
-	return store.ReindexKeep
+	return store.ReindexReject
 }
 
 // UpdateNodeIndexed updates a node and replaces its property-index entries in
@@ -478,35 +669,80 @@ func (g *Graph) ReindexPolicy() store.ReindexPolicy {
 //
 // This is the correct way to edit a node whose properties are indexed. Plain
 // UpdateNode cannot maintain the index — the engine does not know how to decode
-// your Properties blob — so it either leaves stale entries behind or (under
-// store.ReindexPurge) drops entries that were still valid. Passing the full
-// desired index state here avoids both.
+// your Properties blob — so under ReindexReject, the default, it refuses; under
+// ReindexKeep it leaves stale entries behind, and under ReindexPurge it drops
+// entries that were still valid. Passing the desired index state here avoids all
+// three, because it is the one call that knows what the update did.
 //
-// Pass a nil or empty props map to update the node and leave it un-indexed.
+// props is the node's whole indexed state afterwards: **keys it does not mention
+// are dropped.** Use UpdateNodePartialIndex when only one field moved. Pass nil
+// to update the node and leave it un-indexed.
+//
+// The record and the entries are one transaction, so a crash cannot land one
+// without the other. Before v0.5.0 this was three separate calls that the
+// documentation described as atomic and that were not.
 func (g *Graph) UpdateNodeIndexed(n *store.Node, props map[string][]byte) error {
-	if err := g.UpdateNode(n); err != nil {
-		return err
-	}
-	if r, ok := g.GraphStore.(store.Reindexer); ok {
-		if err := r.PurgeNodeIndex(n.ID); err != nil {
-			return err
-		}
-	}
-	return g.IndexNodeProperties(n.ID, props)
+	tx := g.Begin()
+	tx.UpdateNodeIndexed(n, props)
+	return tx.Commit()
+}
+
+// UpdateNodePartialIndex updates a node and replaces the property-index entries
+// for the keys named in changed, leaving every other key as it was.
+//
+// This is what a state transition wants:
+//
+//	g.UpdateNodePartialIndex(n, map[string][]byte{"state": []byte("analyzed")})
+//
+// The node's natural key, and anything else it is indexed under, survive; the
+// named key stops matching its old value and starts matching the new one. The
+// alternative — enumerating every other key so UpdateNodeIndexed can put them
+// back — is how one of them eventually goes missing.
+func (g *Graph) UpdateNodePartialIndex(n *store.Node, changed map[string][]byte) error {
+	tx := g.Begin()
+	tx.UpdateNodePartialIndex(n, changed)
+	return tx.Commit()
 }
 
 // UpdateEdgeIndexed updates an edge and replaces its property-index entries in
 // one step. See UpdateNodeIndexed.
 func (g *Graph) UpdateEdgeIndexed(e *store.Edge, props map[string][]byte) error {
-	if err := g.UpdateEdge(e); err != nil {
-		return err
-	}
-	if r, ok := g.GraphStore.(store.Reindexer); ok {
-		if err := r.PurgeEdgeIndex(e.ID); err != nil {
-			return err
+	tx := g.Begin()
+	tx.UpdateEdgeIndexed(e, props)
+	return tx.Commit()
+}
+
+// UpdateEdgePartialIndex is UpdateNodePartialIndex for edges.
+func (g *Graph) UpdateEdgePartialIndex(e *store.Edge, changed map[string][]byte) error {
+	tx := g.Begin()
+	tx.UpdateEdgePartialIndex(e, changed)
+	return tx.Commit()
+}
+
+// reindexNode is the non-transactional fallback for a backend that cannot do
+// transactions: purge, then register. It is not atomic, which is what Tx.Atomic
+// reports and why both bundled backends never reach it.
+func (g *Graph) reindexNode(id store.NodeID, props map[string][]byte, partial bool) error {
+	if !partial {
+		if r, ok := g.GraphStore.(store.Reindexer); ok {
+			if err := r.PurgeNodeIndex(id); err != nil {
+				return err
+			}
 		}
 	}
-	return g.IndexEdgeProperties(e.ID, props)
+	return g.IndexNodeProperties(id, props)
+}
+
+// reindexEdge is reindexNode for edges.
+func (g *Graph) reindexEdge(id store.EdgeID, props map[string][]byte, partial bool) error {
+	if !partial {
+		if r, ok := g.GraphStore.(store.Reindexer); ok {
+			if err := r.PurgeEdgeIndex(id); err != nil {
+				return err
+			}
+		}
+	}
+	return g.IndexEdgeProperties(id, props)
 }
 
 // Snapshot returns a consistent read view of the graph.

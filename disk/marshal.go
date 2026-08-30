@@ -66,6 +66,10 @@ func marshalledEdgeSize(e *store.Edge) int {
 		len(e.Properties)
 }
 
+// maxPropKeyLen is the longest property key a property-index record can carry,
+// bounded by the uint16 the encoding below writes the key length into.
+const maxPropKeyLen = 1<<16 - 1
+
 // marshalledPropSize is the exact byte count marshalNodeProp and
 // marshalEdgeProp write; the two encodings are identical in shape.
 func marshalledPropSize(key string, value []byte) int {

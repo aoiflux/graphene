@@ -219,8 +219,13 @@ func mutationArgs(path string) []string {
 		return []string{"-node", "1", "-actor", "7", "-reason", "a test"}
 	case "node create":
 		return []string{"-label", "MicroArtefact", "-index", "sha256=cc33"}
+	case "node upsert":
+		return []string{"-key", "k", "-value", "v", "-label", "MicroArtefact"}
 	case "edge create":
 		return []string{"-src", "1", "-dst", "2", "-label", "Reuse"}
+	case "edge upsert":
+		return []string{"-key", "ek", "-value", "1:2:reuse", "-src", "1", "-dst", "2",
+			"-label", "Reuse"}
 	case "node delete":
 		return []string{"-id", "1"}
 	case "edge delete":

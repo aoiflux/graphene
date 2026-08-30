@@ -584,8 +584,21 @@ Index purges are resolved actions too. `Graph.UpdateNode` honours
 property-index entries that the non-transactional path removes, so the purge is
 framed and applied with everything else.
 
-*Scope:* property *indexing* is not transactional — `IndexNodeProperties` is a
-separate call and is not buffered. Index *cleanup* is, for the reason above.
+Index *registration* is a resolved action too, since v0.5.0. `Tx.IndexNodeProperties`
+buffers a `TxOpIndexNode`, which resolves to a `txActionIndexNode` carrying the
+entity and its entries **in sorted key order**, frames into `0x03`/`0x04` records
+inside the same batch, and applies at the same epoch as the topology. The record
+types and their replay predate transactions by several versions; what was missing
+was a way to put them between the begin and commit markers.
+
+Sorting is load-bearing rather than tidy. Framing and applying read the same
+list, and entries arrive as a map — so encounter order would make two identical
+transactions write different bytes, which is the property §12.1's compaction
+determinism rests on.
+
+*Scope:* what a transaction still cannot do is span two stores, and `Tx` remains
+a caller-side buffer with no read methods: a transaction does not see its own
+uncommitted writes, only resolution does (through `txView`).
 
 ### 5.2 Read path
 
@@ -832,12 +845,110 @@ property blob is opaque. So an update must state what happens to them.
 
 | Policy | Behaviour | Failure mode |
 |---|---|---|
-| `ReindexKeep` (default) | entries untouched | they go **stale** — the old value still matches |
+| `ReindexReject` (default, v0.5.0+) | an update to an entity carrying entries is refused | none: it produces no answer rather than a wrong one |
+| `ReindexKeep` (default before v0.5.0) | entries untouched | they go **stale** — the old value still matches |
 | `ReindexPurge` | entity's entries dropped | they are **lost**, including untouched keys |
 
-`UpdateNodeIndexed` / `UpdateEdgeIndexed` avoid both by updating the record and
-replacing its entries in one step. Purges are journalled (`0x07`/`0x08`) so
-replay cannot resurrect superseded values.
+**Why the default moved, and why it did not move to `ReindexPurge`.** The old
+default was a silently wrong answer that the query planner then trusted, and
+avoiding it required every caller to remember a second method name — a design in
+which forgetting produces no error and no symptom. `ReindexPurge` is not the safe
+alternative: it drops the entity's *untouched* keys along with the stale one, so
+it trades a stale-entry bug for a missing-entry bug, and a missing entry costs a
+query result rather than a query. Refusing is the only option that loses nothing,
+and it is scoped to entities that actually carry entries, so it costs nothing on
+a graph it could not hurt.
+
+The refusal is checked **before the log is touched** — an update whose record is
+already appended cannot be taken back by returning an error — and the same check
+runs in `resolveTransaction`, where it refuses the whole transaction.
+
+`UpdateNodeIndexed` / `UpdateEdgeIndexed` state the whole desired entry set;
+`UpdateNodePartialIndex` / `UpdateEdgePartialIndex` state only the keys that
+moved. Both are exempt from the reject, because both carry the record and the
+entries as one operation (`TxOpUpdateNodeIndexed`) and there is nothing left for
+a policy to decide. Purges are journalled (`0x07`/`0x08`) so replay cannot
+resurrect superseded values.
+
+**A partial re-index is still a whole rewrite.** The log has a purge record per
+entity and an add record per entry, and no per-key purge, so replacing one key
+means reading the entity's current entries through the reverse map
+(`PropertyIndex.NodeEntriesOf`), overlaying the named keys, and framing the
+result. That is a deliberate trade: a per-key purge would be a new record type,
+and a new record type is a log an older build cannot read (§4.3). A re-index that
+changes nothing frames nothing at all, which is what makes a re-ingest of
+unchanged data free.
+
+### 6.6 Unique keys
+
+A unique key is the promise that at most one live entity holds any given value
+under it. It is what lets a caller treat an indexed value as a name, and without
+it an upsert cannot be written at all: resolve-by-key is undefined when the key
+resolves to a set.
+
+**Nothing new is stored.** The hash postings already hold, per key, every
+distinct value with its posting list, so "this key is unique" is exactly "every
+value under it has one posting", and the owner of a value is that posting's
+single element. A separate structure would be a second thing that can disagree
+with the first, in a package whose entire verification story (§15, invariant 3)
+is that the forward and reverse maps agree.
+
+The declaration set lives on the **shard**, which needs no new lock and no lock
+ordering: shards are chosen by hashing the property key (§6.3), so a key and its
+uniqueness are in the same shard by construction. That is the same argument
+§6.4a makes for why a composite index cannot live in one.
+
+**Declaring validates.** `DeclareUniqueNodeKey` walks the key's values under the
+shard write lock and returns **every** value held by two or more live entities,
+declaring nothing if there are any. Reporting all of them rather than the first
+is the difference between a repair that is one script and a repair that is one
+pass per duplicate. Liveness is checked through a predicate the store supplies,
+which keeps `index` free of any notion of a record and closes the window a
+two-call shape would open — and it matters in practice, because a posting can
+outlive the entity it names while a snapshot pins an older view (§10.3).
+
+**Enforcement is check-then-insert inside one shard write lock**
+(`IndexNodeUnique`). Splitting it into ask-then-register would leave exactly the
+window the constraint exists to close, open to the concurrency the caller
+declared uniqueness in order to stop worrying about. Registering the value an
+entity already holds is not a conflict: that is the steady state an idempotent
+re-ingest arrives at, and the underlying insert is already a no-op for it.
+
+**Declarations are not persisted.** Ordered keys and composite tuples travel in
+the CSR image (`GORD`, `GCMP`); a unique key does not, and must be re-declared by
+each process that opens the store. That is a deliberate scope choice rather than
+an oversight: persisting it would mean a new image section, a version bump, and a
+hand-rolled binary reader owing a fuzz target. Re-declaring on every `Open` is
+free — the declaration is idempotent — and it re-validates the data, which is
+strictly more than a persisted flag would do.
+
+### 6.7 Upsert, and where the ID comes from
+
+The one genuinely hard part of an upsert here is not the key lookup; it is that
+`Tx` reserves IDs at **buffer time**, caller-side, with no lock (§5.1a), because
+that is what lets `AddEdge` name a node the store has not seen. An upsert cannot
+know at buffer time whether its key already exists without reading, and cannot
+re-map the ID at commit, because the edges the caller buffered next already point
+at it.
+
+So the early read is recorded rather than trusted. `TxOp.Expect` carries who held
+the key when the operation was buffered — the entity's own ID for an update, the
+invalid ID for a create — and resolution, which runs under the write lock,
+re-reads the key and compares. A mismatch means another writer took or removed
+the key in between, and there is nothing to repair from there, so the whole
+transaction is refused with `ErrWriteConflict` and the caller retries against
+what the winner wrote. A single-writer caller never sees it.
+
+That is optimistic concurrency control over exactly one predicate, and it is the
+write half of what a general read-set conflict check would give (§16, limitation
+9). The delta's per-record `nodeVersion.epoch` (§10.3) is the stamp a general
+form would read; nothing here forecloses it.
+
+**Two upserts of one key in one transaction are one entity.** The index cannot
+say so, because nothing has been registered there yet, so the claim is tracked in
+two places: `Tx.claimed`, so the second call returns the ID the first reserved,
+and `txView.claims`, so resolution sees the transaction's own pending
+registrations before the index's.
 
 ---
 
@@ -2318,7 +2429,7 @@ operator looking for corruption that is not there.
 #### The register, extended
 
 The command surface has since grown, and the writing half of it divides into
-three kinds rather than the one the paragraphs above describe. The distinction
+four kinds rather than the one the paragraphs above describe. The distinction
 that organises them is *what a confirmation could protect*.
 
 **Append-only.** `anchor add` records a checkpoint and its publication;
@@ -2345,6 +2456,33 @@ model of this tool is "it does not change my store", and a create is still a
 change to what the next query returns. The only thing they consume is ID space,
 which is not a loss: IDs are never reused, so a create later deleted leaves a
 gap and never a collision.
+
+**Replacing.** `node upsert` and `edge upsert` are the fourth kind, and the one
+the other three do not describe. They add a record when the key is new and
+replace one when it is not — so they can overwrite labels, properties and index
+entries that were already there, which is more than additive, while never
+removing an entity, which is less than destructive. They are behind `-confirm`
+for the same reason a create is.
+
+What makes replacement acceptable here is that it is the *point*: an ingest
+pipeline re-run over a source it has already seen must produce the same graph
+rather than a second copy of it, and there is no way for a shell to express
+"make sure this exists" through an ID it would have to have kept. Last-write-wins
+is what makes the re-run safe when the extraction improves. Keys given with
+`-index` are replaced; keys not named keep the entries they had, so a state field
+moves without the caller enumerating everything else to preserve it. `-index` may
+not name the key itself: registering it twice would move the entity's name in the
+same breath as using it.
+
+Both declare the key unique before writing anything, so a store that already
+holds two entities under one value is refused whole rather than added to, and the
+refusal names `debug unique` — which is the declaration run for its answer rather
+than its effect. That command writes nothing and still opens for writing, because
+declaring is refused on a read-only store: a store that cannot be written to can
+hold a constraint and never enforce it, which is the guarantee without the
+behaviour. Its notice says so. It runs the library's own declaration rather than
+counting postings itself, since a second implementation of uniqueness in the CLI
+would be a second thing that can disagree with the first.
 
 **Destructive.** `node delete`, `edge delete`, `redaction apply`,
 `maintenance compact` and `maintenance reindex`. These are the commands the gate
@@ -3196,6 +3334,15 @@ Any change must preserve these. Each is enforced by tests.
    handed out** (§5.3). Writes copy in; reads alias out. Both halves are load-
    bearing: the first makes it safe for a caller to reuse its buffers, the second
    is what makes reads independent of blob size.
+10. **Every node and every edge carries at least one label.** Enforced on every
+    add path, every update path and inside a transaction — the record layout
+    permits a label-less entity, and such an entity is invisible to `NodesByType`
+    and to every Types-filtered query while still being counted.
+11. **At most one live entity holds a given value under a declared-unique key**
+    (§6.6). Checked when the key is declared, and enforced check-then-insert
+    inside one shard lock on every registration thereafter.
+12. **A transaction's records and its index entries become visible together.**
+    One batch, one epoch (§5.1a).
 
 ---
 
@@ -3237,7 +3384,19 @@ Any change must preserve these. Each is enforced by tests.
    index, because it cannot read the blob.
 9. **A sequence of plain calls is not a transaction** (§10.1). `Snapshot()`
    gives a consistent read view (§10.3); it does not make a *write* sequence
-   atomic, which is what `Begin()` is for.
+   atomic, which is what `Begin()` is for. There is no general read-set conflict
+   detection either: `Tx` records no read set, so a transaction that decided
+   something from a read is not protected by anything. The one exception is an
+   upsert's key, which *is* re-checked under the write lock and refuses with
+   `ErrWriteConflict` (§6.7).
+9a. **Unique-key declarations do not survive a reopen.** Unlike ordered keys and
+   composite tuples, they are not written into the image, so each process that
+   opens the store must re-declare them. Declaring is idempotent and re-validates
+   the data, so the cost is one pass over the key's values at `Open` (§6.6).
+9b. **A unique constraint is not a uniqueness *index*.** It reuses the hash
+   postings rather than adding a structure, so it constrains registration and
+   answers `NodeByProperty` in one lookup, but it does not make anything faster
+   that was not already an equality lookup.
 10. **Pattern matching is unoptimised** (§8.3).
 11. **Memory-backend read concurrency is negative** past one core (§9.3).
 12. **Write scaling is bounded by a single WAL append point** — but no longer by

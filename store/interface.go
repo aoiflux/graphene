@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -137,19 +138,38 @@ type GraphStore interface {
 //
 // The store cannot re-derive index entries itself: indexed values are supplied
 // by the caller in the caller's own encoding (see IndexNodeProperty), and the
-// Properties blob is opaque to the storage layer. So the only two honest
-// options are to keep the old entries or to drop them, and each has a failure
-// mode the caller has to choose between.
+// Properties blob is opaque to the storage layer. So an update that is only
+// given the new record cannot know which entries it invalidated, and every
+// answer to that is wrong in some case. The policy chooses which way to be
+// wrong — or, by default, refuses the question.
 type ReindexPolicy uint8
 
 const (
-	// ReindexKeep leaves property-index entries untouched on update. This is the
-	// default and preserves historical behaviour.
+	// ReindexReject makes UpdateNode / UpdateEdge return
+	// ErrIndexedPropertiesRequired when the entity carries index entries. It is
+	// the default.
+	//
+	// Failure mode: none. It is the only option that cannot silently produce a
+	// wrong answer, because it produces no answer. An entity with no entries
+	// updates normally, so this costs nothing for the graphs it cannot hurt.
+	//
+	// Use UpdateNodeIndexed to replace the entries wholesale, or
+	// UpdateNodePartialIndex to replace only the keys that changed. Both know
+	// what the update did, which is the thing UpdateNode cannot.
+	//
+	// **This became the default in v0.5.0, replacing ReindexKeep.** The old
+	// default was a silently wrong answer that required every caller to remember
+	// a second method name, and a caller who forgot got a query result the
+	// planner trusted. Set ReindexKeep explicitly to restore it.
+	ReindexReject ReindexPolicy = iota
+
+	// ReindexKeep leaves property-index entries untouched on update. This was
+	// the default before v0.5.0.
 	//
 	// Failure mode: entries become STALE. A node whose indexed field changed is
 	// still returned by NodesByProperty for its old value, and the query planner
 	// trusts that answer. Callers must re-register changed fields themselves.
-	ReindexKeep ReindexPolicy = iota
+	ReindexKeep
 
 	// ReindexPurge drops all property-index entries for the updated entity, so
 	// the index can never report a value the entity no longer has.
@@ -157,11 +177,26 @@ const (
 	// Failure mode: entries are LOST. Updating a node drops index entries that
 	// were still accurate — including ones for fields the update did not touch —
 	// so queries silently return fewer results until the caller re-registers.
+	// This is not the safe option either; it is the other way of being wrong.
 	//
 	// Prefer UpdateNodeIndexed / UpdateEdgeIndexed, which purge and re-register
 	// in one step and therefore avoid both failure modes.
 	ReindexPurge
 )
+
+// String names the policy, for diagnostics.
+func (p ReindexPolicy) String() string {
+	switch p {
+	case ReindexReject:
+		return "reject"
+	case ReindexKeep:
+		return "keep"
+	case ReindexPurge:
+		return "purge"
+	default:
+		return "unknown"
+	}
+}
 
 // Reindexer is an optional extension implemented by stores that support
 // configuring how updates interact with the property index. Both bundled
@@ -300,6 +335,58 @@ type CompositeIndexDeclarer interface {
 	// CompositeEdgeProperties returns the declared edge key tuples.
 	CompositeEdgeProperties() [][]string
 }
+
+// UniqueIndexDeclarer is an optional extension implemented by stores that can
+// enforce at most one live entity per value under a property key.
+//
+// Unlike the ordered and composite declarers, a store that does not implement
+// this must not be treated as having silently accepted the declaration. Those
+// two are optimisations: a store ignoring them answers every query correctly,
+// only slower. This one is a constraint, and a store that quietly does not
+// enforce it hands the caller exactly the guarantee they asked for and none of
+// the behaviour — so Graph.DeclareUniqueProperty returns an error rather than
+// nil when the backend lacks it.
+type UniqueIndexDeclarer interface {
+	// DeclareUniqueNodeProperty enforces uniqueness on a node property key from
+	// this point on, after checking that the graph already satisfies it.
+	//
+	// Existing data is validated first, and a graph that violates the constraint
+	// is reported through *UniqueViolationsError naming every offending value —
+	// not the first — so it can be repaired in one pass. Nothing is declared in
+	// that case.
+	//
+	// Declaring a key already declared is a no-op, so this is safe to call on
+	// every Open. Declarations live in memory: like ordered keys, they must be
+	// re-declared by the process that opens the store.
+	DeclareUniqueNodeProperty(key string) error
+
+	// DeclareUniqueEdgeProperty is the edge-property equivalent.
+	DeclareUniqueEdgeProperty(key string) error
+
+	// UniqueNodeProperties returns the declared unique node keys, sorted.
+	UniqueNodeProperties() []string
+
+	// UniqueEdgeProperties returns the declared unique edge keys, sorted.
+	UniqueEdgeProperties() []string
+
+	// UniqueNodeOwner returns the live node holding value under key.
+	//
+	// It reports an error when key is not declared unique, because the answer
+	// would otherwise be "one of the nodes holding it", which is not a thing a
+	// caller can act on. found is false when no live node holds the value.
+	//
+	// Liveness matters here and not only pedantically: a posting can outlive the
+	// entity it names while a snapshot pins an older view, and an upsert that
+	// reused a dead node's ID would resurrect it.
+	UniqueNodeOwner(key string, value []byte) (id NodeID, found bool, err error)
+
+	// UniqueEdgeOwner is UniqueNodeOwner for edges.
+	UniqueEdgeOwner(key string, value []byte) (id EdgeID, found bool, err error)
+}
+
+// ErrKeyNotUnique is returned when an operation that needs a key to name at most
+// one entity is given a key with no unique declaration.
+var ErrKeyNotUnique = errors.New("graphene: property key is not declared unique")
 
 // IndexVerifier is an optional extension implemented by stores that can
 // self-check their indexes against the records those indexes describe.
@@ -803,6 +890,12 @@ const (
 	TxOpUpdateEdge
 	TxOpDeleteNode
 	TxOpDeleteEdge
+	TxOpIndexNode
+	TxOpIndexEdge
+	TxOpUpsertNode
+	TxOpUpsertEdge
+	TxOpUpdateNodeIndexed
+	TxOpUpdateEdgeIndexed
 )
 
 func (k TxOpKind) String() string {
@@ -819,6 +912,18 @@ func (k TxOpKind) String() string {
 		return "delete-node"
 	case TxOpDeleteEdge:
 		return "delete-edge"
+	case TxOpIndexNode:
+		return "index-node"
+	case TxOpIndexEdge:
+		return "index-edge"
+	case TxOpUpsertNode:
+		return "upsert-node"
+	case TxOpUpsertEdge:
+		return "upsert-edge"
+	case TxOpUpdateNodeIndexed:
+		return "update-node-indexed"
+	case TxOpUpdateEdgeIndexed:
+		return "update-edge-indexed"
 	default:
 		return "unknown"
 	}
@@ -827,13 +932,51 @@ func (k TxOpKind) String() string {
 // TxOp is one buffered operation in a transaction.
 //
 // Exactly one of the payload fields is meaningful, selected by Kind: Node for
-// the node operations, Edge for the edge operations, NodeID/EdgeID for deletes.
+// the node operations, Edge for the edge operations, NodeID/EdgeID for deletes
+// and for the index operations, which additionally carry Props.
 type TxOp struct {
 	Kind   TxOpKind
 	Node   *Node
 	Edge   *Edge
 	NodeID NodeID
 	EdgeID EdgeID
+
+	// Props carries the property-index entries for TxOpIndexNode and
+	// TxOpIndexEdge, registered against NodeID or EdgeID respectively.
+	//
+	// Entries are applied in sorted key order rather than map order. That is not
+	// a cosmetic choice: the operations are framed into the log in the order
+	// they are applied, and map iteration is randomised, so two identical
+	// transactions would otherwise produce different bytes.
+	Props map[string][]byte
+
+	// Key and Value are the declared-unique property and the value identifying
+	// the entity, for TxOpUpsertNode and TxOpUpsertEdge.
+	Key   string
+	Value []byte
+
+	// Expect is who held Key=Value when the operation was buffered — the
+	// entity's own ID for an update, InvalidNodeID / InvalidEdgeID for a create.
+	//
+	// It exists because an upsert has to hand back an ID immediately, so that
+	// the caller can name it in the edges it buffers next, which means resolving
+	// the key before the write lock is taken. Re-reading the key under the lock
+	// and comparing against this is what turns that early read from an
+	// assumption into a checked one: a mismatch means another writer took the
+	// key in between, and the transaction is refused with ErrWriteConflict
+	// rather than quietly creating a second entity.
+	Expect uint64
+
+	// Partial selects how TxOpUpdateNodeIndexed and TxOpUpdateEdgeIndexed treat
+	// keys Props does not mention: false replaces the entity's whole entry set
+	// with Props, true leaves unmentioned keys as they are.
+	//
+	// The two exist because both are honest answers to different questions.
+	// "Here is everything this entity is indexed under" is what a re-ingest
+	// knows; "this one field moved" is what a state transition knows, and making
+	// the second caller enumerate the first's answer is how an untouched key
+	// gets dropped by accident.
+	Partial bool
 }
 
 // Syncer is implemented by stores that can force pending writes to durable

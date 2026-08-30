@@ -53,6 +53,11 @@ type plannerFixture struct {
 
 func buildPlannerFixture(t *testing.T, g *graphene.Graph, compactMidway bool) *plannerFixture {
 	t.Helper()
+	// The fixture updates indexed nodes with plain UpdateNode, and the stale
+	// entries that leaves are part of what the planner is being asked to survive.
+	// The v0.5.0 default refuses that update, so the fixture states the policy it
+	// was written against rather than silently building a different graph.
+	g.SetReindexPolicy(store.ReindexKeep)
 	const n = 300
 
 	ids := make([]store.NodeID, 0, n)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -139,24 +140,27 @@ func exampleMutation2_DeleteAndCascade() {
 //
 // The engine cannot maintain the property index across UpdateNode. Indexed
 // values are caller-encoded and decoupled from Properties, so nothing in the
-// engine knows that "status" changed — and the public index API is additive, so
-// a value registered before an update keeps matching afterwards. The result is
-// not a slow query or a missing row: NodesByProperty returns an entity that no
+// engine knows that "status" changed — and index entries are additive, so a
+// value registered before an update keeps matching afterwards. The result is not
+// a slow query or a missing row: NodesByProperty returns an entity that no
 // longer holds the value it was found by, and the query planner trusts that
 // answer.
 //
-// UpdateNodeIndexed is the fix. It updates the entity and replaces its index
-// entries in one step, so the index cannot disagree with the entity. Prefer it
-// for any entity with indexed properties; plain UpdateNode is the right call
-// only for entities that carry none.
+// Since v0.5.0 the engine refuses rather than doing that. ReindexReject is the
+// default policy, and UpdateNode on an entity carrying index entries returns
+// store.ErrIndexedPropertiesRequired — a loud failure in place of a silent wrong
+// answer. The two calls that do know what the update did are the way through:
+// UpdateNodeIndexed states the whole desired index state, UpdateNodePartialIndex
+// states only the keys that moved.
 func exampleMutation3_ReclassifyAndReindex() {
 	fmt.Println("--- Mutation 3: Reclassify; keeping the index honest ---")
 
-	// --- The trap: UpdateNode, then register the new value ---
+	// --- What the old default did, shown by asking for it explicitly ---
 	//
 	// This reads as though it works. It does not: the old value is still in the
 	// index, so the node now matches BOTH statuses.
 	bad := graphene.NewInMemory()
+	bad.SetReindexPolicy(store.ReindexKeep)
 	id, _ := bad.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
 	_ = bad.IndexNodeProperty(id, "status", []byte("suspect"))
 
@@ -170,9 +174,18 @@ func exampleMutation3_ReclassifyAndReindex() {
 	arts, _ := bad.NodesByType(store.NodeTypeMicroArtefact)
 	fmt.Printf("  Node appears under Tag(%d) and MicroArtefact(%d) lookups\n", len(tags), len(arts))
 
-	fmt.Printf("  UpdateNode        -> suspect:%d confirmed:%d  <- WRONG: 'suspect' is stale and still matches\n",
+	fmt.Printf("  ReindexKeep       -> suspect:%d confirmed:%d  <- WRONG: 'suspect' is stale and still matches\n",
 		countHits(bad, "status", "suspect"), countHits(bad, "status", "confirmed"))
 	bad.Close()
+
+	// --- What the default does now: refuse ---
+	strict := graphene.NewInMemory()
+	sid, _ := strict.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	_ = strict.IndexNodeProperty(sid, "status", []byte("suspect"))
+
+	err := strict.UpdateNode(&store.Node{ID: sid, Labels: []store.NodeType{store.NodeTypeTag}})
+	fmt.Printf("  ReindexReject     -> UpdateNode refused: %v\n", errors.Is(err, store.ErrIndexedPropertiesRequired))
+	strict.Close()
 
 	// --- The fix: state the whole desired index state in one call ---
 	good := graphene.NewInMemory()
@@ -190,6 +203,21 @@ func exampleMutation3_ReclassifyAndReindex() {
 
 	fmt.Printf("  UpdateNodeIndexed -> suspect:%d confirmed:%d  <- index agrees with the node\n",
 		countHits(good, "status", "suspect"), countHits(good, "status", "confirmed"))
+
+	// --- And when only one field moved, name only that field ---
+	//
+	// UpdateNodeIndexed would have needed "case" listed again just to keep it.
+	// Forgetting it is how an untouched key goes missing.
+	_ = good.IndexNodeProperty(id2, "case", []byte("c-17"))
+	if err := good.UpdateNodePartialIndex(
+		&store.Node{ID: id2, Labels: []store.NodeType{store.NodeTypeTag}},
+		map[string][]byte{"status": []byte("closed")},
+	); err != nil {
+		log.Fatalf("UpdateNodePartialIndex: %v", err)
+	}
+	fmt.Printf("  PartialIndex      -> confirmed:%d closed:%d case:%d  <- only 'status' moved\n",
+		countHits(good, "status", "confirmed"), countHits(good, "status", "closed"),
+		countHits(good, "case", "c-17"))
 
 	// Deleting the node purges every index entry it had, under either approach.
 	if err := good.DeleteNode(id2); err != nil {

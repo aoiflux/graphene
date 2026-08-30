@@ -1,6 +1,7 @@
 package graphene
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -60,11 +61,26 @@ type Tx struct {
 	// what a transaction carries unless As is called.
 	actor store.TxContext
 
+	// claimed maps a unique key's value to the ID this transaction has already
+	// resolved it to, so upserting one key twice in a transaction returns one
+	// entity rather than two. The store cannot answer for these: nothing has
+	// been registered there yet.
+	claimed map[txClaim]uint64
+
 	done bool
 	// err latches the first buffering error. AddNode/AddEdge return IDs rather
 	// than errors for ergonomics, so a problem detected while buffering has to
 	// surface at Commit.
 	err error
+}
+
+// txClaim identifies one value under one unique key. The kind is part of the
+// identity because node and edge keys are declared separately and may share a
+// name without sharing a meaning.
+type txClaim struct {
+	kind  string // "node" or "edge"
+	key   string
+	value string
 }
 
 // Begin starts a transaction.
@@ -74,7 +90,7 @@ type Tx struct {
 // which is *not* atomic across the node/edge boundary. Callers who need the
 // guarantee can check Atomic.
 func (g *Graph) Begin() *Tx {
-	tx := &Tx{g: g}
+	tx := &Tx{g: g, claimed: make(map[txClaim]uint64)}
 	if tr, ok := g.GraphStore.(store.Transactor); ok {
 		tx.tr = tr
 	}
@@ -146,6 +162,156 @@ func (tx *Tx) AddNode(n *store.Node) store.NodeID {
 	tx.ops = append(tx.ops, store.TxOp{Kind: store.TxOpAddNode, Node: stored})
 	tx.nodesAdded++
 	return id
+}
+
+// UpsertNode buffers a create-or-update keyed on a declared-unique property,
+// and returns the ID the entity will have once committed, along with whether
+// this transaction is creating it.
+//
+// This is what makes re-ingesting a source idempotent. The second run resolves
+// the same key to the same node and replaces it, where AddNode would have
+// written a second one:
+//
+//	g.DeclareUniqueProperty("k")
+//
+//	tx := g.Begin()
+//	ver, _ := tx.UpsertNode("k", []byte("ver:9f3a"),
+//	    &store.Node{Labels: ..., Properties: blob},
+//	    map[string][]byte{"state": []byte("extracted")})
+//	perm, _ := tx.UpsertNode("k", []byte("perm:INTERNET"), permNode, nil)
+//	tx.AddEdge(&store.Edge{Src: ver, Dst: perm, Labels: ...})
+//	err := tx.Commit()
+//
+// The returned ID is usable immediately as an edge endpoint, which is the whole
+// reason the key is resolved here rather than at commit. That early read is
+// re-checked under the write lock: if another writer took the key in between,
+// Commit returns ErrWriteConflict and the transaction is refused whole. Retrying
+// resolves to whatever the winner wrote. A single-writer caller never sees this.
+//
+// created is therefore trustworthy exactly when Commit succeeds, and means
+// nothing if it does not.
+//
+// On a hit, the node's labels and properties are replaced by n, and each key
+// named in props is *replaced* rather than added to — so the superseded value
+// stops matching, which is what a field used as a work queue depends on. Keys
+// props does not name keep what they had. The key entry is registered for you,
+// so props need not repeat it.
+//
+// Upserting one key twice in a transaction returns the same ID both times, and
+// the later call wins.
+func (tx *Tx) UpsertNode(key string, value []byte, n *store.Node, props map[string][]byte) (store.NodeID, bool) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return store.InvalidNodeID, false
+	}
+	if n == nil {
+		tx.setErr(errors.New("Tx.UpsertNode: nil node"))
+		return store.InvalidNodeID, false
+	}
+
+	claim := txClaim{kind: "node", key: key, value: string(value)}
+	existing, resolved := tx.claimed[claim]
+	created := false
+	if !resolved {
+		d, ok := tx.g.GraphStore.(store.UniqueIndexDeclarer)
+		if !ok {
+			tx.setErr(fmt.Errorf("Tx.UpsertNode: %T cannot enforce unique properties", tx.g.GraphStore))
+			return store.InvalidNodeID, false
+		}
+		owner, found, err := d.UniqueNodeOwner(key, value)
+		if err != nil {
+			tx.setErr(fmt.Errorf("Tx.UpsertNode: %w", err))
+			return store.InvalidNodeID, false
+		}
+		if found {
+			existing = uint64(owner)
+		} else {
+			existing = uint64(tx.reserveNodeID())
+			created = true
+			tx.nodesAdded++
+		}
+		tx.claimed[claim] = existing
+	}
+	id := store.NodeID(existing)
+
+	stored := copyNode(n)
+	stored.ID = id
+
+	expect := uint64(store.InvalidNodeID)
+	if !created {
+		expect = existing
+	}
+	tx.ops = append(tx.ops, store.TxOp{
+		Kind:   store.TxOpUpsertNode,
+		Node:   stored,
+		NodeID: id,
+		Key:    key,
+		Value:  bytes.Clone(value),
+		Expect: expect,
+		Props:  copyProps(props),
+	})
+	return id, created
+}
+
+// UpsertEdge is UpsertNode for edges, keyed on a declared-unique edge property.
+//
+// Endpoints are immutable, so on a hit the existing edge keeps the Src and Dst
+// it was created with and e supplies only labels, weight and properties. That is
+// the same rule UpdateEdge applies, and it is why an edge's unique value should
+// name the pair it connects — an edge whose key is stable but whose endpoints
+// were meant to move is a different edge.
+func (tx *Tx) UpsertEdge(key string, value []byte, e *store.Edge, props map[string][]byte) (store.EdgeID, bool) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return store.InvalidEdgeID, false
+	}
+	if e == nil {
+		tx.setErr(errors.New("Tx.UpsertEdge: nil edge"))
+		return store.InvalidEdgeID, false
+	}
+
+	claim := txClaim{kind: "edge", key: key, value: string(value)}
+	existing, resolved := tx.claimed[claim]
+	created := false
+	if !resolved {
+		d, ok := tx.g.GraphStore.(store.UniqueIndexDeclarer)
+		if !ok {
+			tx.setErr(fmt.Errorf("Tx.UpsertEdge: %T cannot enforce unique properties", tx.g.GraphStore))
+			return store.InvalidEdgeID, false
+		}
+		owner, found, err := d.UniqueEdgeOwner(key, value)
+		if err != nil {
+			tx.setErr(fmt.Errorf("Tx.UpsertEdge: %w", err))
+			return store.InvalidEdgeID, false
+		}
+		if found {
+			existing = uint64(owner)
+		} else {
+			existing = uint64(tx.reserveEdgeID())
+			created = true
+			tx.edgesAdded++
+		}
+		tx.claimed[claim] = existing
+	}
+	id := store.EdgeID(existing)
+
+	stored := copyEdge(e)
+	stored.ID = id
+
+	expect := uint64(store.InvalidEdgeID)
+	if !created {
+		expect = existing
+	}
+	tx.ops = append(tx.ops, store.TxOp{
+		Kind:   store.TxOpUpsertEdge,
+		Edge:   stored,
+		EdgeID: id,
+		Key:    key,
+		Value:  bytes.Clone(value),
+		Expect: expect,
+		Props:  copyProps(props),
+	})
+	return id, created
 }
 
 // AddEdge buffers an edge and returns the ID it will have once committed.
@@ -234,6 +400,137 @@ func (tx *Tx) DeleteEdge(id store.EdgeID) {
 	tx.ops = append(tx.ops, store.TxOp{Kind: store.TxOpDeleteEdge, EdgeID: id})
 }
 
+// UpdateNodeIndexed buffers a node update together with the complete
+// replacement of its property-index entries.
+//
+// props is the entity's whole indexed state afterwards: keys it does not mention
+// are dropped. That is the right shape when the caller knows everything the node
+// should be indexed under, which a re-ingest does. When only one field moved, use
+// UpdateNodePartialIndex instead — enumerating the other keys just to preserve
+// them is how one of them eventually goes missing.
+//
+// The record and the entries move in one operation, so the store's ReindexPolicy
+// has nothing left to decide and this is not subject to the refusal an ordinary
+// UpdateNode meets under ReindexReject.
+func (tx *Tx) UpdateNodeIndexed(n *store.Node, props map[string][]byte) {
+	tx.bufferIndexedNodeUpdate(n, props, false)
+}
+
+// UpdateNodePartialIndex buffers a node update that replaces only the entries
+// for the keys named in changed, leaving every other key as it was.
+//
+// This is the shape a state transition has:
+//
+//	tx.UpdateNodePartialIndex(n, map[string][]byte{"state": []byte("analyzed")})
+//
+// The node's key entry, and anything else it is indexed under, survive
+// untouched; "state" stops matching its old value and starts matching the new
+// one. Replacing rather than adding is the point: an added value leaves the old
+// one matching too, and a field used as a work queue then hands the same entity
+// back to the worker forever.
+func (tx *Tx) UpdateNodePartialIndex(n *store.Node, changed map[string][]byte) {
+	tx.bufferIndexedNodeUpdate(n, changed, true)
+}
+
+func (tx *Tx) bufferIndexedNodeUpdate(n *store.Node, props map[string][]byte, partial bool) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return
+	}
+	if n == nil {
+		tx.setErr(errors.New("Tx.UpdateNodeIndexed: nil node"))
+		return
+	}
+	if n.ID == store.InvalidNodeID {
+		tx.setErr(errors.New("Tx.UpdateNodeIndexed: node ID is unset"))
+		return
+	}
+	tx.ops = append(tx.ops, store.TxOp{
+		Kind:    store.TxOpUpdateNodeIndexed,
+		Node:    copyNode(n),
+		NodeID:  n.ID,
+		Props:   copyProps(props),
+		Partial: partial,
+	})
+}
+
+// UpdateEdgeIndexed is UpdateNodeIndexed for edges.
+func (tx *Tx) UpdateEdgeIndexed(e *store.Edge, props map[string][]byte) {
+	tx.bufferIndexedEdgeUpdate(e, props, false)
+}
+
+// UpdateEdgePartialIndex is UpdateNodePartialIndex for edges.
+func (tx *Tx) UpdateEdgePartialIndex(e *store.Edge, changed map[string][]byte) {
+	tx.bufferIndexedEdgeUpdate(e, changed, true)
+}
+
+func (tx *Tx) bufferIndexedEdgeUpdate(e *store.Edge, props map[string][]byte, partial bool) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return
+	}
+	if e == nil {
+		tx.setErr(errors.New("Tx.UpdateEdgeIndexed: nil edge"))
+		return
+	}
+	if e.ID == store.InvalidEdgeID {
+		tx.setErr(errors.New("Tx.UpdateEdgeIndexed: edge ID is unset"))
+		return
+	}
+	tx.ops = append(tx.ops, store.TxOp{
+		Kind:    store.TxOpUpdateEdgeIndexed,
+		Edge:    copyEdge(e),
+		EdgeID:  e.ID,
+		Props:   copyProps(props),
+		Partial: partial,
+	})
+}
+
+// IndexNodeProperties buffers property-index entries for id.
+//
+// Topology and index become durable together or not at all. Registering them
+// outside the transaction — which was the only option before, and which the
+// documentation used to instruct — leaves a window in which a crash produces
+// nodes whose records are correct and whose keys resolve to nothing. Such a node
+// cannot be found again by the key it was written under, so a later re-ingest
+// creates a second one, and the duplicate is the lasting damage rather than the
+// crash.
+//
+// The entries are copied, so the caller may reuse the map and its values as soon
+// as this returns. A key registered twice in one transaction keeps the later
+// value, matching the last-write-wins rule the log already applies to records.
+func (tx *Tx) IndexNodeProperties(id store.NodeID, props map[string][]byte) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return
+	}
+	if len(props) == 0 {
+		return
+	}
+	tx.ops = append(tx.ops, store.TxOp{
+		Kind:   store.TxOpIndexNode,
+		NodeID: id,
+		Props:  copyProps(props),
+	})
+}
+
+// IndexEdgeProperties buffers property-index entries for id. See
+// IndexNodeProperties.
+func (tx *Tx) IndexEdgeProperties(id store.EdgeID, props map[string][]byte) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return
+	}
+	if len(props) == 0 {
+		return
+	}
+	tx.ops = append(tx.ops, store.TxOp{
+		Kind:   store.TxOpIndexEdge,
+		EdgeID: id,
+		Props:  copyProps(props),
+	})
+}
+
 // Len reports how many nodes and edges this transaction *creates*. It does not
 // count updates or deletes; use Ops for the total.
 func (tx *Tx) Len() (nodes, edges int) { return tx.nodesAdded, tx.edgesAdded }
@@ -285,6 +582,19 @@ func (tx *Tx) Rollback() error {
 	tx.done = true
 	tx.ops = nil
 	return nil
+}
+
+// copyProps deep-copies an index-entry map, values included. The store must not
+// retain caller memory, and an index entry outlives the call that registered it
+// by definition.
+func copyProps(props map[string][]byte) map[string][]byte {
+	out := make(map[string][]byte, len(props))
+	for k, v := range props {
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
 }
 
 func copyNode(n *store.Node) *store.Node {
@@ -405,6 +715,36 @@ func (tx *Tx) commitFallback() error {
 
 		case store.TxOpDeleteEdge:
 			err = tx.g.DeleteEdge(realEdge(op.EdgeID))
+
+		case store.TxOpIndexNode:
+			err = tx.g.IndexNodeProperties(realNode(op.NodeID), op.Props)
+
+		case store.TxOpIndexEdge:
+			err = tx.g.IndexEdgeProperties(realEdge(op.EdgeID), op.Props)
+
+		case store.TxOpUpdateNodeIndexed:
+			n := *op.Node
+			n.ID = realNode(n.ID)
+			if err = tx.g.UpdateNode(&n); err == nil {
+				err = tx.g.reindexNode(n.ID, op.Props, op.Partial)
+			}
+
+		case store.TxOpUpdateEdgeIndexed:
+			e := *op.Edge
+			e.ID = realEdge(e.ID)
+			if err = tx.g.UpdateEdge(&e); err == nil {
+				err = tx.g.reindexEdge(e.ID, op.Props, op.Partial)
+			}
+
+		case store.TxOpUpsertNode, store.TxOpUpsertEdge:
+			// An upsert resolves a key under the write lock and refuses on a
+			// conflict; a backend with no transaction has no such lock to hold,
+			// so replaying one here would be a create-or-update with the check
+			// quietly dropped. Refusing is the honest answer, and Atomic already
+			// tells a caller which backends take this path.
+			err = fmt.Errorf("%s is not supported on %T, which does not implement store.Transactor",
+				op.Kind, tx.g.GraphStore)
+		
 
 		default:
 			err = fmt.Errorf("unknown op kind %d", op.Kind)

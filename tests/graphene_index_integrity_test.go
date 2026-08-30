@@ -1,6 +1,7 @@
 package graphene_test
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -325,6 +326,20 @@ func replayMutations(t *testing.T, g *graphene.Graph, ops []mutationOp) {
 	}
 }
 
+// legacyReindexKeep puts a graph back on the pre-v0.5.0 default.
+//
+// These tests drive plain UpdateNode over indexed entities on purpose: what they
+// measure is that incremental index maintenance and a from-scratch rebuild agree
+// about the state an update leaves behind, stale entries included. Under the new
+// default that update is refused, which would make them measure the refusal
+// instead. ReindexKeep is the semantics under test, so it is stated rather than
+// inherited.
+func legacyReindexKeep(t *testing.T, g *graphene.Graph) *graphene.Graph {
+	t.Helper()
+	g.SetReindexPolicy(store.ReindexKeep)
+	return g
+}
+
 // A store mutated in place must end up with the same index state as a store
 // built fresh from the same operation log. Incremental maintenance and a
 // from-scratch build have to agree.
@@ -334,10 +349,10 @@ func TestIndexIntegrity_IncrementalMatchesRebuild(t *testing.T) {
 
 	for seed := int64(1); seed <= 8; seed++ {
 		t.Run(fmt.Sprintf("memory/seed=%d", seed), func(t *testing.T) {
-			mutated := graphene.NewInMemory()
+			mutated := legacyReindexKeep(t, graphene.NewInMemory())
 			ops := applyRandomMutations(t, mutated, rand.New(rand.NewSource(seed)), 400, propKeys, propValues)
 
-			rebuilt := graphene.NewInMemory()
+			rebuilt := legacyReindexKeep(t, graphene.NewInMemory())
 			replayMutations(t, rebuilt, ops)
 
 			got := takeIndexSnapshot(t, mutated, propKeys, propValues)
@@ -364,6 +379,7 @@ func TestIndexIntegrity_DiskCompactAndReopen(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
+			legacyReindexKeep(t, g)
 
 			applyRandomMutations(t, g, rand.New(rand.NewSource(seed)), 250, propKeys, propValues)
 			before := takeIndexSnapshot(t, g, propKeys, propValues)
@@ -414,6 +430,7 @@ func TestIndexIntegrity_RepeatedCompactionIsStable(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer g.Close()
+	legacyReindexKeep(t, g)
 
 	rng := rand.New(rand.NewSource(99))
 	for round := 0; round < 5; round++ {
@@ -481,13 +498,61 @@ func TestReindexPolicy_PurgeSurvivesRestart(t *testing.T) {
 	}
 }
 
-// ReindexKeep is the documented default and must preserve the old behaviour:
-// entries stay, and therefore go stale.
-func TestReindexPolicy_KeepIsDefaultAndLeavesEntriesStale(t *testing.T) {
+// ReindexReject is the default from v0.5.0: an update that would leave the index
+// describing something the entity no longer is refuses instead.
+//
+// The refusal is scoped to entities that actually carry entries, so it costs
+// nothing on a graph it could not hurt.
+func TestReindexPolicy_RejectIsTheDefault(t *testing.T) {
+	backends(t, func(t *testing.T, g *graphene.Graph) {
+		if got := g.ReindexPolicy(); got != store.ReindexReject {
+			t.Fatalf("default ReindexPolicy = %v, want ReindexReject", got)
+		}
+
+		plain, err := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+		if err != nil {
+			t.Fatalf("AddNode: %v", err)
+		}
+		// No entries: nothing to invalidate, so the update goes through.
+		if err := g.UpdateNode(&store.Node{ID: plain, Labels: []store.NodeType{store.NodeTypeTag}}); err != nil {
+			t.Fatalf("UpdateNode on an unindexed node: %v", err)
+		}
+
+		id, err := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+		if err != nil {
+			t.Fatalf("AddNode: %v", err)
+		}
+		if err := g.IndexNodeProperty(id, "sha256", []byte("old")); err != nil {
+			t.Fatalf("IndexNodeProperty: %v", err)
+		}
+
+		err = g.UpdateNode(&store.Node{ID: id, Labels: []store.NodeType{store.NodeTypeTag}})
+		if !errors.Is(err, store.ErrIndexedPropertiesRequired) {
+			t.Fatalf("UpdateNode on an indexed node: got %v, want ErrIndexedPropertiesRequired", err)
+		}
+		// A refusal is not a partial write.
+		n, err := g.GetNode(id)
+		if err != nil {
+			t.Fatalf("GetNode: %v", err)
+		}
+		if n.HasLabel(store.NodeTypeTag) {
+			t.Fatal("a refused UpdateNode changed the record anyway")
+		}
+
+		// Inside a transaction too, and there it refuses the whole thing.
+		tx := g.Begin()
+		tx.UpdateNode(&store.Node{ID: id, Labels: []store.NodeType{store.NodeTypeTag}})
+		if err := tx.Commit(); !errors.Is(err, store.ErrIndexedPropertiesRequired) {
+			t.Fatalf("Tx.UpdateNode on an indexed node: got %v, want ErrIndexedPropertiesRequired", err)
+		}
+	})
+}
+
+// ReindexKeep, set explicitly, still preserves the old behaviour: entries stay,
+// and therefore go stale.
+func TestReindexPolicy_KeepLeavesEntriesStale(t *testing.T) {
 	g := graphene.NewInMemory()
-	if got := g.ReindexPolicy(); got != store.ReindexKeep {
-		t.Fatalf("default ReindexPolicy = %v, want ReindexKeep", got)
-	}
+	g.SetReindexPolicy(store.ReindexKeep)
 
 	id, err := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
 	if err != nil {
@@ -507,6 +572,54 @@ func TestReindexPolicy_KeepIsDefaultAndLeavesEntriesStale(t *testing.T) {
 	if len(hits) != 1 || hits[0] != id {
 		t.Fatalf("ReindexKeep should retain the entry, got %v", hits)
 	}
+}
+
+// UpdateNodePartialIndex replaces only the key it names, which is the shape a
+// state transition has, and the one UpdateNodeIndexed cannot express without the
+// caller enumerating everything else.
+func TestReindexPolicy_PartialIndexReplacesOnlyTheNamedKey(t *testing.T) {
+	backends(t, func(t *testing.T, g *graphene.Graph) {
+		id, err := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
+		if err != nil {
+			t.Fatalf("AddNode: %v", err)
+		}
+		if err := g.IndexNodeProperties(id, map[string][]byte{
+			"k":     []byte("ver:9f3a"),
+			"state": []byte("downloaded"),
+		}); err != nil {
+			t.Fatalf("IndexNodeProperties: %v", err)
+		}
+
+		if err := g.UpdateNodePartialIndex(
+			&store.Node{ID: id, Labels: []store.NodeType{store.NodeTypeEvidenceFile}, Properties: []byte("v2")},
+			map[string][]byte{"state": []byte("analyzed")},
+		); err != nil {
+			t.Fatalf("UpdateNodePartialIndex: %v", err)
+		}
+
+		if hits, _ := g.NodesByProperty("state", []byte("downloaded")); len(hits) != 0 {
+			t.Fatalf("the superseded state value still matches: %v", hits)
+		}
+		hits, err := g.NodesByProperty("state", []byte("analyzed"))
+		if err != nil {
+			t.Fatalf("NodesByProperty: %v", err)
+		}
+		if len(hits) != 1 || hits[0] != id {
+			t.Fatalf("the new state value resolves to %v, want [%d]", hits, id)
+		}
+		// The key it did not name survived, which is the whole difference from
+		// UpdateNodeIndexed.
+		if hits, _ := g.NodesByProperty("k", []byte("ver:9f3a")); len(hits) != 1 || hits[0] != id {
+			t.Fatalf("the untouched key was dropped: %v", hits)
+		}
+		n, err := g.GetNode(id)
+		if err != nil {
+			t.Fatalf("GetNode: %v", err)
+		}
+		if string(n.Properties) != "v2" {
+			t.Fatalf("the record was not updated: %q", n.Properties)
+		}
+	})
 }
 
 // UpdateNodeIndexed is the path that avoids both failure modes: no stale entry
@@ -679,6 +792,8 @@ func TestIndexIntegrity_CrashDuringCompact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+
+	legacyReindexKeep(t, g)
 
 	applyRandomMutations(t, g, rand.New(rand.NewSource(7)), 200, propKeys, propValues)
 	before := takeIndexSnapshot(t, g, propKeys, propValues)

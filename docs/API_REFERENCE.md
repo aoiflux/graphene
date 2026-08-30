@@ -30,6 +30,7 @@ import (
 9. [Property index](#9-property-index)
 9a. [Ordered (range) keys](#9a-ordered-range-keys)
 9b. [Composite (multi-key) indexes](#9b-composite-multi-key-indexes)
+9c. [Unique keys and upsert](#9c-unique-keys-and-upsert)  ← idempotent ingest
 10. [Typed queries](#10-typed-queries)
 11. [Degree & connectivity](#11-degree--connectivity)
 12. [Traversal & patterns](#12-traversal--patterns)
@@ -292,14 +293,56 @@ change before the transaction commits.
 store or created earlier in this transaction. A missing target fails the whole
 transaction with `*store.ErrNotFound`.
 
-> **Indexing properties is not part of a transaction.** `IndexNodeProperties`
-> and friends are separate calls; a `Tx` does not buffer them. Index properties
-> after the transaction commits.
->
-> Index *cleanup* is included, because leaving it out would diverge from the
-> non-transactional path: deleting a node inside a transaction removes its
-> property-index entries, and updating one honours `SetReindexPolicy(ReindexPurge)`
-> exactly as `UpdateNode` does.
+`tx.IndexNodeProperties` / `tx.IndexEdgeProperties` buffer property-index
+entries, so **topology and index become durable together or not at all**:
+
+```go
+tx := g.Begin()
+id := tx.AddNode(&store.Node{Labels: ...})
+tx.IndexNodeProperties(id, map[string][]byte{"k": []byte("ver:9f3a")})
+_ = tx.Commit()   // the node and its key land in one batch, or neither does
+```
+
+> **This changed in v0.5.0.** Indexing used to be a separate call that a
+> transaction did not buffer, and the guidance here was to index *after* the
+> commit. The window between the two is narrow and its consequence is not: a
+> crash inside it leaves nodes whose records are correct and whose keys resolve
+> to nothing, which cannot be found again by the key they were written under —
+> so the next ingest of the same source writes a second one. The duplicate, not
+> the crash, is what is left behind.
+
+Index *cleanup* was already included, and still is: deleting a node inside a
+transaction removes its property-index entries, and updating one honours
+`SetReindexPolicy(ReindexPurge)` exactly as `UpdateNode` does.
+
+Entries are applied in sorted key order rather than map order, so two identical
+transactions frame identical bytes.
+
+#### Upsert inside a transaction
+
+`tx.UpsertNode` resolves a declared-unique key to an existing node or reserves a
+new ID, and hands it back immediately so it can be used as an edge endpoint:
+
+```go
+_ = g.DeclareUniqueProperty("k")
+
+tx := g.Begin()
+ver, created := tx.UpsertNode("k", []byte("ver:9f3a"),
+    &store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}, Properties: blob},
+    map[string][]byte{"state": []byte("extracted")})
+perm, _ := tx.UpsertNode("k", []byte("perm:INTERNET"), permNode, nil)
+tx.AddEdge(&store.Edge{Src: ver, Dst: perm, Labels: ...})
+err := tx.Commit()   // *store.ErrWriteConflict if another writer took a key
+```
+
+That early resolution is re-checked under the write lock at commit. If another
+writer took the key in between, the whole transaction is refused with
+`store.ErrWriteConflict` rather than quietly creating a second entity; retrying
+resolves to whatever the winner wrote. A single-writer caller never sees it.
+`created` is therefore trustworthy exactly when `Commit` succeeds.
+
+Upserting one key twice in a transaction returns the same ID both times, and the
+later call wins.
 
 #### Which should I use?
 
@@ -512,7 +555,7 @@ node → `*store.ErrNotFound`.
 | Durability | Updates re-append a record; deletes append a tombstone. Both replay on restart. |
 | ID reuse | Never. A deleted ID is not handed out again (monotonic counters). |
 | Referential integrity | `DeleteNode` cascades; `AddEdge` onto a deleted node fails with `*ErrInvalidEdge`. |
-| Property index | Purged on delete. **Not** auto-updated on update (indexed values are caller-encoded) — re-index changed fields yourself. |
+| Property index | Purged on delete. **Not** auto-updated on update (indexed values are caller-encoded), and under the default `ReindexReject` an update that would leave entries stale is **refused** with `store.ErrIndexedPropertiesRequired`. Use `UpdateNodeIndexed` or `UpdateNodePartialIndex`. |
 | Space reclamation (disk) | A deleted/updated record still occupies its CSR slot until the next `Compact()`, which rebuilds without it. Reads never see it in the meantime. |
 | Visibility | Effective immediately for all subsequent reads. |
 
@@ -580,13 +623,18 @@ func (g *Graph) EdgesWithProperties(props map[string][]byte) ([]*store.Edge, err
 
 - Use the same encoding for indexing and querying a value.
 - **Delete** purges all of an entity's index entries automatically.
-- **Update** does not: a stale indexed value keeps matching until the entity is
-  deleted. Re-index changed fields with a new `IndexNodeProperty` call.
+- **Update** does not, and since v0.5.0 refuses rather than pretending
+  otherwise — see §17.
+- Registration is **transactional** inside a `Tx` (§5.1), so a record and the
+  keys that find it become durable together.
 
 ```go
 _ = g.IndexNodeProperty(artID, "sha256", []byte("deadbeef"))
 hits, _ := g.NodesByProperty("sha256", []byte("deadbeef"))
 ```
+
+Property keys are at most 65535 bytes, which is what a property-index record can
+encode a key length into. A longer key is refused rather than truncated.
 
 ---
 
@@ -704,6 +752,85 @@ Declarations are written into the CSR image when the store compacts and
 re-applied on open, on the same terms as §9a: they survive a compaction, not a
 bare reopen with no compaction since. `CompositeProperties()` reports what is
 currently declared.
+
+---
+
+## 9c. Unique keys and upsert
+
+A unique key is what turns an indexed value into a *name*. Without one a natural
+key resolves to a set, and "find the entity for this source, or make one" is not
+expressible — every re-ingest appends to the set instead of finding what is
+already there.
+
+```go
+func (g *Graph) DeclareUniqueProperty(key string) error
+func (g *Graph) DeclareUniqueEdgeProperty(key string) error
+func (g *Graph) UniqueProperties() (nodeKeys, edgeKeys []string)
+
+func (g *Graph) NodeByProperty(key string, value []byte) (*store.Node, error)
+func (g *Graph) EdgeByProperty(key string, value []byte) (*store.Edge, error)
+
+func (g *Graph) UpsertNode(key string, value []byte, n *store.Node,
+    props map[string][]byte) (store.NodeID, bool, error)
+func (g *Graph) UpsertEdge(key string, value []byte, e *store.Edge,
+    props map[string][]byte) (store.EdgeID, bool, error)
+```
+
+### Declaring
+
+```go
+if err := g.DeclareUniqueProperty("k"); err != nil {
+    var v *store.UniqueViolationsError
+    if errors.As(err, &v) {
+        for _, c := range v.Conflicts {   // every offending value, not the first
+            log.Printf("%q held by %v", c.Value, c.IDs)
+        }
+    }
+}
+```
+
+- **Existing data is validated first**, and a graph that violates the constraint
+  is reported through `*store.UniqueViolationsError` naming **every** offending
+  value. A caller declaring a constraint on a graph that has been running without
+  one is about to repair it, and one duplicate per pass is not a repair. Nothing
+  is declared in that case.
+- **Declaring a key already declared is a no-op**, so this belongs at every
+  `Open`.
+- **Declarations live in memory.** Unlike an ordered key, which is written into
+  the image at compaction, a unique key must be re-declared by each process that
+  opens the store. Declaring at `Open` is the contract, not a convenience.
+- **A backend that cannot enforce it returns an error**, unlike the ordered and
+  composite declarations which return `nil`. Those are optimisations; a store
+  ignoring one still answers every query correctly. This is a promise about what
+  the graph can contain, and quietly not keeping it would give the caller the
+  guarantee and none of the behaviour.
+
+Registering a value a *different* live entity already holds fails with an error
+satisfying `errors.Is(err, store.ErrUniqueViolation)`. Re-registering the value
+an entity already holds is a no-op, which is the steady state an idempotent
+re-ingest arrives at.
+
+### Upserting
+
+```go
+id, created, err := g.UpsertNode("k", []byte("ver:9f3a"),
+    &store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}, Properties: blob},
+    map[string][]byte{"state": []byte("extracted")})
+```
+
+- On a **miss** the entity is created; on a **hit** its labels and properties are
+  replaced.
+- Each key named in `props` is **replaced**, not added to, so the superseded
+  value stops matching. Keys `props` does not name keep the entries they had.
+- The identity entry (`key` → `value`) is registered for you.
+- `key` must be declared unique, or the call returns `store.ErrKeyNotUnique`.
+- The record and its entries are one transaction. For several upserts and the
+  edges between them, use `Begin` and `tx.UpsertNode` (§5.1), which commits the
+  lot as one unit.
+
+`NodeByProperty` is `NodesByProperty` with the plural removed. It refuses on a
+key that is not declared unique rather than returning the first of several, and
+returns `*store.ErrNotFound` for a value no live node holds.
 
 ---
 
@@ -1350,8 +1477,15 @@ completed `DeleteNode` leaves no dangling edge and no index entry behind, in any
 index, under any key.
 
 **A sequence of calls is not a transaction.** There is no multi-operation
-rollback and no snapshot isolation. If an invariant has to hold across several
-calls — read-decide-write being the usual one — enforce it in your own code.
+rollback and no general snapshot isolation. If an invariant has to hold across
+several calls — read-decide-write being the usual one — enforce it in your own
+code.
+
+The one read-decide-write that the engine does protect is an upsert's key
+(§9c): it is resolved when the operation is buffered and re-checked under the
+write lock at commit, so two writers racing to create the same entity do not both
+succeed. The loser gets `store.ErrWriteConflict`. Nothing else a transaction read
+is tracked.
 
 ### Reads
 
@@ -1620,26 +1754,51 @@ makes it explicit rather than silent.
 ```go
 func (g *Graph) UpdateNodeIndexed(n *store.Node, props map[string][]byte) error
 func (g *Graph) UpdateEdgeIndexed(e *store.Edge, props map[string][]byte) error
+func (g *Graph) UpdateNodePartialIndex(n *store.Node, changed map[string][]byte) error
+func (g *Graph) UpdateEdgePartialIndex(e *store.Edge, changed map[string][]byte) error
 func (g *Graph) SetReindexPolicy(p store.ReindexPolicy)
 func (g *Graph) ReindexPolicy() store.ReindexPolicy
 ```
 
-**Prefer `UpdateNodeIndexed`.** It updates the record and replaces its index
-entries in one step, so neither failure mode below can occur:
+**Plain `UpdateNode` on an entity that carries index entries is refused** under
+the default policy:
 
 ```go
+err := g.UpdateNode(n)
+// *store.ErrIndexedPropertiesRequired, if n carries indexed properties
+```
+
+Use whichever of the two knows what the update did:
+
+```go
+// The whole desired index state. Keys not mentioned are DROPPED.
 _ = g.UpdateNodeIndexed(
     &store.Node{ID: artID, Labels: []store.NodeType{store.NodeTypeTag}},
     map[string][]byte{"sha256": newHash},
 )
+
+// Only the keys that moved. Everything else survives untouched — this is the
+// shape a state transition has.
+_ = g.UpdateNodePartialIndex(n, map[string][]byte{"state": []byte("analyzed")})
 ```
 
-For plain `UpdateNode` / `UpdateEdge`, the policy decides:
+Both are one transaction, so the record and the entries cannot land separately.
 
 | Policy | Behaviour | Failure mode |
 |---|---|---|
-| `store.ReindexKeep` (default) | entries are left alone | entries go **stale** — the old value still matches |
+| `store.ReindexReject` **(default from v0.5.0)** | an update to an entity carrying entries is refused | none — it produces no answer rather than a wrong one |
+| `store.ReindexKeep` (the default before v0.5.0) | entries are left alone | entries go **stale** — the old value still matches |
 | `store.ReindexPurge` | the entity's entries are dropped | entries are **lost**, including ones the update did not touch |
+
+> **This default changed in v0.5.0.** `ReindexKeep` was a silently wrong answer
+> that required every caller to remember a second method name, and a caller who
+> forgot got a query result the planner trusted. Note that `ReindexPurge` is not
+> the safe option either — it drops the entity's *untouched* keys along with the
+> stale one. Refusing is the only choice that loses nothing. Set `ReindexKeep`
+> explicitly to restore the old behaviour.
+
+An entity with no index entries updates normally under any policy, so the refusal
+costs nothing on a graph it could not hurt.
 
 On the disk backend a purge is journalled, so replay cannot resurrect superseded
 values.
@@ -2007,15 +2166,19 @@ or drop them:
 
 | Policy | Behaviour | Failure mode |
 |---|---|---|
-| `ReindexKeep` (default) | entries untouched | **stale** — the old value still matches |
+| `ReindexReject` (default) | the update is refused | none |
+| `ReindexKeep` | entries untouched | **stale** — the old value still matches |
 | `ReindexPurge` | entity's entries dropped | **lost**, including keys you did not touch |
 
 ```go
-// Avoids both: record and entries replaced together.
+// The whole entry set, record and entries replaced together.
 g.UpdateNodeIndexed(
     &store.Node{ID: id, Labels: labels},
     map[string][]byte{"sha256": newHash},
 )
+
+// Or only the keys that moved.
+g.UpdateNodePartialIndex(n, map[string][]byte{"state": []byte("analyzed")})
 ```
 
 #### Deleting is cheap, but scales with label size

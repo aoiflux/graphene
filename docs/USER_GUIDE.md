@@ -444,16 +444,30 @@ _ = g.UpdateNodeIndexed(
 )
 ```
 
-If you use plain `UpdateNode`, pick a policy and know its failure mode:
+When only one field moved, name only that field — everything else survives:
+
+```go
+_ = g.UpdateNodePartialIndex(n, map[string][]byte{"state": []byte("analyzed")})
+```
+
+Plain `UpdateNode` on an entity that carries index entries is **refused** by
+default, because the engine cannot tell which entries the change invalidated:
+
+```go
+err := g.UpdateNode(n)   // *store.ErrIndexedPropertiesRequired
+```
 
 | Policy | Behaviour | What goes wrong |
 |---|---|---|
-| `store.ReindexKeep` (default) | entries kept | they go **stale** — the old value still matches |
+| `store.ReindexReject` (default since v0.5.0) | the update is refused | nothing — you get an error instead of a wrong query result |
+| `store.ReindexKeep` (the default before) | entries kept | they go **stale** — the old value still matches |
 | `store.ReindexPurge` | entries dropped | they are **lost**, including untouched keys |
 
 ```go
-g.SetReindexPolicy(store.ReindexPurge)
+g.SetReindexPolicy(store.ReindexKeep) // restore the pre-v0.5.0 behaviour
 ```
+
+An entity with no index entries updates normally under any policy.
 
 ### Checking the indexes
 

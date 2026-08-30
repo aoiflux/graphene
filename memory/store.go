@@ -220,16 +220,17 @@ func (s *Store) ensureAdj(id store.NodeID) *adjacency {
 // --- GraphStore implementation ---
 
 func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
+	if len(n.Labels) == 0 {
+		return store.InvalidNodeID, fmt.Errorf("AddNode: %w", store.ErrNoLabels)
+	}
 	id := s.nextNodeID()
 
 	// make a copy so the caller can't mutate our stored node
 	stored := &store.Node{
 		ID: id,
 	}
-	if len(n.Labels) > 0 {
-		stored.Labels = make([]store.NodeType, len(n.Labels))
-		copy(stored.Labels, n.Labels)
-	}
+	stored.Labels = make([]store.NodeType, len(n.Labels))
+	copy(stored.Labels, n.Labels)
 	if len(n.Properties) > 0 {
 		stored.Properties = make([]byte, len(n.Properties))
 		copy(stored.Properties, n.Properties)
@@ -248,6 +249,14 @@ func (s *Store) AddNode(n *store.Node) (store.NodeID, error) {
 // AddNodesBatch adds nodes in order and returns assigned IDs.
 // On error, returns successfully added IDs up to the failing index.
 func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
+	// Before the lock and before any ID is taken, so a rejection leaves nothing
+	// behind. Disk does the same, and this backend is what disk is compared
+	// against.
+	for i, n := range nodes {
+		if len(n.Labels) == 0 {
+			return nil, fmt.Errorf("AddNodesBatch: node %d: %w", i, store.ErrNoLabels)
+		}
+	}
 	ids := make([]store.NodeID, len(nodes))
 
 	s.mu.Lock()
@@ -277,15 +286,16 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 }
 
 func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
+	if len(e.Labels) == 0 {
+		return store.InvalidEdgeID, fmt.Errorf("AddEdge: %w", store.ErrNoLabels)
+	}
 	stored := &store.Edge{
 		Src:    e.Src,
 		Dst:    e.Dst,
 		Weight: e.Weight,
 	}
-	if len(e.Labels) > 0 {
-		stored.Labels = make([]store.EdgeType, len(e.Labels))
-		copy(stored.Labels, e.Labels)
-	}
+	stored.Labels = make([]store.EdgeType, len(e.Labels))
+	copy(stored.Labels, e.Labels)
 	if len(e.Properties) > 0 {
 		stored.Properties = make([]byte, len(e.Properties))
 		copy(stored.Properties, e.Properties)
@@ -328,6 +338,13 @@ func (s *Store) ReserveEdgeID() store.EdgeID {
 }
 
 func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
+	// Outside the lock: an empty label set is a property of the argument, not of
+	// the store, so nothing is gained by checking it under the lock.
+	for i, e := range edges {
+		if len(e.Labels) == 0 {
+			return nil, fmt.Errorf("AddEdgesBatch: edge %d: %w", i, store.ErrNoLabels)
+		}
+	}
 	ids := make([]store.EdgeID, len(edges))
 
 	s.mu.Lock()
@@ -411,6 +428,74 @@ func (s *Store) OrderedNodeProperties() []string { return s.propIdx.OrderedNodeK
 // OrderedEdgeProperties implements store.OrderedIndexDeclarer.
 func (s *Store) OrderedEdgeProperties() []string { return s.propIdx.OrderedEdgeKeys() }
 
+// DeclareUniqueNodeProperty implements store.UniqueIndexDeclarer.
+func (s *Store) DeclareUniqueNodeProperty(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conflicts := s.propIdx.DeclareUniqueNodeKey(key, s.nodeExistsLocked)
+	if len(conflicts) > 0 {
+		return &store.UniqueViolationsError{Kind: "node", Key: key, Conflicts: conflicts}
+	}
+	return nil
+}
+
+// DeclareUniqueEdgeProperty implements store.UniqueIndexDeclarer.
+func (s *Store) DeclareUniqueEdgeProperty(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conflicts := s.propIdx.DeclareUniqueEdgeKey(key, s.edgeExistsLocked)
+	if len(conflicts) > 0 {
+		return &store.UniqueViolationsError{Kind: "edge", Key: key, Conflicts: conflicts}
+	}
+	return nil
+}
+
+// UniqueNodeProperties implements store.UniqueIndexDeclarer.
+func (s *Store) UniqueNodeProperties() []string { return s.propIdx.UniqueNodeKeys() }
+
+// UniqueEdgeProperties implements store.UniqueIndexDeclarer.
+func (s *Store) UniqueEdgeProperties() []string { return s.propIdx.UniqueEdgeKeys() }
+
+// nodeExistsLocked reports whether id names a live node. Caller must hold s.mu.
+func (s *Store) nodeExistsLocked(id store.NodeID) bool {
+	_, ok := s.nodes[id]
+	return ok
+}
+
+// edgeExistsLocked reports whether id names a live edge. Caller must hold s.mu.
+func (s *Store) edgeExistsLocked(id store.EdgeID) bool {
+	_, ok := s.edges[id]
+	return ok
+}
+
+// UniqueNodeOwner implements store.UniqueIndexDeclarer.
+func (s *Store) UniqueNodeOwner(key string, value []byte) (store.NodeID, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.propIdx.IsUniqueNodeKey(key) {
+		return store.InvalidNodeID, false, fmt.Errorf("%w: %q", store.ErrKeyNotUnique, key)
+	}
+	owner, held := s.propIdx.NodeUniqueOwner(key, value)
+	if !held || !s.nodeExistsLocked(owner) {
+		return store.InvalidNodeID, false, nil
+	}
+	return owner, true, nil
+}
+
+// UniqueEdgeOwner implements store.UniqueIndexDeclarer.
+func (s *Store) UniqueEdgeOwner(key string, value []byte) (store.EdgeID, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.propIdx.IsUniqueEdgeKey(key) {
+		return store.InvalidEdgeID, false, fmt.Errorf("%w: %q", store.ErrKeyNotUnique, key)
+	}
+	owner, held := s.propIdx.EdgeUniqueOwner(key, value)
+	if !held || !s.edgeExistsLocked(owner) {
+		return store.InvalidEdgeID, false, nil
+	}
+	return owner, true, nil
+}
+
 // DeclareCompositeNodeProperties implements store.CompositeIndexDeclarer.
 func (s *Store) DeclareCompositeNodeProperties(keys []string) error {
 	return s.propIdx.DeclareCompositeNodeKeys(keys)
@@ -441,7 +526,7 @@ func (s *Store) PurgeEdgeIndex(id store.EdgeID) error {
 
 func (s *Store) UpdateNode(n *store.Node) error {
 	if len(n.Labels) == 0 {
-		return fmt.Errorf("UpdateNode: node %d must carry at least one label", n.ID)
+		return fmt.Errorf("UpdateNode: node %d: %w", n.ID, store.ErrNoLabels)
 	}
 
 	s.mu.Lock()
@@ -453,6 +538,9 @@ func (s *Store) UpdateNode(n *store.Node) error {
 		return &store.ErrNotFound{Kind: "node", ID: uint64(n.ID)}
 	}
 
+	if s.reindexPolicy == store.ReindexReject && s.propIdx.NodeHasEntries(n.ID) {
+		return fmt.Errorf("UpdateNode: node %d: %w", n.ID, store.ErrIndexedPropertiesRequired)
+	}
 	if s.reindexPolicy == store.ReindexPurge {
 		s.propIdx.RemoveNode(n.ID)
 	}
@@ -475,7 +563,7 @@ func (s *Store) UpdateNode(n *store.Node) error {
 
 func (s *Store) UpdateEdge(e *store.Edge) error {
 	if len(e.Labels) == 0 {
-		return fmt.Errorf("UpdateEdge: edge %d must carry at least one label", e.ID)
+		return fmt.Errorf("UpdateEdge: edge %d: %w", e.ID, store.ErrNoLabels)
 	}
 
 	s.mu.Lock()
@@ -487,6 +575,9 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 		return &store.ErrNotFound{Kind: "edge", ID: uint64(e.ID)}
 	}
 
+	if s.reindexPolicy == store.ReindexReject && s.propIdx.EdgeHasEntries(e.ID) {
+		return fmt.Errorf("UpdateEdge: edge %d: %w", e.ID, store.ErrIndexedPropertiesRequired)
+	}
 	if s.reindexPolicy == store.ReindexPurge {
 		s.propIdx.RemoveEdge(e.ID)
 	}
@@ -800,13 +891,11 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) IndexNodeProperty(id store.NodeID, key string, value []byte) error {
-	s.propIdx.IndexNode(id, key, value)
-	return nil
+	return s.propIdx.IndexNodeUnique(id, key, value)
 }
 
 func (s *Store) IndexEdgeProperty(id store.EdgeID, key string, value []byte) error {
-	s.propIdx.IndexEdge(id, key, value)
-	return nil
+	return s.propIdx.IndexEdgeUnique(id, key, value)
 }
 
 // NodesByProperty returns the nodes indexed under key with exactly value.

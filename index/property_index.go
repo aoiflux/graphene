@@ -1,10 +1,12 @@
 package index
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -81,6 +83,12 @@ type propertyShard struct {
 	// see orderedIndex and index/encoding.
 	orderedNodeKeys map[string]*orderedIndex[store.NodeID]
 	orderedEdgeKeys map[string]*orderedIndex[store.EdgeID]
+
+	// Keys declared unique. No structure accompanies them: uniqueness is a
+	// predicate over the postings above, not a second index. See
+	// unique_index.go.
+	uniqueNodeKeys map[string]struct{}
+	uniqueEdgeKeys map[string]struct{}
 }
 
 // shardFor returns the shard owning key.
@@ -138,6 +146,8 @@ func NewPropertyIndex() *PropertyIndex {
 			edges:           newPostings[store.EdgeID](),
 			orderedNodeKeys: make(map[string]*orderedIndex[store.NodeID]),
 			orderedEdgeKeys: make(map[string]*orderedIndex[store.EdgeID]),
+			uniqueNodeKeys:  make(map[string]struct{}),
+			uniqueEdgeKeys:  make(map[string]struct{}),
 		}
 	}
 	return p
@@ -1271,4 +1281,91 @@ func (p *PropertyIndex) ForEachEdgeProperty(fn func(id store.EdgeID, key string,
 			return
 		}
 	}
+}
+
+// PropEntry is one (key, value) pair an entity is indexed under.
+type PropEntry struct {
+	Key   string
+	Value []byte
+}
+
+// NodeEntriesOf returns every property-index entry registered for id, sorted by
+// key then value.
+//
+// This is the reverse map read forwards. It exists because replacing what one
+// entity is indexed under is only expressible as "drop everything, register the
+// new set": the log has a purge record per entity and an add record per entry,
+// and no per-key purge — so a caller changing one key has to know the others in
+// order to put them back. Sorted, so the re-registration that follows frames the
+// same bytes every time.
+func (p *PropertyIndex) NodeEntriesOf(id store.NodeID) []PropEntry {
+	var out []PropEntry
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		sh.nodes.forEachRef(id, func(r propRef) bool {
+			out = append(out, PropEntry{Key: sh.nodes.keyName(r.keyID), Value: []byte(r.value)})
+			return true
+		})
+		sh.mu.RUnlock()
+	}
+	sortPropEntries(out)
+	return out
+}
+
+// EdgeEntriesOf is NodeEntriesOf for edges.
+func (p *PropertyIndex) EdgeEntriesOf(id store.EdgeID) []PropEntry {
+	var out []PropEntry
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		sh.edges.forEachRef(id, func(r propRef) bool {
+			out = append(out, PropEntry{Key: sh.edges.keyName(r.keyID), Value: []byte(r.value)})
+			return true
+		})
+		sh.mu.RUnlock()
+	}
+	sortPropEntries(out)
+	return out
+}
+
+func sortPropEntries(e []PropEntry) {
+	slices.SortFunc(e, func(a, b PropEntry) int {
+		if c := strings.Compare(a.Key, b.Key); c != 0 {
+			return c
+		}
+		return bytes.Compare(a.Value, b.Value)
+	})
+}
+
+// NodeHasEntries reports whether id carries any property-index entry.
+//
+// Sixteen map lookups, which is what the reverse map being sharded by key rather
+// than by entity costs. It is paid only where an update has to decide whether it
+// is about to leave something stale behind.
+func (p *PropertyIndex) NodeHasEntries(id store.NodeID) bool {
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		has := sh.nodes.hasRefs(id)
+		sh.mu.RUnlock()
+		if has {
+			return true
+		}
+	}
+	return false
+}
+
+// EdgeHasEntries is NodeHasEntries for edges.
+func (p *PropertyIndex) EdgeHasEntries(id store.EdgeID) bool {
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		has := sh.edges.hasRefs(id)
+		sh.mu.RUnlock()
+		if has {
+			return true
+		}
+	}
+	return false
 }
