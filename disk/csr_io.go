@@ -211,6 +211,28 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 			nodeCount, len(data)-pos)
 	}
 	nodes := make([]nodeRecord, nodeCount)
+
+	// Labels and property blobs are allocated once each for the whole image
+	// rather than once per record, and every record's slice is a sub-slice of
+	// the arena. The file already holds them as one packed byte stream; the old
+	// loop unpacked that stream into two heap objects per record and handed the
+	// collector 600 000 of them on a 300 000-record image, live for the life of
+	// the store.
+	//
+	// Every sub-slice is taken with the three-index form, so cap == len and an
+	// append by a caller reallocates instead of writing over the next record's
+	// bytes. That is what keeps the existing csrBytes aliasing contract true
+	// under a shared backing array; without it this would be a silent
+	// cross-record corruption rather than an optimisation.
+	//
+	// Spans are recorded during the parse and resolved to slices afterwards,
+	// because appending to the arena may move it and would leave any slice taken
+	// mid-parse pointing at a stale array.
+	nodeLabelArena := make([]store.NodeType, 0, nodeCount)
+	nodePropArena := make([]byte, 0, len(data)/8)
+	nodeLabelSpan := make([][2]uint32, nodeCount)
+	nodePropSpan := make([][2]uint32, nodeCount)
+
 	for i := range nodes {
 		if pos+9 > len(data) {
 			return nil, nil, fmt.Errorf("deserialiseCSR: truncated node record %d", i)
@@ -238,22 +260,31 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		if pos+labelBytes+nodeTail > len(data) {
 			return nil, nil, fmt.Errorf("deserialiseCSR: truncated node labels %d", i)
 		}
-		labels := make([]store.NodeType, labelCount)
+		labelStart := uint32(len(nodeLabelArena))
 		for j := 0; j < labelCount; j++ {
 			if version >= csrVersionWithU16Labels {
-				labels[j] = store.NodeType(binary.LittleEndian.Uint16(data[pos:]))
+				nodeLabelArena = append(nodeLabelArena, store.NodeType(binary.LittleEndian.Uint16(data[pos:])))
 				pos += currentLabelBytesPerValue
 			} else {
-				labels[j] = store.NodeType(data[pos])
+				nodeLabelArena = append(nodeLabelArena, store.NodeType(data[pos]))
 				pos++
 			}
 		}
-		props, nextPos, err := readCSRProperties(data, pos, version, "node", i)
+		nodeLabelSpan[i] = [2]uint32{labelStart, uint32(labelCount)}
+
+		arena, propStart, propLen, nextPos, err := readCSRPropertiesInto(nodePropArena, data, pos, version, "node", i)
 		if err != nil {
 			return nil, nil, err
 		}
+		nodePropArena = arena
+		nodePropSpan[i] = [2]uint32{propStart, propLen}
 		pos = nextPos
-		nodes[i] = nodeRecord{ID: nid, Labels: labels, Properties: props}
+		nodes[i] = nodeRecord{ID: nid}
+	}
+
+	for i := range nodes {
+		nodes[i].Labels = arenaLabels(nodeLabelArena, nodeLabelSpan[i])
+		nodes[i].Properties = arenaBytes(nodePropArena, nodePropSpan[i])
 	}
 
 	if edgeCount < 0 || edgeCount > (len(data)-pos)/minEdgeRecordBytes {
@@ -261,6 +292,13 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 			edgeCount, len(data)-pos)
 	}
 	edges := make([]rawEdge, edgeCount)
+
+	// Same arena treatment as the node records above, and for the same reason.
+	edgeLabelArena := make([]store.EdgeType, 0, edgeCount)
+	edgePropArena := make([]byte, 0, len(data)/8)
+	edgeLabelSpan := make([][2]uint32, edgeCount)
+	edgePropSpan := make([][2]uint32, edgeCount)
+
 	for i := range edges {
 		if pos+25 > len(data) {
 			return nil, nil, fmt.Errorf("deserialiseCSR: truncated edge record %d", i)
@@ -286,24 +324,32 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		if pos+labelBytes+edgeTail > len(data) {
 			return nil, nil, fmt.Errorf("deserialiseCSR: truncated edge labels %d", i)
 		}
-		labels := make([]store.EdgeType, labelCount)
+		labelStart := uint32(len(edgeLabelArena))
 		for j := 0; j < labelCount; j++ {
 			if version >= csrVersionWithU16Labels {
-				labels[j] = store.EdgeType(binary.LittleEndian.Uint16(data[pos:]))
+				edgeLabelArena = append(edgeLabelArena, store.EdgeType(binary.LittleEndian.Uint16(data[pos:])))
 				pos += currentLabelBytesPerValue
 			} else {
-				labels[j] = store.EdgeType(data[pos])
+				edgeLabelArena = append(edgeLabelArena, store.EdgeType(data[pos]))
 				pos++
 			}
 		}
+		edgeLabelSpan[i] = [2]uint32{labelStart, uint32(labelCount)}
 		weight := math.Float32frombits(binary.LittleEndian.Uint32(data[pos:]))
 		pos += 4
-		props, nextPos, err := readCSRProperties(data, pos, version, "edge", i)
+		arena, propStart, propLen, nextPos, err := readCSRPropertiesInto(edgePropArena, data, pos, version, "edge", i)
 		if err != nil {
 			return nil, nil, err
 		}
+		edgePropArena = arena
+		edgePropSpan[i] = [2]uint32{propStart, propLen}
 		pos = nextPos
-		edges[i] = rawEdge{ID: eid, Src: src, Dst: dst, Labels: labels, Weight: weight, Properties: props}
+		edges[i] = rawEdge{ID: eid, Src: src, Dst: dst, Weight: weight}
+	}
+
+	for i := range edges {
+		edges[i].Labels = arenaLabels(edgeLabelArena, edgeLabelSpan[i])
+		edges[i].Properties = arenaBytes(edgePropArena, edgePropSpan[i])
 	}
 
 	// Build indexes its arrays by entity ID, not by record count, so it allocates
@@ -611,6 +657,57 @@ func readCSRIndexSection(data []byte, offset int) (*csrIndexSection, error) {
 	}
 
 	return section, nil
+}
+
+// arenaLabels resolves a recorded span to a sub-slice of the label arena. The
+// three-index form is load-bearing: it makes cap == len so that a caller
+// appending to a record's Labels reallocates rather than overwriting the next
+// record's labels in the shared array.
+func arenaLabels[T store.NodeType | store.EdgeType](arena []T, span [2]uint32) []T {
+	if span[1] == 0 {
+		return nil
+	}
+	lo, hi := span[0], span[0]+span[1]
+	return arena[lo:hi:hi]
+}
+
+// arenaBytes is arenaLabels for the property arena, under the same contract and
+// for the same reason. A zero-length blob resolves to nil rather than to an
+// empty sub-slice, because both stores normalise an empty blob to nil on the way
+// in and a reader must not be able to tell the two apart.
+func arenaBytes(arena []byte, span [2]uint32) []byte {
+	if span[1] == 0 {
+		return nil
+	}
+	lo, hi := span[0], span[0]+span[1]
+	return arena[lo:hi:hi]
+}
+
+// readCSRPropertiesInto is readCSRProperties writing through an arena: it
+// appends the blob and reports where it landed, instead of allocating one slice
+// per record. It returns the (possibly reallocated) arena, which the caller must
+// store back.
+func readCSRPropertiesInto(arena []byte, data []byte, pos int, version uint16, kind string, index int) ([]byte, uint32, uint32, int, error) {
+	if version == 2 {
+		if pos+8 > len(data) {
+			return arena, 0, 0, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
+		}
+		return arena, 0, 0, pos + 8, nil
+	}
+	if pos+4 > len(data) {
+		return arena, 0, 0, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
+	}
+	propLen := int(binary.LittleEndian.Uint32(data[pos:]))
+	pos += 4
+	if pos+propLen > len(data) {
+		return arena, 0, 0, pos, fmt.Errorf("deserialiseCSR: truncated %s property blob %d", kind, index)
+	}
+	if propLen == 0 {
+		return arena, 0, 0, pos, nil
+	}
+	off := uint32(len(arena))
+	arena = append(arena, data[pos:pos+propLen]...)
+	return arena, off, uint32(propLen), pos + propLen, nil
 }
 
 func readCSRProperties(data []byte, pos int, version uint16, kind string, index int) ([]byte, int, error) {

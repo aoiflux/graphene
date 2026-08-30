@@ -34,22 +34,29 @@ results:
 
 **Benchmarking Conditions:**
 
-- **Date**: 2026-07-21
+- **Date**: 2026-08-30
 - **OS**: Windows 11 (amd64)
-- **Go Version**: go1.26.2
+- **Go Version**: go1.27.0
 - **Hardware**: AMD Ryzen 9 5980HS with Radeon Graphics (16 cores)
 - **Architecture**: amd64
-- **Command**: `./test.ps1 -Bench -BenchTime 1s`
+- **Command**: `go test ./tests/ -tags=stress -bench=... -benchmem -benchtime=1s -count=3`
 
 **Core operations:**
 
-| Benchmark             |       Result |                     Memory |
-| --------------------- | -----------: | -------------------------: |
-| Add node              |  814.0 ns/op |      306 B/op, 3 allocs/op |
-| Get node              |  5.815 ns/op |        0 B/op, 0 allocs/op |
-| BFS traversal         | 353200 ns/op |  234240 B/op, 77 allocs/op |
-| Shortest path         | 188300 ns/op | 100472 B/op, 576 allocs/op |
-| Property index lookup |  42.78 ns/op |         8 B/op, 1 alloc/op |
+| Benchmark             |       Result |                    Memory |
+| --------------------- | -----------: | ------------------------: |
+| Add node              |  669.4 ns/op |     253 B/op, 3 allocs/op |
+| Get node              |  6.827 ns/op |       0 B/op, 0 allocs/op |
+| BFS traversal         | 190495 ns/op | 35808 B/op, 36 allocs/op |
+| Shortest path         | 226060 ns/op | 69888 B/op, 37 allocs/op |
+| Property index lookup |  78.30 ns/op |        8 B/op, 1 alloc/op |
+
+These are **absolute figures from one session on a warm laptop**, refreshed
+2026-08-30. The `B/op` and `allocs/op` columns are deterministic and comparable
+across runs; the `ns/op` column is not, and no claim about a change in it is
+supported by this table. Change claims come only from the interleaved A/B runs
+in [benchmarks.md](docs/benchmarks.md), which measure both arms in alternating
+rounds against a byte-identical control.
 
 The suite now runs **68 benchmarks** covering reads, writes, concurrency, a
 10k→100k scale sweep, and resident memory footprint — up from 5. See
@@ -121,17 +128,20 @@ query 14× slower (2.91 ms → 41.38 ms); it is now flat (704 ns → 590 ns).
 Traversal was reworked separately, where the metric is **allocations per walk**
 rather than latency — allocation is what the GC turns into tail latency:
 
-| Operation                    |        Before |      After |      Change |
-| ---------------------------- | ------------: | ---------: | ----------: |
-| BFS over a 10,000-node chain | 30,190 allocs | 216 allocs | ~140× fewer |
-| BFS over a 1,000-node chain  |  3,058 allocs |  77 allocs |  ~40× fewer |
-| BFS over a 100×100 fan-out   |  1,323 allocs | 232 allocs | ~5.7× fewer |
-| Shortest path                |  1,563 allocs | 576 allocs | ~2.7× fewer |
-| BFS on the disk backend      |    913 allocs | 394 allocs | ~2.3× fewer |
+| Operation                    |    Originally | After the traversal rework | After Phase 7 |      Change |
+| ---------------------------- | ------------: | -------------------------: | ------------: | ----------: |
+| BFS over a 10,000-node chain | 30,190 allocs |                 198 allocs |    **58** | ~520× fewer |
+| BFS over a 1,000-node chain  |  3,058 allocs |                  77 allocs |    **36** |  ~85× fewer |
+| BFS over a 100×100 fan-out   |  1,323 allocs |                 237 allocs |    **97** |  ~14× fewer |
+| Shortest path                |  1,563 allocs |                 576 allocs |    **37** |  ~42× fewer |
+| BFS on the disk backend      |    913 allocs |                 395 allocs |   **385** | ~2.4× fewer |
 
-Wall-clock improved alongside it (disk BFS −21%, shortest path −10%), and the
-new `BFSIDs` walks the graph without building a single record: 20 allocations
-where the record-returning walk needs 394.
+Wall-clock improved alongside it. Phase 7's interleaved A/B, with the control
+read first and moving 5.6% *against* the tree, puts the wide in-memory walks at
+**−52 to −58%** and the disk walks at −2 to −21%; the middle column above came
+from an earlier rework that took the disk BFS −21% and shortest path −10%. The
+`BFSIDs` family walks the graph without building a single record: 15 allocations
+on the disk fixture where the record-returning walk needs 385.
 
 Allocation dropped alongside latency: a filtered query that used to allocate
 **93 MB** now allocates **576 bytes**, and hub degree counting allocates nothing
@@ -527,6 +537,8 @@ go run ./examples
   [TECHNICAL_DETAILS.md](docs/TECHNICAL_DETAILS.md)
 - Benchmark methodology and results: [benchmarks.md](docs/benchmarks.md)
 - Engine comparison notes: [comparison.md](docs/comparison.md)
+- Where we stand against a native graph database, and what would close the
+  gap: [RESEARCH_NATIVE_GRAPH.md](docs/RESEARCH_NATIVE_GRAPH.md)
 - **Security model, guarantees, and their limits:** [SECURITY.md](SECURITY.md) —
   read this before relying on the integrity machinery for anything evidentiary.
   It states what digests, Merkle roots, signatures, and attestations actually

@@ -633,6 +633,252 @@ way:
 
 ---
 
+## Phase 7 — allocation and footprint (2026-08-30)
+
+A separate campaign from everything above, and measured to a stricter rule. The
+sections before this one report a single A/B against `036aac0`; Phase 7 reports
+**three columns for every item — sec/op, resident bytes, allocs/op — in the
+project's standing priority order, speed > resident memory > allocations.** An
+item that wins the third column and loses either of the first two is reverted,
+not shipped with a caveat. That rule has precedent: bulk index loading cut
+allocations 9-19%, cost 35-75% more resident memory, and was reverted.
+
+### Method, and where the baseline comes from
+
+| | |
+| --- | --- |
+| **Date** | 2026-08-30 |
+| **Baseline** | git `2b94606`, built into a separate worktree, benchmarked as the other arm |
+| **Method** | Interleaved A/B, alternating rounds at `-benchtime=1s`, warm-up round discarded, issued as one background job with nothing else touching the machine |
+| **Control** | `PointLookupNode_Memory` — byte-identical between the arms — read **before** the headline |
+| **Resident** | `-tags=stress -bench=Footprint -benchtime=1x`, five interleaved rounds. Not `B/op`, which is bytes allocated *during* an op and says nothing about what a long-lived process holds |
+| **Profile** | `make allocprofile`, which runs at `-test.memprofilerate=1` — see below |
+
+**The baseline is the HEAD arm of the interleaved runs, not a separately
+recorded table.** A table taken in its own session and compared against later is
+exactly the "never compare across sessions" mistake; a HEAD worktree measured in
+the same alternating rounds as the tree is the same discipline the phases before
+it used, and is a stronger baseline rather than a substitute for one.
+
+### `make allocprofile`, and why the sample rate is the whole point
+
+```
+make allocprofile
+```
+
+runs the ingest and traversal benchmarks under `-memprofile` at
+**`-test.memprofilerate=1`** and prints two `pprof` rankings, `-alloc_objects`
+and `-alloc_space`, because the largest count and the largest bytes are rarely
+the same site.
+
+The rate is not a detail. At Go's default sampling interval the single-record
+write path — three allocations per record, the phase's first finding — **did not
+appear in the profile at all**; only `&store.Node{}` and `&nodeVersion{}` did.
+Small short-lived allocations are precisely what gets under-sampled, and they
+are precisely what this phase exists to remove. A profile that cannot see them
+is worse than no profile, because it ranks confidently and wrongly.
+
+### The write path — three allocations per record became one
+
+Control read first: **−0.2%** (20.0-34.7 ns HEAD, 19.9-32.0 tree). The run stands.
+
+| Benchmark | sec/op | resident | allocs/op | B/op |
+| --- | ---: | ---: | ---: | ---: |
+| `Ingest_AddNode_Disk` | **−18.1%** (4 465 → 3 655 ns) | flat | **8 → 5** (−37.5%) | −37.1% |
+| `BulkWrite_AddNodes_Disk_NoSync` n=10000 | **−21.0%** (3.71 → 2.93 ms) | flat | **50 191 → 40 111** (−20.1%) | −28.3% |
+| — n=1000 | **−23.7%** (628 → 479 µs) | flat | 5 066 → 4 045 (−20.2%) | −30.6% |
+| — n=100 | −2.5% — inside the noise | flat | 540 → 430 (−20.4%) | −27.4% |
+| `Ingest_AddNodes_Batch1000` | −5.7% — inside the noise | flat | flat | +0.2% |
+| `ShortestPath` | −8.1% | n/a — traversal scratch | **576 → 37** (−93.6%) | −30.4% |
+
+`marshalNode` built a payload, `WAL.append` copied it because a caller *may*
+reuse its slice, and `writeRecord` allocated the frame and copied again. Two of
+the three defended against a caller that does not exist: all eight single-record
+call sites marshal a temporary and drop it. The path now frames straight into
+the buffer the ring takes ownership of.
+
+`ShortestPath`'s 576 allocations were not the visited maps the plan suspected.
+`expandAndAdvance` grew the next level's frontier from `nil` on every level of
+every direction — 590k of the benchmark's 789k allocations, **75% of the whole
+thing**.
+
+### The read path — one membership set, three representations
+
+Control read first: **+5.6%** (19.8-98.5 ns HEAD, 20.9-111.7 tree), and the
+drift runs *against* the tree, so each figure below is a floor rather than a
+ceiling.
+
+| Benchmark | sec/op | resident | allocs/op | B/op |
+| --- | ---: | ---: | ---: | ---: |
+| `BFSIDs_Wide` | **−58.2%** | n/a | **104 → 34** (−67.3%) | −61.6% |
+| `BFS_Wide` | **−52.2%** | n/a | **237 → 97** (−59.1%) | −54.1% |
+| `BFS_Deep` | **−41.7%** | n/a | **198 → 58** (−70.7%) | −65.1% |
+| `BFSIDs_Deep` | **−34.9%** | n/a | **97 → 27** (−72.2%) | −61.9% |
+| `BFS3Hop_Disk` | **−20.7%** | n/a | 45 → 39 (−13.3%) | −21.2% |
+| `BFSIDs_Disk_Deep` | −7.2% | n/a | 20 → 15 (−25.0%) | −18.0% |
+| `Neighbours1Hop_Disk` | −5.1% | n/a | 8 → 8 | ±0.0% |
+| `BFS_Disk_Deep` | −2.2% | n/a | 395 → 385 (−2.5%) | −7.9% |
+| `ReopenCompactedStore` | −1.0% | n/a | flat | flat |
+| `Ingest_AddNode_Disk` | −0.1% | flat | 5 → 5 | overlapping ranges |
+
+Resident bytes, five footprint fixtures, **±0.0% on every one**: DiskFileSize
+175.0 B/node, HalfDeleted_Compacted 158.2, HalfDeleted_Uncompacted 835.0,
+TopologyOnly 298.9, WithPropertyIndex 575.9.
+
+At `-test.memprofilerate=1` on a wide BFS, the two `map[ID]struct{}` sets were
+**1.13 MB of the walk's 2.17 MB/op** — more than half of everything it
+allocated. They are now one `idSet` with three representations chosen by
+measured density rather than by a tuned constant; see
+[TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md) §14.12.
+
+### The measurement that changed the design, and what it cost to find
+
+The first `idSet` had two representations and **lost the A/B on every disk
+walk** — a flat +192 B and +2 allocations per set, whatever the walk's size,
+while winning 46-58% on the in-memory ones. Under the revert rule that is a
+revert, so the cause had to be found rather than argued around.
+
+It was not the algorithm. On the disk fixtures the density rule correctly never
+builds a bitset at all: `midNode` sits at ID ~33 000 against ~15 entries
+visited. `go build -gcflags='-m'` named it instead — **a map reached through a
+pointer-held struct field cannot be proved non-escaping.** The maps this
+replaced were short-lived locals the compiler put on the *stack*; moving one
+behind `s.m` moves it to the heap, and that cost is paid by every walk whether
+it grows or not.
+
+The fix is a 32-entry inline array scanned linearly, so the small case allocates
+nothing on any path. An isolated micro-benchmark at the fixtures' ID shape:
+map 1 872 B / 10 allocs, first `idSet` 2 256 B / 14 allocs — reproducing the
++384 B / +4 on a two-set walk exactly — and **0 B / 0 allocs** after.
+
+### One run voided, and why it is recorded rather than dropped
+
+A run with the control at **+62.4%** and absolutes of 63-206 ns against 17-20 on
+a quiet host was discarded whole. The load was this session's own tool calls
+landing during the run. `B/op` and `allocs/op` from it are still valid and were
+used — they are deterministic — but nothing in the `sec/op` column survived, and
+a fourth run was taken. Phases 4 and 5 each discarded a run for the same reason;
+this is the third.
+
+## The CSR load path — two candidates, one kept (2026-08-30)
+
+Both candidates came out of the Phase 7 arena spike ([TECHNICAL_DETAILS.md
+§14.13](TECHNICAL_DETAILS.md)). Both were built, both were measured on all three
+of the phase's columns, and the revert rule fired on one of them.
+
+**Neither is a format change.** The on-disk image already stores records as one
+packed byte stream, and adjacency has not been serialised since v7 — `Build`
+recomputes the neighbour arrays on every load. Both candidates are in-memory
+representation changes on the load path. `Footprint_DiskFileSize` is **175.0
+B/node in every arm of every run below**, which is the empirical form of that
+claim.
+
+### Kept: the record arena
+
+`disk/csr_io.go` packs every record's labels and property blob into shared
+backing arrays and hands each record a three-index sub-slice — `arena[lo:hi:hi]`,
+which preserves the `csrBytes` aliasing contract by forcing an append to copy
+rather than scribble into the next record. Roughly 600 000 small objects become a
+handful of large ones.
+
+| column | result | |
+| --- | --- | --- |
+| allocations, load path | **−21.8%** | deterministic |
+| `ReopenCompactedStore` | **+11.6%** (58.6 → 65.3 ms) | consistent in direction across three runs |
+| GC cycle, 512-byte blobs | **−21.4%** (5.452 → 4.285 ms) | disjoint ranges |
+| GC cycle, 64-byte blobs | +5.4% | overlapping, base spread 53% |
+| GC cycle, no blobs | −14.7% | overlapping, tree spread 42% |
+| resident, five footprint fixtures | ±0.0% | **weak instrument — see below** |
+
+**Kept.** Speed is split and nets positive: the reopen cost is paid once per
+process, the GC saving every cycle for the life of it, so break-even is ~6 forced
+cycles at 512-byte blobs and ~14 at none. Nothing loses on resident bytes or
+allocations, so §7.5's revert rule does not fire.
+
+**The resident row is a "no regression", not a measurement.** No footprint
+fixture reopens a store from disk, so not one of them executes the arena load
+path. Saying "flat" is honest; saying "measured and unchanged" would not be.
+
+### The GC benchmark, and two harness defects it took to get a number
+
+`tests/gc_bench_test.go` (`stress`) builds 100 000 nodes and 200 000 edges,
+compacts, closes, and **reopens** — the reopened image is the one under test,
+because it is built by the reader rather than by `Build`. It then calls
+`debug.SetGCPercent(-1)` and times a loop whose body is one `runtime.GC()` and
+nothing else, so `ns/op` is the per-cycle scan cost directly.
+
+**Disabling the trigger is not a detail.** At a fixed GOGC a smaller live heap
+triggers proportionally more cycles, so comparing two layouts at GOGC=on measures
+the trigger rate rather than the scan cost. The original spike did not disable
+it, which is why its baseline — 1.34 / 2.29 / 5.77 ms, rising with blob size —
+does not reproduce against the shipped loader, where the same three fixtures are
+flat.
+
+Two runs were then thrown away, both to the same family of defect:
+
+1. **The 25 ns control shared a process with the GC benchmarks.** The control
+   read through a live 100 000-node store and three forced-GC loops; it moved
+   **−9.7%** across all rounds and **−13.3%** with the warm-up discarded, on
+   byte-identical code, with a base-arm spread of **119%**. Voided.
+2. **The three blob sizes shared a process with each other.** Control was clean
+   at +1.6%, but each sub-benchmark's forced-GC loop was collecting its
+   predecessor's store: blob0's *fastest* round was its highest iteration count
+   (N=508 → 2.11 ms) and its slowest was N=364 → 5.83 ms, and blob0/blob64 swung
+   against blob512 round by round. Base-arm spreads of **176%** and **147%** —
+   uninterpretable in either direction, though blob512 was clean and disjoint in
+   both runs.
+
+The fix needed no code change, since `-test.bench` accepts a sub-benchmark
+pattern: run every sub-benchmark in its own process, per arm, per round, control
+first. Isolating them **flipped blob0's sign** (+41.1% → −14.7%) and tightened
+blob64's base spread from 147% to 53% — which is what says the apparent
+small-blob regression was the harness rather than the change.
+
+Final run, six interleaved rounds, warm-up discarded, control read first:
+
+| fixture | base (min) | spread | tree (min) | spread | change | |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| _Control:_ `PointLookupNode_Memory` | 28.05 ns | 37.2% | 27.87 ns | 20.3% | **−0.6%** | overlap — run stands |
+| GC cycle, blob 0 B | 3.245 ms | 18.0% | 2.769 ms | 41.8% | −14.7% | overlap |
+| GC cycle, blob 64 B | 3.419 ms | 53.1% | 3.605 ms | 37.4% | +5.4% | overlap |
+| GC cycle, blob 512 B | 5.452 ms | 16.0% | 4.285 ms | 20.2% | **−21.4%** | **disjoint** |
+
+The 512-byte row is disjoint for the third time under a third harness — −32.6%,
+−34.0%, −21.4%. The magnitude tracks host temperature; the direction does not
+move. The absolutes in this run are ~1.7× the previous one's on both arms
+(control minima 28 ns against 19), which is thermal drift on a laptop after a
+long benchmarking session — the reason interleaving is the method and minima are
+the statistic.
+
+### Reverted: denormalised neighbour arrays
+
+Storing the far endpoint `NodeID` beside the `EdgeID` in the adjacency arrays,
+plus an unfiltered fast-path hop that skips record resolution when a walk asks
+for no edge-type filter.
+
+| column | result |
+| --- | --- |
+| resident, `Footprint_Disk_*` | **+10.8% / +7.7% / +5.6%** |
+| four walk benchmarks | inside the control's spread |
+| degree sweep to 32 768 | scatter, with the opposite of the predicted shape |
+
+**The cost needed no interpretation.** The footprint fixtures give each node two
+edges, and 2 edges × 2 directions × 8 bytes is **32 B/node** against the **32.1
+B/node** observed.
+
+**The arithmetic is why the scatter is a decision and not a failed run.** At
+degree 32 768 the walk costs **351 ns per edge**; the isolated denormalised hop
+cost **14.6 ns per edge**. The work this change removes is ~4% of what
+`Neighbours` does — the rest is result materialisation, dedupe and the caller's
+iteration — so its ceiling is **~2.8% at any degree**, permanently below this
+suite's noise floor. A fixture that could show it would be a fixture built to
+flatter the change.
+
+**Reverted** under §7.5: it loses the resident column and cannot win the speed
+column by more than its own arithmetic allows. `disk/csr.go` is back at HEAD. It
+stays cheap to revisit, because adjacency is recomputed on load and nothing about
+it is durable.
+
 ## What is still slow
 
 - **`Contains` filters are a scan and will stay one.** No ordering can bound a

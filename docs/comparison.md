@@ -197,3 +197,8 @@ property support.
 Graphene is graph-native at the storage layer, but it is still best described
 today as an experimental embedded graph engine rather than a production-complete
 peer to Neo4j-class graph database products.
+
+What would close that gap — an audit of Neo4j's three layers, which of its
+claims survive scrutiny, the algorithm and query-engine matrices, and the
+primitives that block them — is in
+[RESEARCH_NATIVE_GRAPH.md](RESEARCH_NATIVE_GRAPH.md).

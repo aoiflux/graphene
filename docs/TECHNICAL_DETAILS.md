@@ -2691,6 +2691,258 @@ ordering to size them with, and the entry count remains an honest upper bound;
 guessing a selectivity would order residual steps on a number with no evidence
 behind it (§7.3).
 
+### 14.12 Taken: three representations for a traversal's visited set
+
+At `-test.memprofilerate=1` on a wide BFS, the two `map[ID]struct{}` sets a walk
+carries were **1.13 MB of its 2.17 MB/op** — more than half of everything it
+allocated, and the largest remaining site on the read path. They appear nowhere
+near the top by object *count*: what costs is a map's growth as the walk widens,
+which is why the two rankings `make allocprofile` prints are both needed.
+
+`traversal.idSet` replaces them. It has three representations and **no tuning
+constant deciding between the two that grow.**
+
+**The choice is measured density, not an entry-count threshold.** A threshold is
+a bet on the walk continuing, and a walk that stops just after paying for the
+switch has paid for nothing. The rule, re-tested on every insert:
+
+```
+a bitset covering maxSeen costs (maxSeen/64 + 1) words
+the same entries in a map cost at least one word each
+so the bitset is never larger once maxSeen/64 <= n
+```
+
+For the dense, contiguous IDs a compacted CSR holds this is true on the first
+insert, so a dense walk never builds a map at all. For a walk starting at ID
+90 000 it becomes true at ~1 400 entries — the point where the map genuinely is
+the more expensive of the two. The bitset is therefore **never** the larger
+representation, which is what makes the promotion safe to do unconditionally.
+Demotion is the same rule read backwards; `maxSeen` only rises, so the two
+cannot alternate.
+
+**The third representation exists because of a measurement, and the first
+version shipped without it and lost.** With only the map and the bitset, the set
+cost a flat **+192 B and +2 allocations per set on every disk walk**, whatever
+its size, while winning 46-58% on the in-memory ones. Under Phase 7's revert
+rule that is a revert, so the cause had to be found rather than worked around.
+
+It was not the algorithm. On the disk fixtures the density rule correctly
+declines to build a bitset at all — the walk starts at ID ~33 000 and visits ~15
+nodes, so `33334/64 = 522 > 15`. `go build -gcflags='-m'` named the real cause:
+
+> `idset.go:93: make(map[uint64]struct {}) escapes to heap`
+> `dfs.go:65: visited does not escape`
+
+**A map reached through a pointer-held struct field cannot be proved
+non-escaping.** The maps this replaced were short-lived locals the compiler put
+on the *stack*. Moving one behind `s.m` moves it to the heap unconditionally,
+and every walk pays that whether it grows or not — a cost created by the
+refactor, invisible in the algorithm, and only findable by escape analysis.
+
+So the small case gets neither map nor bitset: the first 32 distinct IDs live in
+an array inside the set and are scanned linearly, allocating nothing on any
+path. The bound is not fitted to a benchmark — it is where a linear scan stops
+being obviously cheaper than hashing, and it is the same value and the same
+argument as `neighbourDedupeLinear` in `disk/view_read.go`. Overflowing it spills
+directly to whichever growable representation the density rule picks, so the
+first heap allocation the set makes is already the right one.
+
+Measured at the disk fixtures' ID shape, isolated: map **1 872 B / 10 allocs**,
+two-representation `idSet` **2 256 B / 14 allocs** (reproducing the +384 B / +4
+on a two-set walk exactly), three-representation `idSet` **0 B / 0 allocs**. The
+full A/B is in [benchmarks.md](benchmarks.md); every walk wins all three columns,
+resident bytes are ±0.0% on all five footprint fixtures, and the control moved
++5.6% *against* the tree.
+
+### 14.13 CSR record arena: the spike, the correction, and what shipped
+
+§14.3 rejected offset-table-plus-decode-on-access for mmap, and the Phase 2 mmap
+spike rejected mmap itself while pointing at something better: with no property
+blobs at all, 14.1 MiB of a 19.4 MiB heap is the record arrays, and **48 of every
+56-80 bytes per record are two slice headers pointing at two bytes of labels.**
+
+`nodeRecord` is `{ID, Labels []NodeType, Properties []byte}`; `rawEdge` is the
+same shape. The spike's proposal was to replace both slices with `(off, len
+uint32)` into two byte arenas, giving `arenaNode` at **24 bytes against 56** and
+`arenaEdge` at **48 against 80**, and — the part that was said to matter — making
+both arrays **pointer-free**.
+
+#### What the spike reported
+
+`disk/arena_spike_test.go` (`stress`), 100 000 nodes / 200 000 edges at three
+blob sizes, resident bytes through the footprint suite's own measurement and GC
+cycle cost as the mean of 12 forced cycles with the image live:
+
+| blob | current | arena | saved | B/node | B/edge | GC now | GC arena |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 B | 22 235 992 | 12 705 904 | **42.9%** | 95.3 | 47.7 | 1.344 ms | 223 µs |
+| 64 B | 41 410 528 | 33 357 920 | **19.4%** | 80.5 | 40.3 | 2.29 ms | 258 µs |
+| 512 B | 175 810 704 | 166 707 296 | **5.2%** | 91.0 | 45.5 | 5.774 ms | < 1 µs |
+
+Its verdict was *no-go on P2, go on P1* — the resident share collapsing from
+42.9% to 5.2% as blobs grow (the same trap mmap fell into), against a GC cost
+said to be 6× to 25× lower and blob-independent.
+
+#### Three corrections, and only one of them is about the number
+
+**1. The GC column was measured with the collector's trigger left on.** The
+spike calls `runtime.GC()` in a timed loop but never `debug.SetGCPercent(-1)`.
+At a fixed GOGC a smaller live heap triggers proportionally more cycles, so a
+comparison of two layouts at GOGC=on measures the **trigger rate** as much as the
+**scan cost** — and the arena's whole claim is about scan cost. Every figure in
+the last two columns above mixes the two. `tests/gc_bench_test.go`, written for
+the A/B below, disables the trigger and times nothing but forced cycles.
+
+**2. The spike's baseline does not reproduce.** Its "GC now" column *tracks blob
+size* — 1.344 → 2.29 → 5.774 ms, a 4.3× rise — and that rise is most of the
+argument, since it says the current design gets worse as a store grows. Measured
+on the shipped loader with the trigger disabled, the same three fixtures are
+**flat**: 3.22 / 3.14 / 3.76 ms in one run, 3.25 / 3.42 / 5.45 in another. The
+shape the spike found is an artifact of the instrument in (1).
+
+**3. What shipped is not the layout the spike modelled, and this is the
+important one.** `nodeRecord` and `rawEdge` **still hold `[]NodeType` and
+`[]byte`**. The change in `disk/csr_io.go` packs every record's labels and blobs
+into shared backing arrays and hands each record a three-index sub-slice
+(`arena[lo:hi:hi]`, which preserves the `csrBytes` aliasing contract by making an
+append copy rather than scribble into a neighbour). That changes **where the
+pointers point**, not **whether they exist** — `CSRGraph.nodes` and `.edges`
+remain pointer-bearing arrays the collector walks. So the mechanism the spike
+predicted the win from was never built: what shipped is the allocation-count half
+(~600k small objects become a handful of large ones) without the layout half.
+
+The GC win below is therefore real but differently caused. Mark cost is **per
+object** even for an object holding no pointers, so collapsing the object count
+is worth something on its own — and it is worth *more* as blobs grow, which is
+the opposite of the resident prize's shape and the reason the measured win is
+largest at 512 bytes rather than flat across all three.
+
+#### There is no v9
+
+The section above used to end by costing a durable format break: two arena
+sections, an offset table, and a third hand-rolled parser owing Phase 6 a fuzz
+target. **None of that is needed, and none of it was built.**
+
+The on-disk format already stores records as one packed byte stream, and
+adjacency has not been serialised since v7 — `Build` recomputes the neighbour
+arrays on every load. So both wins here are **in-memory representation changes on
+the load path**, invisible to the file: no section, no version gate, no parser,
+no migration, and no new fuzz surface. The evidence is in the footprint suite
+rather than in the argument: `DiskFileSize` is **175.0 B/node in every arm of
+every run**, ±0.0%.
+
+Phase 6 still owes two fuzz targets (`readCompositeSection` and `bulk/dump.go`).
+It does not owe a third.
+
+#### The A/B, and what the revert rule did with it
+
+Interleaved against a HEAD worktree, prebuilt binaries, warm-up round discarded,
+minima as the statistic, `PointLookupNode_Memory` as the byte-identical control
+read **before** the headline.
+
+Two harness defects were found and fixed before any number was believed, both of
+the same family — **a 25 ns control must not share a process with a benchmark
+that builds a 100 000-node store, and neither must two such benchmarks share one
+with each other.** The first voided two runs outright (control −9.7% to −13.3%).
+The second left a valid control but two uninterpretable rows: with all three blob
+sizes in one process, each sub-benchmark's forced-GC loop was collecting its
+predecessor's store, and the base arm's spread reached **176%** at blob0 and
+**147%** at blob64. Per-sub-benchmark process isolation fixed it — no code
+change, since `-test.bench` accepts a sub-benchmark pattern.
+
+Final run, control **−0.6%** (28.05 → 27.87 ns, overlapping ranges):
+
+| fixture | base (min) | spread | tree (min) | spread | change | |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| blob 0 B | 3.245 ms | 18.0% | 2.769 ms | 41.8% | **−14.7%** | overlap |
+| blob 64 B | 3.419 ms | 53.1% | 3.605 ms | 37.4% | **+5.4%** | overlap |
+| blob 512 B | 5.452 ms | 16.0% | 4.285 ms | 20.2% | **−21.4%** | **disjoint** |
+
+Isolating the sub-benchmarks **flipped blob0's sign** (+41.1% → −14.7%) and
+tightened blob64's base spread from 147% to 53%, which is what says the apparent
+small-blob regression in the previous run was the harness and not the change.
+blob512 is disjoint for the third time under a third harness — −32.6%, −34.0%,
+−21.4%; the magnitude tracks host temperature, the direction does not move.
+
+**Verdict against §7.5's three columns: keep.**
+
+- **Speed** is split and nets positive. Reopening a compacted store is **+11.6%
+  slower** (58.6 → 65.3 ms), consistent in direction across three runs — the
+  arena has to size and fill the backing arrays before it can slice them. That is
+  paid **once per process**; the GC saving is paid **every cycle for the life of
+  the process**. Break-even is ~6 forced cycles at 512-byte blobs and ~14 at
+  none.
+- **Resident** is ±0.0% on all five footprint fixtures — and that is a **weak
+  instrument here, not a measurement**: no footprint fixture reopens from disk,
+  so none of them executes the arena load path at all. "No regression" is what
+  the suite can support; "measured and unchanged" is not.
+- **Allocations** are **−21.8%** on the load path, deterministic.
+
+The revert rule fires on an allocation win that costs speed or resident bytes.
+Neither column loses, so it does not fire. It did fire on the other candidate
+measured beside this one — denormalised neighbour arrays, reverted; see §14.14.
+
+**Why this slab is not the slab §14.4 and CONTRIBUTING §3 reject.** That
+objection is about lifetime spread — "a slab lives until every object in it
+dies", which is why `Node`, `Labels` and `deltaAdj` are still allocated
+individually in the delta. A built `CSRGraph` has no lifetime spread at all: it
+is immutable, and every record in it dies at one moment, when a compaction
+replaces the image and the last snapshot pinning it closes. The arena's lifetime
+**is** the image's lifetime, so it retains nothing that was not retained anyway.
+This is the one structure in the engine where that holds.
+
+It is also not §14.3's rejected design. Accessors return **sub-slices of a
+resident arena** under the aliasing contract `csrBytes` already documents — no
+decode, no offset-table lookup on the read path. §14.3 rejected decode-on-access
+for a mapped file; this is the opposite trade.
+
+### 14.14 Reverted: denormalised neighbour arrays
+
+The second candidate measured beside the arena, and the one the revert rule
+fired on.
+
+**The premise, which is sound.** The adjacency arrays hold `EdgeID`, so to learn
+*one neighbour* `reader.incidentEdges` does three cache-hostile things per
+incident edge: a map probe into the delta (paid even when the delta is empty), a
+random access into an 80-byte-stride record array, and a pointer chase into a
+separately allocated label slice. The far endpoint — the one field a hop actually
+needs — is the one field not present where the walk is looking. Storing it
+beside the `EdgeID`, plus an unfiltered fast path that skips record resolution
+entirely when a walk asks for no edge-type filter, removes all three for the
+common hop.
+
+**What it cost, and the arithmetic that attributes it.** Resident bytes rose
+**+10.8% / +7.7% / +5.6%** across the footprint fixtures. That is not a
+measurement artifact and it needed no interpretation: the fixtures give each node
+two edges, and 2 edges × 2 directions × 8 bytes is **32 B/node** against the
+**32.1 B/node** observed. The change costs exactly what it stores.
+
+**What it bought: nothing this suite can resolve.** All four walk benchmarks
+landed inside the control's own spread. A degree sweep to 32 768 was written
+specifically to give the change its most favourable case — the deeper the
+adjacency span, the more record resolutions the fast path skips — and it returned
+scatter with the *opposite* of the predicted shape.
+
+**The arithmetic explains the scatter, which is what makes this a decision rather
+than a failed run.** At degree 32 768 the walk costs **351 ns per edge**. The
+spike's isolated denormalised hop cost **14.6 ns per edge**. So the work B1
+eliminates is about **4% of what `Neighbours` actually does** — the remaining 96%
+is result materialisation, dedupe and the caller's own iteration, none of which
+the change touches. Its ceiling is therefore **~2.8% at any degree**, permanently
+below this suite's noise floor. No fixture would have shown it, and building a
+fixture that could would have been building a benchmark to flatter a change
+rather than to test it.
+
+**Verdict: reverted.** §7.5's rule is that an item losing resident bytes must win
+speed to survive, and this one cannot win speed by more than its own arithmetic
+allows. `disk/csr.go` is back at HEAD.
+
+**It stays cheap to revisit.** Adjacency has not been serialised since v7, so
+none of this was ever a format change — the neighbour arrays are recomputed by
+`Build` on every load. If a workload ever appears whose hop cost is dominated by
+record resolution rather than by materialising results, the change costs a
+rebuild and no migration.
+
 ---
 
 ## 15. Invariants

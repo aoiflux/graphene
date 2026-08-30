@@ -6,6 +6,25 @@ package disk
 //
 //	go test ./disk/ -tags=stress -run TestArenaSpike -v
 //
+// # Superseded on two counts — read TECHNICAL_DETAILS.md §14.13 first
+//
+// 1. Its GC columns were measured with the collector's trigger left on: the loop
+//    below calls runtime.GC() but never debug.SetGCPercent(-1), so at a fixed
+//    GOGC a smaller live heap triggers proportionally more cycles and the figure
+//    mixes trigger rate with the scan cost it means to isolate. The rising
+//    baseline it reports (1.34 / 2.29 / 5.77 ms) does not reproduce against the
+//    shipped loader, which is flat. tests/gc_bench_test.go disables the trigger.
+//
+// 2. This is not a durable format change, contrary to the paragraph below. The
+//    image already stores records as one packed byte stream and adjacency has
+//    not been serialised since v7, so what shipped is an in-memory change on the
+//    load path: no v9, no new section, no parser, no fuzz target owed.
+//
+// What shipped also keeps []NodeType and []byte on every record — it packs them
+// into shared backing arrays via three-index slicing — so the arrays are still
+// pointer-bearing and the pointer-free mechanism argued for below was never
+// built. The measured win is the allocation-count half.
+//
 // # Why this is a measurement and not a design
 //
 // The Phase 2 mmap spike found this and recorded it as the better lead: with no
