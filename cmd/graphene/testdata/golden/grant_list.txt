@@ -1,0 +1,5 @@
+$ graphene grant list fx
+exit 0
+--- stdout ---
+role grants  none recorded
+--- stderr ---

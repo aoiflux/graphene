@@ -329,21 +329,21 @@ func runMaintenanceReindex(cx *Context) (Result, error) {
 // not exist sends them looking for a tool that has one, and the tool they find
 // will not have this one's caution. Naming what does exist, and why the thing
 // they asked for is absent, is the more useful answer.
-func refusal(name, short, why string) *Command {
+func refusal(group, name, short, why string) *Command {
 	return plain(Command{
-		Group: "maintenance", Name: name, Usage: "<dir>",
+		Group: group, Name: name, Usage: "<dir>",
 		Short: short, Long: why,
 		Open: OpenNone, Tier: CtxAdvisory,
 	}, func(cx *Context) (Result, error) {
 		return Result{}, &Fault{
 			Kind: FaultRefused,
-			Err:  fmt.Errorf("maintenance %s is not implemented, deliberately", name),
+			Err:  fmt.Errorf("%s %s is not implemented, deliberately", group, name),
 			Hint: why,
 		}
 	})
 }
 
-var maintenanceRepair = refusal("repair",
+var maintenanceRepair = refusal("maintenance", "repair",
 	"not implemented, deliberately",
 	"There is no repair. A tool that rewrites records it has decided are wrong "+
 		"is a tool that can destroy the evidence it was pointed at, and it does "+
@@ -353,7 +353,7 @@ var maintenanceRepair = refusal("repair",
 		"  backup restore        rebuilds a whole store from a verified copy\n"+
 		"  store csr -verify     says what is actually wrong, before anything acts")
 
-var maintenanceVacuum = refusal("vacuum",
+var maintenanceVacuum = refusal("maintenance", "vacuum",
 	"not implemented, deliberately",
 	"There is no vacuum. Reclaiming space means discarding history, and the "+
 		"history is the product: a store that can be silently shortened records "+

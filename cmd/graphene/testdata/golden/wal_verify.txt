@@ -1,0 +1,21 @@
+$ graphene wal verify fx
+exit 0
+--- stdout ---
+active log             
+  records              0
+  commits              0
+  bytes                50 B
+  framing              v2
+  bad checksums        0
+  unvalidated commits  0
+  truncated tail       false
+  open batch           false
+                       
+retired segments       
+  segments             0
+  digest chain         nothing to check
+
+  - no retired WAL segments; the commit history of past compactions was discarded. Set Options.Retention to keep it
+
+1 finding(s) — the account is incomplete, not broken
+--- stderr ---

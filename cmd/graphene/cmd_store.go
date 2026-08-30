@@ -12,7 +12,6 @@ package main
 import (
 	"flag"
 
-	"github.com/aoiflux/graphene"
 	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/store"
 )
@@ -231,15 +230,4 @@ func lockName(m disk.LockMode) string {
 		return "exclusive (writer)"
 	}
 	return "shared (reader)"
-}
-
-// forensicsOrRefuse returns the disk store behind a Graph, or an error naming
-// why there is not one. Shared by the commands that need both layers.
-func forensicsOrRefuse(g *graphene.Graph) (*disk.Store, error) {
-	ds, ok := g.Forensics()
-	if !ok {
-		return nil, Usagef("this store is not disk-backed, so it keeps none of the " +
-			"forensic history this command reports on")
-	}
-	return ds, nil
 }

@@ -227,6 +227,35 @@ window is two instructions wide.
 For lock-free work the correctness argument has to rest on the design. Tests are
 defence in depth, not proof.
 
+### Output people read is behaviour, and it is pinned
+
+`cmd/graphene/testdata/golden/` holds the exact stdout, stderr and exit status of
+every read-only command against a fixed fixture. The other CLI tests assert on
+facts — a field is present, an exit code is right, a legacy spelling agrees with
+its group spelling — and none of them notices a column that lost its alignment, a
+heading that changed word, or a notice that quietly stopped being printed. Those
+break somebody's `grep`, and they are invisible in review.
+
+A diff here is not a failure. It is the change being shown to whoever is making
+it. Accept it deliberately:
+
+```
+go test ./cmd/graphene/ -run TestGoldenOutput -update
+```
+
+and the before-and-after lands in the commit. Regenerating without reading the
+diff is the one way to make this corpus worthless.
+
+Two things are masked, and only two: the Go toolchain and platform in the JSON
+version trailer, and RFC 3339 wall-clock stamps. Digests are **not** masked. That
+this fixture's snapshot root is the same value on every machine and in every run
+is the property that makes the store verifiable, and a corpus that hid it would
+be unable to report the one change that matters most.
+
+The corollary is that genuinely time-dependent output cannot be a golden case.
+`anchor show` is excluded because a checkpoint digest commits to its capture
+time — masking that digest would leave the file asserting nothing.
+
 ---
 
 ## 3. Changing things

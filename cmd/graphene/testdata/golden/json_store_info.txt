@@ -1,0 +1,5 @@
+$ graphene -json store info fx
+exit 0
+--- stdout ---
+{"schema":"graphene.cli/v1","command":"store info","status":"ok","exit":0,"target":"fx","data":{"detail":{"store":"fx","unreplayed_log":"50 B of records to apply on next open"},"csr_image":{"version":"v8","size":{"bytes":663,"human":"663 B"},"nodes":5,"edges":5,"property_entries":"2 node, 0 edge","sequence_high_water":"node 5, edge 5","highest_id":"node 5, edge 5"},"write_ahead_log":{"size":{"bytes":50,"human":"50 B"},"records":0,"commits":0}},"version":{"version":"(devel)","dirty":false,"source":"unknown","go_version":"<GO>","os":"<OS>","arch":"<ARCH>","csr_format":8,"dependencies":[]}}
+--- stderr ---

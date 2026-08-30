@@ -1,0 +1,9 @@
+$ graphene anchor list fx
+exit 0
+--- stdout ---
+checkpoints  none recorded
+
+  - this store has never captured a checkpoint, so there is nothing an anchor could have witnessed
+
+1 finding(s) — the account is incomplete, not broken
+--- stderr ---

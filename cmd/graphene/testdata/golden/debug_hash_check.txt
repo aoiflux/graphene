@@ -1,0 +1,10 @@
+$ graphene debug hash-check fx
+exit 0
+--- stdout ---
+image       
+  digest    match
+  computed  4809bf20ee4ddbae14d3596b05f4e390341339367db7f5c81a60d76778e218e5
+  roots     describe the records
+
+VERIFIED
+--- stderr ---

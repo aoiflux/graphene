@@ -1,0 +1,13 @@
+$ graphene query relations -anchor 1 fx
+exit 0
+--- stdout ---
+relations  
+ID         SRC  DST  LABELS    WEIGHT  PROPERTIES
+1          1    3    Contains  0       0 B
+2          1    4    Contains  0       0 B
+           
+anchors    1
+direction  both
+relations  2
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

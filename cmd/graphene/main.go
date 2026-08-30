@@ -19,10 +19,10 @@
 // There is no repair and no truncate. A tool that is safe to point at
 // production is worth more than one that can also fix things, and adding a
 // mutation should be a deliberate decision rather than a convenience.
-// `maintenance repair` and `maintenance vacuum` are registered commands whose
-// only job is to refuse and to name what does exist — an operator told a tool
-// cannot help them goes looking for one that can, and the one they find will
-// not have this tool's caution.
+// `maintenance repair`, `maintenance vacuum` and `wal compact` are registered
+// commands whose only job is to refuse and to name what does exist — an
+// operator told a tool cannot help them goes looking for one that can, and the
+// one they find will not have this tool's caution.
 //
 // Everything that writes is argued rather than assumed, in three kinds:
 //

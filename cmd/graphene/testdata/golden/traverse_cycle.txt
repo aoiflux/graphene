@@ -1,0 +1,8 @@
+$ graphene traverse cycle -from 1 fx
+exit 0
+--- stdout ---
+from             1
+depth            100
+cycle reachable  false
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

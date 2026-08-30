@@ -1,0 +1,8 @@
+$ graphene maintenance vacuum fx
+exit 1
+--- stdout ---
+--- stderr ---
+graphene maintenance vacuum: maintenance vacuum is not implemented, deliberately
+  There is no vacuum. Reclaiming space means discarding history, and the history is the product: a store that can be silently shortened records nothing an adversary cannot un-record.
+
+`maintenance compact` folds the delta into the image and shortens the log through the engine's own path, which retires segments rather than deleting them when retention is on.

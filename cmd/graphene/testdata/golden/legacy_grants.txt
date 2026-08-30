@@ -1,0 +1,5 @@
+$ graphene grants fx
+exit 0
+--- stdout ---
+role grants  none recorded
+--- stderr ---

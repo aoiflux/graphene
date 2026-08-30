@@ -1,0 +1,19 @@
+$ graphene provenance chain -node 4 fx
+exit 0
+--- stdout ---
+chain         
+STEP          NODE  LABELS         VIA EDGE
+0             4     MicroArtefact  -
+1             1     EvidenceFile   2
+              
+from          4
+depth limit   20
+chain length  2
+root reached  1
+max nodes     100000
+              
+what this is  
+  a structural walk over inbound edges — see `graphene provenance custody`
+  for the cryptographic account of this entity
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

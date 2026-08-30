@@ -1,0 +1,9 @@
+$ graphene assertion list fx
+exit 0
+--- stdout ---
+audit chain  no entries
+
+  - no audit log; operator actions are unrecorded. Set Options.Audit to record them
+
+1 finding(s) — the account is incomplete, not broken
+--- stderr ---

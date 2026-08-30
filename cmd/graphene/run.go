@@ -28,14 +28,14 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// among them.
 	cfg, err := loadConfig()
 	if err != nil {
-		return fail(stderr, g, "", err)
+		return fail(stderr, "", err)
 	}
 	cfg.apply(g)
 	applyEnv(g)
 
 	rest, err := splitGlobals(argv, g)
 	if err != nil {
-		return fail(stderr, g, "", err)
+		return fail(stderr, "", err)
 	}
 
 	res := resolve(rest)
@@ -47,11 +47,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 0
 	case res.unknown != "":
 		if res.unknownFor != "" {
-			return fail(stderr, g, "", Usagef(
+			return fail(stderr, "", Usagef(
 				"%s is not a %s command — try one of: %s",
 				res.unknown, res.unknownFor, verbList(res.unknownFor)))
 		}
-		return fail(stderr, g, "", Usagef("unknown subcommand %q%s", res.unknown, didYouMean(res.unknown)))
+		return fail(stderr, "", Usagef("unknown subcommand %q%s", res.unknown, didYouMean(res.unknown)))
 	case res.cmd == nil:
 		return writeHelp(stdout, nil)
 	}
@@ -122,7 +122,7 @@ func invoke(c *Command, args []string, g *Globals, cfg *Config, stdout, stderr i
 	if g.CPUProfile != "" {
 		stop, err := startProfile(g.CPUProfile)
 		if err != nil {
-			return fail(stderr, g, c.Path(), err)
+			return fail(stderr, c.Path(), err)
 		}
 		defer stop()
 	}
@@ -146,7 +146,7 @@ func invoke(c *Command, args []string, g *Globals, cfg *Config, stdout, stderr i
 		if len(r.Sections) > 0 || len(r.Findings) > 0 {
 			_ = (humanRenderer{verbose: g.Verbose}).Render(stdout, r)
 		}
-		return fail(stderr, g, c.Path(), err)
+		return fail(stderr, c.Path(), err)
 	}
 
 	exit := exitFor(FaultInternal, r.Verdict, false)
@@ -154,7 +154,7 @@ func invoke(c *Command, args []string, g *Globals, cfg *Config, stdout, stderr i
 	if g.JSON {
 		env := envelopeFor(c.Path(), r, elapsed, exit, nil, g.Verbose)
 		if rerr := (jsonRenderer{indent: g.Indent}).Render(stdout, env); rerr != nil {
-			return fail(stderr, g, c.Path(), rerr)
+			return fail(stderr, c.Path(), rerr)
 		}
 		return exit
 	}
@@ -167,7 +167,7 @@ func invoke(c *Command, args []string, g *Globals, cfg *Config, stdout, stderr i
 		}
 	}
 	if rerr := (humanRenderer{verbose: g.Verbose}).Render(stdout, r); rerr != nil {
-		return fail(stderr, g, c.Path(), rerr)
+		return fail(stderr, c.Path(), rerr)
 	}
 	return exit
 }
@@ -265,8 +265,12 @@ func rootContext(g *Globals) (context.Context, context.CancelFunc) {
 	return tctx, func() { cancel(); stop() }
 }
 
-// fail reports an error in human mode and returns the exit status.
-func fail(stderr io.Writer, g *Globals, path string, err error) int {
+// fail reports an error in human mode and returns the exit status. It takes no
+// Globals because there is nothing in them it would consult: JSON mode never
+// reaches here — an error under -json is rendered as an envelope on stdout by
+// the caller, so that a script gets the same shape whether the command worked
+// or not — and -quiet silences notices, not errors.
+func fail(stderr io.Writer, path string, err error) int {
 	kind, hint := classify(err)
 	prefix := "graphene: "
 	if path != "" {

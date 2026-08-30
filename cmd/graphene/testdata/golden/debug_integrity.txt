@@ -1,0 +1,36 @@
+$ graphene debug integrity fx
+exit 0
+--- stdout ---
+image                 
+  digest              match
+  computed            4809bf20ee4ddbae14d3596b05f4e390341339367db7f5c81a60d76778e218e5
+  roots               describe the records
+                      
+indexes               
+  property index      agrees with the records
+                      
+wal segments          
+  segments            0
+  digest chain        nothing retained
+                      
+checkpoints           
+  checkpoints         0
+  chain               none captured
+                      
+signed layers         
+LAYER                 RESULT                           RECORDS
+snapshot attestation  absent                           0
+audit chain           absent                           0
+redaction ledger      empty                            0
+grant ledger          empty                            0
+key timeline          no rotations in the current log  0
+
+  - no retired WAL segments; the commit history of past compactions was discarded. Set Options.Retention to keep it
+  - this store has never captured a checkpoint, so there is nothing an anchor could have witnessed
+  - the image carries no attestation, so nothing records who produced it
+  - no audit log; operator actions are unrecorded. Set Options.Audit to record them
+  - no -pubkey was supplied, so no signature was checked — the hash chains above stand on their own and say nothing about who wrote them
+
+5 finding(s) — the account is incomplete, not broken
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

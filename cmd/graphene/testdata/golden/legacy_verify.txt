@@ -1,0 +1,12 @@
+$ graphene verify fx
+exit 0
+--- stdout ---
+indexes        consistent
+nodes          5
+edges          5
+delta records  0
+log            50 B
+
+VERIFIED
+--- stderr ---
+verify opens the store read-only; a writer must not hold it

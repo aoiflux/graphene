@@ -1,0 +1,21 @@
+$ graphene info fx
+exit 0
+--- stdout ---
+store                  fx
+                       
+CSR image              
+  version              v8
+  size                 663 B
+  nodes                5
+  edges                5
+  property entries     2 node, 0 edge
+  sequence high-water  node 5, edge 5
+  highest ID           node 5, edge 5
+                       
+Write-ahead log        
+  size                 50 B
+  records              0
+  commits              0
+                       
+unreplayed log         50 B of records to apply on next open
+--- stderr ---

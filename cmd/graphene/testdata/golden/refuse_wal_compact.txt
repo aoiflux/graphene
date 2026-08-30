@@ -1,0 +1,13 @@
+$ graphene wal compact fx
+exit 1
+--- stdout ---
+--- stderr ---
+graphene wal compact: wal compact is not implemented, deliberately
+  There is no wal compact. Truncating the log is the one operation that can destroy history nothing else records: the image holds state, and only the log and its retired segments hold the order it was reached in.
+
+`maintenance compact` is the supported route. It folds the delta into the image through the engine's own path, which retires segments into the digest chain rather than deleting them when retention is on, and records the compaction in the audit ledger so `provenance custody` can account for it afterwards.
+
+To see what a compaction would do first:
+  maintenance compact -dry-run   the engine's own reasoning, nothing written
+  wal segments                   what is retained now
+  wal verify                     whether the chain is intact before anything acts

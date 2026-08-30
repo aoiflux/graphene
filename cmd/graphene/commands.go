@@ -33,6 +33,7 @@ var registry = []*Command{
 	walShow,
 	walSegments,
 	walVerify,
+	walCompact,
 
 	// What is in the store.
 	nodeGet,

@@ -1,0 +1,13 @@
+$ graphene node neighbours -id 1 fx
+exit 0
+--- stdout ---
+neighbours  
+NODE        LABELS         VIA EDGE  EDGE LABELS  DIRECTION
+3           MicroArtefact  1         Contains     out
+4           MicroArtefact  2         Contains     out
+            
+node        1
+direction   both
+neighbours  2
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

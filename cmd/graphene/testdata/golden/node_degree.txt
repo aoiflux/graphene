@@ -1,0 +1,9 @@
+$ graphene node degree -id 1 fx
+exit 0
+--- stdout ---
+node      1
+inbound   0
+outbound  2
+total     2
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

@@ -619,11 +619,11 @@ Every subcommand that existed before groups still answers to its old flat name â
 `graphene custody`, `graphene redactions`, `graphene verify-proof` and the rest.
 Those spellings are hidden from help, not removed, and will keep working.
 
-**There is no repair, no truncate and no bare compact.** `maintenance repair`
-and `maintenance vacuum` exist only to explain why they are not implemented and
-to name what is: `maintenance compact`, `maintenance reindex`, `backup restore`.
-A tool that is safe to point at production is worth more than one that can also
-fix things.
+**There is no repair, no truncate and no bare compact.** `maintenance repair`,
+`maintenance vacuum` and `wal compact` exist only to explain why they are not
+implemented and to name what is: `maintenance compact`, `maintenance reindex`,
+`backup restore`. A tool that is safe to point at production is worth more than
+one that can also fix things.
 
 Everything that changes bytes already on disk is behind `-confirm` and supports
 `-dry-run`, which opens the store *read-only* rather than trusting a handler to

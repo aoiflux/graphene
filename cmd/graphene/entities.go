@@ -46,11 +46,6 @@ func edgeLabelList(e *store.Edge) []string {
 	return parts
 }
 
-// nodeLabels and edgeLabels are the string form, for a sentence rather than a
-// field.
-func nodeLabels(n *store.Node) string { return strings.Join(nodeLabelList(n), ",") }
-func edgeLabels(e *store.Edge) string { return strings.Join(edgeLabelList(e), ",") }
-
 func nodeRow(n *store.Node) []Value {
 	return []Value{
 		ID(uint64(n.ID)),

@@ -1,0 +1,11 @@
+$ graphene edge get -id 1 fx
+exit 0
+--- stdout ---
+edges      
+ID         SRC  DST  LABELS    WEIGHT  PROPERTIES
+1          1    3    Contains  0       0 B
+           
+asked for  1
+found      1
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

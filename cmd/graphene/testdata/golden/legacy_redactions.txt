@@ -1,0 +1,5 @@
+$ graphene redactions fx
+exit 0
+--- stdout ---
+redactions  none recorded
+--- stderr ---

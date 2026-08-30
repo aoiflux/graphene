@@ -1,0 +1,24 @@
+$ graphene custody -node 1 fx
+exit 0
+--- stdout ---
+node             1
+known to store   true
+in snapshot      true
+snapshot root    354aece52feacc718ab68f28d691c8b8f92b8711b056fb10d61d39f401103393
+attested         false (verified: false)
+signatures       signatures unchecked: no -pubkey supplied
+segments walked  0
+audit entries    0 (0 compactions)
+                 
+summary          
+  node 1: custody incomplete (5 gaps)
+
+  - [attestation/incomplete] the snapshot carries no attestation, so nothing records who produced it
+  - [segments/incomplete] no retired WAL segments; the commit history of past compactions was discarded. Set Options.Retention to keep it
+  - [audit/incomplete] no audit log; operator actions are unrecorded. Set Options.Audit to record them
+  - [roles/incomplete] no role grants are recorded, so nothing says who was permitted to write, redact or compact. Set Options.Roles to record it
+  - [external/incomplete] no externally retained root was supplied, so every check above compares the store against itself. Use CustodyForAnchored to close this
+
+5 finding(s) — the account is incomplete, not broken
+--- stderr ---
+custody opens the store read-only; a writer must not hold it

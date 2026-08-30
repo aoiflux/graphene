@@ -1,0 +1,45 @@
+$ graphene -json -indent store csr fx
+exit 0
+--- stdout ---
+{
+  "schema": "graphene.cli/v1",
+  "command": "store csr",
+  "status": "ok",
+  "exit": 0,
+  "target": "fx",
+  "data": {
+    "detail": {
+      "file": "fx/\graphene.csr",
+      "size": "663 bytes",
+      "format": "v8",
+      "nodes": 5,
+      "edges": 5,
+      "node_seq_high_water": 5,
+      "edge_seq_high_water": 5,
+      "highest_node_id": 5,
+      "highest_edge_id": 5,
+      "property_entries": "2 node, 0 edge",
+      "commit_seq_high_water": 2,
+      "last_compacted": "<TIME>",
+      "snapshot_root": "354aece52feacc718ab68f28d691c8b8f92b8711b056fb10d61d39f401103393",
+      "node_root": "4bc64be72fba500199ed8c4a92d304a7c511b519a5361c50c6c696956f0f5f43",
+      "edge_root": "1a5ce387e9ce910d4cfb680bbe3ea5da8d5e0db2f4519570082abaebae784d14",
+      "index_root": "885a32d6871f842a755972a2659af35797f98539cfb326920c4050f1d34ad275",
+      "replaces": "(first compaction)",
+      "sections": 2,
+      "gidx": "optional, 68 bytes at 352",
+      "ghsh": "CRITICAL, 193 bytes at 420"
+    }
+  },
+  "version": {
+    "version": "(devel)",
+    "dirty": false,
+    "source": "unknown",
+    "go_version": "<GO>",
+    "os": "<OS>",
+    "arch": "<ARCH>",
+    "csr_format": 8,
+    "dependencies": []
+  }
+}
+--- stderr ---

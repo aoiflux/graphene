@@ -2357,12 +2357,20 @@ invocation states that the removal is unattributed and names `redaction apply` a
 the command that records one. The operator most likely to reach for a delete on
 an evidence store is the one who has not read the help.
 
-**`maintenance repair` and `maintenance vacuum` are registered commands that
-refuse.** They exist so that somebody who types one gets an argument rather than
-"unknown subcommand", and the refusal names what does exist — `reindex`,
-`backup restore`, `store csr -verify`. An operator told a tool cannot help them
+**`maintenance repair`, `maintenance vacuum` and `wal compact` are registered
+commands that refuse.** They exist so that somebody who types one gets an
+argument rather than "unknown subcommand", and each refusal names what does
+exist — `reindex`, `backup restore`, `store csr -verify` for the first two,
+`maintenance compact` for the third. An operator told a tool cannot help them
 goes looking for one that can, and the one they find will not have this tool's
 caution. Refusing usefully is part of the doctrine, not an afterthought to it.
+
+`wal compact` earns its registration twice over. Before it was registered, the
+verb matched nothing under `wal`, fell through to the `wal` legacy alias, and
+was read as a store directory — so a command this tool has a considered position
+on reported `compact: no such file or directory`. That is worse than an unknown
+subcommand: it sends the operator looking for a path, and the doctrine it would
+have run into never gets stated.
 
 #### What a `-dry-run` is, structurally
 

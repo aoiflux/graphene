@@ -1,0 +1,18 @@
+$ graphene store snapshot fx
+exit 0
+--- stdout ---
+roots                
+  snapshot           354aece52feacc718ab68f28d691c8b8f92b8711b056fb10d61d39f401103393 (retain this one)
+  nodes              4bc64be72fba500199ed8c4a92d304a7c511b519a5361c50c6c696956f0f5f43
+  edges              1a5ce387e9ce910d4cfb680bbe3ea5da8d5e0db2f4519570082abaebae784d14
+  property index     885a32d6871f842a755972a2659af35797f98539cfb326920c4050f1d34ad275
+  tombstones         e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  previous snapshot  0000000000000000000000000000000000000000000000000000000000000000 (zero for the first image)
+  body version       3
+                     
+live view            
+  epoch              0 (orders versions within this open store; meaningless across processes)
+
+VERIFIED
+--- stderr ---
+opens the store read-only (shared lock) to read the image's roots

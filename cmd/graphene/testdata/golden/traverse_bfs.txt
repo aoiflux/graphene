@@ -1,0 +1,28 @@
+$ graphene traverse bfs -from 1 -depth 3 fx
+exit 0
+--- stdout ---
+nodes reached  
+ID             LABELS         PROPERTIES
+1              EvidenceFile   0 B
+3              MicroArtefact  0 B
+4              MicroArtefact  0 B
+5              Tag            0 B
+2              EvidenceFile   0 B
+               
+edges crossed  
+ID             SRC  DST  LABELS      WEIGHT  PROPERTIES
+1              1    3    Contains    0       0 B
+2              1    4    Contains    0       0 B
+4              3    4    SimilarTo   0.75    0 B
+5              4    5    TaggedWith  0       0 B
+3              2    4    Contains    0       0 B
+               
+walk           bfs
+from           1
+depth          3
+direction      both
+nodes          5
+edges          5
+max nodes      100000
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

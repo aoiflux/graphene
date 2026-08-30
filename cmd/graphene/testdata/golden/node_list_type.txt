@@ -1,0 +1,12 @@
+$ graphene node list -type MicroArtefact fx
+exit 0
+--- stdout ---
+nodes   
+ID      LABELS         PROPERTIES
+3       MicroArtefact  0 B
+4       MicroArtefact  0 B
+        
+labels  MicroArtefact
+shown   2
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

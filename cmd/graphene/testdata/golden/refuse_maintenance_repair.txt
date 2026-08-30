@@ -1,0 +1,11 @@
+$ graphene maintenance repair fx
+exit 1
+--- stdout ---
+--- stderr ---
+graphene maintenance repair: maintenance repair is not implemented, deliberately
+  There is no repair. A tool that rewrites records it has decided are wrong is a tool that can destroy the evidence it was pointed at, and it does so at exactly the moment nobody is in a position to check its work.
+
+What exists instead:
+  maintenance reindex   rebuilds derived state from the records
+  backup restore        rebuilds a whole store from a verified copy
+  store csr -verify     says what is actually wrong, before anything acts

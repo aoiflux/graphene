@@ -8,8 +8,8 @@ package main
 // want to check a segment chain is the moment a store is under suspicion and
 // probably still open somewhere.
 //
-// There is no `wal compact` and there will not be one. Truncating a log is the
-// one operation that can destroy history that nothing else records, which is
+// `wal compact` is registered and refuses. Truncating a log is the one
+// operation that can destroy history that nothing else records, which is
 // exactly what the doctrine at the top of main.go refuses. `maintenance
 // compact` folds the delta into the image and retires the log through the
 // engine's own path, which keeps the segments.
@@ -191,3 +191,26 @@ func runWALVerify(cx *Context) (Result, error) {
 	}
 	return r, nil
 }
+
+// --- wal compact ---
+
+// Registered so that it refuses by name. The alternative is what this used to
+// do: `wal compact <dir>` matched no verb, fell through to the `wal` legacy
+// alias, and read "compact" as a store directory — reporting a missing file for
+// a command the tool has a considered position on. An operator who is told a
+// path does not exist goes looking for the path. An operator who is told the
+// truncation is refused, and why, goes looking for `maintenance compact`.
+var walCompact = refusal("wal", "compact",
+	"not implemented, deliberately",
+	"There is no wal compact. Truncating the log is the one operation that can "+
+		"destroy history nothing else records: the image holds state, and only "+
+		"the log and its retired segments hold the order it was reached in.\n\n"+
+		"`maintenance compact` is the supported route. It folds the delta into "+
+		"the image through the engine's own path, which retires segments into "+
+		"the digest chain rather than deleting them when retention is on, and "+
+		"records the compaction in the audit ledger so `provenance custody` can "+
+		"account for it afterwards.\n\n"+
+		"To see what a compaction would do first:\n"+
+		"  maintenance compact -dry-run   the engine's own reasoning, nothing written\n"+
+		"  wal segments                   what is retained now\n"+
+		"  wal verify                     whether the chain is intact before anything acts")

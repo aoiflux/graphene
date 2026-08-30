@@ -1,0 +1,9 @@
+$ graphene wal segments fx
+exit 0
+--- stdout ---
+segments  none retained
+
+  - no retired WAL segments; the commit history of past compactions was discarded. Set Options.Retention to keep it
+
+1 finding(s) — the account is incomplete, not broken
+--- stderr ---

@@ -1,0 +1,8 @@
+$ graphene redaction tombstones fx
+exit 0
+--- stdout ---
+tombstones  none; this image records no removals
+
+VERIFIED
+--- stderr ---
+opens the store read-only (shared lock) to read the image's tombstone list

@@ -1,0 +1,20 @@
+$ graphene traverse subgraph -id 1,3,4 fx
+exit 0
+--- stdout ---
+nodes      
+ID         LABELS         PROPERTIES
+1          EvidenceFile   0 B
+3          MicroArtefact  0 B
+4          MicroArtefact  0 B
+           
+edges      
+ID         SRC  DST  LABELS     WEIGHT  PROPERTIES
+1          1    3    Contains   0       0 B
+2          1    4    Contains   0       0 B
+4          3    4    SimilarTo  0.75    0 B
+           
+asked for  3
+nodes      3
+edges      3
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

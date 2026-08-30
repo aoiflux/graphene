@@ -1,0 +1,7 @@
+$ graphene node count fx
+exit 0
+--- stdout ---
+nodes  5
+edges  5
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

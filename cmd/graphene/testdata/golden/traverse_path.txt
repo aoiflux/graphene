@@ -1,0 +1,17 @@
+$ graphene traverse path -from 1 -to 5 fx
+exit 0
+--- stdout ---
+route      
+STEP       NODE  LABELS         VIA EDGE  EDGE LABELS
+0          1     EvidenceFile   -         -
+1          4     MicroArtefact  2         Contains
+2          5     Tag            5         TaggedWith
+           
+from       1
+to         5
+hops       2
+max nodes  100000
+
+VERIFIED
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

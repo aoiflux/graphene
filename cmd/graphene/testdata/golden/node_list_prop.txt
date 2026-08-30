@@ -1,0 +1,11 @@
+$ graphene node list -prop sha256=aa11 fx
+exit 0
+--- stdout ---
+nodes   
+ID      LABELS         PROPERTIES
+3       MicroArtefact  0 B
+        
+filter  sha256 = aa11
+shown   1
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it

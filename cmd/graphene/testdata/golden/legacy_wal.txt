@@ -1,0 +1,9 @@
+$ graphene wal fx
+exit 0
+--- stdout ---
+file      fx/graphene.wal (50 B)
+records   0 in 0 commits
+          
+records   
+  (none)  
+--- stderr ---

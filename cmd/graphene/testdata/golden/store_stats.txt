@@ -1,0 +1,26 @@
+$ graphene store stats fx
+exit 0
+--- stdout ---
+nodes                                     5
+edges                                     5
+                                          
+compacted image                           
+  nodes                                   5
+  edges                                   5
+                                          
+delta, written since the last compaction  
+  nodes                                   0
+  edges                                   0
+  deleted nodes                           0
+  deleted edges                           0
+                                          
+property index                            
+  node entries                            2
+  edge entries                            0
+                                          
+log                                       
+  size                                    50 B (the best proxy for how long the next open takes)
+  commit high-water                       2
+  visible epoch                           0
+--- stderr ---
+opens the store read-only (shared lock); refused while a writer holds it
