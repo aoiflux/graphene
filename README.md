@@ -522,13 +522,16 @@ package main
 import (
     "fmt"
 
-    "graphene"
-    "graphene/store"
+    "github.com/aoiflux/graphene"
+    "github.com/aoiflux/graphene/store"
 )
 
 func main() {
     g := graphene.NewInMemory()
 
+    // Every node and edge must carry at least one label; an empty set is
+    // refused with store.ErrNoLabels rather than stored where nothing can
+    // find it again.
     a, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
     b, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
     _, _ = g.AddEdge(&store.Edge{Src: a, Dst: b, Labels: []store.EdgeType{store.EdgeTypeContains}})
@@ -696,6 +699,8 @@ arm64, static and reproducible:
 ## Docs
 
 - Release notes, including breaking changes: [CHANGELOG.md](CHANGELOG.md)
+- Latest release at a glance, with diagrams:
+  [RELEASE_v0.5.0.md](docs/RELEASE_v0.5.0.md)
 - Easy usage guide: [USER_GUIDE.md](docs/USER_GUIDE.md)
 - Complete API reference: [API_REFERENCE.md](docs/API_REFERENCE.md)
 - Deep technical architecture and LLD:
@@ -736,12 +741,18 @@ Migration approach:
 
 ## Project Layout
 
-- `graphene.go` and `helpers.go`: public API surface.
+- `graphene.go`, `helpers.go` and `transaction.go`: public API surface,
+  including `Begin()`, upsert and the unique-key declarations.
+- `store/`: the shared types, the backend interface, and every error sentinel.
 - `memory/` and `disk/`: storage backends.
 - `index/`: property index (sorted postings + reverse map), ordered range index,
   and `index/encoding` order-preserving value encoders.
 - `traversal/`: graph traversal and pattern matching.
+- `bulk/`: import and export — JSONL, CSV tables, native `graphene_dump`.
+- `merkle/` and `signing/`: inclusion proofs, signatures and attestation.
 - `viz/`: interactive HTML export.
+- `cmd/graphene/`: the CLI, one file per command group.
+- `tests/`: the cross-package suite, including the `stress`-tagged benchmarks.
 
 ## Current Fit
 
