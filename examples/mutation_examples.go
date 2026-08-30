@@ -232,3 +232,86 @@ func countHits(g *graphene.Graph, key, val string) int {
 	hits, _ := g.NodesByProperty(key, []byte(val))
 	return len(hits)
 }
+
+// ----------------------------------------------------------------------------
+// Mutation Example 4 — Ingesting the same source twice
+// ----------------------------------------------------------------------------
+//
+// AddNode always adds. Run an ingest twice — a re-run after a crash, a hunt
+// re-executed with a better rule — and the graph holds two nodes for one thing
+// with nothing to say which is current. The engine could not have known they
+// were the same, because the identity lives in the caller's data.
+//
+// A unique property key is how that identity is declared, and UpsertNode is the
+// verb that uses it: resolve the key to the entity already carrying it, or
+// create one. So a re-ingest of an unchanged source is a no-op, and a re-ingest
+// of a changed one is an update.
+func exampleMutation4_IdempotentIngest() {
+	fmt.Println("--- Mutation 4: Ingesting the same source twice ---")
+
+	const key = "k" // the caller's natural key: "ver:<sha256>", "perm:<name>", ...
+
+	// --- What AddNode does with a re-run ---
+	dup := graphene.NewInMemory()
+	for range 2 {
+		id, _ := dup.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
+		_ = dup.IndexNodeProperty(id, key, []byte("ver:9f3a"))
+	}
+	st, _ := dup.Stats()
+	fmt.Printf("  AddNode x2     -> %d nodes for one source  <- WRONG: a duplicate, not a re-ingest\n", st.NodeCount)
+	dup.Close()
+
+	// --- The same run, with the key declared ---
+	g := graphene.NewInMemory()
+	defer g.Close()
+
+	// Declare at every Open: idempotent, and it validates the data already there
+	// rather than trusting a flag. A graph that violates the constraint is
+	// refused with *store.UniqueViolationsError naming every offending value.
+	if err := g.DeclareUniqueProperty(key); err != nil {
+		log.Fatalf("DeclareUniqueProperty: %v", err)
+	}
+
+	for _, state := range []string{"extracted", "analyzed"} {
+		id, created, err := g.UpsertNode(key, []byte("ver:9f3a"),
+			&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}},
+			map[string][]byte{"state": []byte(state)})
+		if err != nil {
+			log.Fatalf("UpsertNode: %v", err)
+		}
+		fmt.Printf("  UpsertNode     -> id=%d created=%v state=%q\n", id, created, state)
+	}
+
+	st, _ = g.Stats()
+	fmt.Printf("  after x2       -> %d node, extracted:%d analyzed:%d  <- the entry moved; it did not accumulate\n",
+		st.NodeCount, countHits(g, "state", "extracted"), countHits(g, "state", "analyzed"))
+
+	// NodeByProperty is what a unique key buys on the read side: one entity or a
+	// not-found, rather than a set to disambiguate.
+	found, err := g.NodeByProperty(key, []byte("ver:9f3a"))
+	if err != nil {
+		log.Fatalf("NodeByProperty: %v", err)
+	}
+	fmt.Printf("  NodeByProperty -> id=%d\n", found.ID)
+
+	// --- A whole source in one commit ---
+	//
+	// tx.UpsertNode hands the ID back before commit, so an edge can name it. The
+	// key is re-read under the write lock at commit; if another writer took it in
+	// between, the whole transaction is refused with store.ErrWriteConflict
+	// rather than quietly creating a second entity.
+	tx := g.Begin()
+	ver, _ := tx.UpsertNode(key, []byte("ver:9f3a"),
+		&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}}, nil)
+	perm, _ := tx.UpsertNode(key, []byte("perm:INTERNET"),
+		&store.Node{Labels: []store.NodeType{store.NodeTypeTag}}, nil)
+	tx.AddEdge(&store.Edge{Src: ver, Dst: perm, Labels: []store.EdgeType{store.EdgeTypeContains}})
+	if err := tx.Commit(); err != nil {
+		log.Fatalf("Commit: %v", err)
+	}
+
+	st, _ = g.Stats()
+	fmt.Printf("  one Tx         -> %d nodes, %d edge; the re-upserted source kept id=%d\n",
+		st.NodeCount, st.EdgeCount, ver)
+	fmt.Println()
+}

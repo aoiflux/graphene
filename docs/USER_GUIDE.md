@@ -185,6 +185,44 @@ if err != nil {
 }
 ```
 
+### Ingest the same source twice
+
+`AddNode` always adds, so ingesting one APK, disk image or case file twice makes
+two nodes for one thing. `UpsertNode` is the other verb: it resolves a natural
+key to the entity already carrying it, or creates one.
+
+```go
+// Once, at every Open. This key is the entity's name, not just a queryable field.
+if err := g.DeclareUniqueProperty("k"); err != nil {
+    return err
+}
+
+id, created, err := g.UpsertNode("k", []byte("ver:9f3a"),
+    &store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}, Properties: blob},
+    map[string][]byte{"state": []byte("extracted")})
+```
+
+`created` separates the first ingest from every later one. On a hit the labels
+and properties are replaced, and each key named in the last argument is replaced
+rather than added to — so a re-run whose extraction improved leaves one entity
+holding the newer answer instead of two entities disagreeing. Keys the map does
+not name keep the entries they had.
+
+For a whole source in one commit — the entities and the edges between them —
+`tx.UpsertNode` hands the ID back before commit, so it can be an endpoint:
+
+```go
+tx := g.Begin()
+ver, _ := tx.UpsertNode("k", []byte("ver:9f3a"), verNode, nil)
+perm, _ := tx.UpsertNode("k", []byte("perm:INTERNET"), permNode, nil)
+tx.AddEdge(&store.Edge{Src: ver, Dst: perm, Labels: []store.EdgeType{store.EdgeTypeContains}})
+err := tx.Commit()   // store.ErrWriteConflict if another writer took a key first
+```
+
+`UpsertEdge` is the same shape over a declared-unique *edge* property — key it on
+something that names the relationship, such as `<srcID>:<dstID>:<kind>`. Both
+require the key to be declared unique first; see §5.
+
 ### Update nodes and edges
 
 `UpdateNode` / `UpdateEdge` replace an existing entity's labels and properties in
@@ -208,8 +246,10 @@ _ = g.UpdateEdge(&store.Edge{
 })
 ```
 
-> The property index is caller-maintained and is **not** auto-updated by
-> `UpdateNode`/`UpdateEdge`. If you changed an indexed field, re-index it.
+> **The property index is not maintained for you — and since v0.5.0 it will not
+> let you leave it wrong.** `UpdateNode` / `UpdateEdge` on an entity that carries
+> index entries is refused with `*store.ErrIndexedPropertiesRequired`. Use
+> `UpdateNodeIndexed` or `UpdateNodePartialIndex`, both below in §5.
 
 ### Delete nodes and edges
 
@@ -428,6 +468,47 @@ _ = window
 ```
 
 `Contains` cannot be accelerated by any ordering and always scans.
+
+### Unique keys: when a value is a name
+
+`DeclareOrderedProperty` makes a key *comparable*. `DeclareUniqueProperty` makes
+it *identifying*: at most one live entity may hold any one value under it.
+
+```go
+err := g.DeclareUniqueProperty("k")
+```
+
+Declaring **validates what is already there**, and a graph that violates the
+constraint is refused with every offending value named, not the first:
+
+```go
+var v *store.UniqueViolationsError
+if errors.As(err, &v) {
+    for _, c := range v.Conflicts {
+        log.Printf("%q is held by %v", c.Value, c.IDs) // c.IDs has two or more
+    }
+}
+```
+
+That list is what a repair works from — one pass, rather than one pass per
+duplicate. Remove or re-key the extras and declare again.
+
+Three things to know:
+
+- **Declarations are not persisted.** Unlike an ordered key, which is written
+  into the image at compaction, a unique key must be declared by every process
+  that opens the store. Declare at `Open`: it is idempotent, and it re-validates
+  the data, which a persisted flag would not.
+- **`NodeByProperty(key, value)` returns the one entity**, or
+  `*store.ErrNotFound`. It refuses a key that is not declared unique rather than
+  returning the first of several.
+- **A backend that cannot enforce it returns an error** rather than `nil`. The
+  ordered and composite declarations are optimisations, and a store ignoring one
+  still answers every query correctly; this one is a promise about what the graph
+  may contain.
+
+From a shell, `graphene debug unique -key k <dir>` asks the same question of an
+existing store and writes nothing.
 
 ### Keeping the index correct when you update
 
@@ -804,15 +885,58 @@ go test ./tests/ -tags=stress -run TestStress
 
 ## 14. Troubleshooting
 
-### AddEdge fails
+### AddNode or AddEdge fails
 
 Cause:
 
-- source or destination node does not exist.
+- source or destination node does not exist,
+- the label set is empty — `store.ErrNoLabels`, refused since v0.5.0 because a
+  label-less entity indexes into no posting and is invisible to every
+  type-filtered query while still being counted.
 
 Fix:
 
-- create nodes first, then create edges.
+- create nodes first, then create edges,
+- give every node and edge at least one label.
+
+### UpdateNode returns ErrIndexedPropertiesRequired
+
+Cause:
+
+- the entity carries property-index entries, and a plain `UpdateNode` cannot
+  know which of them the change invalidated. Refusing is the default since
+  v0.5.0.
+
+Fix:
+
+- `UpdateNodeIndexed(n, props)` when you are restating every indexed key,
+- `UpdateNodePartialIndex(n, changed)` when only one field moved,
+- `g.SetReindexPolicy(store.ReindexKeep)` to restore the pre-v0.5.0 behaviour,
+  knowing the entries then go stale.
+
+### Re-ingesting a source duplicates it
+
+Cause:
+
+- `AddNode` adds; it has no way to recognise the entity it already wrote.
+
+Fix:
+
+- give the entity a natural key, `DeclareUniqueProperty` it at every `Open`, and
+  ingest with `UpsertNode` / `tx.UpsertNode` (§4).
+
+### DeclareUniqueProperty fails on an existing store
+
+Cause:
+
+- the data already violates the constraint. Declaring validates before it
+  promises anything.
+
+Fix:
+
+- read `*store.UniqueViolationsError.Conflicts` — it names **every** offending
+  value and its holders — remove or re-key the extras, and declare again.
+  `graphene debug unique -key <k> <dir>` reports the same list from a shell.
 
 ### Property query returns empty
 

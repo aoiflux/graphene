@@ -1,5 +1,8 @@
 # Changelog
 
+Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
+`git log` for those.
+
 ## v0.5.0 — idempotent ingest
 
 The theme is one property: **re-ingesting a source that has already been ingested
@@ -83,6 +86,11 @@ the record without the entries.
   the one `UpdateNodeIndexed` cannot express without the caller enumerating
   everything else just to preserve it.
 
+- **The same four on a transaction**: `Tx.UpdateNodeIndexed`,
+  `Tx.UpdateEdgeIndexed`, `Tx.UpdateNodePartialIndex`, `Tx.UpdateEdgePartialIndex`.
+  A record and the entries describing it belong in one commit wherever they are
+  written from.
+
 - **`store.ErrWriteConflict`.** An upsert's key is resolved when the operation is
   buffered and re-checked under the write lock at commit, so two writers racing
   to create the same entity do not both succeed. This is optimistic concurrency
@@ -99,7 +107,9 @@ the record without the entries.
 
 - **New errors**: `store.ErrNoLabels`, `store.ErrUniqueViolation`,
   `store.ErrIndexedPropertiesRequired`, `store.ErrWriteConflict`,
-  `store.ErrKeyNotUnique`, and `*store.UniqueViolationsError`.
+  `store.ErrKeyNotUnique`, and `*store.UniqueViolationsError` carrying
+  `[]store.UniqueConflict`. Every sentinel is listed in
+  [docs/API_REFERENCE.md](docs/API_REFERENCE.md) §4.
 
 ### Fixed
 

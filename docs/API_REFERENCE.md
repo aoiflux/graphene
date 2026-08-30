@@ -158,12 +158,12 @@ func ParseEdgeType(selector string) (EdgeType, error)
 
 ## 4. Errors
 
+Two shapes carry structure, and are matched with `errors.As`:
+
 ```go
 type ErrNotFound struct { Kind string; ID uint64 }   // "node" or "edge"
-type ErrInvalidEdge struct { MissingID NodeID }       // AddEdge with missing endpoint
+type ErrInvalidEdge struct { MissingID NodeID }      // AddEdge with missing endpoint
 ```
-
-Match with `errors.As`:
 
 ```go
 var nf *store.ErrNotFound
@@ -171,6 +171,31 @@ if _, err := g.GetNode(id); errors.As(err, &nf) {
     // id does not exist
 }
 ```
+
+The rest are sentinels, matched with `errors.Is`:
+
+| Sentinel | Returned by | Meaning |
+|---|---|---|
+| `store.ErrNoLabels` | `AddNode`, `AddEdge`, their batch and `Tx` forms, `UpdateNode`, `UpdateEdge` | the label set is empty |
+| `store.ErrIndexedPropertiesRequired` | `UpdateNode`, `UpdateEdge` under `ReindexReject` | the entity carries index entries the update would invalidate (§17) |
+| `store.ErrKeyNotUnique` | `UpsertNode`, `UpsertEdge`, `NodeByProperty`, `EdgeByProperty` | the key was never declared unique (§9c) |
+| `store.ErrUniqueViolation` | any write registering a value another live entity holds | the constraint would be broken |
+| `store.ErrWriteConflict` | `Tx.Commit` | an upsert's key moved between buffering and commit; retry |
+
+A uniqueness *declaration* that fails reports all of it at once:
+
+```go
+type UniqueConflict struct { Value []byte; IDs []uint64 }
+
+type UniqueViolationsError struct {
+    Kind      string            // "node" or "edge"
+    Key       string
+    Conflicts []UniqueConflict  // every offending value, ascending
+}
+```
+
+It unwraps to `ErrUniqueViolation`, so one condition covers a violation whichever
+stage it surfaced at — but `Conflicts` is the field a repair reads.
 
 ---
 
@@ -184,9 +209,11 @@ func (g *Graph) AddNodes(nodes []*store.Node) ([]store.NodeID, error)
 func (g *Graph) AddEdges(edges []*store.Edge) ([]store.EdgeID, error)
 ```
 
-- `AddNode` — assigns and returns a fresh `NodeID`. `n.Labels` must be non-empty.
+- `AddNode` — assigns and returns a fresh `NodeID`. `n.Labels` must be non-empty,
+  else `store.ErrNoLabels`.
 - `AddEdge` — `Src` and `Dst` must already exist (and not be deleted), else
-  `*store.ErrInvalidEdge`. Returns a fresh `EdgeID`.
+  `*store.ErrInvalidEdge`. `e.Labels` must be non-empty, else
+  `store.ErrNoLabels`. Returns a fresh `EdgeID`.
 - `AddNodes` / `AddEdges` — ordered batch insert, and **transactional**: the whole
   batch is applied or none of it is. On error nothing is created and no IDs are
   returned. On the disk backend the batch is framed with begin/commit markers and
@@ -210,6 +237,18 @@ func (tx *Tx) UpdateNode(n *store.Node)
 func (tx *Tx) UpdateEdge(e *store.Edge)
 func (tx *Tx) DeleteNode(id store.NodeID)
 func (tx *Tx) DeleteEdge(id store.EdgeID)
+
+func (tx *Tx) UpsertNode(key string, value []byte, n *store.Node,
+    props map[string][]byte) (store.NodeID, bool)
+func (tx *Tx) UpsertEdge(key string, value []byte, e *store.Edge,
+    props map[string][]byte) (store.EdgeID, bool)
+
+func (tx *Tx) IndexNodeProperties(id store.NodeID, props map[string][]byte)
+func (tx *Tx) IndexEdgeProperties(id store.EdgeID, props map[string][]byte)
+func (tx *Tx) UpdateNodeIndexed(n *store.Node, props map[string][]byte)
+func (tx *Tx) UpdateEdgeIndexed(e *store.Edge, props map[string][]byte)
+func (tx *Tx) UpdateNodePartialIndex(n *store.Node, changed map[string][]byte)
+func (tx *Tx) UpdateEdgePartialIndex(e *store.Edge, changed map[string][]byte)
 
 func (tx *Tx) Commit() error
 func (tx *Tx) Rollback() error
@@ -349,6 +388,7 @@ later call wins.
 | Situation | Use | Why |
 |---|---|---|
 | Nodes **and** their edges together | **`Begin`** | The only shape that commits both atomically |
+| Re-ingesting a source that may already be in the graph | **`Begin`** + `tx.UpsertNode` | Resolves each natural key to what is already there (§9c) |
 | Loading a graph from a file / another system | **`Begin`**, chunked | Atomic per chunk, and endpoints can be wired without a second pass |
 | A multi-step edit that must not half-apply | **`Begin`** | e.g. delete a node, re-attach its edges elsewhere |
 | Deleting several related entities | **`Begin`** | One commit; cascades resolve against the transaction's own view |
@@ -518,7 +558,7 @@ func (g *Graph) DeleteEdge(id store.EdgeID) error
 Replaces the **labels and properties** of the node identified by `n.ID`.
 
 - `n.ID` must reference an existing node → else `*store.ErrNotFound`.
-- `n.Labels` must be non-empty.
+- `n.Labels` must be non-empty → else `store.ErrNoLabels`.
 - The node's ID never changes. The new labels/properties fully replace the old.
 
 ### UpdateEdge
@@ -527,7 +567,8 @@ Replaces the **labels, weight, and properties** of the edge identified by `e.ID`
 - **Endpoints are immutable.** Any `e.Src` / `e.Dst` you set are ignored; the
   edge keeps its original endpoints. To reconnect an edge, `DeleteEdge` it and
   `AddEdge` a new one.
-- `e.ID` must exist → else `*store.ErrNotFound`. `e.Labels` must be non-empty.
+- `e.ID` must exist → else `*store.ErrNotFound`. `e.Labels` must be non-empty →
+  else `store.ErrNoLabels`.
 
 ### DeleteEdge
 Removes a single edge and purges its property-index entries. Missing edge →

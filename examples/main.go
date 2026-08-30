@@ -66,6 +66,7 @@ func main() {
 	exampleMutation1_EditEntities()
 	exampleMutation2_DeleteAndCascade()
 	exampleMutation3_ReclassifyAndReindex()
+	exampleMutation4_IdempotentIngest()
 
 	fmt.Println("--- Visualization Examples ---")
 	fmt.Println()
