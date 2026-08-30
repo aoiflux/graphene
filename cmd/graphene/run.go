@@ -21,6 +21,16 @@ import (
 // run executes one invocation and returns the exit status.
 func run(argv []string, stdout, stderr io.Writer) int {
 	g := &Globals{}
+
+	// Config, then environment, then flags — each layer overriding the one
+	// before it, and the command line always winning. A config may set only the
+	// reporting flags; see config.go for why -confirm and -dry-run are not
+	// among them.
+	cfg, err := loadConfig()
+	if err != nil {
+		return fail(stderr, g, "", err)
+	}
+	cfg.apply(g)
 	applyEnv(g)
 
 	rest, err := splitGlobals(argv, g)
@@ -46,12 +56,12 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return writeHelp(stdout, nil)
 	}
 
-	return invoke(res.cmd, res.args, g, stdout, stderr)
+	return invoke(res.cmd, res.args, g, cfg, stdout, stderr)
 }
 
 // invoke parses the command's flags, opens what it declared, runs it and
 // renders the result.
-func invoke(c *Command, args []string, g *Globals, stdout, stderr io.Writer) int {
+func invoke(c *Command, args []string, g *Globals, cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet(c.Path(), flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() { writeCommandHelp(stderr, c, fs) }
@@ -81,19 +91,36 @@ func invoke(c *Command, args []string, g *Globals, stdout, stderr io.Writer) int
 	ctx, cancel := rootContext(g)
 	defer cancel()
 
+	// A profile name in the operand position, resolved to its directory. A path
+	// that exists always wins, so a profile can never shadow a real directory
+	// and adding one cannot change what an existing command means.
+	target := fs.Arg(0)
+	if c.Open.needsTarget() {
+		if dir, prof, ok := cfg.resolve(target); ok {
+			if !g.Quiet {
+				// Said out loud. A tool that silently substituted a path would
+				// be one you could not safely paste a command into.
+				_, _ = io.WriteString(stderr,
+					"graphene: profile "+target+" -> "+dir+"\n")
+			}
+			target = dir
+			applyProfileKeys(fs, prof, g, stderr)
+		}
+	}
+
 	cx := &Context{
 		Ctx:     ctx,
 		Globals: g,
 		Cmd:     c,
 		Now:     time.Now,
-		Target:  fs.Arg(0),
+		Target:  target,
 		Args:    fs.Args(),
 		Out:     stdout,
 		Err:     stderr,
 	}
 
-	if g.Profile != "" {
-		stop, err := startProfile(g.Profile)
+	if g.CPUProfile != "" {
+		stop, err := startProfile(g.CPUProfile)
 		if err != nil {
 			return fail(stderr, g, c.Path(), err)
 		}
@@ -168,11 +195,20 @@ func execute(cx *Context, c *Command, h Handler, g *Globals) (Result, error) {
 		mode = mode.readOnly()
 	}
 
-	if c.Notice != "" && !g.Quiet {
+	// The notice, or the dry run's correction of it. A writing command's notice
+	// says it takes the exclusive lock, and under -dry-run that is no longer
+	// true — the mode was downgraded above. Printing it anyway would have the
+	// tool describe a lock it is not holding, which is the sort of small
+	// dishonesty that makes an operator stop believing the rest of the output.
+	notice := c.Notice
+	if g.DryRun && c.Open.writes() {
+		notice = "dry run: opening read-only; nothing will be written"
+	}
+	if notice != "" && !g.Quiet {
 		if g.JSON {
-			r.Notice("%s", c.Notice)
+			r.Notice("%s", notice)
 		} else {
-			_, _ = io.WriteString(cx.Err, c.Notice+"\n")
+			_, _ = io.WriteString(cx.Err, notice+"\n")
 		}
 	}
 
@@ -202,6 +238,12 @@ func execute(cx *Context, c *Command, h Handler, g *Globals) (Result, error) {
 	// Carry anything the framework recorded before the handler ran — notices,
 	// mostly — into the document the handler returned.
 	out.Notices = append(r.Notices, out.Notices...)
+	if cx.metrics != nil {
+		// After the handler and before the deferred Close, so a command's own
+		// work is measured and the close is not. The close would otherwise
+		// attribute its final sync to whatever ran last.
+		cx.metrics.report(&out)
+	}
 	if out.Target == "" {
 		out.Target = cx.Target
 	}

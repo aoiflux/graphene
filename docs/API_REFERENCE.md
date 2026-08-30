@@ -1543,11 +1543,17 @@ there; nothing excludes a second process.
 
 #### Inspecting a busy store
 
-`graphene store info`, `store csr`, `wal show`, `redaction list` and
-`grant list` parse the files directly
-and never open the store, so they work against a directory another process is
-writing. That is what they are for: the moment you most want to look at a store
-is the moment something is wrong with it and a live process is still attached.
+`graphene store info`, `store csr`, `wal show`, `wal segments`, `wal verify`,
+`anchor list`, `assertion list`, `redaction list` and `grant list` parse the
+files directly and never open the store, so they work against a directory
+another process is writing. That is what they are for: the moment you most want
+to look at a store is the moment something is wrong with it and a live process
+is still attached.
+
+Everything else in the tool — the `node`, `edge`, `traverse` and `query` groups,
+`store stats`, `store health`, `debug integrity` — needs the WAL replayed over
+the image and so opens the store under the shared lock. Each says so on stderr
+before it does, and `graphene help <group> <verb>` states which lock it takes.
 
 ### Other properties
 
@@ -2512,8 +2518,11 @@ things make that real:
    bytes that prove one entity was in one snapshot and disclose nothing about
    any other. Handing over the image discloses everything.
 3. **Never bundle the root with the proof.** There is no API that does, and
-   `graphene verify-proof` requires `-root` for the same reason: a proof checked
-   against a root its author chose proves nothing.
+   `graphene provenance verify` requires `-root` for the same reason: a proof
+   checked against a root its author chose proves nothing. `node verify` and
+   `edge verify` accept `-root` and, without one, report the check as a finding
+   rather than as a pass — the tool will not print a verdict that reads
+   stronger than what it established.
 
 ```go
 blob, _ := s.ExportNodeProof(id)                      // producer

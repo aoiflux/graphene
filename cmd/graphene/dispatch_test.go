@@ -174,3 +174,15 @@ func TestGlobalsDoNotShadowCommandFlags(t *testing.T) {
 		})
 	}
 }
+
+// TestEveryGroupIsIntroduced. groupBlurb falls back to "<name> commands", which
+// is a placeholder that reads like one — and placeholders in shipped help are
+// exactly the kind of thing nobody notices until a user does. A new group now
+// fails the build until somebody says what it is for.
+func TestEveryGroupIsIntroduced(t *testing.T) {
+	for _, g := range visibleGroups() {
+		if _, ok := groupBlurbs[g]; !ok {
+			t.Errorf("group %q has no blurb; add one to groupBlurbs in help.go", g)
+		}
+	}
+}

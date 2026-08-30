@@ -1,9 +1,9 @@
 package main
 
-// debug indexes, provenance custody, anchor verify.
+// debug indexes, provenance custody, anchor verify, node verify.
 //
-// These three open the store, because what they check includes state that only
-// exists once the log has been replayed. The framework does the opening and the
+// These open the store, because what they check includes state that only exists
+// once the log has been replayed. The framework does the opening and the
 // closing; see context.go for why that is structural rather than stylistic.
 //
 // custody and anchor are where the lock leak lived. Both ended with
@@ -14,6 +14,7 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
 	"flag"
 	"time"
 
@@ -120,19 +121,7 @@ func runProvenanceCustody(cx *Context, o *custodyOpts) (Result, error) {
 		return r, err
 	}
 
-	sec := r.Section("")
-	sec.Add("node", ID(uint64(report.NodeID)))
-	sec.Add("known to store", Bool(report.Live))
-	sec.Add("in snapshot", Bool(report.InSnapshot))
-	if report.InSnapshot {
-		sec.Add("snapshot root", Hash(report.SnapshotRoot))
-	}
-	sec.AddNote("attested", Bool(report.Attested),
-		"(verified: "+boolWord(report.AttestationVerified)+")")
-	sec.Add("signatures", Str(signatureNote(verifier)))
-	sec.Add("segments walked", Int(int64(report.SegmentsChecked)))
-	sec.Addf("audit entries", "%d (%d compactions)",
-		report.AuditEntriesWalked, report.CompactionsRecorded)
+	addCustody(r.Section(""), report, verifier)
 
 	r.Notes("summary").Line("%s", report.Summary())
 	for _, g := range report.Gaps {
@@ -222,6 +211,33 @@ func runAnchorVerify(cx *Context, o *anchorOpts) (Result, error) {
 	return r, nil
 }
 
+// addCustody writes a custody report into a section.
+//
+// Shared with `edge provenance`, which reports the custody of an edge's two
+// endpoints: an edge has no custody record of its own, and the two endpoint
+// accounts must be laid out identically to this one or a reader comparing them
+// is comparing two different reports.
+func addCustody(sec *Section, report disk.CustodyReport, verifier store.Verifier) {
+	sec.Add("node", ID(uint64(report.NodeID)))
+	sec.Add("known to store", Bool(report.Live))
+	sec.Add("in snapshot", Bool(report.InSnapshot))
+	if report.InSnapshot {
+		sec.Add("snapshot root", Hash(report.SnapshotRoot))
+	}
+	sec.AddNote("attested", Bool(report.Attested),
+		"(verified: "+boolWord(report.AttestationVerified)+")")
+	sec.Add("signatures", Str(signatureNote(verifier)))
+	sec.Add("segments walked", Int(int64(report.SegmentsChecked)))
+	sec.Addf("audit entries", "%d (%d compactions)",
+		report.AuditEntriesWalked, report.CompactionsRecorded)
+	if report.Redacted != nil {
+		// A documented removal is the difference between lawful redaction and
+		// evidence destruction, and it belongs next to the absence it explains.
+		sec.Add("redacted", Str(report.Redacted.String()))
+		sec.Add("removal provable from the image", Bool(report.RemovalProvable))
+	}
+}
+
 // setVerdict records the outcome of a check that distinguishes broken from
 // merely incomplete. This is the exit-status policy in one place: only the
 // first of those is a failure.
@@ -241,4 +257,133 @@ func boolWord(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// --- node verify ---
+
+type verifyNodeOpts struct {
+	id   uint64
+	root string
+	keys pubkeyList
+}
+
+var nodeVerify = cmd(Command{
+	Group: "node", Name: "verify", Usage: "<dir>",
+	Short: "prove a node is in the image, and check who vouched for it",
+	Long: "Two independent claims, reported separately:\n\n" +
+		"  inclusion    a Merkle proof that this node is in the image under the\n" +
+		"               snapshot root. Needs no key.\n" +
+		"  attestation  a signature over that root by whoever vouched for it.\n" +
+		"               Needs -pubkey.\n\n" +
+		"Give -root a snapshot root you obtained independently — from an anchor, a\n" +
+		"countersigned checkpoint, an earlier report. Without it the proof is\n" +
+		"checked against the root the store itself states, which proves the store\n" +
+		"agrees with itself and nothing more. That is reported as a finding, not\n" +
+		"as a pass.",
+	Notice: "opens the store read-only (shared lock)",
+	Open:   OpenDiskRO, Tier: CtxAdvisory,
+},
+	func(fs *flag.FlagSet, o *verifyNodeOpts) {
+		fs.Uint64Var(&o.id, "id", 0, "node ID (required)")
+		fs.StringVar(&o.root, "root", "",
+			"snapshot root, hex, obtained independently of this store")
+		fs.Var(&o.keys, "pubkey", "ID:HEX Ed25519 public key (repeatable)")
+	},
+	runNodeVerify)
+
+func runNodeVerify(cx *Context, o *verifyNodeOpts) (Result, error) {
+	var r Result
+	if o.id == 0 {
+		return r, Usagef("need -id <node>")
+	}
+	verifier, err := verifierFromFlag(o.keys)
+	if err != nil {
+		return r, err
+	}
+	s := cx.Disk()
+
+	proof, err := s.ProveNode(store.NodeID(o.id))
+	if err != nil {
+		if errors.Is(err, disk.ErrNoSnapshotRoots) {
+			r.Find(SevWarn, "node.no_roots",
+				"this image carries no snapshot roots, so nothing in it can be proved; "+
+					"compact the store to write an image that does")
+			return r, nil
+		}
+		// The node is not in the image. A verdict, not a fault: an entity
+		// written since the last compaction is legitimately absent from it.
+		r.Section("inclusion").Add("node", ID(o.id))
+		r.Find(SevWarn, "node.not_in_image",
+			"node %d is not provable from this image: %v", o.id, err)
+		return r, nil
+	}
+
+	inc := r.Section("inclusion")
+	inc.Add("node", ID(o.id))
+	inc.Add("snapshot root", Hash(proof.Roots.Snapshot))
+
+	against := proof.Roots.Snapshot
+	independent := false
+	if o.root != "" {
+		h, herr := parseRoot(o.root)
+		if herr != nil {
+			return r, herr
+		}
+		against, independent = h, true
+		inc.Add("checked against", Hash(h))
+	}
+
+	if verr := disk.VerifyNodeInclusion(against, proof); verr != nil {
+		inc.Add("proof", Str("FAILED"))
+		r.Find(SevBroken, "node.inclusion_failed", "%v", verr)
+	} else {
+		inc.Add("proof", Str("resolves to the root"))
+		if !independent {
+			r.Find(SevWarn, "node.root_not_independent",
+				"the proof is well formed, but it was checked against the root this "+
+					"store states — supply -root to check it against one you obtained elsewhere")
+		}
+	}
+
+	// The attestation half. AttestNode reads: it pairs the image's own signed
+	// attestation with this node's inclusion proof to make a transferable
+	// claim, and creates nothing. There is no per-node attestation to write —
+	// the signature is over the snapshot root and is produced at compaction —
+	// so there is no `node assert` in this tool, and the brief's assumption
+	// that there could be one does not survive contact with the engine.
+	att := r.Section("attestation")
+	na, aerr := s.AttestNode(store.NodeID(o.id))
+	switch {
+	case errors.Is(aerr, disk.ErrNoAttestation):
+		att.Add("attestation", Str("none"))
+		r.Find(SevWarn, "node.not_attested",
+			"the image carries no attestation, so nothing vouches for node %d "+
+				"or for anything else in it", o.id)
+	case aerr != nil:
+		att.Add("attestation", Str("unavailable"))
+		r.Find(SevWarn, "node.not_attested", "%v", aerr)
+	case verifier == nil:
+		att.Add("attestation", Str("present, unchecked"))
+		att.Add("actor", Uint(na.Attestation.ActorID))
+		att.Add("signed by key", Uint(na.Attestation.KeyID))
+		att.Add("at", Time(na.Attestation.UnixNano))
+		r.Find(SevWarn, "signatures.unchecked",
+			"no -pubkey was supplied, so the attestation's signature was not checked")
+	default:
+		if verr := disk.VerifyNodeAttestation(verifier, na); verr != nil {
+			att.Add("attestation", Str("FAILED"))
+			r.Find(SevBroken, "node.attestation_failed", "%v", verr)
+		} else {
+			att.Add("attestation", Str("verified"))
+			att.Add("actor", Uint(na.Attestation.ActorID))
+			att.Add("signed by key", Uint(na.Attestation.KeyID))
+			att.Add("at", Time(na.Attestation.UnixNano))
+			att.Add("subject", Hash(na.Attestation.Subject))
+		}
+	}
+
+	if r.Verdict == VerdictNone {
+		r.Verdict = VerdictVerified
+	}
+	return r, nil
 }

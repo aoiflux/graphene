@@ -12,6 +12,7 @@ package main
 
 import (
 	"flag"
+	"strings"
 
 	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/merkle"
@@ -207,9 +208,16 @@ func summarizeLedger(r *Result, noun string, total, shown int, filtered bool,
 	}
 }
 
+// pluralWord is deliberately small and deliberately not a library. It handles
+// the three nouns this package actually pluralises — "record", "grant", "audit
+// entry" — and an -y ending, which is the one that produced "audit entrys".
 func pluralWord(n int, noun string) string {
-	if n == 1 {
+	switch {
+	case n == 1:
 		return noun
+	case strings.HasSuffix(noun, "y"):
+		return noun[:len(noun)-1] + "ies"
+	default:
+		return noun + "s"
 	}
-	return noun + "s"
 }

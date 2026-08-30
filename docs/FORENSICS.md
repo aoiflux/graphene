@@ -277,31 +277,76 @@ Commands are grouped by noun. `graphene help` prints the full list, and
 `graphene help <group> <verb>` explains one — both generated from the registry,
 so they cannot drift out of step with the binary the way this page once did.
 
+The forensic surface, by the question it answers:
+
 ```
+# What does this store say about itself?
 graphene store info   <dir>          summary of the image and the log
 graphene store csr    <dir>          CSR header detail (-verify checks digest and roots)
+graphene store snapshot <dir>        the roots — retain the snapshot root elsewhere
 graphene wal show     <dir>          record-by-record log dump
-graphene debug indexes <dir>         structural index check
-graphene provenance custody <dir>    account for one entity across every history
+graphene wal segments <dir>          retired logs, and the digest chain linking them
+graphene wal verify   <dir>          record CRCs, and that chain
+
+# Who did what, and who was allowed to?
+graphene assertion list <dir>        the audit chain: who did what, and when
+graphene assertion verify <dir>      that chain, and the attestation over the image
 graphene redaction list <dir>        ledger of attributed removals
+graphene redaction tombstones <dir>  the removals the image itself records
 graphene grant list   <dir>          role grants, and the capabilities they imply
-graphene anchor verify <dir>         publish or check a checkpoint
+graphene grant check -actor 7 -cap redact <dir>
+graphene keys timeline <dir>         signing-key rotations
+
+# Can it be proved to someone who does not have the store?
+graphene node verify -id 7 -root <hex> <dir>   inclusion, and who vouched for it
+graphene edge verify -id 7 -root <hex> <dir>   that a removal was recorded
+graphene provenance custody <dir>    account for one entity across every history
 graphene provenance export <dir>     export a proof
 graphene provenance verify <file>    check a proof against a root you retained
+graphene export bundle -to case.tar -node 7 <dir>
+graphene anchor list  <dir>          the local checkpoint chain
+graphene anchor verify <dir>         check it against an anchor
+
+# All of it, one verdict
+graphene debug integrity -pubkey 1:<hex> <dir>
 ```
 
-Every one of these also answers to the flat name it had before groups existed —
-`graphene custody`, `graphene redactions`, `graphene verify-proof` and the rest
-all still work and always will. The short spellings are hidden from help rather
-than removed.
+Every one of the commands that predates groups also answers to the flat name it
+had — `graphene custody`, `graphene redactions`, `graphene verify-proof` and the
+rest all still work and always will. The short spellings are hidden from help
+rather than removed.
 
-`store info`, `store csr`, `wal show`, `redaction list` and `grant list` read
-the files directly and are safe against a store another process is using.
-`provenance verify` touches nothing but the file you give it. Everything else
-opens the store.
+`store info`, `store csr`, `wal show`, `wal segments`, `wal verify`,
+`anchor list`, `assertion list`, `redaction list` and `grant list` read the
+files directly and are safe against a store another process is using — which is
+the moment you most want them. `provenance verify` touches nothing but the file
+you give it. Everything else opens the store, and says so on stderr first.
 
-`anchor verify -publish` is the only one of these that writes, and it only
-appends.
+Three of these write, and each only ever appends: `anchor add` (a checkpoint),
+`assertion add` (an audit entry) and `grant add` / `grant revoke` (a ledger
+record). None can alter or remove anything already recorded, which is why none
+of them is behind `-confirm` — a gate on a command that cannot lose anything
+teaches the habit of typing `-confirm` without reading it, which is what makes
+the gate stop working where it matters.
+
+`redaction apply` is the one command here that destroys content, and it is
+behind `-confirm`. Run `redaction impact -node N` first: the cost of a node
+redaction is the edges it takes with it, and finding that out afterwards is
+finding it out too late.
+
+### Two verifications that are weaker than they sound
+
+**`edge verify` proves a removal, not a presence.** The engine commits to node
+identities and to tombstones; there is no Merkle commitment to an edge's
+presence, so there is no `ProveEdge` and no inclusion proof for one. What it can
+answer is "does this image attest that edge N was deliberately removed".
+
+**A root that travels with the thing it attests proves nothing.** Every
+`-root` flag exists so the check can be made against a value obtained
+*elsewhere* — an anchor, a countersigned checkpoint, an earlier report. Without
+one, the proof is checked against the root the store itself states, the tool
+reports that as a finding rather than as a pass, and it should be read as "this
+store agrees with itself".
 
 Add `-json` to any of them for a machine-readable document with a stable schema:
 

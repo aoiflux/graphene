@@ -927,10 +927,28 @@ Compact afterwards, or the removal is known to the ledger and not to the image.
 
 ```
 graphene provenance custody -node 7 <dir>    account for one entity across every history
+graphene redaction impact -node 7 <dir>      what a removal would take with it — changes nothing
+graphene redaction apply -node 7 -actor 3 -reason "..." -confirm <dir>
 graphene redaction list <dir>                who removed what, when, and why
 graphene grant list <dir>                    who was permitted to do it
 graphene provenance export -node 7 -out c.gprf <dir>
 graphene provenance verify -root <hex> c.gprf     # needs no store
+```
+
+`redaction impact` is a pure dry run and is available while refusing is still
+possible, which is the point of it: the cost of a node redaction is the edges it
+cascades to, and that is worth knowing before rather than after.
+
+The rest of the shell surface, in one place:
+
+```
+graphene node list -type MicroArtefact -prop sha256=d4e5 <dir>
+graphene traverse path -from 7 -to 42 <dir>
+graphene traverse bfs -from 7 -depth 3 -viz out.html <dir>
+graphene store health <dir>                  counts, compaction, lock, verification
+graphene backup restore -to D -at-commit 4711 <backup>
+graphene maintenance compact -confirm <dir>
+graphene debug integrity <dir>
 ```
 
 The flat spellings these commands had before groups existed — `custody`,
@@ -938,7 +956,12 @@ The flat spellings these commands had before groups existed — `custody`,
 going away; they are hidden from help rather than removed.
 
 `graphene help` lists everything, and `-json` on any command gives a document
-with a stable schema instead of a report.
+with a stable schema instead of a report. `-metrics` reports what the engine
+actually did — commits, fsyncs, queries, and the replay the open performed.
+
+Anything that changes bytes already on disk needs `-confirm` and supports
+`-dry-run`. A dry run opens the store *read-only*, so it cannot write by
+construction rather than by a handler remembering to check a flag.
 
 ### What none of it does
 

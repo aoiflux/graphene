@@ -89,12 +89,18 @@ Usage:
   -indent          indent the JSON (implies -json)
   -verbose         more detail in the report
   -quiet           suppress the asides on stderr
+  -no-color        plain output even on a terminal
+  -log-level L     error | warn | info | debug
+  -metrics         report what the engine did: commits, syncs, queries, replay
   -dry-run         report what would change, and change nothing
   -timeout D       give up starting new work after this
-  -profile PATH    write a CPU profile
+  -cpuprofile P    write a pprof CPU profile to this path
+
+A <dir> operand may be a profile name instead of a path — see `+"`graphene help profile`"+`.
+A path that exists always wins, so a profile can never shadow a real directory.
 
 Every subcommand that existed before groups still works by its old name.
-`+"`graphene custody <dir>`"+` and `+"`graphene node custody <dir>`"+` are the same
+`+"`graphene custody <dir>`"+` and `+"`graphene provenance custody <dir>`"+` are the same
 command; the short spellings are kept for compatibility and hidden from this
 list.
 
@@ -178,18 +184,30 @@ func groupBlurb(group string) string {
 	return group + " commands"
 }
 
+// groupBlurbs is the one line each group is introduced with. A group without
+// an entry falls back to "<name> commands", which is a placeholder and reads
+// like one — a registry test would be the place to make that a build failure if
+// the fallback ever starts appearing in shipped help.
 var groupBlurbs = map[string]string{
-	"store":      "the image, the log, and what they say about each other",
-	"node":       "entities: read them, account for them, prove them",
-	"edge":       "relationships",
-	"wal":        "the write-ahead log and its segments",
-	"anchor":     "checkpoints and the external roots they are published to",
-	"grant":      "role grants and the capabilities they imply",
-	"redaction":  "the ledger of attributed removals: who, when, why",
-	"provenance": "where an entity came from, and who has vouched for it",
-	"backup":     "consistent copies, and restoring from them",
-	"transfer":   "bulk import and export",
-	"debug":      "verification, and what the engine is spending time on",
+	"store":       "the image, the log, and what they say about each other",
+	"node":        "entities: read them, account for them, prove them",
+	"edge":        "relationships",
+	"traverse":    "walks over the graph's shape: neighbourhoods, paths, patterns",
+	"query":       "adjacency-driven queries around nodes you name",
+	"wal":         "the write-ahead log and its segments",
+	"anchor":      "checkpoints and the external roots they are published to",
+	"keys":        "the signing keys, and the rotations between them",
+	"assertion":   "the audit chain, and the attestation over the image",
+	"grant":       "role grants and the capabilities they imply — recorded, never enforced",
+	"redaction":   "attributed removal: who removed what, when, and why",
+	"provenance":  "where an entity came from, and who has vouched for it",
+	"backup":      "consistent copies, and restoring from them",
+	"export":      "getting a graph, a region of one, or a proof bundle out",
+	"import":      "building a store from a dump",
+	"debug":       "verification, one narrow check at a time or all of them at once",
+	"maintenance": "the two operations that are safe, and the two that are refused",
+	"config":      "this tool's own configuration file",
+	"profile":     "names for store directories, and the keys that go with them",
 }
 
 func sortCommands(cs []*Command) {

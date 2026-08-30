@@ -37,10 +37,21 @@ type Globals struct {
 	Quiet    bool
 	NoColor  bool
 	LogLevel string
-	Profile  string
-	DryRun   bool
-	Confirm  bool
-	Timeout  time.Duration
+
+	// CPUProfile is a pprof output path. Named -cpuprofile rather than
+	// -profile because `profile` is the group that names store directories,
+	// and one word meaning two unrelated things on the same command line is
+	// how somebody ends up writing a pprof file into a directory they meant to
+	// inspect.
+	CPUProfile string
+	DryRun     bool
+	Confirm    bool
+	Timeout    time.Duration
+
+	// Metrics attaches a store.Metrics sink at open time and appends a summary
+	// of what the engine did. See metrics.go for why this is a global flag
+	// rather than the `debug profile` verb the brief asked for.
+	Metrics bool
 }
 
 // bindGlobals registers the process-wide flags on a command's flag set.
@@ -57,9 +68,11 @@ func bindGlobals(fs *flag.FlagSet, g *Globals) {
 	fs.BoolVar(&g.Quiet, "quiet", g.Quiet, "suppress the asides on stderr")
 	fs.BoolVar(&g.NoColor, "no-color", g.NoColor, "plain output even on a terminal")
 	fs.StringVar(&g.LogLevel, "log-level", g.LogLevel, "error | warn | info | debug")
-	fs.StringVar(&g.Profile, "profile", g.Profile, "write a CPU profile to this path")
+	fs.StringVar(&g.CPUProfile, "cpuprofile", g.CPUProfile, "write a pprof CPU profile to this path")
 	fs.BoolVar(&g.DryRun, "dry-run", g.DryRun, "report what would change, and change nothing")
 	fs.DurationVar(&g.Timeout, "timeout", g.Timeout, "give up starting new work after this")
+	fs.BoolVar(&g.Metrics, "metrics", g.Metrics,
+		"report what the engine did: commits, syncs, queries, replay")
 }
 
 // globalNames is the set bindGlobals registers. The dispatcher uses it to know
@@ -67,13 +80,13 @@ func bindGlobals(fs *flag.FlagSet, g *Globals) {
 // flag shadows one.
 var globalNames = map[string]bool{
 	"json": true, "indent": true, "verbose": true, "quiet": true,
-	"no-color": true, "log-level": true, "profile": true,
-	"dry-run": true, "timeout": true,
+	"no-color": true, "log-level": true, "cpuprofile": true,
+	"dry-run": true, "timeout": true, "metrics": true,
 }
 
 // globalTakesValue distinguishes `-timeout 30s` from `-json`.
 var globalTakesValue = map[string]bool{
-	"log-level": true, "profile": true, "timeout": true,
+	"log-level": true, "cpuprofile": true, "timeout": true,
 }
 
 // applyEnv seeds the globals from the environment, before any flag is parsed.

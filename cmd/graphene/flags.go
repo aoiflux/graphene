@@ -5,7 +5,6 @@ package main
 import (
 	"crypto/ed25519"
 	"encoding/hex"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,26 +24,29 @@ func verifierFromFlag(specs []string) (store.Verifier, error) {
 	if len(specs) == 0 {
 		return nil, nil
 	}
+	// Usage faults, not internal ones: a malformed -pubkey is a wrong command
+	// line, and the exit status should say so (2) rather than claiming the
+	// store could not be read (1).
 	ring := signing.NewKeyring()
 	for _, spec := range specs {
 		id, hexKey, ok := strings.Cut(spec, ":")
 		if !ok {
-			return nil, fmt.Errorf("-pubkey wants ID:HEX, got %q", spec)
+			return nil, Usagef("-pubkey wants ID:HEX, got %q", spec)
 		}
 		keyID, err := strconv.ParseUint(id, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("-pubkey %q: %w", spec, err)
+			return nil, Usagef("-pubkey %q: %v", spec, err)
 		}
 		raw, err := hex.DecodeString(hexKey)
 		if err != nil {
-			return nil, fmt.Errorf("-pubkey %q: %w", spec, err)
+			return nil, Usagef("-pubkey %q: %v", spec, err)
 		}
 		if len(raw) != ed25519.PublicKeySize {
-			return nil, fmt.Errorf("-pubkey %q: an Ed25519 public key is %d hex bytes, got %d",
+			return nil, Usagef("-pubkey %q: an Ed25519 public key is %d hex bytes, got %d",
 				spec, ed25519.PublicKeySize, len(raw))
 		}
 		if err := ring.Add(keyID, ed25519.PublicKey(raw)); err != nil {
-			return nil, err
+			return nil, Usagef("-pubkey %q: %v", spec, err)
 		}
 	}
 	return ring, nil

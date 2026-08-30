@@ -150,34 +150,12 @@ func runExportGraph(cx *Context, o *exportOpts) (Result, error) {
 		return r, Usagef("unknown format %q; want one of %s", o.format, formatList())
 	}
 
-	g := cx.Graph()
-	opts := bulk.Options{SkipProperties: o.skipProps}
-	var sum bulk.Summary
-	var err error
-
-	if o.format == "csv" {
-		if sum, err = bulk.ExportCSV(o.to, g.GraphStore, opts); err != nil {
-			return r, err
-		}
-	} else {
-		// O_EXCL: refusing to overwrite is the same rule ExportCSV applies to a
-		// directory that already holds a manifest, and for the same reason — a
-		// half-overwritten export is worse than no export.
-		f, ferr := os.OpenFile(o.to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-		if ferr != nil {
-			return r, fmt.Errorf("create %s: %w", o.to, ferr)
-		}
-		if o.format == "jsonl" {
-			sum, err = bulk.ExportJSONL(f, g.GraphStore, opts)
-		} else {
-			sum, err = bulk.ExportDump(f, g.GraphStore, opts)
-		}
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			return r, err
-		}
+	// Through the same writer `export subgraph` uses, so the two cannot disagree
+	// about what a jsonl export is or about refusing to overwrite.
+	sum, err := writeExport(o.format, o.to, cx.Graph().GraphStore,
+		bulk.Options{SkipProperties: o.skipProps})
+	if err != nil {
+		return r, err
 	}
 
 	s := r.Section("")

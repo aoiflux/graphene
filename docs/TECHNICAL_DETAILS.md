@@ -2301,6 +2301,104 @@ distinguishes "there is no image" — an ordinary state for a store that has nev
 compacted — from "the image will not parse", because collapsing the two sends an
 operator looking for corruption that is not there.
 
+#### The register, extended
+
+The command surface has since grown, and the writing half of it divides into
+three kinds rather than the one the paragraphs above describe. The distinction
+that organises them is *what a confirmation could protect*.
+
+**Append-only.** `anchor add` records a checkpoint and its publication;
+`assertion add` writes an audit entry; `grant add` and `grant revoke` write
+ledger records. Each of these adds and can neither alter nor remove anything
+already recorded, so there is nothing for `-confirm` to protect — and gating
+them anyway would be worse than leaving them open, because a gate on a command
+that cannot lose anything teaches the habit of typing `-confirm` without reading
+it, which is precisely what makes the gate stop working on the commands where it
+matters. None of them is behind `-confirm`. All of them honour `-dry-run`.
+
+Two consequences worth recording. `assertion add` refuses any audit kind below
+`AuditCustom`, because `CustodyFor` compares recorded compactions against
+retired segments specifically to catch a compaction that was never recorded — an
+audit log a caller can write engine history into is not evidence of what the
+engine did. And it reads the chain back before reporting success: `RecordAudit`
+on a store opened without `Options.Audit` succeeds and writes nothing, which is
+right for a library and silent in exactly the wrong way for a command whose only
+job is to record something. See §11b.4 for the related fix.
+
+**Additive.** `node create` and `edge create` add records and touch nothing that
+was already there. They are behind `-confirm` regardless, because the operator's
+model of this tool is "it does not change my store", and a create is still a
+change to what the next query returns. The only thing they consume is ID space,
+which is not a loss: IDs are never reused, so a create later deleted leaves a
+gap and never a collision.
+
+**Destructive.** `node delete`, `edge delete`, `redaction apply`,
+`maintenance compact` and `maintenance reindex`. These are the commands the gate
+exists for.
+
+`maintenance compact` is `migrate` without the version check, and rests on the
+same argument. `maintenance reindex` is safe for a different reason: indexes are
+derived state, rebuilt from the authoritative records, so nothing that is not
+already in the store can be lost by rebuilding them — and it verifies afterwards,
+because a rebuild that still disagrees means the records are the problem, which
+is a very different conversation.
+
+`redaction apply` destroys content deliberately and records the fact: signed
+into a hash-chained ledger, with a tombstone in the next image under the
+snapshot root and the version hash of what was destroyed retained. That record
+is what separates lawful redaction from evidence destruction, which is why the
+engine requires a reason and this does not soften it.
+
+`node delete` and `edge delete` are the exception that is hardest to justify, and
+they are here because a store is not always evidence and an engine that cannot
+delete is not a graph store. What makes them acceptable is that they say what
+they are, every time they run and not only in the help text: the notice on every
+invocation states that the removal is unattributed and names `redaction apply` as
+the command that records one. The operator most likely to reach for a delete on
+an evidence store is the one who has not read the help.
+
+**`maintenance repair` and `maintenance vacuum` are registered commands that
+refuse.** They exist so that somebody who types one gets an argument rather than
+"unknown subcommand", and the refusal names what does exist — `reindex`,
+`backup restore`, `store csr -verify`. An operator told a tool cannot help them
+goes looking for one that can, and the one they find will not have this tool's
+caution. Refusing usefully is part of the doctrine, not an afterthought to it.
+
+#### What a `-dry-run` is, structurally
+
+The framework downgrades the open mode for a dry run — `OpenGraphRW` becomes
+`OpenGraphRO`, `OpenDiskRW` becomes `OpenDiskRO` — before the store is acquired.
+A dry run therefore cannot take the exclusive lock and cannot write, because the
+handle it holds makes both impossible, not because the handler remembered to
+check a flag. The command's own notice is replaced under a dry run too: a notice
+that says "takes the exclusive lock" while the tool holds a shared one is a small
+dishonesty that costs more than it saves.
+
+Each gated command additionally answers the question the operator actually has.
+`redaction apply -dry-run` reports the cascade. `node delete -dry-run` lists the
+edges that would go with the node. `backup restore -dry-run` verifies the backup
+and reports where the cut would land, including when the requested commit is
+below the backup's image commit and the rewind cannot go that far — which is
+worth saying before the restore, because a restored store that is newer than
+asked for is how somebody comes to believe a rewind happened when it did not.
+
+A test walks the registry and, for every command declaring `Mutates`, asserts
+both halves: omitting `-confirm` refuses, and `-dry-run` leaves the directory
+byte-for-byte as it was. Asserting on exit status alone would pass even if the
+command wrote.
+
+#### Configuration may not reach the gate
+
+The CLI reads a config file, and it may set only how a command reports: `-json`,
+`-indent`, `-quiet`, `-no-color`, `-log-level`, `-metrics`. There is no way to
+put `-confirm` or `-dry-run` in it, and unknown fields are a load error rather
+than something silently ignored.
+
+A config that could set `-confirm` would make `graphene node delete -id 7`
+destructive on one machine and a refusal on another, with the difference living
+in a file that the command line does not show. The gate is only worth having if
+it means the same thing everywhere.
+
 ### 11b.4 Who owns the store the CLI opens
 
 Handlers do not open the store. The framework opens what a command's registry
@@ -2361,6 +2459,52 @@ depending on the command, and the one place it differed would be the command
 people use it on most. Paging is a shared binder with a per-command default
 instead, which gives the consistency a global was wanted for and keeps
 `wal -limit 0` meaning what it always meant.
+
+**The CLI opens a store the way it was built.** The audit, redaction and grant
+ledgers are per-open options: a directory holding `graphene.audit` opened
+without `Options.Audit` has no audit log as far as the engine is concerned, and
+`RecordAudit` on it succeeds and writes nothing. That is right for a library —
+auditing is the caller's decision, and a caller that did not ask for it should
+not pay for it — and wrong for a tool that is handed a directory and nothing
+else.
+
+It also had a consequence worth naming, present before the ledger question was
+noticed. `migrate` compacts, and a compaction performed by a store opened
+without `Options.Audit` is not recorded in the audit log. `CustodyFor` compares
+recorded compactions against retired segments *precisely* to catch a compaction
+that was never recorded, so the tool was manufacturing the exact anomaly the
+custody report exists to detect — and doing it during the operation an operator
+runs across a whole fleet.
+
+So the framework stats for the three ledger files before opening and enables the
+matching option for each one it finds. A store that has none gets none, because
+creating a ledger is a change nobody asked for. Under a read-only open the
+engine ignores all three (it will not open a ledger it cannot write), so the
+detection costs nothing there. The filenames are the on-disk format's; a
+regression test builds a store with all three ledgers, appends an audit entry
+through the CLI and reads the chain back, which is what would fail if the names
+ever moved.
+
+**Metrics are a global flag, not a `debug profile` verb.** `store.Metrics` can
+only be attached at open time, through `disk.Options.Metrics`, and in this tool
+the framework owns the open — so a `debug profile <subcommand...>` wrapper would
+have to re-enter dispatch from inside a handler and open the store a second way,
+which is the arrangement the section above exists to prevent. `-metrics`
+composes with every command that opens a store instead, so a slow `node list`
+and a slow `backup create` are profiled identically and nobody has to learn
+which commands the profiler knows how to wrap. It costs nothing when unset:
+`Options.Metrics` stays nil and the engine's emission sites compile down to a
+nil check.
+
+**Profiles resolve in the operand, and only when nothing is there.** A `<dir>`
+operand that names a profile in the config resolves to that profile's directory
+— but a path that exists always wins, so adding a profile can never change what
+a command that works today means. The resolution is printed on stderr: a tool
+that silently substituted a path would be one you could not safely paste a
+command into. A profile's public keys are supplied to any command that binds
+`-pubkey` and was given none, never merged with keys that were, and the command
+says on stderr that it used them. A report reading "signatures verified" has to
+be able to answer "against which keys".
 
 ## 12. Worked examples
 

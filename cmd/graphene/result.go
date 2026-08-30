@@ -199,6 +199,21 @@ func Uint(n uint64) Value { return Value{text: fmt.Sprintf("%d", n), j: n} }
 // values a reader would paste back into another command.
 func ID(n uint64) Value { return Uint(n) }
 
+// Float is a fractional number — an edge weight, a ratio. Rendered with %g so
+// a weight of 0 is "0" rather than "0.000000", and a JSON number either way.
+func Float(f float64) Value { return Value{text: fmt.Sprintf("%g", f), j: f} }
+
+// Strs is a list of strings: comma-joined for a human, a JSON array for a
+// machine. A node's labels are a set, and flattening them to a string in JSON
+// would make `jq '.labels | index("Tag")'` a substring search — which finds
+// "Tag" inside "Tagged" and calls it a match.
+func Strs(ss []string) Value {
+	if ss == nil {
+		ss = []string{}
+	}
+	return Value{text: strings.Join(ss, ","), j: ss}
+}
+
 // Bool renders true/false in both.
 func Bool(b bool) Value { return Value{text: fmt.Sprintf("%v", b), j: b} }
 

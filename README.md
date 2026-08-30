@@ -525,28 +525,63 @@ func main() {
 `cmd/graphene` inspects a store from a shell. Commands are grouped by noun;
 `graphene help` prints the list and `graphene help <group> <verb>` explains one.
 
+The command list below is a sample, not the list — that lives in the registry,
+and `graphene help` prints it from there.
+
+**What is in the store**
+
 ```
-graphene store info   <dir>          summary of the image and the log
-graphene store csr    <dir>          CSR header detail (-verify checks digest and roots)
-graphene wal show     <dir>          record-by-record log dump
-graphene debug indexes <dir>         structural index check
-graphene provenance custody <dir>    account for one entity across every history
-graphene provenance export <dir>     export a proof to hand to someone else
-graphene provenance verify <file>    check a proof against a root you retained
-graphene redaction list <dir>        who removed what, when, and why
-graphene grant list   <dir>          role grants, and the capabilities they imply
-graphene anchor verify <dir>         publish or check a checkpoint
-graphene backup create <dir> -to D   consistent copy
-graphene backup verify <dir>         check a backup against its manifest
-graphene export graph <dir> -to F    the whole graph as jsonl, csv or a native dump
-graphene import graph <dir> -from F  build a store from a dump
-graphene store migrate <dir>         bring the image up to the current format
+graphene node list   -type MicroArtefact -prop sha256=d4e5 <dir>
+graphene node get    -id 7,8,9 <dir>            node degree, node neighbours
+graphene edge of     -node 7 -direction both <dir>
+graphene node explain -prop size'>'1000 <dir>   how the planner resolves a query
 ```
 
-Most of these read `graphene.csr`, `graphene.wal` and the ledger files directly
-and take no lock, so they work against a store another process is writing to —
-which is when you most want them. The ones that open the store say so on stderr
-first, and `graphene help <cmd>` states which lock each takes.
+Property filters take seven operators: `k=v` equals, `k~v` contains, `k^v`
+prefix, `k>v`, `k>=v`, `k<v`, `k<=v`, and `k[lo:hi]` between-inclusive.
+
+**What shape it is**
+
+```
+graphene traverse bfs  -from 7 -depth 3 -viz out.html <dir>
+graphene traverse path -from 7 -to 42 <dir>
+graphene traverse pattern -spec shape.json -scope 7,8,9 <dir>
+graphene query relations -anchor 7 -counterpart 42 <dir>
+```
+
+Every walk takes `-max-nodes`, `-max-edges` and `-max-time`. Depth alone does
+not bound a walk — one hub of degree 100 000 puts 100 000 entries in the visited
+set at depth one — so `-max-nodes` defaults to 100 000 rather than to unlimited.
+A budget that is hit is a *refusal*, not a truncation: nothing partial comes
+back looking complete.
+
+**What can be proved about it**
+
+```
+graphene store snapshot <dir>                   the root worth retaining elsewhere
+graphene node verify -id 7 -root <hex> <dir>    inclusion, and who vouched for it
+graphene provenance custody -node 7 <dir>       one entity across every history
+graphene debug integrity -pubkey 1:<hex> <dir>  every check, one verdict
+graphene assertion list <dir>                   the audit chain
+graphene redaction impact -node 7 <dir>         what a removal would take with it
+```
+
+**Copies, transfer and recovery**
+
+```
+graphene backup create  -to D <dir>
+graphene backup restore -to D -at-commit 4711 <backup>   point-in-time recovery
+graphene export subgraph -from 7 -depth 2 -to region.jsonl <dir>
+graphene export bundle  -to case.tar -node 7 <dir>       proofs for a recipient
+graphene import graph   -from dump.jsonl <empty-dir>
+```
+
+`store info`, `store csr`, `wal show`, `wal segments`, `anchor list`,
+`assertion list`, `redaction list` and `grant list` read `graphene.csr`,
+`graphene.wal` and the ledger files directly and take no lock, so they work
+against a store another process is writing to — which is when you most want
+them. Everything else opens the store, says so on stderr first, and
+`graphene help <group> <verb>` states which lock it takes.
 
 Add `-json` for a document with a stable schema instead of a report:
 
@@ -555,16 +590,47 @@ graphene store info -json <dir> | jq .data.csr_image.nodes
 graphene provenance custody -json -node 7 <dir> | jq -r '.findings[].code'
 ```
 
+`-metrics` reports what the engine actually did — commits, fsyncs, queries and
+the WAL replay the open performed — for any command that opens a store.
+
 Exit status is non-zero only when something is actually broken. A store that was
 never signed, audited or anchored is reported as *findings* and exits zero,
 because that is the normal state of most stores.
+
+Name a store once and use the name as the operand:
+
+```
+graphene profile add -dir /data/cases/case01 -pubkey 1:<hex> case01
+graphene debug integrity case01
+```
+
+A path that exists always wins, so a profile can never shadow a real directory.
+The profile's public keys are supplied to any command that takes `-pubkey` and
+was given none, and the command says on stderr that it used them.
+
+Shell completion is generated from the same registry help is:
+
+```
+graphene completion bash > /etc/bash_completion.d/graphene
+graphene completion powershell >> $PROFILE
+```
 
 Every subcommand that existed before groups still answers to its old flat name —
 `graphene custody`, `graphene redactions`, `graphene verify-proof` and the rest.
 Those spellings are hidden from help, not removed, and will keep working.
 
-**There is no repair, no truncate and no bare compact.** A tool that is safe to
-point at production is worth more than one that can also fix things.
+**There is no repair, no truncate and no bare compact.** `maintenance repair`
+and `maintenance vacuum` exist only to explain why they are not implemented and
+to name what is: `maintenance compact`, `maintenance reindex`, `backup restore`.
+A tool that is safe to point at production is worth more than one that can also
+fix things.
+
+Everything that changes bytes already on disk is behind `-confirm` and supports
+`-dry-run`, which opens the store *read-only* rather than trusting a handler to
+check a flag. `node delete` and `edge delete` are the only commands that destroy
+content without recording anything about the decision, and both say so every
+time they run: `redaction apply` removes the same thing with an attributed,
+signed, hash-chained record and a tombstone under the snapshot root.
 
 ## Run It
 

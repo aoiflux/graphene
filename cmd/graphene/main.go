@@ -16,15 +16,29 @@
 //
 // # The safety doctrine
 //
-// There is no repair, no truncate, and no bare compact. A tool that is safe to
-// point at production is worth more than one that can also fix things, and
-// adding a mutation should be a deliberate decision rather than a convenience.
+// There is no repair and no truncate. A tool that is safe to point at
+// production is worth more than one that can also fix things, and adding a
+// mutation should be a deliberate decision rather than a convenience.
+// `maintenance repair` and `maintenance vacuum` are registered commands whose
+// only job is to refuse and to name what does exist — an operator told a tool
+// cannot help them goes looking for one that can, and the one they find will
+// not have this tool's caution.
 //
-// Five subcommands write, and each exception is argued rather than assumed —
-// see the register at the top of cmd_transfer.go, and `anchor -publish`, which
-// only ever appends a checkpoint and an audit entry and can neither alter nor
-// remove anything already recorded. None of them can lose what is already
-// there.
+// Everything that writes is argued rather than assumed, in three kinds:
+//
+//   - append-only, and so not gated: anchor add, assertion add, grant
+//     add/revoke. Nothing they write can alter or remove what is already
+//     recorded, so there is nothing for a -confirm to protect — and a gate on a
+//     command that cannot lose anything teaches the habit of typing -confirm
+//     without reading it.
+//   - writing somewhere else entirely: backup, export, import. See the register
+//     at the top of cmd_transfer.go.
+//   - gated behind -confirm, with -dry-run: node/edge create and delete,
+//     redaction apply, maintenance compact and reindex, migrate. See the
+//     registers at the top of cmd_write.go and cmd_restore.go.
+//
+// A dry run cannot write because the framework downgrades the open mode before
+// the store is acquired, not because a handler remembered to check a flag.
 //
 // # Exit status
 //
@@ -43,12 +57,16 @@
 // `graphene help` prints it from the registry in commands.go, which is the only
 // list there is.
 //
-//	run.go        one invocation, start to finish
-//	registry.go   the Command type; dispatch, help and completion all read it
-//	dispatch.go   argv -> a command, including the legacy spellings
-//	result.go     the document both renderers walk
-//	errors.go     verdicts, faults, and the exit-status policy
-//	context.go    what a handler gets, and who owns the store it uses
+//	run.go         one invocation, start to finish
+//	registry.go    the Command type; dispatch, help and completion all read it
+//	commands.go    the registry itself — the only command list there is
+//	dispatch.go    argv -> a command, including the legacy spellings
+//	result.go      the document both renderers walk
+//	errors.go      verdicts, faults, and the exit-status policy
+//	context.go     what a handler gets, and who owns the store it uses
+//	selectors.go   flags -> queries: types, property filters, budgets
+//	config.go      the config file, and profile names for store directories
+//	metrics.go     -metrics, and why it is a flag rather than a `debug profile`
 package main
 
 import "os"

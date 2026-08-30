@@ -18,7 +18,36 @@ import (
 	"github.com/aoiflux/graphene/store"
 )
 
+// TestMain points the config at a scratch file.
+//
+// Without this the suite reads — and `config init` and `profile add` would
+// write — the developer's own configuration. A test that depends on the machine
+// it runs on is not a test, and one that edits the operator's config as a side
+// effect is worse than that.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "graphene-cli-config")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("GRAPHENE_CONFIG", filepath.Join(dir, "config.json"))
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 // fixture builds a small store and returns its directory.
+//
+// Shaped rather than merely populated. The query and traversal commands need a
+// graph with a path through it, a node of degree more than one, two labels to
+// filter between and an indexed property to query on — a store of three nodes
+// and one edge proves those commands run and nothing about whether they answer.
+//
+//	e1 --Contains--> a1 --SimilarTo--> a2 --TaggedWith--> t1
+//	e1 --Contains--> a2
+//	e2 --Contains--> a2
+//
+// So: a1 and a2 are MicroArtefacts, e1 and e2 EvidenceFiles, t1 a Tag; e1 has
+// out-degree 2, a2 in-degree 3, and there is a path from e1 to t1 of three hops.
 func fixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -31,16 +60,35 @@ func fixture(t *testing.T) string {
 		{Labels: []store.NodeType{store.NodeTypeEvidenceFile}},
 		{Labels: []store.NodeType{store.NodeTypeEvidenceFile}},
 		{Labels: []store.NodeType{store.NodeTypeMicroArtefact}},
+		{Labels: []store.NodeType{store.NodeTypeMicroArtefact}},
+		{Labels: []store.NodeType{store.NodeTypeTag}},
 	}
 	ids, err := g.AddNodes(nodes)
 	if err != nil {
 		t.Fatalf("add nodes: %v", err)
 	}
+	e1, e2, a1, a2, t1 := ids[0], ids[1], ids[2], ids[3], ids[4]
+
 	if _, err := g.AddEdges([]*store.Edge{
-		{Src: ids[0], Dst: ids[1], Labels: []store.EdgeType{store.EdgeTypeContains}},
+		{Src: e1, Dst: a1, Labels: []store.EdgeType{store.EdgeTypeContains}},
+		{Src: e1, Dst: a2, Labels: []store.EdgeType{store.EdgeTypeContains}},
+		{Src: e2, Dst: a2, Labels: []store.EdgeType{store.EdgeTypeContains}},
+		{Src: a1, Dst: a2, Labels: []store.EdgeType{store.EdgeTypeSimilarTo}, Weight: 0.75},
+		{Src: a2, Dst: t1, Labels: []store.EdgeType{store.EdgeTypeTaggedWith}},
 	}); err != nil {
 		t.Fatalf("add edges: %v", err)
 	}
+
+	// Indexed properties, so `node list -prop` has something to resolve through
+	// the property index rather than falling back to a scan on every run.
+	for id, sha := range map[store.NodeID]string{
+		a1: "aa11", a2: "bb22",
+	} {
+		if err := g.IndexNodeProperties(id, map[string][]byte{"sha256": []byte(sha)}); err != nil {
+			t.Fatalf("index: %v", err)
+		}
+	}
+
 	if err := g.Compact(); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
@@ -73,6 +121,30 @@ func TestReadCommandsAgainstAFixture(t *testing.T) {
 		{"debug", "indexes", dir},
 		{"redactions", dir},
 		{"grants", dir},
+
+		{"node", "count", dir},
+		{"node", "get", "-id", "1,2", dir},
+		{"node", "list", "-type", "MicroArtefact", dir},
+		{"node", "list", "-prop", "sha256=aa11", dir},
+		{"node", "degree", "-id", "1", dir},
+		{"node", "neighbours", "-id", "1", dir},
+		{"node", "explain", "-type", "EvidenceFile", dir},
+
+		{"edge", "count", dir},
+		{"edge", "get", "-id", "1", dir},
+		{"edge", "list", "-type", "Contains", dir},
+		{"edge", "of", "-node", "1", dir},
+		{"edge", "explain", "-src", "1", dir},
+		{"edge", "provenance", "-id", "1", dir},
+
+		{"traverse", "bfs", "-from", "1", "-depth", "3", dir},
+		{"traverse", "dfs", "-from", "1", "-depth", "3", dir},
+		{"traverse", "path", "-from", "1", "-to", "5", dir},
+		{"traverse", "cycle", "-from", "1", dir},
+		{"traverse", "subgraph", "-id", "1,3,4", dir},
+
+		{"query", "relations", "-anchor", "1", dir},
+		{"provenance", "chain", "-node", "4", dir},
 	} {
 		t.Run(strings.Join(argv[:len(argv)-1], "_"), func(t *testing.T) {
 			out, errb, code := exec(t, argv...)
