@@ -10,6 +10,10 @@ cpu.prof
 mem.prof
 *.pprof
 
+# Release binaries (build.sh / build.ps1). The *.exe rule above catches the two
+# Windows targets and nothing else, so the directory is named explicitly.
+dist/
+
 # Note on what is deliberately NOT ignored:
 #
 #   testdata/fuzz/**   Crash reproducers found by fuzzing. Go re-runs these as

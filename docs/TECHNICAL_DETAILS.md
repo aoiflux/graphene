@@ -2301,6 +2301,67 @@ distinguishes "there is no image" — an ordinary state for a store that has nev
 compacted — from "the image will not parse", because collapsing the two sends an
 operator looking for corruption that is not there.
 
+### 11b.4 Who owns the store the CLI opens
+
+Handlers do not open the store. The framework opens what a command's registry
+entry declares, defers the close in `run`'s own frame, calls the handler, and
+returns an exit status. That is not tidiness; it is the fix for a defect, and
+the shape of the fix is the point.
+
+Two commands used to end with `if report.Broken() { os.Exit(1) }` inside a
+function holding the store under a `defer s.Close()`. **`os.Exit` does not run
+deferred functions.** A `custody` or `anchor` that found a broken chain
+therefore left the lock file behind, and the next process to try the store was
+told it was busy by a process that had already exited — a store that looks
+locked, by nobody, after the one command an operator runs when they already
+suspect something is wrong.
+
+Adding a `Close` before those two `Exit` calls would have fixed those two. It
+would also have left the trap armed for the next command that wanted to exit
+early, and there were seven `os.Exit(1)` sites in the file. Moving the open into
+the framework removes the class: a handler returns a **verdict**, there is no
+`os.Exit` reachable from one, and no early return can skip a close because the
+handler never held the thing.
+
+**Verdict and error are different questions.** An error means the command could
+not answer — the store is held, the file is not there. A verdict is the answer,
+and a negative answer is still a successful run. That distinction is what makes
+the documented exit-status policy expressible: `VerdictFindings` exits zero,
+because a store that was never signed, audited or anchored is unprovisioned
+rather than broken, and that is the normal state of most stores. A tool that
+exited non-zero on it would be useless in the scripts that most want it.
+
+**The mutation gate is enforced before the open, not inside the handler.** A
+command marked `Mutates` is refused without `-confirm`, and under `-dry-run` its
+open mode is *downgraded* — `OpenGraphRW` becomes `OpenGraphRO` — so a dry run
+cannot take the exclusive lock and cannot write by construction rather than by
+the handler remembering to check a flag.
+
+The one precondition that cannot live in a handler is `import`'s: it must refuse
+a destination that is not empty, and `graphene.Open` *creates* the directory, so
+by the time a framework-opened handler could look, the check would already be
+meaningless. That is what `Command.Before` exists for, and it has exactly one
+use.
+
+**`-timeout` is honest about what it can reach.** Most of the library has no
+context-taking variant — the whole `bulk` package, every `Open` (which replays
+the log, and is the slow step for precisely the commands a deadline is aimed
+at), `CustodyFor`, and every ledger read. So each command declares a tier, and a
+command whose work is one uninterruptible call says so in its help and *reports*
+at the deadline rather than cancelling. A hard kill mid-compaction would
+manufacture exactly the torn write the engine exists to prevent, on the
+operator's behalf.
+
+**`-limit` is deliberately not a global flag.** `wal -limit N` predates the
+group surface and means something specific — stop after N records, `0` means
+all, default 50. Registering a global `-limit` on that command's flag set makes
+the `flag` package panic outright (`flag redefined: limit`), and exempting `wal`
+from the global would be worse: the same flag would mean two different things
+depending on the command, and the one place it differed would be the command
+people use it on most. Paging is a shared binder with a per-command default
+instead, which gives the consistency a global was wanted for and keeps
+`wal -limit 0` meaning what it always meant.
+
 ## 12. Worked examples
 
 ### 12.1 A two-filter query, end to end

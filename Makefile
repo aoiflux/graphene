@@ -12,6 +12,7 @@
 #
 #   make            same as `make check`
 #   make check      what CI runs on every push: lint, test, stress
+#   make build-all  cross-compile release binaries into dist/
 #   make test       unit tests, race detector on
 #   make stress     the build-tagged stress suite
 #   make bench      benchmarks (see CONTRIBUTING.md before believing any number)
@@ -57,7 +58,7 @@ RUN_FLAG :=
 endif
 
 .DEFAULT_GOAL := check
-.PHONY: check build test stress bench allocprofile fuzz lint fmt cover clean help
+.PHONY: check build build-all test stress bench allocprofile fuzz lint fmt cover clean help
 
 ## check: lint, unit tests, stress — the same gates CI applies on a push.
 check: lint test stress
@@ -142,9 +143,14 @@ cover:
 build:
 	$(GO) build ./...
 
-## clean: remove generated profiles.
+## build-all: cross-compile release binaries for every platform into dist/.
+build-all:
+	./build.sh
+
+## clean: remove generated profiles and release binaries.
 clean:
 	rm -f coverage.out alloc.prof graphene graphene.exe
+	rm -rf dist
 
 ## help: list targets.
 help:

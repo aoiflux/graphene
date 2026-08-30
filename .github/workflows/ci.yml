@@ -8,6 +8,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
   schedule:
@@ -156,3 +157,58 @@ jobs:
         env:
           GRAPHENE_PERSISTENT_STRESS: "1"
         run: go test ./tests/ -tags=stress -count=1 -run TestStress -timeout 50m
+
+  # Cross-compiled release binaries. Runs on every push so a build break on a
+  # platform nobody develops on is caught when it is introduced rather than on
+  # release day; uploads artifacts only for a tag.
+  #
+  # This job is the definition of a release build. build.sh and build.ps1 exist
+  # to reproduce it locally, and a script that disagrees with the flags here is
+  # a bug in the script.
+  release:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # fetch-depth: 0 so `git describe --tags` can see the tags. The build
+      # reads the repository and never writes to it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build every target
+        run: ./build.sh
+
+      # Two builds of one commit must produce identical bytes. -trimpath and
+      # -buildvcs=false are what make that true, and this is what proves they
+      # are still doing their job — a reproducibility claim nobody checks is
+      # not a claim.
+      - name: Reproducible
+        run: |
+          DIST=dist2 ./build.sh >/dev/null
+          if ! diff dist/SHA256SUMS dist2/SHA256SUMS; then
+            echo "the same commit built twice produced different binaries"
+            exit 1
+          fi
+          rm -rf dist2
+
+      # The host binary is the only one this runner can execute. The other five
+      # are proven to link, not to run.
+      - name: Smoke test the host binary
+        run: |
+          ./dist/graphene_linux_amd64 version
+          ./dist/graphene_linux_amd64 help > /dev/null
+          ./dist/graphene_linux_amd64 -json version | grep -q '"schema"'
+
+      - name: Upload
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphene-binaries
+          path: |
+            dist/graphene_*
+            dist/SHA256SUMS

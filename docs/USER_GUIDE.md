@@ -926,12 +926,19 @@ Compact afterwards, or the removal is known to the ledger and not to the image.
 ### From a shell
 
 ```
-graphene custody -node 7 <dir>       account for one entity across every history
-graphene redactions <dir>            who removed what, when, and why
-graphene grants <dir>                who was permitted to do it
-graphene prove -node 7 -out c.gprf <dir>
-graphene verify-proof -root <hex> c.gprf     # needs no store
+graphene provenance custody -node 7 <dir>    account for one entity across every history
+graphene redaction list <dir>                who removed what, when, and why
+graphene grant list <dir>                    who was permitted to do it
+graphene provenance export -node 7 -out c.gprf <dir>
+graphene provenance verify -root <hex> c.gprf     # needs no store
 ```
+
+The flat spellings these commands had before groups existed — `custody`,
+`redactions`, `grants`, `prove`, `verify-proof` — all still work and are not
+going away; they are hidden from help rather than removed.
+
+`graphene help` lists everything, and `-json` on any command gives a document
+with a stable schema instead of a report.
 
 ### What none of it does
 

@@ -1543,7 +1543,8 @@ there; nothing excludes a second process.
 
 #### Inspecting a busy store
 
-`graphene info`, `csr`, `wal`, `redactions` and `grants` parse the files directly
+`graphene store info`, `store csr`, `wal show`, `redaction list` and
+`grant list` parse the files directly
 and never open the store, so they work against a directory another process is
 writing. That is what they are for: the moment you most want to look at a store
 is the moment something is wrong with it and a live process is still attached.

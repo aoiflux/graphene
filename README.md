@@ -462,8 +462,9 @@ every mutator returns `disk.ErrReadOnly`.
 
 The lock file also records whether the last writer closed cleanly, so a store
 recovered after a crash reports it — and audits it — without refusing to open.
-`graphene info`, `csr` and `wal` parse the files directly and still work against
-a store another process is writing, which is when you most want them.
+`graphene store info`, `store csr` and `wal show` parse the files directly and
+still work against a store another process is writing, which is when you most
+want them.
 
 ### Keeping the index truthful
 
@@ -519,6 +520,52 @@ func main() {
 }
 ```
 
+## Command Line
+
+`cmd/graphene` inspects a store from a shell. Commands are grouped by noun;
+`graphene help` prints the list and `graphene help <group> <verb>` explains one.
+
+```
+graphene store info   <dir>          summary of the image and the log
+graphene store csr    <dir>          CSR header detail (-verify checks digest and roots)
+graphene wal show     <dir>          record-by-record log dump
+graphene debug indexes <dir>         structural index check
+graphene provenance custody <dir>    account for one entity across every history
+graphene provenance export <dir>     export a proof to hand to someone else
+graphene provenance verify <file>    check a proof against a root you retained
+graphene redaction list <dir>        who removed what, when, and why
+graphene grant list   <dir>          role grants, and the capabilities they imply
+graphene anchor verify <dir>         publish or check a checkpoint
+graphene backup create <dir> -to D   consistent copy
+graphene backup verify <dir>         check a backup against its manifest
+graphene export graph <dir> -to F    the whole graph as jsonl, csv or a native dump
+graphene import graph <dir> -from F  build a store from a dump
+graphene store migrate <dir>         bring the image up to the current format
+```
+
+Most of these read `graphene.csr`, `graphene.wal` and the ledger files directly
+and take no lock, so they work against a store another process is writing to —
+which is when you most want them. The ones that open the store say so on stderr
+first, and `graphene help <cmd>` states which lock each takes.
+
+Add `-json` for a document with a stable schema instead of a report:
+
+```
+graphene store info -json <dir> | jq .data.csr_image.nodes
+graphene provenance custody -json -node 7 <dir> | jq -r '.findings[].code'
+```
+
+Exit status is non-zero only when something is actually broken. A store that was
+never signed, audited or anchored is reported as *findings* and exits zero,
+because that is the normal state of most stores.
+
+Every subcommand that existed before groups still answers to its old flat name —
+`graphene custody`, `graphene redactions`, `graphene verify-proof` and the rest.
+Those spellings are hidden from help, not removed, and will keep working.
+
+**There is no repair, no truncate and no bare compact.** A tool that is safe to
+point at production is worth more than one that can also fix things.
+
 ## Run It
 
 ```powershell
@@ -527,10 +574,15 @@ go run ./examples
 ./test.ps1 -Bench
 ```
 
+Cross-compiled release binaries for linux, darwin and windows on amd64 and
+arm64, static and reproducible:
+
+```powershell
+.\build.ps1          # or ./build.sh, or `make build-all`
+```
+
 ## Docs
 
-- Release notes: [v0.4.0](docs/RELEASE_NOTES_v0.4.0.md) — the forensic release:
-  what is new, what changed on disk, and what is still absent
 - Easy usage guide: [USER_GUIDE.md](docs/USER_GUIDE.md)
 - Complete API reference: [API_REFERENCE.md](docs/API_REFERENCE.md)
 - Deep technical architecture and LLD:

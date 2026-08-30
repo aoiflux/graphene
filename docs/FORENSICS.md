@@ -200,8 +200,8 @@ err = disk.VerifyRedactionChain(records, ring)   // ring may be nil
 ```
 
 ```
-graphene redactions <dir>            # who removed what, when, and why
-graphene redactions -node 7 <dir>
+graphene redaction list <dir>            # who removed what, when, and why
+graphene redaction list -node 7 <dir>
 ```
 
 ## 5. Chain of custody
@@ -229,7 +229,7 @@ compared the store against itself. Supplying a retained root or an anchor is
 what closes that.
 
 ```
-graphene custody -node 7 <dir>
+graphene provenance custody -node 7 <dir>
 ```
 
 ## 6. Anchoring
@@ -267,29 +267,52 @@ checkpoint is still freely rewritable, and `AnchorAudit` reports that window
 rather than leaving you to infer it.
 
 ```
-graphene anchor -publish -insecure-local-file <path> <dir>
-graphene anchor -insecure-local-file <path> <dir>
+graphene anchor verify -publish -insecure-local-file <path> <dir>
+graphene anchor verify -insecure-local-file <path> <dir>
 ```
 
 ## Reading a store from a shell
 
+Commands are grouped by noun. `graphene help` prints the full list, and
+`graphene help <group> <verb>` explains one — both generated from the registry,
+so they cannot drift out of step with the binary the way this page once did.
+
 ```
-graphene info    <dir>        summary of the image and the log
-graphene csr     <dir>        CSR header detail (-verify checks digest and roots)
-graphene wal     <dir>        record-by-record log dump
-graphene verify  <dir>        structural index check
-graphene custody <dir>        account for one entity across every history
-graphene redactions <dir>     ledger of attributed removals
-graphene anchor  <dir>        publish or check a checkpoint
-graphene prove   <dir>        export a proof
-graphene verify-proof <file>  check a proof against a root you retained
+graphene store info   <dir>          summary of the image and the log
+graphene store csr    <dir>          CSR header detail (-verify checks digest and roots)
+graphene wal show     <dir>          record-by-record log dump
+graphene debug indexes <dir>         structural index check
+graphene provenance custody <dir>    account for one entity across every history
+graphene redaction list <dir>        ledger of attributed removals
+graphene grant list   <dir>          role grants, and the capabilities they imply
+graphene anchor verify <dir>         publish or check a checkpoint
+graphene provenance export <dir>     export a proof
+graphene provenance verify <file>    check a proof against a root you retained
 ```
 
-`info`, `csr`, `wal` and `redactions` read the files directly and are safe
-against a store another process is using. `verify-proof` touches nothing but the
-file you give it. Everything else opens the store.
+Every one of these also answers to the flat name it had before groups existed —
+`graphene custody`, `graphene redactions`, `graphene verify-proof` and the rest
+all still work and always will. The short spellings are hidden from help rather
+than removed.
 
-`anchor -publish` is the only subcommand that writes, and it only appends.
+`store info`, `store csr`, `wal show`, `redaction list` and `grant list` read
+the files directly and are safe against a store another process is using.
+`provenance verify` touches nothing but the file you give it. Everything else
+opens the store.
+
+`anchor verify -publish` is the only one of these that writes, and it only
+appends.
+
+Add `-json` to any of them for a machine-readable document with a stable schema:
+
+```
+graphene store info -json <dir> | jq .data.csr_image.nodes
+graphene provenance custody -json -node 7 <dir> | jq -r '.findings[].code'
+```
+
+Exit status is non-zero only when something is actually broken. A store that was
+never signed, audited or anchored is reported as *findings* and exits zero — the
+JSON envelope carries the distinction in its `status` field.
 
 ## What none of this does
 
