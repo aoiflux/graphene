@@ -2265,6 +2265,20 @@ valid length and takes the reader somewhere arbitrary before anything notices.
 Every length is bounded against the bytes available before it sizes an
 allocation, which is `readOrderedKeySection`'s rule in the CSR reader.
 
+**Compression is a CLI concern, not a format one.** `-gzip` wraps the file the
+CLI opens; nothing in `bulk` knows about it, because the exporters take an
+`io.Writer` and the importers an `io.Reader` and neither should acquire a second
+notion of what a dump is. Two consequences follow. The gzip writer is closed
+before the file and its error is kept — `Close` is what writes the final block
+and the trailer, so closing the file first would produce a stream that
+decompresses to a dump missing exactly the trailer the paragraph above relies on
+to detect truncation, and the export would have reported counts it never
+finished writing. And the *import* side sniffs the two-byte magic number rather
+than taking a `-gzip` flag of its own: a flag there could only ever be a way to
+contradict the file, and sniffing is what lets the export write the path it was
+given instead of renaming it to end in `.gz`. `-format csv` is refused, since it
+writes a directory of tables and there is no single stream to sit in front of.
+
 **It has no fuzz target, and that is what the deferral cost.** A hand-rolled
 binary reader over attacker-controllable lengths is precisely what CONTRIBUTING
 §2 points at. The bounds and the CRC are an argument, not evidence. Together

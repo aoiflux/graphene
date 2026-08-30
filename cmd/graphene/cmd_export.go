@@ -15,9 +15,12 @@ package main
 // would trip it.
 
 import (
+	"compress/gzip"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"github.com/aoiflux/graphene"
 	"github.com/aoiflux/graphene/bulk"
@@ -36,6 +39,7 @@ type subgraphExportOpts struct {
 	format    string
 	to        string
 	skipProps bool
+	gzip      bool
 }
 
 var exportSubgraph = cmd(Command{
@@ -60,6 +64,7 @@ var exportSubgraph = cmd(Command{
 		fs.StringVar(&o.format, "format", "jsonl", "jsonl | dump | csv")
 		fs.StringVar(&o.to, "to", "", "file (jsonl, dump) or directory (csv) to write (required)")
 		fs.BoolVar(&o.skipProps, "no-properties", false, "omit indexed property entries")
+		fs.BoolVar(&o.gzip, "gzip", false, "compress the output (not with -format csv)")
 		o.budget.Bind(fs)
 	},
 	runExportSubgraph)
@@ -71,6 +76,9 @@ func runExportSubgraph(cx *Context, o *subgraphExportOpts) (Result, error) {
 	}
 	if _, ok := exportFormats[o.format]; !ok {
 		return r, Usagef("unknown format %q; want one of %s", o.format, formatList())
+	}
+	if err := checkGzip(o.format, o.gzip); err != nil {
+		return r, err
 	}
 	if len(o.ids) == 0 && o.from == 0 {
 		return r, Usagef("need -id (repeatable) or -from, to say what to export")
@@ -116,7 +124,7 @@ func runExportSubgraph(cx *Context, o *subgraphExportOpts) (Result, error) {
 		src.nodes[id] = true
 	}
 
-	sum, err := writeExport(o.format, o.to, src, bulk.Options{SkipProperties: o.skipProps})
+	sum, err := writeExport(o.format, o.to, o.gzip, src, bulk.Options{SkipProperties: o.skipProps})
 	if err != nil {
 		return r, err
 	}
@@ -124,6 +132,7 @@ func runExportSubgraph(cx *Context, o *subgraphExportOpts) (Result, error) {
 	s := r.Section("")
 	s.Add("to", Str(o.to))
 	s.Add("format", Str(o.format))
+	reportCompression(&r, s, o.gzip, o.to)
 	if o.from != 0 {
 		s.Addf("scope", "%d nodes within %d hops of node %d", len(scope), o.depth, o.from)
 	} else {
@@ -209,7 +218,36 @@ func (s *scopedSource) ForEachEdgeProperty(fn func(id store.EdgeID, key string, 
 }
 
 // writeExport is the format switch, shared with `export graph`.
-func writeExport(format, to string, src bulk.Source, opts bulk.Options) (bulk.Summary, error) {
+// checkGzip refuses the one combination that has no meaning. csv writes a
+// directory of tables, not a stream, so there is no single output for a gzip
+// writer to sit in front of. Compressing each table inside it would produce a
+// directory `import -format csv` could not read, which is worse than a refusal.
+func checkGzip(format string, gz bool) error {
+	if gz && format == "csv" {
+		return Usagef("-gzip does not apply to -format csv: csv writes a directory of " +
+			"tables, not a stream\n" +
+			"  compress the directory afterwards, or export jsonl or dump instead")
+	}
+	return nil
+}
+
+// reportCompression records that the output is compressed, and says so when the
+// name does not. Nothing is renamed: the path given is the path written, because
+// a script that named an output file should get that file. The suffix is a
+// convention for whoever finds the file later, not something import needs —
+// import sniffs the magic number, so a compressed dump under any name reads back.
+func reportCompression(r *Result, s *Section, gz bool, to string) {
+	if !gz {
+		return
+	}
+	s.Add("compressed", Str("gzip"))
+	if !strings.HasSuffix(to, ".gz") {
+		r.Notice("the output is gzipped and %s does not say so; "+
+			"`import graph` detects it either way", to)
+	}
+}
+
+func writeExport(format, to string, gz bool, src bulk.Source, opts bulk.Options) (bulk.Summary, error) {
 	if format == "csv" {
 		return bulk.ExportCSV(to, src, opts)
 	}
@@ -220,11 +258,26 @@ func writeExport(format, to string, src bulk.Source, opts bulk.Options) (bulk.Su
 	if err != nil {
 		return bulk.Summary{}, fmt.Errorf("create %s: %w", to, err)
 	}
+	var w io.Writer = f
+	var zw *gzip.Writer
+	if gz {
+		zw = gzip.NewWriter(f)
+		w = zw
+	}
 	var sum bulk.Summary
 	if format == "jsonl" {
-		sum, err = bulk.ExportJSONL(f, src, opts)
+		sum, err = bulk.ExportJSONL(w, src, opts)
 	} else {
-		sum, err = bulk.ExportDump(f, src, opts)
+		sum, err = bulk.ExportDump(w, src, opts)
+	}
+	// The gzip writer closes first and its error is kept: Close is what writes
+	// the final block and the trailer, so closing the file first would leave a
+	// stream that decompresses to a truncated dump — and the export would have
+	// reported the counts it never finished writing.
+	if zw != nil {
+		if cerr := zw.Close(); err == nil {
+			err = cerr
+		}
 	}
 	if cerr := f.Close(); err == nil {
 		err = cerr

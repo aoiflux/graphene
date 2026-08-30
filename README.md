@@ -573,8 +573,15 @@ graphene backup create  -to D <dir>
 graphene backup restore -to D -at-commit 4711 <backup>   point-in-time recovery
 graphene export subgraph -from 7 -depth 2 -to region.jsonl <dir>
 graphene export bundle  -to case.tar -node 7 <dir>       proofs for a recipient
+graphene export graph   -gzip -to dump.jsonl.gz <dir>
 graphene import graph   -from dump.jsonl <empty-dir>
 ```
+
+`-gzip` applies to the stream formats, not to `-format csv`, which writes a
+directory of tables rather than a stream. `import graph` detects a compressed
+dump from its first two bytes instead of taking a flag of its own, so the export
+writes the path it was given rather than renaming it, and a dump that does not
+advertise the compression in its name still reads back.
 
 `store info`, `store csr`, `wal show`, `wal segments`, `anchor list`,
 `assertion list`, `redaction list` and `grant list` read `graphene.csr`,

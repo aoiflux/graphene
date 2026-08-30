@@ -18,9 +18,12 @@ package main
 // There is still no repair and no truncate.
 
 import (
+	"bufio"
+	"compress/gzip"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -125,6 +128,7 @@ type exportOpts struct {
 	format    string
 	to        string
 	skipProps bool
+	gzip      bool
 }
 
 var exportGraph = cmd(Command{
@@ -138,6 +142,7 @@ var exportGraph = cmd(Command{
 		fs.StringVar(&o.to, "to", "",
 			"file (jsonl, dump) or directory (csv) to write (required)")
 		fs.BoolVar(&o.skipProps, "no-properties", false, "omit indexed property entries")
+		fs.BoolVar(&o.gzip, "gzip", false, "compress the output (not with -format csv)")
 	},
 	runExportGraph)
 
@@ -149,10 +154,14 @@ func runExportGraph(cx *Context, o *exportOpts) (Result, error) {
 	if _, ok := exportFormats[o.format]; !ok {
 		return r, Usagef("unknown format %q; want one of %s", o.format, formatList())
 	}
+	if err := checkGzip(o.format, o.gzip); err != nil {
+		return r, err
+	}
 
 	// Through the same writer `export subgraph` uses, so the two cannot disagree
-	// about what a jsonl export is or about refusing to overwrite.
-	sum, err := writeExport(o.format, o.to, cx.Graph().GraphStore,
+	// about what a jsonl export is, about refusing to overwrite, or about the
+	// order the gzip and file handles are closed in.
+	sum, err := writeExport(o.format, o.to, o.gzip, cx.Graph().GraphStore,
 		bulk.Options{SkipProperties: o.skipProps})
 	if err != nil {
 		return r, err
@@ -161,6 +170,7 @@ func runExportGraph(cx *Context, o *exportOpts) (Result, error) {
 	s := r.Section("")
 	s.Add("to", Str(o.to))
 	s.Add("format", Str(o.format))
+	reportCompression(&r, s, o.gzip, o.to)
 	s.Add("nodes", Int(int64(sum.Nodes)))
 	s.Add("edges", Int(int64(sum.Edges)))
 	s.Add("node properties", Int(int64(sum.NodeProperties)))
@@ -218,19 +228,21 @@ func runImportGraph(cx *Context, o *importOpts) (Result, error) {
 	var sum bulk.Summary
 	var err error
 
+	var compressed bool
 	if o.format == "csv" {
 		sum, err = bulk.ImportCSV(o.from, g.GraphStore, opts)
 	} else {
-		f, ferr := os.Open(o.from)
+		src, closeSrc, gz, ferr := openDump(o.from)
 		if ferr != nil {
-			return r, fmt.Errorf("open %s: %w", o.from, ferr)
+			return r, ferr
 		}
+		compressed = gz
 		if o.format == "jsonl" {
-			sum, err = bulk.ImportJSONL(f, g.GraphStore, opts)
+			sum, err = bulk.ImportJSONL(src, g.GraphStore, opts)
 		} else {
-			sum, err = bulk.ImportDump(f, g.GraphStore, opts)
+			sum, err = bulk.ImportDump(src, g.GraphStore, opts)
 		}
-		f.Close()
+		closeSrc()
 	}
 	if err != nil {
 		// Said plainly, because it is the one thing an operator has to act on:
@@ -242,6 +254,9 @@ func runImportGraph(cx *Context, o *importOpts) (Result, error) {
 
 	s := r.Section("")
 	s.Add("into", Str(cx.Target))
+	if compressed {
+		s.Add("compressed", Str("gzip"))
+	}
 	s.Add("nodes", Int(int64(sum.Nodes)))
 	s.Add("edges", Int(int64(sum.Edges)))
 	s.Add("node properties", Int(int64(sum.NodeProperties)))
@@ -262,6 +277,33 @@ func runImportGraph(cx *Context, o *importOpts) (Result, error) {
 		s.Add("compacted", Bool(true))
 	}
 	return r, nil
+}
+
+// openDump opens a dump for reading and transparently decompresses a gzipped
+// one. Sniffed rather than flagged, for two reasons: the magic number is two
+// bytes and unambiguous, so a -gzip flag here could only ever be a way to get it
+// wrong; and it makes `export graph -gzip` reversible under any filename, which
+// matters because the export deliberately does not rename what it was told to
+// write. The reader stays buffered either way — the peek needs a buffer, and the
+// import readers are better off with one.
+func openDump(path string) (io.Reader, func(), bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("open %s: %w", path, err)
+	}
+	br := bufio.NewReader(f)
+	// A short read here is not an error worth reporting: a file too small to
+	// hold a magic number is too small to hold a dump, and the format reader
+	// gives a better account of what is wrong with it than this could.
+	if magic, perr := br.Peek(2); perr == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+		zr, zerr := gzip.NewReader(br)
+		if zerr != nil {
+			f.Close()
+			return nil, nil, false, fmt.Errorf("read %s as gzip: %w", path, zerr)
+		}
+		return zr, func() { zr.Close(); f.Close() }, true, nil
+	}
+	return br, func() { f.Close() }, false, nil
 }
 
 // --- store migrate ---

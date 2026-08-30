@@ -274,3 +274,102 @@ func keysOf(m map[string]any) []string {
 	}
 	return out
 }
+
+// TestJSONEnvelopeSchema checks the envelope over every read-only command, not
+// just the one `store info` case above.
+//
+// It unmarshals rather than diffing, deliberately. The golden corpus already
+// pins five JSON documents byte for byte, which is the right check for
+// formatting and the wrong one for schema: reordering a section would fail it
+// without anything having broken for a consumer, and a renamed envelope field
+// would fail it in a diff that looks like ordinary churn. This asserts the
+// contract a script actually depends on — the envelope's shape, the status
+// vocabulary, and that the exit code inside the document agrees with the one the
+// process returned — and is indifferent to order.
+func TestJSONEnvelopeSchema(t *testing.T) {
+	dir := fixture(t)
+	// The whole vocabulary, from Verdict.String in errors.go. Listed rather than
+	// derived: a status the tool starts emitting should have to be added here by
+	// somebody who then asks whether every consumer switching on it will cope.
+	statuses := map[string]bool{"ok": true, "findings": true, "broken": true}
+
+	for _, argv := range [][]string{
+		{"store", "info", dir},
+		{"store", "csr", dir},
+		{"store", "stats", dir},
+		{"store", "snapshot", dir},
+		{"store", "health", dir},
+		{"wal", "show", dir},
+		{"wal", "segments", dir},
+		{"wal", "verify", dir},
+		{"node", "count", dir},
+		{"node", "list", "-type", "MicroArtefact", dir},
+		{"node", "get", "-id", "1", dir},
+		{"node", "degree", "-id", "1", dir},
+		{"node", "neighbours", "-id", "1", dir},
+		{"node", "explain", "-type", "EvidenceFile", dir},
+		{"edge", "count", dir},
+		{"edge", "list", "-type", "Contains", dir},
+		{"edge", "of", "-node", "1", dir},
+		{"edge", "provenance", "-id", "1", dir},
+		{"traverse", "bfs", "-from", "1", "-depth", "3", dir},
+		{"traverse", "path", "-from", "1", "-to", "5", dir},
+		{"traverse", "cycle", "-from", "1", dir},
+		{"traverse", "subgraph", "-id", "1,3,4", dir},
+		{"query", "relations", "-anchor", "1", dir},
+		{"provenance", "chain", "-node", "4", dir},
+		{"anchor", "list", dir},
+		{"assertion", "list", dir},
+		{"redaction", "list", dir},
+		{"redaction", "tombstones", dir},
+		{"grant", "list", dir},
+		{"keys", "timeline", dir},
+		{"debug", "hash-check", dir},
+		{"debug", "indexes", dir},
+		{"debug", "stats", dir},
+		{"debug", "integrity", dir},
+	} {
+		t.Run(strings.Join(argv[:len(argv)-1], "_"), func(t *testing.T) {
+			out, errb, code := exec(t, append([]string{"-json"}, argv...)...)
+
+			var env struct {
+				Status   string         `json:"status"`
+				Exit     *int           `json:"exit"`
+				Data     map[string]any `json:"data"`
+				Findings []struct {
+					Code     string `json:"code"`
+					Severity string `json:"severity"`
+					Message  string `json:"message"`
+				} `json:"findings"`
+			}
+			if err := json.Unmarshal([]byte(out), &env); err != nil {
+				t.Fatalf("stdout is not JSON: %v\n%s\nstderr:\n%s", err, out, errb)
+			}
+			if !statuses[env.Status] {
+				t.Errorf("status %q is not one a consumer can switch on", env.Status)
+			}
+			// A pointer, so that a missing field is distinguishable from the
+			// zero that a successful command legitimately reports.
+			if env.Exit == nil {
+				t.Fatal("the envelope has no exit field")
+			}
+			if *env.Exit != code {
+				t.Errorf("the envelope says exit %d, the process returned %d", *env.Exit, code)
+			}
+			if len(env.Data) == 0 {
+				t.Error("the envelope carries no data")
+			}
+			for i, f := range env.Findings {
+				if f.Code == "" {
+					t.Errorf("finding %d has no code; a monitor cannot match on it", i)
+				}
+				if f.Severity == "" {
+					t.Errorf("finding %d (%s) has no severity", i, f.Code)
+				}
+				if f.Message == "" {
+					t.Errorf("finding %d (%s) has no message", i, f.Code)
+				}
+			}
+		})
+	}
+}

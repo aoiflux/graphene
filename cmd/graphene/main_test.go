@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -316,7 +317,12 @@ func snapshotDir(t *testing.T, dir string) string {
 		b.WriteString(":")
 		b.WriteString(fi.ModTime().UTC().Format("20060102150405.000000000"))
 		b.WriteString(":")
-		b.WriteString(string(rune(fi.Size())))
+		// strconv, not string(rune(size)). A rune conversion is not a rendering
+		// of the number: every size above 0x10FFFF, and every one in the
+		// surrogate range, becomes U+FFFD — so a store that grew past a megabyte
+		// would compare equal to any other that had, and the test would pass on
+		// a dry run that had written.
+		b.WriteString(strconv.FormatInt(fi.Size(), 10))
 		b.WriteString("\n")
 		return nil
 	})
