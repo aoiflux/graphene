@@ -3,7 +3,7 @@
 Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 `git log` for those.
 
-## v0.6.0 — structure, aggregates, and names
+## v0.6.0 "Armchair" — structure, aggregates, and names
 
 Three additions, all of them things a caller was working around, and one fix to
 the only traversal budget dimension that was never enforceable. Nothing here
