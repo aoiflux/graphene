@@ -227,8 +227,15 @@ Scale validation covered by stress tests:
   registrations** together — atomic and durable, including a delete's edge cascade.
 - **Idempotent ingest**: declare a property key unique, then `UpsertNode` on it.
   Re-ingesting a source produces the same graph rather than a second copy of it.
+- **Duplicate-free structure**: `DeclareUniqueEdge(t)` gives at most one edge of a
+  type between any two nodes — the rule for bulk relationships, where a unique
+  key on every edge is not affordable.
 - Traversal toolkit: BFS, DFS, provenance chain, shortest path.
 - Query primitives: type lookups, property lookups, degree/connectivity checks.
+- **Aggregates**: counts by label and by indexed value, and `NeighbourFrequency`
+  — rank what a set of nodes point at, by how many of them point at it.
+- **Named custom labels**, written beside the image, so a store stays readable
+  without the program that wrote it.
 - Pattern discovery: scoped VF2-inspired subgraph matching.
 - Persistence lifecycle: open, replay, compact, reopen.
 - Visualization export: interactive HTML graph maps for quick analysis.
@@ -339,6 +346,12 @@ Queries are served from indexes, not from scans. What exists today:
 | Label (type)          | Postings per label, built for both the delta and CSR | `NodesByType`, `EdgesByType`, `Types` filters     |
 | Property (secondary)  | Sorted postings per `(key, value)` + reverse ID map  | Equality filters, `NodesByProperty`               |
 | Ordered (range)       | Sorted values per _declared_ key, ascending postings | `>`, `>=`, `<`, `<=`, `Between`, `Prefix`         |
+
+Two rules are enforced without an index at all, deliberately: a **unique property
+key** is "every value under this key has one posting", and **edge cardinality** is
+a scan of the source node's outbound adjacency. Both answers are already in
+structures the store maintains, and a second structure holding them would be a
+second thing that can disagree with the first.
 
 The query planner picks whichever of these bounds the result most tightly —
 property postings, a declared ordered key's range, label postings, or the

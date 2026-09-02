@@ -98,6 +98,12 @@ type txView struct {
 	// there yet, so two upserts of one key in a single transaction would each
 	// find the value free and each create an entity.
 	claims map[uniqueClaim]uint64
+
+	// pairs are the edge-cardinality slots taken but not yet applied, and
+	// pairsOf is the reverse index that makes releasing them cheap. See
+	// disk/edgeunique.go.
+	pairs   map[pairSlot]store.EdgeID
+	pairsOf map[store.EdgeID][]pairSlot
 }
 
 // uniqueClaim identifies one value under one unique key, on one side of the
@@ -118,6 +124,8 @@ func newTxView(s *Store, hint int) *txView {
 		delEdge:  make(map[store.EdgeID]struct{}),
 		incident: make(map[store.NodeID][]store.EdgeID),
 		claims:   make(map[uniqueClaim]uint64),
+		pairs:    make(map[pairSlot]store.EdgeID),
+		pairsOf:  make(map[store.EdgeID][]pairSlot),
 	}
 }
 
@@ -321,6 +329,12 @@ func (s *Store) resolveTransaction(ops []store.TxOp) ([]txAction, error) {
 			if !v.nodeLive(e.Dst) {
 				return nil, &store.ErrInvalidEdge{MissingID: e.Dst}
 			}
+			// An update may have changed the labels, so whatever this edge was
+			// holding is released before it claims again.
+			v.releaseEdgePairs(e.ID)
+			if err := v.claimEdgePairs(e); err != nil {
+				return nil, fmt.Errorf("transaction op %d (%s): %w", i, op.Kind, err)
+			}
 			if _, known := v.edges[e.ID]; !known {
 				v.incident[e.Src] = append(v.incident[e.Src], e.ID)
 				if e.Dst != e.Src {
@@ -345,6 +359,7 @@ func (s *Store) resolveTransaction(ops []store.TxOp) ([]txAction, error) {
 			// leave an edge pointing at a node that is already gone.
 			for _, eid := range v.cascadeFor(op.NodeID) {
 				v.delEdge[eid] = struct{}{}
+				v.releaseEdgePairs(eid)
 				delete(v.edges, eid)
 				actions = append(actions, txAction{kind: txActionDelEdge, edgeID: eid})
 			}
@@ -357,6 +372,7 @@ func (s *Store) resolveTransaction(ops []store.TxOp) ([]txAction, error) {
 				return nil, &store.ErrNotFound{Kind: "edge", ID: uint64(op.EdgeID)}
 			}
 			v.delEdge[op.EdgeID] = struct{}{}
+			v.releaseEdgePairs(op.EdgeID)
 			delete(v.edges, op.EdgeID)
 			actions = append(actions, txAction{kind: txActionDelEdge, edgeID: op.EdgeID})
 

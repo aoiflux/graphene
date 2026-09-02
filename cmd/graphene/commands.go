@@ -118,6 +118,7 @@ var registry = []*Command{
 	debugSignatureCheck,
 	debugIndexes,
 	debugUnique,
+	debugUniqueEdge,
 	debugStats,
 	debugIntegrity,
 

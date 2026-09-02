@@ -42,9 +42,39 @@ type Budget struct {
 	// unlimited.
 	//
 	// The limit of last resort, and the only one expressed in what a caller
-	// actually has to spend. Checked periodically rather than per step: reading
-	// the clock on the inner loop of a walk that crosses a million edges costs
-	// more than the walk.
+	// actually has to spend.
+	//
+	// # It is best-effort, and MaxNodes and MaxEdges are not
+	//
+	// MaxNodes and MaxEdges are charged per visit, so they are exact: the walk
+	// stops on the step that crosses them. MaxTime cannot be, because the walk
+	// has to look at a clock to know, and a clock is neither free to read nor
+	// infinitely fine.
+	//
+	// Two consequences a caller should size a budget around:
+	//
+	//   - The overshoot is bounded by one check interval plus one step. The
+	//     interval is small (traversal/guard.go names it), but nothing preempts
+	//     a step that runs long — a single cold page read can outlast any
+	//     MaxTime by itself, and no periodic check can prevent that.
+	//
+	//   - A MaxTime below the platform's monotonic clock granularity cannot be
+	//     observed at all, so it does not stop anything. On Linux that
+	//     granularity is nanoseconds and the point is theoretical. On Windows
+	//     the Go runtime reads the system interrupt time, which advances only at
+	//     the timer tick — 15.6 ms by default, and around 0.5 ms while some
+	//     process on the machine has raised the timer resolution. It is a global
+	//     property of the machine that changes as unrelated programs start and
+	//     stop, so "how small can MaxTime usefully be" has no fixed answer there.
+	//
+	// Read that as: MaxTime is the backstop that keeps a runaway walk from
+	// running all afternoon. It is not a scheduler, and a deadline in the
+	// microseconds is a deadline in name only. Bound the work with MaxNodes and
+	// MaxEdges, which are exact, and let MaxTime catch what they miss.
+	//
+	// A negative MaxTime is a deadline that has already passed: the walk is
+	// refused before it visits anything. Zero is unlimited, so the zero Budget
+	// keeps behaving exactly as it did.
 	MaxTime time.Duration
 }
 

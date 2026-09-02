@@ -1215,3 +1215,130 @@ before drawing conclusions from anything under 25%.
 | `Footprint_PropIndex_NoIndex`            |    16.23 |   16.23 |        ~ |
 | `Footprint_DiskFileSize`                 |    12.68 |   21.27 |  +67.74% |
 | `Footprint_DiskFileSize`                 |    10.97 |    0.00 | -100.00% |
+
+---
+
+## Phase 8 — what a traversal deadline costs (2026-09-01)
+
+`store.Budget` had three dimensions and only two of them were ever measured.
+Every traversal benchmark in the tree passed the zero `Budget`, which takes the
+guard's `off` fast path, so the accounting had never been run against the walk it
+accounts for. `BenchmarkBFS_Deep_Budget` closes that: one 10 000-node chain
+fixture, three arms in one binary.
+
+| Arm         | Budget                    | What it isolates                          |
+|-------------|---------------------------|-------------------------------------------|
+| `unbounded` | `Budget{}`                | the `off` path — must never move           |
+| `nodes`     | `Budget{MaxNodes: 1<<30}` | accounting on, no clock                    |
+| `time`      | `Budget{MaxTime: 1h}`     | accounting plus a deadline                 |
+
+The budgets are generous on purpose and asserted not to fire before the timer
+starts; an arm that trips would be measuring the error path.
+
+### Choosing the deadline cadence
+
+`MaxTime` used to share cancellation's 256-step cadence, which meant a walk
+charging fewer than 256 steps never checked the clock at all. Per step is the
+obvious fix and it is not free. Ten interleaved runs of the prebuilt binary,
+`benchstat` over the pair:
+
+| Benchmark                     | every step | every 16 steps | vs base            |
+|-------------------------------|-----------:|---------------:|--------------------|
+| `BFS_Deep_Budget/unbounded`   |   2.167 ms |       2.087 ms | ~ (p=0.393, n=10)  |
+| `BFS_Deep_Budget/nodes`       |   2.317 ms |       2.205 ms | ~ (p=0.739, n=10)  |
+| `BFS_Deep_Budget/time`        |   2.712 ms |       2.185 ms | **−19.43%** (p=0.003) |
+| `PointLookupNode_Memory`      |   27.18 ns |       26.61 ns | ~ (p=0.529, n=10)  |
+| `BlobPointLookupNode/blob=32` |   15.80 ns |       14.94 ns | ~ (p=0.063, n=10)  |
+
+`B/op` and `allocs/op` are identical across all three arms and both sides —
+614.5 KiB and 58 allocations — so this is time and nothing else.
+
+The `time` arm is the only significant movement in the comparison; `unbounded`,
+`nodes` and all three controls sit still, which is what makes the number
+readable. At 16 the deadline arm is indistinguishable from `nodes`, so the
+enforcement is effectively free while the overshoot falls from 256 charged steps
+to 16 — five or six nodes on a BFS. The cost is paid only by callers who set
+`MaxTime`; with no deadline the guard runs the code it always ran, which is what
+`unbounded` and `nodes` confirm.
+
+Read against the control spread: `PointLookupNode_Memory` is a very short op and
+came in at ±37% / ±15%, well past the ±6% CONTRIBUTING calls usable. The blob
+controls at ±4–11% are the ones to trust here, and the p-values are computed over
+ten runs rather than one.
+
+### What no cadence can fix
+
+The Go monotonic clock on Windows is `_INTERRUPT_TIME` from the
+`KUSER_SHARED_DATA` page, which advances at the system timer interrupt — 15.6 ms
+by default, ~0.5 ms while some process has raised the timer resolution. Two
+readings inside one tick are equal rather than ordered, so a `MaxTime` shorter
+than a tick cannot be observed as exceeded by any comparison. `MaxTime` is
+documented as best-effort with that floor named, `MaxNodes` and `MaxEdges` remain
+exact, and the enforcement tests drive an injected clock instead of asserting
+that the real one moved.
+
+---
+
+## Phase 9 — two costs that were being guessed at (2026-09-01)
+
+Neither of these produced a code change. Both were open questions an embedder
+would otherwise have had to discover by running into them, which is the worst
+way to learn a number.
+
+### Declaring a unique key at Open
+
+Unique declarations live in memory and must be re-declared by every process that
+opens the store, which means the validation runs before the process can serve
+anything. `DeclareUniqueNodeKey` walks the key's value buckets and skips any held
+by fewer than two live entities: O(distinct values under that key), over an
+already-resident index, with no I/O and no graph scan. The question was what that
+constant is.
+
+`BenchmarkDeclareUniqueProperty`, `-benchtime=3x`:
+
+| Arm                            | Nodes     | ns/op        | B/op | allocs/op |
+|--------------------------------|----------:|-------------:|-----:|----------:|
+| `distinct/10000`               |    10 000 |      147 067 |  208 |         1 |
+| `distinct/100000`              |   100 000 |    1 469 633 |  208 |         1 |
+| `distinct/1000000`             | 1 000 000 |   14 679 700 |  208 |         1 |
+| `distinct+bystander/1000000`   | 1 000 000 |   15 707 400 |  208 |         1 |
+
+**About 14.7 ns per distinct value, linear, one allocation regardless of size.**
+A million distinct values cost 14.7 ms; ten million would cost about 150 ms,
+once, at Open. That is a number an embedder can plan around rather than trip
+over, and it is small enough that the declare-without-validating escape hatch
+this measurement was going to justify is not worth building.
+
+Every arm declares over *distinct* values, because a declaration that would be
+refused is not a declaration and would measure the failure path. The bystander
+arm adds a second, low-cardinality key to the same index and costs the same
+within noise, which is what says the walk is per key rather than per index.
+
+### One transaction holding a large ingest
+
+The `bulk` package batches, which bounds memory by giving up per-entity
+atomicity: a load that fails partway leaves behind the batches that already
+committed. A caller who wants one source to be one transaction cannot use that,
+and a single source can be a million records.
+
+`BenchmarkFootprint_OpenTransaction_*` measures the buffer while it is still
+open — every record the transaction holds and the resolver's view of them, before
+anything is written — over 200 000 nodes and 199 999 edges:
+
+| Benchmark                            | Total     | Per entity |
+|--------------------------------------|----------:|-----------:|
+| `Footprint_OpenTransaction_Memory`   | 74.91 MiB |     ~196 B |
+| `Footprint_OpenTransaction_Disk`     | 74.94 MiB |     ~196 B |
+
+Identical across backends, which is expected: the buffer lives in the root
+package and neither backend sees it until commit. For comparison, the same graph
+*stored* in the memory backend is 42.57 MiB, so an open transaction costs roughly
+1.75× what the data will occupy once it lands.
+
+**The position, stated rather than left to be discovered:** one source is one
+transaction up to a few million entities, at roughly 0.2 KB each plus whatever
+the property blobs carry — about 400 MB for a million nodes and a million edges.
+Past that, `bulk` is the answer and per-entity atomicity is what it costs. A
+transaction that spilled to the WAL incrementally would remove the ceiling; at
+these numbers it is not yet worth the complexity, and this is the measurement to
+re-run before deciding otherwise.

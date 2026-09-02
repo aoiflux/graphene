@@ -22,6 +22,13 @@ package main
 // can disagree with the first, and this package has already watched three copies
 // of one list drift apart (see registry.go).
 //
+// `debug unique-edge` is the same command for the other constraint: at most one
+// edge of a type between two nodes, which is the rule for structure the way a
+// unique property key is the rule for identity. Same shape, same lock, same
+// answer-not-a-constraint outcome — what differs is that the conflicts it
+// reports are node pairs rather than values, so it is a separate verb rather
+// than another flag on this one.
+//
 // # Why that takes the exclusive lock
 //
 // Declaring is refused on a read-only store, deliberately: a store that cannot
@@ -127,6 +134,82 @@ func runDebugUnique(cx *Context, o *debugUniqueOpts) (Result, error) {
 	r.Notes("what to do",
 		"delete or re-key the extra holders of each value above, then run this again",
 		"until it passes, the constraint cannot be declared and upsert cannot use this key")
+	return r, nil
+}
+
+// --- debug unique-edge ---
+
+type debugUniqueEdgeOpts struct {
+	edgeType string
+}
+
+var debugUniqueEdge = cmd(Command{
+	Group: "debug", Name: "unique-edge", Usage: "<dir>",
+	Short: "check whether an edge type can be declared unique per node pair",
+	Long: "-type names an edge type. The check is the declaration the library\n" +
+		"performs: every live edge carrying that type is grouped by the ordered\n" +
+		"pair it joins, and the type is unique when no pair is joined twice.\n\n" +
+		"This is the constraint for structure, where `debug unique` is the one\n" +
+		"for identity. An edge that exists only to say that one node owns\n" +
+		"another carries no value worth indexing, so a unique property key\n" +
+		"cannot name it, and paying for one per edge is what a caller writing\n" +
+		"millions of them cannot afford.\n\n" +
+		"Direction is part of the pair, and the rule is per label rather than\n" +
+		"per label set: an edge carrying two types counts against a declaration\n" +
+		"on each of them independently.\n\n" +
+		"Every conflicting pair is reported, not the first.\n\n" +
+		"The constraint itself is not persisted, exactly as with `debug unique`.\n" +
+		"What survives is the answer.",
+	Notice: "debug unique-edge opens the store for writing and takes the exclusive lock; " +
+		"it writes nothing",
+	Open: OpenGraphRW, Tier: CtxAdvisory,
+},
+	func(fs *flag.FlagSet, o *debugUniqueEdgeOpts) {
+		fs.StringVar(&o.edgeType, "type", "", "edge type to check (required)")
+	},
+	runDebugUniqueEdge)
+
+func runDebugUniqueEdge(cx *Context, o *debugUniqueEdgeOpts) (Result, error) {
+	var r Result
+	if o.edgeType == "" {
+		return r, Usagef("need -type; there is nothing to check without one")
+	}
+	t, err := store.ParseEdgeType(o.edgeType)
+	if err != nil {
+		return r, Usagef("-type %q: %v", o.edgeType, err)
+	}
+
+	s := r.Section("")
+	s.Add("edge type", Str(t.String()))
+
+	err = cx.Graph().DeclareUniqueEdge(t)
+	if err == nil {
+		s.Add("unique", Str("yes"))
+		r.Verdict = VerdictVerified
+		return r, nil
+	}
+
+	var v *store.EdgeCardinalityViolationsError
+	if !errors.As(err, &v) {
+		// Not an answer about the data at all — a backend that cannot enforce a
+		// constraint, or a store that refused to open for writing.
+		return r, err
+	}
+
+	s.Add("unique", Str("no"))
+	s.Add("conflicting pairs", Int(int64(len(v.Conflicts))))
+
+	// Conflicts arrive in ascending pair order, so the table is diffable between
+	// runs without sorting here.
+	tbl := r.Table("conflicts", Col("src"), Col("dst"), Col("edges"))
+	for _, c := range v.Conflicts {
+		tbl.Row(ID(uint64(c.Pair.Src)), ID(uint64(c.Pair.Dst)), Str(joinEdgeIDs(c.IDs)))
+	}
+	r.Find(SevBroken, "unique.violated",
+		"%d node pair(s) are joined by more than one %s edge", len(v.Conflicts), t)
+	r.Notes("what to do",
+		"delete the extra edge of each pair above, then run this again",
+		"until it passes, the constraint cannot be declared and duplicate edges are not prevented")
 	return r, nil
 }
 
@@ -409,6 +492,14 @@ func propValue(b []byte) Value {
 		return Str(string(b))
 	}
 	return Hex(b)
+}
+
+func joinEdgeIDs(ids []store.EdgeID) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.FormatUint(uint64(id), 10)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func joinIDs(ids []uint64) string {

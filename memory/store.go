@@ -82,6 +82,10 @@ type Store struct {
 	// reindexPolicy governs what updates do to propIdx. Guarded by mu.
 	reindexPolicy store.ReindexPolicy
 
+	// uniqueEdgeTypes holds the edge types under a cardinality constraint.
+	// Guarded by mu, and read on every edge write — see memory/edgeunique.go.
+	uniqueEdgeTypes store.UniqueEdgeTypeSet
+
 	nodeSeq atomic.Uint64
 	edgeSeq atomic.Uint64
 
@@ -104,6 +108,8 @@ func New() *Store {
 		nodesByType: make(map[store.NodeType][]store.NodeID),
 		edgesByType: make(map[store.EdgeType][]store.EdgeID),
 		propIdx:     index.NewPropertyIndex(),
+
+		uniqueEdgeTypes: make(store.UniqueEdgeTypeSet),
 	}
 }
 
@@ -313,6 +319,9 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 	if _, ok := s.nodes[e.Dst]; !ok {
 		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Dst}
 	}
+	if err := s.checkEdgeCardinalityLocked(e.Src, e.Dst, stored.Labels, store.InvalidEdgeID); err != nil {
+		return store.InvalidEdgeID, fmt.Errorf("AddEdge: %w", err)
+	}
 
 	id := s.nextEdgeID()
 	stored.ID = id
@@ -358,12 +367,24 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	// too, or the two disagree on what a failed batch leaves behind. Since this
 	// store is the parity oracle, a difference here would be a difference the
 	// tests are supposed to be measuring against.
-	for _, e := range edges {
+	//
+	// Cardinality is checked here too, and against the batch as well as the
+	// store: two duplicate edges arriving together are the same violation as one
+	// arriving after the other, and a check that only consulted the adjacency
+	// would let a batch write the pair it is meant to prevent.
+	claimed := s.batchPairClaims(edges)
+	for i, e := range edges {
 		if _, ok := s.nodes[e.Src]; !ok {
 			return nil, &store.ErrInvalidEdge{MissingID: e.Src}
 		}
 		if _, ok := s.nodes[e.Dst]; !ok {
 			return nil, &store.ErrInvalidEdge{MissingID: e.Dst}
+		}
+		if err := s.checkEdgeCardinalityLocked(e.Src, e.Dst, e.Labels, store.InvalidEdgeID); err != nil {
+			return nil, fmt.Errorf("AddEdgesBatch: edge %d: %w", i, err)
+		}
+		if err := claimed.claim(s.uniqueEdgeTypes, e, i); err != nil {
+			return nil, fmt.Errorf("AddEdgesBatch: edge %d: %w", i, err)
 		}
 	}
 
@@ -580,6 +601,13 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 	}
 	if s.reindexPolicy == store.ReindexPurge {
 		s.propIdx.RemoveEdge(e.ID)
+	}
+
+	// An update can add a declared label to an edge whose pair already has one.
+	// Endpoints are immutable, so the pair to check is the existing one, and the
+	// edge cannot collide with itself.
+	if err := s.checkEdgeCardinalityLocked(existing.Src, existing.Dst, e.Labels, e.ID); err != nil {
+		return fmt.Errorf("UpdateEdge: %w", err)
 	}
 
 	// Reconcile the type index: drop old labels, add new ones.

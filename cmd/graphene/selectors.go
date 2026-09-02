@@ -271,9 +271,16 @@ type budgetOpts struct {
 func (b *budgetOpts) Bind(fs *flag.FlagSet) {
 	fs.IntVar(&b.maxNodes, "max-nodes", 100000, "stop after visiting this many nodes (0 = unlimited)")
 	fs.IntVar(&b.maxEdges, "max-edges", 0, "stop after crossing this many edges (0 = unlimited)")
-	fs.StringVar(&b.maxTime, "max-time", "", "stop after this much wall clock (e.g. 30s; empty = unlimited)")
+	fs.StringVar(&b.maxTime, "max-time", "", "stop after roughly this much wall clock (e.g. 30s; empty = unlimited)")
 }
 
+// budget builds the store.Budget the flags describe.
+//
+// "roughly" in the -max-time help is not hedging. MaxNodes and MaxEdges are
+// charged per visit and stop the walk exactly; MaxTime is checked periodically
+// against a clock whose granularity is the platform's, which on Windows is the
+// system timer tick. store/budget.go has the full contract. A duration under a
+// millisecond is not a useful thing to ask this flag for.
 func (b budgetOpts) budget() (store.Budget, error) {
 	bud := store.Budget{MaxNodes: b.maxNodes, MaxEdges: b.maxEdges}
 	if b.maxTime != "" {

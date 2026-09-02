@@ -96,6 +96,10 @@ type Store struct {
 	// reindexPolicy governs what updates do to propIdx. Guarded by mu.
 	reindexPolicy store.ReindexPolicy
 
+	// uniqueEdgeTypes holds the edge types under a cardinality constraint.
+	// Guarded by mu, and read on every edge write — see disk/edgeunique.go.
+	uniqueEdgeTypes store.UniqueEdgeTypeSet
+
 	// Sequence counters (shared across CSR and delta).
 	nodeSeq atomic.Uint64
 	edgeSeq atomic.Uint64
@@ -773,10 +777,13 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		// crashed writer's evidence is still there for the next *writer* to find
 		// — and a reader reporting a recovery it did not perform would be a claim
 		// about a directory it does not own.
-		unclean:        !opts.ReadOnly && prevOwner.Present && !prevOwner.Clean,
-		live:           opts.LiveReader,
-		logPath:        walPath,
-		propIdx:        index.NewPropertyIndex(),
+		unclean: !opts.ReadOnly && prevOwner.Present && !prevOwner.Clean,
+		live:    opts.LiveReader,
+		logPath: walPath,
+		propIdx: index.NewPropertyIndex(),
+
+		uniqueEdgeTypes: make(store.UniqueEdgeTypeSet),
+
 		maxSnapshotAge: opts.MaxSnapshotAge,
 		syncOnCommit:   true,
 		metrics:        opts.Metrics,
@@ -1118,6 +1125,12 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 	if !s.nodeExistsLocked(e.Dst) {
 		return store.InvalidEdgeID, &store.ErrInvalidEdge{MissingID: e.Dst}
 	}
+	// Before the ID is issued and long before the WAL is touched: a refusal
+	// whose record is already appended cannot be taken back by returning an
+	// error.
+	if err := s.checkEdgeCardinalityLocked(e.Src, e.Dst, stored.Labels, store.InvalidEdgeID); err != nil {
+		return store.InvalidEdgeID, fmt.Errorf("AddEdge: %w", err)
+	}
 
 	id := store.EdgeID(s.edgeSeq.Add(1))
 	stored.ID = id
@@ -1157,6 +1170,7 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	unlock := sync.OnceFunc(s.mu.Unlock)
 	defer unlock()
 
+	claimed := s.batchPairClaims(edges)
 	for i, e := range edges {
 		// Validation happens before anything is written, so a failure here means
 		// the transaction never started. Returning ids[:i] would name IDs for
@@ -1166,6 +1180,15 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 		}
 		if !s.nodeExistsLocked(e.Dst) {
 			return nil, &store.ErrInvalidEdge{MissingID: e.Dst}
+		}
+		// Cardinality against the store and against the batch: two duplicates
+		// arriving together are the same violation as one arriving after the
+		// other, and the adjacency cannot see the batch's own earlier edges.
+		if err := s.checkEdgeCardinalityLocked(e.Src, e.Dst, e.Labels, store.InvalidEdgeID); err != nil {
+			return nil, fmt.Errorf("AddEdgesBatch: edge %d: %w", i, err)
+		}
+		if err := claimBatchPair(claimed, s.uniqueEdgeTypes, e, i); err != nil {
+			return nil, fmt.Errorf("AddEdgesBatch: edge %d: %w", i, err)
 		}
 
 		id := store.EdgeID(s.edgeSeq.Add(1))
@@ -1319,6 +1342,13 @@ func (s *Store) DeclareUniqueEdgeProperty(key string) error {
 
 // UniqueNodeProperties implements store.UniqueIndexDeclarer.
 func (s *Store) UniqueNodeProperties() []string { return s.index().UniqueNodeKeys() }
+
+// Dir returns the directory this store was opened on.
+//
+// Present so the sidecar files that live beside the image — the label table, and
+// whatever follows it — can be found by code outside this package without
+// threading the path through every constructor.
+func (s *Store) Dir() string { return s.dir }
 
 // UniqueEdgeProperties implements store.UniqueIndexDeclarer.
 func (s *Store) UniqueEdgeProperties() []string { return s.index().UniqueEdgeKeys() }
@@ -1490,6 +1520,12 @@ func (s *Store) UpdateEdge(e *store.Edge) error {
 	// record is already appended cannot be taken back by returning an error.
 	if s.reindexPolicy == store.ReindexReject && s.propIdx.EdgeHasEntries(e.ID) {
 		return fmt.Errorf("UpdateEdge: edge %d: %w", e.ID, store.ErrIndexedPropertiesRequired)
+	}
+	// An update can add a declared label to an edge whose pair already has one.
+	// Endpoints are immutable, so the pair to check is the stored one, and the
+	// edge cannot collide with itself.
+	if err := s.checkEdgeCardinalityLocked(cur.Src, cur.Dst, stored.Labels, e.ID); err != nil {
+		return fmt.Errorf("UpdateEdge: %w", err)
 	}
 	if err := s.wal.appendEdgeOwned(stored); err != nil {
 		return fmt.Errorf("UpdateEdge: wal: %w", err)

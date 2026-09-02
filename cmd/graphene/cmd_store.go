@@ -10,8 +10,11 @@ package main
 // reach for when the store is busy.
 
 import (
+	"cmp"
 	"flag"
+	"slices"
 
+	"github.com/aoiflux/graphene"
 	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/store"
 )
@@ -42,6 +45,8 @@ func runStoreStats(cx *Context) (Result, error) {
 	s.Add("nodes", Uint(st.NodeCount))
 	s.Add("edges", Uint(st.EdgeCount))
 
+	addTypeCounts(&r, st)
+
 	if !st.HasStorage {
 		// The in-memory backend has no delta layer and no log. Saying so beats
 		// printing a screen of zeroes that read like an empty disk store.
@@ -50,6 +55,72 @@ func runStoreStats(cx *Context) (Result, error) {
 	}
 	addStorage(&r, st.Storage)
 	return r, nil
+}
+
+// addTypeCounts renders the per-label breakdown when the backend can produce it.
+//
+// Two tables rather than two lists, and sorted by count: the question an
+// operator has when they run this is "what is in here", and the answer is a
+// shape — a hundred thousand of one type and nine of another is the interesting
+// fact, not the alphabet.
+//
+// The totals deliberately do not add up to the node and edge counts above, and
+// the note says so rather than leaving it to be noticed: an entity carrying two
+// labels is counted under both, and a reader who assumes otherwise concludes the
+// store is corrupt.
+func addTypeCounts(r *Result, st *graphene.GraphStats) {
+	if !st.HasTypeCounts || (len(st.NodesByType) == 0 && len(st.EdgesByType) == 0) {
+		return
+	}
+	multi := false
+
+	if len(st.NodesByType) > 0 {
+		var summed uint64
+		t := r.Table("nodes by label", Col("label"), Col("count"))
+		for _, e := range sortedCounts(st.NodesByType) {
+			summed += e.count
+			t.Row(Str(e.label), Uint(e.count))
+		}
+		multi = multi || summed > st.NodeCount
+	}
+	if len(st.EdgesByType) > 0 {
+		var summed uint64
+		t := r.Table("edges by label", Col("label"), Col("count"))
+		for _, e := range sortedCounts(st.EdgesByType) {
+			summed += e.count
+			t.Row(Str(e.label), Uint(e.count))
+		}
+		multi = multi || summed > st.EdgeCount
+	}
+	if multi {
+		r.Notes("about these counts",
+			"an entity carrying two labels is counted under both, so these total "+
+				"more than the counts above")
+	}
+}
+
+type labelCount struct {
+	label string
+	count uint64
+}
+
+// sortedCounts orders a label breakdown by count descending, then by name, so
+// two runs over one store print the same table.
+func sortedCounts[T interface {
+	~uint16
+	String() string
+}](counts map[T]uint64) []labelCount {
+	out := make([]labelCount, 0, len(counts))
+	for t, n := range counts {
+		out = append(out, labelCount{label: t.String(), count: n})
+	}
+	slices.SortFunc(out, func(a, b labelCount) int {
+		if c := cmp.Compare(b.count, a.count); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.label, b.label)
+	})
+	return out
 }
 
 // addStorage renders StorageStats, shared with `debug stats` and `store health`.

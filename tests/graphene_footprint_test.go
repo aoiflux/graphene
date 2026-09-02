@@ -146,6 +146,67 @@ func BenchmarkFootprint_Disk_TopologyOnly(b *testing.B) {
 	})
 }
 
+// --- One transaction, held open ---
+//
+// The bulk package batches, which bounds memory by giving up per-entity
+// atomicity: a load that fails partway leaves the batches that already
+// committed. A caller who wants one source to be one transaction — so a failed
+// ingest leaves nothing rather than half of something — cannot use that, and has
+// to know what the buffer costs instead. A single source can be a million nodes.
+//
+// This measures the buffer while it is still open: every record the transaction
+// is holding, plus the resolver's view of them, before anything is written. The
+// numbers are in docs/benchmarks.md so the trade can be made with a figure
+// rather than a guess.
+
+const txFootprintNodes = 200_000
+
+func BenchmarkFootprint_OpenTransaction_Memory(b *testing.B) {
+	footprintOf(b, txFootprintNodes, txFootprintNodes-1, func() any {
+		g := graphene.NewInMemory()
+		return buildOpenTx(g, txFootprintNodes)
+	})
+}
+
+func BenchmarkFootprint_OpenTransaction_Disk(b *testing.B) {
+	dir, err := os.MkdirTemp("", "graphene-fp-tx-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	footprintOf(b, txFootprintNodes, txFootprintNodes-1, func() any {
+		g, err := graphene.Open(dir)
+		if err != nil {
+			b.Fatal(err)
+		}
+		return buildOpenTx(g, txFootprintNodes)
+	})
+}
+
+// buildOpenTx returns a transaction holding n nodes and n-1 edges, uncommitted.
+//
+// The graph is returned alongside so neither is collected before the
+// measurement: the transaction is what is being measured, and the graph is what
+// it will be committed into.
+func buildOpenTx(g *graphene.Graph, n int) any {
+	tx := g.Begin()
+	ids := make([]store.NodeID, n)
+	for i := range ids {
+		ids[i] = tx.AddNode(&store.Node{
+			Labels:     []store.NodeType{store.NodeTypeMicroArtefact},
+			Properties: []byte(fmt.Sprintf("method-%09d", i)),
+		})
+	}
+	for i := 1; i < n; i++ {
+		tx.AddEdge(&store.Edge{
+			Src: ids[i-1], Dst: ids[i],
+			Labels: []store.EdgeType{store.EdgeTypeContains},
+		})
+	}
+	return []any{g, tx}
+}
+
 // --- With the property index: 3 entries per node ---
 
 func BenchmarkFootprint_Memory_WithPropertyIndex(b *testing.B) {

@@ -169,9 +169,24 @@ func TestCtx_CancelStopsTraversal(t *testing.T) {
 
 		// A deadline is expressed through the budget rather than the context
 		// when the caller has no context to hand.
+		//
+		// Negative rather than a small positive duration, which is what this
+		// used to be. A positive MaxTime is only observable once the platform's
+		// monotonic clock has advanced past it, and on Windows that clock is the
+		// system timer interrupt: 15.6 ms by default, ~0.5 ms while some
+		// unrelated program has raised the resolution, and therefore different
+		// between two runs on one machine. Whether a walk of a given size
+		// straddled a tick was the thing this assertion was really testing, so
+		// it passed or failed according to what else the machine was doing.
+		//
+		// A negative MaxTime is a deadline already passed. It needs no elapsed
+		// time to be observed and so means the same thing on every platform.
+		// What it does not cover — that a deadline reached mid-walk stops the
+		// walk, on the cadence it claims — is covered exactly in
+		// traversal/guard_test.go, against a clock the test drives itself.
 		if _, err := g.BFSCtx(context.Background(), ids[0], 4000, store.DirectionBoth, nil,
-			store.Budget{MaxTime: time.Nanosecond}); !errors.Is(err, store.ErrBudgetExceeded) {
-			t.Fatalf("MaxTime of one nanosecond did not stop the walk: %v", err)
+			store.Budget{MaxTime: -time.Second}); !errors.Is(err, store.ErrBudgetExceeded) {
+			t.Fatalf("a MaxTime already elapsed did not stop the walk: %v", err)
 		}
 	})
 }

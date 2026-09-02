@@ -90,6 +90,12 @@ func ParseNodeType(selector string) (NodeType, error) {
 	case "case":
 		return NodeTypeCase, nil
 	}
+	// A registered name, after the built-ins so nothing can shadow one — the
+	// registry refuses those anyway, and before the numeric fallback so a name
+	// is tried as a name first.
+	if t, named := nodeTypeByName(norm); named {
+		return t, nil
+	}
 
 	num, err := strconv.Atoi(norm)
 	if err == nil {
@@ -116,6 +122,12 @@ func (t NodeType) String() string {
 		return "Case"
 	default:
 		if t >= NodeTypeCustomBase {
+			// A registered name if the application gave one — see
+			// store/typenames.go. Custom(7) is still what ParseNodeType
+			// accepts, so nothing that round-tripped before stops.
+			if name, named := nodeTypeName(t); named {
+				return name
+			}
 			return fmt.Sprintf("Custom(%d)", t-NodeTypeCustomBase)
 		}
 		// A reserved value that has not been given a name yet. Render the number
@@ -201,6 +213,10 @@ func ParseEdgeType(selector string) (EdgeType, error) {
 	case "belongsto":
 		return EdgeTypeBelongsTo, nil
 	}
+	// See ParseNodeType.
+	if t, named := edgeTypeByName(norm); named {
+		return t, nil
+	}
 
 	num, err := strconv.Atoi(norm)
 	if err == nil {
@@ -285,6 +301,10 @@ func (t EdgeType) String() string {
 		return "BelongsTo"
 	default:
 		if t >= EdgeTypeCustomBase {
+			// See NodeType.String.
+			if name, named := edgeTypeName(t); named {
+				return name
+			}
 			return fmt.Sprintf("Custom(%d)", t-EdgeTypeCustomBase)
 		}
 		// See NodeType.String: an unnamed reserved value renders as its number so

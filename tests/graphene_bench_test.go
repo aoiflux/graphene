@@ -12,10 +12,12 @@
 package graphene_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aoiflux/graphene"
 	"github.com/aoiflux/graphene/store"
@@ -500,6 +502,70 @@ func BenchmarkDeclareOrderedProperty(b *testing.B) {
 	}
 }
 
+// Declaring a unique key over an already-populated index.
+//
+// Unique declarations live in memory and must be re-declared by every process
+// that opens the store, which means this runs before the process can serve
+// anything. An embedder putting a natural key on tens of millions of nodes
+// deserves a number rather than a discovery, so the sweep is here and the answer
+// is in docs/benchmarks.md.
+//
+// What it costs is O(distinct values under the key) over an already-resident
+// index — DeclareUniqueNodeKey walks the key's value buckets and skips any held
+// by fewer than two — so no I/O and no graph scan. The sweep exists to say what
+// that constant actually is, and the /distinct arm is the one that matters: a
+// natural key is distinct by construction, which is the worst case for a walk
+// that can only skip on collisions.
+func BenchmarkDeclareUniqueProperty(b *testing.B) {
+	for _, n := range []int{10_000, 100_000, 1_000_000} {
+		b.Run(fmt.Sprintf("distinct/%d", n), func(b *testing.B) {
+			benchDeclareUnique(b, n, n)
+		})
+	}
+	// The same declaration over an index carrying a second, low-cardinality key
+	// alongside. It should cost what the arm above costs: the walk is per key,
+	// not per index, and this is what says so.
+	b.Run("distinct+bystander/1000000", func(b *testing.B) {
+		benchDeclareUnique(b, 1_000_000, 1000)
+	})
+}
+
+// benchDeclareUnique times one declaration over `nodes` nodes, each carrying a
+// distinct value under "k" plus — when values < nodes — a low-cardinality value
+// under "bucket".
+//
+// "k" is always distinct because a declaration that would be refused is not a
+// declaration; "bucket" is the bystander that shows the walk does not touch it.
+func benchDeclareUnique(b *testing.B, nodes, values int) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		g := graphene.NewInMemory()
+		batch := make([]*store.Node, nodes)
+		for j := range batch {
+			batch[j] = &store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}}
+		}
+		ids, err := g.AddNodes(batch)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for j, id := range ids {
+			props := map[string][]byte{"k": fmt.Appendf(nil, "key-%09d", j)}
+			if values < nodes {
+				props["bucket"] = fmt.Appendf(nil, "b-%06d", j%values)
+			}
+			if err := g.IndexNodeProperties(id, props); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.StartTimer()
+
+		if err := g.DeclareUniqueProperty("k"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // =============================================================================
 // Adjacency — anchored relation queries and neighbourhood reads
 // =============================================================================
@@ -729,6 +795,53 @@ func BenchmarkBFS_Deep(b *testing.B) {
 		if _, err := g.BFS(ids[0], 10_000, store.DirectionOutbound, nil); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// The cost of the guard, one fixture, three arms.
+//
+// There was no benchmark anywhere that exercised a non-zero Budget: every
+// traversal benchmark took the `off` fast path, so the accounting had never been
+// measured against the walk it accounts for. That mattered once MaxTime moved to
+// a per-step clock check — the arm that pays for it is the only one that changed,
+// and without /nodes beside it there is no way to separate the clock read from
+// the accounting that was always there.
+//
+// One binary and one fixture, per CONTRIBUTING's rule for comparing two
+// implementations. Read /unbounded first: it is byte-identical work on both
+// sides of any A/B and is this group's own control.
+//
+//	unbounded — Budget{}, the off path. Must not move, ever.
+//	nodes     — accounting on, no deadline: the ctx cadence, unchanged at 256.
+//	time      — accounting on plus a deadline: one clock read per charged step.
+func BenchmarkBFS_Deep_Budget(b *testing.B) {
+	g, ids := buildChain(b, 10_000)
+
+	arms := []struct {
+		name   string
+		budget store.Budget
+	}{
+		{"unbounded", store.Budget{}},
+		{"nodes", store.Budget{MaxNodes: 1 << 30}},
+		{"time", store.Budget{MaxTime: time.Hour}},
+	}
+
+	for _, arm := range arms {
+		b.Run(arm.name, func(b *testing.B) {
+			// A budget that fires would measure the error path, not the walk.
+			if _, err := g.BFSCtx(context.Background(), ids[0], 10_000,
+				store.DirectionOutbound, nil, arm.budget); err != nil {
+				b.Fatalf("%s: budget is not generous enough to measure the walk: %v", arm.name, err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := g.BFSCtx(context.Background(), ids[0], 10_000,
+					store.DirectionOutbound, nil, arm.budget); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

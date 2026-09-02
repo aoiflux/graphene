@@ -71,6 +71,12 @@ type txView struct {
 	// claims are the unique values this transaction has taken but not yet
 	// applied; see the disk backend for why the index cannot answer for them.
 	claims map[uniqueClaim]uint64
+
+	// pairs are the edge-cardinality slots taken but not yet applied, and
+	// pairsOf is the reverse index that makes releasing them cheap. See
+	// memory/edgeunique.go.
+	pairs   map[pairSlot]store.EdgeID
+	pairsOf map[store.EdgeID][]pairSlot
 }
 
 type uniqueClaim struct {
@@ -88,6 +94,8 @@ func newTxView(s *Store, hint int) *txView {
 		delEdge:  make(map[store.EdgeID]struct{}),
 		incident: make(map[store.NodeID][]store.EdgeID),
 		claims:   make(map[uniqueClaim]uint64),
+		pairs:    make(map[pairSlot]store.EdgeID),
+		pairsOf:  make(map[store.EdgeID][]pairSlot),
 	}
 }
 
@@ -282,6 +290,12 @@ func (s *Store) resolveTransaction(ops []store.TxOp) ([]txAction, error) {
 			if !v.nodeLive(e.Dst) {
 				return nil, &store.ErrInvalidEdge{MissingID: e.Dst}
 			}
+			// An update may have changed the labels, so whatever this edge was
+			// holding is released before it claims again.
+			v.releaseEdgePairs(e.ID)
+			if err := v.claimEdgePairs(e); err != nil {
+				return nil, fmt.Errorf("transaction op %d (%s): %w", i, op.Kind, err)
+			}
 			if _, known := v.edges[e.ID]; !known {
 				v.incident[e.Src] = append(v.incident[e.Src], e.ID)
 				if e.Dst != e.Src {
@@ -304,6 +318,7 @@ func (s *Store) resolveTransaction(ops []store.TxOp) ([]txAction, error) {
 			}
 			for _, eid := range v.cascadeFor(op.NodeID) {
 				v.delEdge[eid] = struct{}{}
+				v.releaseEdgePairs(eid)
 				delete(v.edges, eid)
 				actions = append(actions, txAction{kind: txActionDelEdge, edgeID: eid})
 			}
@@ -316,6 +331,7 @@ func (s *Store) resolveTransaction(ops []store.TxOp) ([]txAction, error) {
 				return nil, &store.ErrNotFound{Kind: "edge", ID: uint64(op.EdgeID)}
 			}
 			v.delEdge[op.EdgeID] = struct{}{}
+			v.releaseEdgePairs(op.EdgeID)
 			delete(v.edges, op.EdgeID)
 			actions = append(actions, txAction{kind: txActionDelEdge, edgeID: op.EdgeID})
 

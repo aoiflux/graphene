@@ -23,6 +23,16 @@ type GraphStats struct {
 	NodeCount uint64
 	EdgeCount uint64
 
+	// NodesByType and EdgesByType break the totals down by label. Valid only
+	// when HasTypeCounts is true; a backend that cannot enumerate its own types
+	// has nothing to report, and an empty map would say the graph is empty.
+	//
+	// An entity carrying two labels is counted under both, so these sum to more
+	// than NodeCount and EdgeCount on any graph using multi-label entities.
+	NodesByType   map[store.NodeType]uint64
+	EdgesByType   map[store.EdgeType]uint64
+	HasTypeCounts bool
+
 	// Storage describes what the backend is holding — delta size, log size, and
 	// when it last compacted. Valid only when HasStorage is true; backends
 	// without a delta layer or a log have nothing to report.
@@ -46,7 +56,97 @@ func (g *Graph) Stats() (*GraphStats, error) {
 		out.Storage = sr.StorageStats()
 		out.HasStorage = true
 	}
+	if a, ok := g.GraphStore.(store.Aggregator); ok {
+		ctx := context.Background()
+		nodes, err := a.CountNodesByType(ctx)
+		if err != nil {
+			return nil, err
+		}
+		edges, err := a.CountEdgesByType(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out.NodesByType, out.EdgesByType, out.HasTypeCounts = nodes, edges, true
+	}
 	return out, nil
+}
+
+// --- Aggregation ---
+//
+// The counts a caller cannot get cheaply from outside. Pulling IDs into Go and
+// counting them there is fine at a thousand entities and stops being fine well
+// before a hundred thousand: a per-type breakdown that way is one NodesByType
+// call per type and a copy of every ID in the graph, built to be discarded.
+//
+// These return an error on a backend that cannot answer them, rather than an
+// empty map. There is no generic fallback to degrade to — a GraphStore cannot
+// enumerate its own types — and an empty map would say the graph is empty.
+// Both bundled backends implement them.
+
+// CountNodesByType returns the number of live nodes carrying each type.
+//
+// A node carrying two labels is counted under both, so the values sum to more
+// than NodeCount on any graph using multi-label nodes. Types with no live nodes
+// are absent rather than zero.
+func (g *Graph) CountNodesByType() (map[store.NodeType]uint64, error) {
+	return g.CountNodesByTypeCtx(context.Background())
+}
+
+// CountNodesByTypeCtx is CountNodesByType, cancellable.
+func (g *Graph) CountNodesByTypeCtx(ctx context.Context) (map[store.NodeType]uint64, error) {
+	a, ok := g.GraphStore.(store.Aggregator)
+	if !ok {
+		return nil, fmt.Errorf("CountNodesByType: %T cannot count by type", g.GraphStore)
+	}
+	return a.CountNodesByType(ctx)
+}
+
+// CountEdgesByType returns the number of live edges carrying each type, with the
+// same multi-label caveat as CountNodesByType.
+func (g *Graph) CountEdgesByType() (map[store.EdgeType]uint64, error) {
+	return g.CountEdgesByTypeCtx(context.Background())
+}
+
+// CountEdgesByTypeCtx is CountEdgesByType, cancellable.
+func (g *Graph) CountEdgesByTypeCtx(ctx context.Context) (map[store.EdgeType]uint64, error) {
+	a, ok := g.GraphStore.(store.Aggregator)
+	if !ok {
+		return nil, fmt.Errorf("CountEdgesByType: %T cannot count by type", g.GraphStore)
+	}
+	return a.CountEdgesByType(ctx)
+}
+
+// CountNodesByProperty returns how many live nodes hold each distinct value
+// under key — the distribution of an indexed field.
+//
+// Only nodes with an index entry under key are counted, which is the useful
+// reading: a node that never registered a value has no value to distribute.
+// Values are the caller-encoded bytes as stored, keyed by their string form.
+func (g *Graph) CountNodesByProperty(key string) (map[string]uint64, error) {
+	return g.CountNodesByPropertyCtx(context.Background(), key)
+}
+
+// CountNodesByPropertyCtx is CountNodesByProperty, cancellable.
+func (g *Graph) CountNodesByPropertyCtx(ctx context.Context, key string) (map[string]uint64, error) {
+	a, ok := g.GraphStore.(store.Aggregator)
+	if !ok {
+		return nil, fmt.Errorf("CountNodesByProperty: %T cannot count by property", g.GraphStore)
+	}
+	return a.CountNodesByProperty(ctx, key)
+}
+
+// CountEdgesByProperty is CountNodesByProperty for edge properties.
+func (g *Graph) CountEdgesByProperty(key string) (map[string]uint64, error) {
+	return g.CountEdgesByPropertyCtx(context.Background(), key)
+}
+
+// CountEdgesByPropertyCtx is CountEdgesByProperty, cancellable.
+func (g *Graph) CountEdgesByPropertyCtx(ctx context.Context, key string) (map[string]uint64, error) {
+	a, ok := g.GraphStore.(store.Aggregator)
+	if !ok {
+		return nil, fmt.Errorf("CountEdgesByProperty: %T cannot count by property", g.GraphStore)
+	}
+	return a.CountEdgesByProperty(ctx, key)
 }
 
 // StorageStats reports the backend's storage state, and whether it could.
@@ -574,16 +674,40 @@ func (g *Graph) Degree(id store.NodeID, edgeTypes []store.EdgeType) (int, error)
 // EdgeExists reports whether at least one direct edge exists from src to dst.
 // Pass nil edgeTypes to consider edges of any type.
 func (g *Graph) EdgeExists(src, dst store.NodeID, edgeTypes []store.EdgeType) (bool, error) {
+	_, found, err := g.EdgeIDBetween(src, dst, edgeTypes)
+	return found, err
+}
+
+// EdgeIDBetween returns a live edge from src to dst carrying any of edgeTypes.
+// Pass nil edgeTypes to consider edges of any type.
+//
+// Which edge, when several match, is unspecified — unless the type is declared
+// through DeclareUniqueEdge, which is the point of declaring it: the question
+// then has one answer. found is false when nothing matches, which is not an
+// error.
+//
+// This exists because a caller checking for a duplicate almost always wants the
+// incumbent rather than a boolean, and because EdgeExists used to materialise
+// the entire outbound edge slice — records, label slices and property blobs —
+// to compare one field. The backends can answer from adjacency without building
+// any of that, and both bundled ones do.
+func (g *Graph) EdgeIDBetween(src, dst store.NodeID, edgeTypes []store.EdgeType) (store.EdgeID, bool, error) {
+	if b, ok := g.GraphStore.(store.EdgeCardinalityDeclarer); ok {
+		return b.EdgeBetween(src, dst, edgeTypes)
+	}
+	// A third-party store without the extension still answers correctly, just
+	// by building what it then throws away — the same fallback shape degreeOf
+	// uses for DegreeCounter.
 	edges, err := g.EdgesOf(src, store.DirectionOutbound, edgeTypes)
 	if err != nil {
-		return false, err
+		return store.InvalidEdgeID, false, err
 	}
 	for _, e := range edges {
 		if e.Dst == dst {
-			return true, nil
+			return e.ID, true, nil
 		}
 	}
-	return false, nil
+	return store.InvalidEdgeID, false, nil
 }
 
 // IsConnected reports whether src and dst are reachable from one another via

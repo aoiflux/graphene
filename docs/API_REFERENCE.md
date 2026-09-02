@@ -33,6 +33,8 @@ import (
 9c. [Unique keys and upsert](#9c-unique-keys-and-upsert)  ← idempotent ingest
 10. [Typed queries](#10-typed-queries)
 11. [Degree & connectivity](#11-degree--connectivity)
+11a. [Edge cardinality](#11a-edge-cardinality--at-most-one-edge-of-a-type-per-pair)  ← duplicate edges without a key
+11b. [Aggregation](#11b-aggregation)
 12. [Traversal & patterns](#12-traversal--patterns)
 13. [Subgraph, cycles, result helpers](#13-subgraph-cycles-result-helpers)
 14. [Persistence lifecycle](#14-persistence-lifecycle)
@@ -154,6 +156,57 @@ func ParseNodeType(selector string) (NodeType, error)
 func ParseEdgeType(selector string) (EdgeType, error)
 ```
 
+#### Naming them
+
+Left unnamed, every custom type renders as `Custom(7)` — so an application with a
+dozen of them carries its own number-to-name table and translates at every
+boundary. That table is a second copy of the numbering, and the moment it drifts
+from the one the data was written with, every log line, error and export silently
+misreads the database.
+
+```go
+func (g *Graph) DeclareTypeNames(nodes map[store.NodeType]string, edges map[store.EdgeType]string) error
+func (g *Graph) TypeNames() (nodes map[store.NodeType]string, edges map[store.EdgeType]string)
+
+// The registry underneath, for a caller with no Graph in scope.
+func store.RegisterNodeTypeName(t store.NodeType, name string) error
+func store.RegisterEdgeTypeName(t store.EdgeType, name string) error
+func store.NodeTypeNames() map[store.NodeType]string
+func store.EdgeTypeNames() map[store.EdgeType]string
+```
+
+```go
+g.DeclareTypeNames(
+    map[store.NodeType]string{nodeApp: "App", nodeVersion: "AppVersion"},
+    map[store.EdgeType]string{edgeOwns: "Owns"},
+)
+nodeApp.String()                  // "App"
+store.ParseNodeType("App")        // nodeApp
+store.ParseNodeType("custom:0")   // nodeApp, still
+```
+
+The name is what `String()` renders and what the parsers accept, **in addition to
+— never instead of** — the `Custom(7)`, `custom:7` and bare-numeric forms.
+Nothing that parsed before stops parsing.
+
+**Only the custom range can be named.** The built-ins mean what the engine says
+they mean, and renaming one would change what `ParseNodeType("case")` resolves
+to. Names that could not round-trip are refused for the same reason: a built-in
+name, a bare numeric, anything shaped like a custom-offset selector, anything
+that normalises to nothing.
+
+**On a disk store the table is persisted** to `graphene.labels` beside the image,
+which is the half worth more: the graph stays interpretable without the program
+that wrote it. It is a sidecar, not part of the image format, so an older engine
+ignores it and a store carrying one opens unchanged. Backup includes it.
+
+`Open` registers what the table says. **A disagreement is an error**
+(`store.ErrTypeNameConflict`), not a resolution — the registry is process-wide,
+so two stores in one process that disagree about what 32 768 means cannot both be
+rendered correctly, and picking one silently is the confident wrong answer this
+exists to prevent. Declaring the same names again is a no-op, so this belongs
+beside the other declarations at every `Open`.
+
 ---
 
 ## 4. Errors
@@ -179,8 +232,10 @@ The rest are sentinels, matched with `errors.Is`:
 | `store.ErrNoLabels` | `AddNode`, `AddEdge`, their batch and `Tx` forms, `UpdateNode`, `UpdateEdge` | the label set is empty |
 | `store.ErrIndexedPropertiesRequired` | `UpdateNode`, `UpdateEdge` under `ReindexReject` | the entity carries index entries the update would invalidate (§17) |
 | `store.ErrKeyNotUnique` | `UpsertNode`, `UpsertEdge`, `NodeByProperty`, `EdgeByProperty` | the key was never declared unique (§9c) |
-| `store.ErrUniqueViolation` | any write registering a value another live entity holds | the constraint would be broken |
+| `store.ErrUniqueViolation` | any write registering a value another live entity holds, or a second edge of a declared type between one pair | the constraint would be broken |
 | `store.ErrWriteConflict` | `Tx.Commit` | an upsert's key moved between buffering and commit; retry |
+| `store.ErrBudgetExceeded` | any `*Ctx` traversal or aggregate | the walk hit `MaxNodes`, `MaxEdges` or `MaxTime` (§12) |
+| `store.ErrTypeNameConflict` | `DeclareTypeNames`, `Open` on a store whose label table disagrees | two namings of one type value (§3) |
 
 A uniqueness *declaration* that fails reports all of it at once:
 
@@ -196,6 +251,29 @@ type UniqueViolationsError struct {
 
 It unwraps to `ErrUniqueViolation`, so one condition covers a violation whichever
 stage it surfaced at — but `Conflicts` is the field a repair reads.
+
+The edge-cardinality constraint (§11a) has the same pair of shapes, reporting
+node pairs where the property constraint reports values:
+
+```go
+type EdgePair struct { Src, Dst NodeID }
+
+type EdgeCardinalityConflict struct { Pair EdgePair; IDs []EdgeID }
+
+type EdgeCardinalityViolationsError struct {   // from DeclareUniqueEdge
+    Type      EdgeType
+    Conflicts []EdgeCardinalityConflict        // every offending pair, ascending
+}
+
+type ErrEdgeTaken struct {                     // from a refused write
+    Pair  EdgePair
+    Type  EdgeType
+    Owner EdgeID                               // the edge that already joins them
+}
+```
+
+Both unwrap to `ErrUniqueViolation` as well, so a caller handling "this violates
+a uniqueness rule" handles all four the same way.
 
 ---
 
@@ -990,9 +1068,143 @@ func (g *Graph) InDegree(id store.NodeID, edgeTypes []store.EdgeType) (int, erro
 func (g *Graph) OutDegree(id store.NodeID, edgeTypes []store.EdgeType) (int, error)
 func (g *Graph) Degree(id store.NodeID, edgeTypes []store.EdgeType) (int, error) // in + out
 func (g *Graph) EdgeExists(src, dst store.NodeID, edgeTypes []store.EdgeType) (bool, error)
+func (g *Graph) EdgeIDBetween(src, dst store.NodeID, edgeTypes []store.EdgeType) (store.EdgeID, bool, error)
 func (g *Graph) IsConnected(src, dst store.NodeID) (bool, error) // any-path reachability
 func (g *Graph) NeighboursByNodeType(id store.NodeID, dir store.Direction, nodeType store.NodeType, edgeTypes []store.EdgeType) ([]*store.Node, error)
 ```
+
+`EdgeIDBetween` returns the incumbent rather than a boolean, which is what a
+caller checking for a duplicate actually wants — and what lets it use the edge
+that exists instead of looking it up again. `EdgeExists` is a wrapper on it.
+Which edge, when several match, is unspecified *unless* the type is declared
+through `DeclareUniqueEdge` (§11a), which is the point of declaring it: the
+question then has one answer.
+
+---
+
+## 11a. Edge cardinality — at most one edge of a type per pair
+
+```go
+func (g *Graph) DeclareUniqueEdge(t store.EdgeType) error
+func (g *Graph) UniqueEdges() []store.EdgeType
+```
+
+Unique property keys (§9c) name an entity by a value. That is right for an edge
+carrying identity of its own, and wrong for structure: an edge that exists only
+to say "this owns that" has no value worth indexing, and giving each one a unique
+key means paying an index entry per edge to restate what its endpoints already
+say. A caller writing millions of them cannot afford that, and is left with a
+convention — own a subtree, delete it before re-ingesting, never add an edge
+twice by hand — which holds exactly as long as nobody forgets.
+
+```go
+if err := g.DeclareUniqueEdge(edgeOwns); err != nil {
+    var v *store.EdgeCardinalityViolationsError
+    if errors.As(err, &v) {
+        // v.Conflicts names every pair joined more than once
+    }
+}
+
+_, err := g.AddEdge(&store.Edge{Src: a, Dst: b, Labels: []store.EdgeType{edgeOwns}})
+var taken *store.ErrEdgeTaken
+if errors.As(err, &taken) {
+    // taken.Owner is the edge that already joins this pair
+}
+```
+
+**Per label, not per label set.** Every filter in the engine treats a type list
+as OR over labels, so a declaration names one type and means "at most one live
+edge from src to dst carries this type". An edge labelled `{Owns, Contains}`
+counts against a declaration on each independently. **Direction is part of the
+pair**: src→dst and dst→src are two pairs.
+
+Enforced on every path that can create an edge or give one a declared label —
+`AddEdge`, `AddEdges`, `UpdateEdge`, and all three inside a transaction — and
+identically on both backends. A batch and a transaction also check against
+themselves: two duplicates arriving together are the same violation as one
+arriving after the other. **Deleting an edge frees the pair within the same
+transaction**, which is what makes delete-the-subtree-and-rebuild work:
+
+```go
+tx := g.Begin()
+for _, id := range ownedByThisVersion {
+    tx.DeleteNode(id)          // cascades to the edges
+}
+rebuild(tx)                    // the pairs the deletes freed are available again
+tx.Commit()
+```
+
+Declaring over a graph that already violates the rule reports **every** offending
+pair and declares nothing. Both errors unwrap to `store.ErrUniqueViolation`, so
+one condition covers a refused write and a refused declaration.
+
+Nothing new is stored: the answer is in the source node's outbound adjacency, and
+a second structure holding it is a second thing that can disagree with the first.
+The cost is a scan of that adjacency per constrained write — O(out-degree of
+src), cheap for the ownership edges this exists for, and worth knowing about
+before declaring a type whose sources are hubs.
+
+Declarations live in memory and must be re-declared at every `Open`, exactly as
+with unique property keys. A backend that cannot enforce the constraint returns
+an error rather than accepting the declaration. `graphene debug unique-edge -type
+<t> <dir>` answers "can I?" from the shell.
+
+---
+
+## 11b. Aggregation
+
+```go
+func (g *Graph) NeighbourFrequency(anchors []store.NodeID, dir store.Direction, edgeTypes []store.EdgeType, nodeTypes []store.NodeType) (map[store.NodeID]uint64, error)
+func (g *Graph) NeighbourFrequencyCtx(ctx context.Context, anchors []store.NodeID, dir store.Direction, edgeTypes []store.EdgeType, nodeTypes []store.NodeType, budget store.Budget) (map[store.NodeID]uint64, error)
+
+func (g *Graph) CountNodesByType() (map[store.NodeType]uint64, error)
+func (g *Graph) CountEdgesByType() (map[store.EdgeType]uint64, error)
+func (g *Graph) CountNodesByProperty(key string) (map[string]uint64, error)
+func (g *Graph) CountEdgesByProperty(key string) (map[string]uint64, error)
+// plus a *Ctx form of each.
+```
+
+The counts a caller cannot get cheaply from outside. Pulling IDs into Go and
+counting them there is fine at a thousand entities and stops being fine well
+before a hundred thousand: a per-type breakdown that way is one `NodesByType`
+call per type and a copy of every ID in the graph, built to be discarded.
+
+**`NeighbourFrequency`** is the shape most cross-graph analytics turn out to be:
+rank what a set of sources point at, by how many of them point at it.
+
+```go
+freq, err := g.NeighbourFrequency(versions, store.DirectionOutbound,
+    []store.EdgeType{edgeEmbeds}, []store.NodeType{nodeTracker})
+// freq[tracker] = how many of `versions` embed it
+```
+
+It counts **anchors, not edges**. A neighbour reached twice from one anchor — two
+edges of different types, or one edge seen from both directions — is one vote,
+and a repeated anchor is one anchor. Counting edges would make the answer depend
+on how the graph happens to be modelled rather than on what it says. `nil`
+`edgeTypes` follows every edge and `nil` `nodeTypes` counts every neighbour; both
+are OR over labels. An anchor that is not live is skipped rather than reported:
+the set usually came from an earlier query, and something deleted in between is a
+race the caller cannot prevent.
+
+Use `NeighbourFrequencyCtx` whenever the anchor set is data rather than something
+you chose. It takes a `store.Budget` for the same reason the walks do — one hub
+among the anchors is enough to make this arbitrarily large.
+
+**`CountNodesByType` / `CountEdgesByType`** are answered from the label postings,
+and also appear on `GraphStats` and in `graphene store stats`. **An entity
+carrying two labels is counted under both**, so these total more than `NodeCount`
+and `EdgeCount` on any graph using multi-label entities. Types with no live
+entities are absent rather than zero.
+
+**`CountNodesByProperty` / `CountEdgesByProperty`** distribute an indexed field's
+values, counting only live holders. An entity with no entry under the key has no
+value to distribute and is absent, as is a value held only by deleted entities.
+
+All four are `store.Aggregator`, an optional extension both bundled backends
+implement. There is no generic fallback — a `GraphStore` cannot enumerate its own
+types — so a backend without it returns an error rather than an empty map that
+would say the graph is empty.
 
 ---
 
@@ -1085,9 +1297,23 @@ alongside the error, because a partial answer that looks complete is the failure
 this exists to prevent.
 
 `MaxNodes` bounds memory, `MaxEdges` bounds work on a dense graph, and `MaxTime`
-is the limit of last resort. The context and the clock are checked every 256
-steps, so a cancel takes effect within a few microseconds of walking rather than
-instantly.
+is the limit of last resort. The context is checked every 256 steps, so a cancel
+takes effect within a few microseconds of walking rather than instantly.
+
+**`MaxNodes` and `MaxEdges` are exact; `MaxTime` is best-effort.** The first two
+are charged per visit and stop the walk on the step that crosses them. `MaxTime`
+has to read a clock, so it is checked every 16 steps when set — and it cannot see
+what the platform's clock cannot resolve. On Linux that granularity is
+nanoseconds. On Windows the Go monotonic clock is the system timer interrupt,
+which advances every 15.6 ms by default and every ~0.5 ms while some process on
+the machine has raised the timer resolution; a `MaxTime` below that does not stop
+anything, and which of the two applies is a global property of the machine that
+changes as unrelated programs start and stop.
+
+Nothing preempts a step that runs long either, so a single cold page read can
+outlast a `MaxTime` on its own. Size a walk with `MaxNodes` and `MaxEdges`, and
+let `MaxTime` catch what they miss. A negative `MaxTime` is a deadline already
+passed: the walk is refused before it visits anything.
 
 The recursive walks — `DFSCtx`, `ProvenanceChainCtx`, `FindPatternsCtx` — also
 carry a hard limit of 100 000 stack frames whatever the budget says. A goroutine

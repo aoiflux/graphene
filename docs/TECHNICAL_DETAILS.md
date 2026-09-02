@@ -106,11 +106,23 @@ small separate interface a backend may satisfy, which callers type-assert:
 | `IndexVerifier` | `VerifyIndexes` |
 | `IndexRebuilder` | `RebuildIndexes` |
 | `OrderedIndexDeclarer` | `DeclareOrderedProperty` |
+| `UniqueIndexDeclarer` | `DeclareUniqueProperty`, and the owner lookups upsert needs |
+| `EdgeCardinalityDeclarer` | `DeclareUniqueEdge`, `EdgeBetween` (§6.8) |
+| `Aggregator` | `CountNodesByType`, `CountNodesByProperty` and their edge forms (§6.9) |
 | `NodeQueryExplainer` / `EdgeQueryExplainer` | Query plans |
 
 This is what lets the disk backend expose a zero-allocation degree count from CSR
 offsets without forcing the memory backend into the same shape, and lets callers
 degrade gracefully rather than crash on a backend that lacks a capability.
+
+**Three of them do not degrade, and the distinction matters.** Most of these are
+optimisations: a backend ignoring `DegreeCounter` answers every question
+correctly, only slower, so `Graph` type-asserts and falls back. But
+`UniqueIndexDeclarer` and `EdgeCardinalityDeclarer` are *constraints* — a store
+that quietly does not enforce one has handed the caller the guarantee they asked
+for and none of the behaviour — and `Aggregator` has no fallback to degrade to,
+because a `GraphStore` cannot enumerate its own types and an empty map would say
+the graph is empty. All three return an error on a backend that lacks them.
 
 ---
 
@@ -205,9 +217,16 @@ none of them is created unless the corresponding option is set:
 | `graphene.redactions` | `Options.Redaction` | attributed removals |
 | `graphene.grants` | `Options.Roles` | privilege changes |
 | `graphene.checkpoints` | on `PublishCheckpoint` | anchoring |
+| `graphene.labels` | on `DeclareTypeNames` | the custom-label name table (§4.5) |
 
 The four ledgers are each hash-chained and independently readable; see
 [FORENSICS.md](FORENSICS.md).
+
+Everything after the first two rows is a **sidecar**: a file beside the image
+rather than a section inside it. That is what lets each of them be added without
+a format generation, and what lets an engine that predates one ignore it and read
+the store correctly anyway. `Backup` copies the directory rather than a list of
+names it knows, so a new sidecar travels with no change to backup.
 
 ### 4.1 CSR file layout
 
@@ -463,6 +482,54 @@ itself, so write scaling is bounded by the file regardless.
 
 ---
 
+### 4.5 The label table
+
+`NodeTypeCustomBase` opens 32 768 values whose meaning the application defines.
+The store records that node 4 981 is type 32 768; what 32 768 *means* lives in
+the program that wrote it. So a store outliving that program — or examined by
+anything else, which for a forensics engine is the normal case rather than the
+exception — is a graph of numbers, and a program whose own table has drifted
+since the data was written reads every one of them as the wrong thing,
+confidently and with no symptom.
+
+`graphene.labels` is the numbering, written beside the image:
+
+```
+graphene-labels v1
+node<TAB>32768<TAB>App
+node<TAB>32769<TAB>AppVersion
+edge<TAB>32768<TAB>Owns
+```
+
+Deliberately the least interesting format in the tree. It is text, because the
+thing it exists to defend against is a reader that has nothing but the file; it
+is sorted by kind and then by value, so one naming produces one file and two
+stores with the same naming produce the same bytes; and it is written to a
+temporary and renamed, because a half-written label table is a mislabelling that
+survives. Names cannot contain a tab or a newline because
+`store.RegisterNodeTypeName` rejects control characters, so the encoding needs no
+escaping.
+
+The header is a generation marker, and an unrecognised one is an error rather
+than something to guess at: guessing is how a label table becomes a
+mislabelling.
+
+**The registry it feeds is process-wide**, and that is a deliberate consequence
+rather than an accident of implementation. `String()` is a method on a `uint16`
+with no store in scope, and moving rendering behind a store handle would change
+every call site in the engine and in every caller. What follows is that one
+process has one naming — which is the correct constraint for what this is, since
+a numbering is a property of the data and two stores that disagree about 32 768
+cannot both be rendered correctly. `Open` therefore *reports* the disagreement
+(`ErrTypeNameConflict`) rather than resolving it.
+
+Only the custom range can be named, and a name that could not round-trip through
+`ParseNodeType` is refused — a built-in name, a bare numeric, anything shaped
+like `custom:7`. The property being defended is that a type parses back to what
+it prints as, which is the whole reason the mechanism is trustworthy.
+
+---
+
 ## 5. Read and write paths
 
 ### 5.1 Write path
@@ -677,6 +744,8 @@ bulk read 2.05 ms → 0.48 ms. Figures in [benchmarks.md](benchmarks.md).
 | 8 | Property index | sorted postings + reverse map | O(1) equality | **yes**, v6 |
 | 9 | Ordered index | sorted values per declared key | O(log n + k) | declarations only, v8 |
 | 10 | Composite index | tuple → sorted postings, per declared key set | O(1) conjunction | declarations only, v8 |
+| — | Edge cardinality | *no structure* — answered from out-adjacency | O(out-degree of src) per write | declarations only, in memory |
+| — | Label names | copy-on-write map behind an atomic pointer | O(1) | **yes**, `graphene.labels` sidecar |
 
 ### 6.2 Why postings are sorted, not hashed
 
@@ -949,6 +1018,121 @@ say so, because nothing has been registered there yet, so the claim is tracked i
 two places: `Tx.claimed`, so the second call returns the ID the first reserved,
 and `txView.claims`, so resolution sees the transaction's own pending
 registrations before the index's.
+
+### 6.8 Edge cardinality, and why it is not an index
+
+A unique property key names an entity by a value. That is right for an edge
+carrying identity of its own and wrong for structure: an edge whose whole meaning
+is "this owns that" has no value worth indexing, and a caller writing 10^6 of
+them per source cannot afford an index entry each to restate what the endpoints
+already say. `DeclareUniqueEdge(t)` gives the structural rule directly — at most
+one live edge of type `t` between any ordered pair.
+
+**Per label, not per label set.** `Edge.Labels` is a set and every filter in the
+engine is OR over it, so a declaration on one type composes: an edge labelled
+`{Owns, Contains}` counts against a declaration on `Owns` and one on `Contains`
+independently. A rule about whole label *sets* would not compose, and a rule
+about a "primary" label would invent a concept the store does not have — `viz`
+picks `Labels[0]` for rendering, which is a display convention rather than a
+model.
+
+**Nothing new is stored**, for the reason §6.6 gives for unique keys: the answer
+is already in the source node's outbound adjacency, and a second structure
+holding it is a second thing that can disagree with the first. The consequences
+of that choice are the whole design:
+
+- The check is a scan of `src`'s outbound edges, O(out-degree of src). Cheap for
+  ownership edges, which fan out from a source that owns tens or hundreds of
+  things. Not cheap for a type whose sources are hubs, and the API documentation
+  says so rather than leaving it to be measured.
+- `deleteEdgeLocked` and `applyEdgeDelete` need no unindex step, `Compact` needs
+  no rebuild, and there is no derived state that can go stale. A declaration is
+  correct the moment it is made and stays correct.
+- A sorted-by-neighbour adjacency (P7 in `RESEARCH_NATIVE_GRAPH.md`) would turn
+  the scan into a binary search. It is not taken here for the reason that section
+  gives: it costs +43.5% on a build and changes edge ordering for every existing
+  caller, and one write-path scan is not the thing that justifies it.
+
+**Five write funnels, two backends, one rule.** `AddEdge`, `AddEdgesBatch`,
+`UpdateEdge` and the `TxOpAddEdge`/`TxOpUpdateEdge` resolver each check before
+anything is written — before the ID is issued and long before the WAL is touched,
+because a refusal whose record is already appended cannot be taken back by
+returning an error. `memory.Store` is the parity oracle and the disk backend must
+reject exactly what it rejects; `tests/graphene_edgeunique_test.go` runs every
+case against both.
+
+**A batch and a transaction check against themselves.** Two duplicates arriving
+together are the same violation as one arriving after the other, and the
+adjacency cannot see edges the batch has not applied yet. A batch keeps a
+`(pair, type) → batch index` claim set; a transaction keeps `txView.pairs`, the
+structural twin of `txView.claims` (§6.7).
+
+**And a transaction's deletions free what its own additions claimed.** This is
+the half that makes the constraint usable rather than merely safe: re-ingesting a
+source means deleting the subtree it owns and rebuilding it, in one transaction,
+and a check that only consulted the stored adjacency would see every edge the
+transaction had just removed and refuse the entire rebuild. `txView.storedEdgeBetween`
+skips edges the transaction has deleted or holds its own copy of, and
+`releaseEdgePairs` gives back the slots an edge held when it is deleted or
+relabelled. The reverse index `txView.pairsOf` is what keeps that O(slots held)
+rather than a walk of every claim — a transaction that deletes a subtree does it
+once per edge removed, and the walk would make that quadratic.
+
+Declarations live in memory, as unique keys do (§6.6), and validation at
+declaration time groups the type's edges by pair and reports every pair joined
+more than once. On disk that means resolving each candidate posting against the
+writer's epoch, which is the same order `EdgeCount` already pays.
+
+### 6.9 Counting without materialising
+
+`GraphStats` carried two numbers, and everything else a caller wanted — how many
+of each type, how an indexed field distributes, which neighbours are shared —
+meant pulling IDs into Go and counting them there. That is one `NodesByType` call
+per type and a copy of every ID in the graph, built to be discarded. Fine at 10^3
+entities; not fine at 10^5.
+
+`store.Aggregator` is the optional extension both backends implement:
+
+| Call | Memory | Disk |
+|---|---|---|
+| `CountNodesByType` | O(types) — posting lengths are exact | O(candidates) — postings are candidates until resolved |
+| `CountEdgesByType` | O(types) | O(candidates) |
+| `CountNodesByProperty` | O(entries under the key) | same, plus epoch resolution per holder |
+| `CountEdgesByProperty` | O(entries under the key) | same |
+
+The asymmetry is the delta layer. Memory maintains its label postings on every
+write *and unmaintains them on every delete*, so `len(nodesByType[t])` is the
+answer. On disk a posting is a candidate — entries are left behind while a
+snapshot pins an older view — so every one is re-resolved against the reader's
+epoch, which is the same order `NodeCount` already pays and still far cheaper
+than a per-type `NodesByType` loop, because nothing is copied into a result
+slice.
+
+Two contracts worth stating rather than leaving to be discovered:
+
+- **An entity is counted under every label it carries**, so the per-type counts
+  total more than `NodeCount` on any multi-label graph. `graphene store stats`
+  prints a note when that happens, because a reader who assumes otherwise
+  concludes the store is corrupt.
+- **Only live holders are counted, and only entities with an entry under the
+  key.** A posting can outlive the entity it names while a snapshot pins an older
+  view, and a distribution counting those would report entities no read would
+  return — the same liveness filter §6.6 applies for the same reason.
+
+There is no generic fallback: a `GraphStore` cannot enumerate its own types, so a
+backend without the extension gets an error rather than an empty map that would
+say the graph is empty. That is the `UniqueIndexDeclarer` rule (§13) rather than
+the `DegreeCounter` one.
+
+`NeighbourFrequency` is the third aggregate and lives in `traversal` instead,
+because it is the one that needs a budget. The anchor set is usually the result
+of an earlier query, so its size is data rather than something the caller chose,
+and one hub among the anchors makes the work arbitrarily large. It counts
+**anchors rather than edges** — a neighbour reached twice from one anchor is one
+vote — because counting edges would make the ranking depend on how the graph
+happens to be modelled rather than on what it says. It reuses the walker's
+incident-edge buffer and its per-expansion neighbour set, so the whole aggregate
+allocates one map plus the result.
 
 ---
 
@@ -1866,10 +2050,39 @@ graph, and `MaxTime` is the limit of last resort. Exceeding one is a **refusal,
 not a truncation** — a partial answer that looks complete is the failure mode
 this exists to prevent, so nothing partial comes back with the error.
 
-The context and clock are checked every 256 steps rather than every step:
-`ctx.Err()` takes a mutex on a cancellable context and `time.Now()` is a vDSO
-call, and neither is cheap a million times. The worst-case overshoot after a
-cancel is a few microseconds of walking.
+The context is checked every 256 steps rather than every step: `ctx.Err()` takes
+a mutex on a cancellable context, and that is not cheap a million times. The
+worst-case overshoot after a cancel is a few microseconds of walking.
+
+A deadline is checked on a much shorter cadence, every 16 steps, and the split is
+the point. 256 was answering a question about cancellation, where overshooting
+costs nothing because the caller has stopped caring about the answer. As a
+deadline cadence it left a hole: a walk charging fewer than 256 steps never
+reached the check at all, so `MaxTime` went unenforced on exactly the walks whose
+cost a caller cannot predict — few steps, each of them slow, which is what a
+traversal over cold pages looks like. `MaxNodes` and `MaxEdges` never had that
+hole, because they are charged per visit.
+
+16 is measured rather than assumed. `BenchmarkBFS_Deep_Budget` runs one fixture
+in three arms — `unbounded`, `nodes` (accounting, no deadline) and `time`
+(accounting plus a deadline) — and interleaved over ten runs, checking the clock
+on *every* step put the `time` arm at 2.712 ms against `nodes` at 2.317 ms. At 16
+it is 2.185 ms against 2.205 ms: indistinguishable, and the only significant
+movement in the comparison (−19.4%, p=0.003) while `unbounded` and every control
+sat still. The clock read is cheap; doing it on the inner loop of a walk that
+charges three ticks per node is not. Only a caller who set `MaxTime` pays for it
+at all — with no deadline the guard runs the code it always ran.
+
+What this cannot fix is a clock too coarse to see the deadline. The Go monotonic
+reading on Windows is `_INTERRUPT_TIME` from the `KUSER_SHARED_DATA` page, which
+advances at the system timer interrupt: 15.6 ms by default, ~0.5 ms while some
+process has raised the timer resolution. Two readings inside one tick are *equal*,
+not ordered, so a `MaxTime` shorter than a tick can never be observed as exceeded
+— by `After`, by `!Before`, or by any other comparison. `MaxTime` is therefore
+documented as best-effort with that floor named, and the enforcement tests drive
+an injected clock (`traversal/guard_test.go`) rather than asserting that the real
+one moved. A test that depends on the machine's timer resolution is a test that
+passes or fails according to what else is running on the box.
 
 A zero `Budget` with a background context sets a flag that makes every check a
 single boolean test, so the unbounded call costs what it always did — the
@@ -2750,6 +2963,14 @@ proportional to N's own entries — **686× faster** on a populated index.
 Implement `store.GraphStore`, then opt into whichever capability interfaces make
 sense (§2.3). The parity suite is the acceptance test: it compares the new
 backend against `memory.Store` across queries, traversals and mutations.
+
+Note which capabilities are constraints rather than optimisations (§2.3): an
+implementation of `UniqueIndexDeclarer` or `EdgeCardinalityDeclarer` must reject
+**exactly** what `memory.Store` rejects, on every write funnel, or the parity
+suite is measuring two different databases. For edge cardinality that is
+`AddEdge`, the batch form, `UpdateEdge`, and the `TxOpAddEdge`/`TxOpUpdateEdge`
+resolver — and the transaction must also see its own pending additions and its
+own deletions, which is the part a new backend is most likely to miss.
 
 ### 13.4 Invariants any change must preserve
 

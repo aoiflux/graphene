@@ -388,6 +388,86 @@ type UniqueIndexDeclarer interface {
 // one entity is given a key with no unique declaration.
 var ErrKeyNotUnique = errors.New("graphene: property key is not declared unique")
 
+// EdgeCardinalityDeclarer is an optional extension implemented by stores that
+// can enforce at most one live edge of a type between any two nodes.
+//
+// It is the structural counterpart to UniqueIndexDeclarer, and it exists because
+// that one does not scale to bulk edges: a unique property key costs an index
+// entry per edge, which a caller writing millions of ownership edges cannot
+// afford to spend restating what the endpoints already say. See
+// store/edgeunique.go for why the constraint is per label rather than per label
+// set.
+//
+// Like UniqueIndexDeclarer and unlike the ordered and composite declarers, this
+// is a constraint rather than an optimisation. A store that quietly does not
+// enforce it hands the caller the guarantee they asked for and none of the
+// behaviour, so Graph.DeclareUniqueEdge returns an error rather than nil when
+// the backend lacks it.
+type EdgeCardinalityDeclarer interface {
+	// DeclareUniqueEdgeType enforces at most one live edge of type t between any
+	// ordered pair of nodes from this point on, after checking that the graph
+	// already satisfies it.
+	//
+	// Existing data is validated first, and a graph that violates the constraint
+	// is reported through *EdgeCardinalityViolationsError naming every offending
+	// pair — not the first — so it can be repaired in one pass. Nothing is
+	// declared in that case.
+	//
+	// Declaring a type already declared is a no-op, so this is safe to call on
+	// every Open. Declarations live in memory: like unique property keys, they
+	// must be re-declared by the process that opens the store.
+	DeclareUniqueEdgeType(t EdgeType) error
+
+	// UniqueEdgeTypes returns the declared types, sorted.
+	UniqueEdgeTypes() []EdgeType
+
+	// EdgeBetween returns a live edge from src to dst carrying any of edgeTypes.
+	//
+	// nil edgeTypes means any type. Which edge, when several match, is
+	// unspecified unless the type is declared — the point of a declaration is
+	// that the question has one answer. found is false when no live edge
+	// matches, which is not an error.
+	EdgeBetween(src, dst NodeID, edgeTypes []EdgeType) (id EdgeID, found bool, err error)
+}
+
+// Aggregator is an optional extension implemented by stores that can count
+// without materialising what they count.
+//
+// The counts are the ones a caller cannot get cheaply from outside: a per-type
+// breakdown means one NodesByType call per type and a slice per call, and a
+// per-value breakdown means reading every entity under a key. Both are answered
+// here from postings the store already maintains.
+//
+// Unlike the constraint declarers this is an optimisation, but there is no
+// generic fallback to degrade to — a GraphStore cannot enumerate its own types —
+// so Graph reports an error rather than a wrong answer on a backend without it.
+// Both bundled backends implement it.
+type Aggregator interface {
+	// CountNodesByType returns the number of live nodes carrying each type.
+	//
+	// A node carrying two labels is counted under both, so the values sum to
+	// more than NodeCount on any graph using multi-label nodes. Types with no
+	// live nodes are absent rather than zero.
+	CountNodesByType(ctx context.Context) (map[NodeType]uint64, error)
+
+	// CountEdgesByType is CountNodesByType for edges, with the same
+	// multi-label caveat.
+	CountEdgesByType(ctx context.Context) (map[EdgeType]uint64, error)
+
+	// CountNodesByProperty returns the number of live nodes holding each
+	// distinct value under key.
+	//
+	// Only entities with an index entry under key are counted, which is the
+	// useful reading: the question is "how do the values of this indexed field
+	// distribute", and an entity that never registered one has no value to
+	// distribute. Values are the caller-encoded bytes as stored, keyed by their
+	// string form.
+	CountNodesByProperty(ctx context.Context, key string) (map[string]uint64, error)
+
+	// CountEdgesByProperty is CountNodesByProperty for edges.
+	CountEdgesByProperty(ctx context.Context, key string) (map[string]uint64, error)
+}
+
 // IndexVerifier is an optional extension implemented by stores that can
 // self-check their indexes against the records those indexes describe.
 type IndexVerifier interface {

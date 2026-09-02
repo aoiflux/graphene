@@ -698,6 +698,7 @@ outDeg, _ := g.OutDegree(nodeID, nil)
 deg, _ := g.Degree(nodeID, nil)
 
 exists, _ := g.EdgeExists(srcID, dstID, nil)
+id, found, _ := g.EdgeIDBetween(srcID, dstID, nil) // the edge itself, not just yes/no
 connected, _ := g.IsConnected(nodeA, nodeB)
 ```
 
@@ -718,6 +719,165 @@ nbrs, _ := g.NeighboursByNodeType(nodeID, store.DirectionOutbound, store.NodeTyp
 ```go
 nodes, edges, err := g.InducedSubgraph(scopeNodeIDs)
 ```
+
+### Preventing duplicate edges
+
+`UpsertNode` on a unique key keeps re-ingest from duplicating *entities*. The
+equivalent for *structure* is a cardinality declaration:
+
+```go
+g.DeclareUniqueEdge(edgeOwns)   // at most one Owns edge per (src, dst)
+```
+
+Reach for this instead of `UpsertEdge` when the edges are bulk relationships —
+"this version owns that method", by the million. `UpsertEdge` names an edge by a
+declared-unique *property*, which costs an index entry per edge to restate what
+the endpoints already say. `DeclareUniqueEdge` costs nothing stored at all; the
+rule is checked against the source node's outbound adjacency on the way in.
+
+```go
+_, err := g.AddEdge(&store.Edge{Src: a, Dst: b, Labels: []store.EdgeType{edgeOwns}})
+var taken *store.ErrEdgeTaken
+if errors.As(err, &taken) {
+    useExisting(taken.Owner)   // the edge that already joins them
+}
+```
+
+Three things to know before you declare one:
+
+- **It is per label and per direction.** An edge labelled `{Owns, Contains}`
+  counts against a declaration on each independently, and `a→b` and `b→a` are two
+  different pairs.
+- **Declare it at every `Open`.** Like unique property keys, declarations live in
+  memory. Declaring twice is a no-op, so put it beside the other declarations.
+- **It costs a scan of the source node's outbound edges per write.** That is
+  cheap when sources fan out to tens or hundreds of things, and expensive when
+  the source is a hub with a hundred thousand outbound edges. Declare it on
+  ownership edges, not on the edges pointing *into* your shared vocabulary.
+
+Declaring over a graph that already has duplicates tells you all of them:
+
+```go
+if err := g.DeclareUniqueEdge(edgeOwns); err != nil {
+    var v *store.EdgeCardinalityViolationsError
+    if errors.As(err, &v) {
+        for _, c := range v.Conflicts {
+            log.Printf("%d -> %d joined by %v", c.Pair.Src, c.Pair.Dst, c.IDs)
+        }
+    }
+}
+```
+
+or from the shell, without writing any code:
+
+```bash
+graphene debug unique-edge -type custom:0 ./store
+```
+
+#### Re-ingesting a source
+
+The constraint is designed around this shape, and the important part is that a
+transaction's own deletions free the pairs they were holding:
+
+```go
+tx := g.Begin()
+for _, id := range g.ownedBy(version) {
+    tx.DeleteNode(id)          // cascades to the edges
+}
+rebuildSubtree(tx, version)    // the same pairs, allowed again
+if err := tx.Commit(); err != nil { ... }
+```
+
+Run twice, that produces the same graph rather than a second copy of it — and
+anything the subtree merely *points at*, like a shared vocabulary node, is
+untouched.
+
+The thing to expect on the way there: **once the type is declared, re-running an
+ingest that adds its edges unconditionally is refused rather than absorbed.**
+That is the constraint working — the alternative is the silent second copy it
+exists to stop — but it does mean a pipeline written against a store without the
+declaration needs one of the two shapes, not neither:
+
+```go
+// Either: delete what this source owns, then rebuild it. One transaction.
+// Or: ask first, and use the edge that already joins them.
+if id, ok, err := g.EdgeIDBetween(src, dst, []store.EdgeType{edgeOwns}); err != nil {
+    return err
+} else if ok {
+    useExisting(id)
+} else {
+    g.AddEdge(&store.Edge{Src: src, Dst: dst, Labels: []store.EdgeType{edgeOwns}})
+}
+```
+
+Inside a transaction the refusal fails the whole commit, so a partial re-ingest
+is not a state the store can be left in.
+
+### Aggregates
+
+The counts you would otherwise write a loop for.
+
+```go
+// Rank what a set of nodes point at, by how many of them point at it.
+freq, _ := g.NeighbourFrequency(versions, store.DirectionOutbound,
+    []store.EdgeType{edgeEmbeds}, []store.NodeType{nodeTracker})
+
+// What is in this store?
+byType, _ := g.CountNodesByType()
+
+// How does an indexed field distribute?
+states, _ := g.CountNodesByProperty("state")
+```
+
+`NeighbourFrequency` counts **anchors, not edges**: a neighbour reached twice
+from one anchor is one vote. So `freq[tracker]` is "how many of these versions
+embed it", which is almost always the question, rather than "how many edges point
+at it", which depends on how you modelled the graph.
+
+Use the `Ctx` form whenever the anchor list came from a query rather than from
+you, and give it a budget — one hub in the anchor set is enough to make the work
+unbounded:
+
+```go
+freq, err := g.NeighbourFrequencyCtx(ctx, anchors, store.DirectionOutbound,
+    nil, nil, store.Budget{MaxEdges: 5_000_000})
+if errors.Is(err, store.ErrBudgetExceeded) {
+    // narrow the anchor set, or the edge types
+}
+```
+
+**A multi-label entity is counted under every label it carries**, so the per-type
+counts total more than `NodeCount`. That is not a bug and the CLI says so; if you
+want a partition rather than a breakdown, count a label you only ever apply
+alone.
+
+### Naming your custom types
+
+If you use the custom label range, name it. Otherwise everything the engine
+prints — logs, errors, CLI tables, exported visualisations — says `Custom(7)`,
+and you end up maintaining a translation table that can drift from the data.
+
+```go
+g.DeclareTypeNames(
+    map[store.NodeType]string{nodeApp: "App", nodeVersion: "AppVersion"},
+    map[store.EdgeType]string{edgeOwns: "Owns", edgeEmbeds: "Embeds"},
+)
+```
+
+Put it beside your other declarations at every `Open` — it is a no-op the second
+time. On a disk store the table is written to `graphene.labels` next to the
+image, which is the part that matters: **the store stays readable without your
+program**. Someone handed the directory a year from now sees `App`, not `32768`.
+
+`String()` renders the name and the parsers accept it, on top of everything they
+accepted before — `custom:0`, `Custom(0)` and the bare number all still resolve.
+Only the custom range can be named.
+
+If `Open` returns `store.ErrTypeNameConflict`, the store's table disagrees with
+what this process already registered. That is the engine refusing to render one
+store's data with another store's names; reconcile the numbering, or open them in
+separate processes.
+
 
 ## 8. Pattern Matching
 

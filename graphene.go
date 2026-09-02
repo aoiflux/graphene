@@ -79,6 +79,13 @@ func Open(dir string) (*Graph, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The label table, if the store carries one. A disagreement with what
+	// this process already believes is an error rather than a resolution —
+	// see typenames.go.
+	if err := loadTypeNames(s); err != nil {
+		s.Close()
+		return nil, err
+	}
 	return &Graph{GraphStore: s}, nil
 }
 
@@ -102,6 +109,13 @@ func Open(dir string) (*Graph, error) {
 func OpenReadOnly(dir string) (*Graph, error) {
 	s, err := disk.OpenReadOnly(dir)
 	if err != nil {
+		return nil, err
+	}
+	// The label table, if the store carries one. A disagreement with what
+	// this process already believes is an error rather than a resolution —
+	// see typenames.go.
+	if err := loadTypeNames(s); err != nil {
+		s.Close()
 		return nil, err
 	}
 	return &Graph{GraphStore: s}, nil
@@ -133,6 +147,13 @@ func OpenReadOnly(dir string) (*Graph, error) {
 func OpenLive(dir string) (*Graph, error) {
 	s, err := disk.OpenLive(dir)
 	if err != nil {
+		return nil, err
+	}
+	// The label table, if the store carries one. A disagreement with what
+	// this process already believes is an error rather than a resolution —
+	// see typenames.go.
+	if err := loadTypeNames(s); err != nil {
+		s.Close()
 		return nil, err
 	}
 	return &Graph{GraphStore: s}, nil
@@ -421,6 +442,67 @@ func (g *Graph) UniqueProperties() (nodeKeys, edgeKeys []string) {
 		return nil, nil
 	}
 	return d.UniqueNodeProperties(), d.UniqueEdgeProperties()
+}
+
+// DeclareUniqueEdge enforces that at most one live edge of type t joins any
+// ordered pair of nodes, and validates that the graph already satisfies it.
+//
+// This is the structural counterpart to DeclareUniqueProperty, and it exists
+// because that one does not scale to bulk edges. UpsertEdge resolves an edge
+// through a declared-unique *property*, which is right for an edge carrying
+// identity of its own and wrong for structure: a caller writing millions of
+// ownership edges would pay an index entry each to restate what the endpoints
+// already say. The alternative such a caller is left with is a convention —
+// own a subtree, delete it before re-ingesting, never add an edge twice by hand
+// — which holds exactly as long as nobody forgets.
+//
+//	if err := g.DeclareUniqueEdge(edgeOwns); err != nil {
+//	    var v *store.EdgeCardinalityViolationsError
+//	    if errors.As(err, &v) {
+//	        // v.Conflicts names every pair joined more than once
+//	    }
+//	}
+//
+// **Per label, not per label set.** An edge carries one or more types and every
+// filter in the engine treats a type list as OR over labels, so a declaration
+// names one type and means "at most one live edge from src to dst carries this
+// type". An edge labelled {Owns, Contains} counts against a declaration on each
+// independently.
+//
+// **Existing data is validated first, and every violation is reported**, not
+// the first: a caller declaring a constraint over an existing graph is about to
+// repair it, and one pair per pass turns a script into an afternoon. Nothing is
+// declared when the graph does not already satisfy the rule.
+//
+// Declaring a type already declared is a no-op, so this belongs at every Open.
+// Declarations live in memory and must be re-declared by each process that opens
+// the store — as with DeclareUniqueProperty, that is the contract rather than a
+// convenience.
+//
+// The constraint is answered from the source node's outbound adjacency rather
+// than from an index, so nothing new is stored and nothing can go stale — but
+// enforcement costs a scan of that adjacency on every write of a constrained
+// edge. That is cheap for the ownership edges this exists for and worth knowing
+// about before declaring a type whose sources are hubs.
+//
+// **Like DeclareUniqueProperty and unlike the ordered and composite
+// declarations, this returns an error on a backend that cannot enforce it.**
+func (g *Graph) DeclareUniqueEdge(t store.EdgeType) error {
+	d, ok := g.GraphStore.(store.EdgeCardinalityDeclarer)
+	if !ok {
+		return fmt.Errorf("DeclareUniqueEdge: %T cannot enforce edge cardinality", g.GraphStore)
+	}
+	return d.DeclareUniqueEdgeType(t)
+}
+
+// UniqueEdges returns the edge types currently under a cardinality constraint,
+// sorted.
+func (g *Graph) UniqueEdges() []store.EdgeType {
+	d, ok := g.GraphStore.(store.EdgeCardinalityDeclarer)
+	if !ok {
+		return nil
+	}
+	return d.UniqueEdgeTypes()
 }
 
 // UpsertNode creates or replaces the node identified by value under the
@@ -847,6 +929,42 @@ func (g *Graph) FindPatterns(pattern *traversal.Pattern, scope []store.NodeID, m
 // For a walk that must also see one consistent graph, take a Snapshot and pass
 // it to the traversal package directly — every function there accepts a
 // store.GraphReader, which a Snapshot is.
+
+// NeighbourFrequency counts, for each node one hop from any anchor, how many
+// distinct anchors reach it.
+//
+// This is the aggregate most cross-graph analytics turn out to be: rank the
+// things a set of sources point at, by how many of them point at it. "Which
+// trackers do the most app versions embed", "which permissions co-occur",
+// "which libraries are shared across the corpus" are one call each.
+//
+// The alternative is a loop over Neighbours in the caller, which materialises
+// every neighbouring record — labels and property blobs included — to increment
+// a counter and throw the record away.
+//
+//	freq, err := g.NeighbourFrequency(versions, store.DirectionOutbound,
+//	        []store.EdgeType{edgeEmbeds}, []store.NodeType{nodeTracker})
+//
+// Anchors are counted, not edges: a neighbour reached twice from one anchor
+// counts once, and a repeated anchor is one anchor. Counting edges would make
+// the answer depend on how the graph happens to be modelled rather than on what
+// it says.
+//
+// nil edgeTypes follows every edge and nil nodeTypes counts every neighbour;
+// both filters are OR over labels, as everywhere else.
+//
+// Use NeighbourFrequencyCtx on an anchor set whose size is data rather than
+// something you chose — it is the form that can be bounded and cancelled, and
+// one hub among the anchors is enough to make this arbitrarily large.
+func (g *Graph) NeighbourFrequency(anchors []store.NodeID, dir store.Direction, edgeTypes []store.EdgeType, nodeTypes []store.NodeType) (map[store.NodeID]uint64, error) {
+	return traversal.NeighbourFrequency(g.GraphStore, anchors, dir, edgeTypes, nodeTypes)
+}
+
+// NeighbourFrequencyCtx is NeighbourFrequency bounded by budget and cancellable
+// through ctx.
+func (g *Graph) NeighbourFrequencyCtx(ctx context.Context, anchors []store.NodeID, dir store.Direction, edgeTypes []store.EdgeType, nodeTypes []store.NodeType, budget store.Budget) (map[store.NodeID]uint64, error) {
+	return traversal.NeighbourFrequencyCtx(ctx, g.GraphStore, anchors, dir, edgeTypes, nodeTypes, budget)
+}
 
 // BFSCtx is BFS bounded by budget and cancellable through ctx.
 func (g *Graph) BFSCtx(ctx context.Context, origin store.NodeID, maxDepth int, dir store.Direction, edgeTypes []store.EdgeType, budget store.Budget) (*traversal.BFSResult, error) {
