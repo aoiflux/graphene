@@ -1176,6 +1176,44 @@ makes `DeclareUniqueEdge` return an error instead of `nil`: a constraint the
 store quietly does not enforce hands the caller the guarantee they asked for and
 none of the behaviour.
 
+**Which view a tracked read runs against.** A read and the validation of that
+read have to come from the same state, and until they did, a tracked
+read-modify-write loop under contention did not terminate.
+
+Group commit (§11.1) applies a batch under the write lock and publishes its
+epoch only once the fsync returns, so between those two points `visibleEpoch`
+lags what the delta already holds — deliberately, because that is the durability
+boundary doing its job. Validation cannot lag: it runs under the write lock and
+reads through `writerLocked`, for the reason that function documents. So a
+transaction read the old value, was refused by a writer it was not permitted to
+see, retried, read the *same* old value because the fsync was still outstanding,
+and was refused again. With a handful of concurrent writers there is always a
+commit in flight, so no attempt can ever incorporate the write refusing it. That
+is a livelock, not slowness, and no amount of retrying escapes it: measured at
+15 877 conflicts with five of six writers starved, against 1 046 conflicts and
+none starved with `SetSyncOnCommit(false)` — the sync being the entire window.
+
+`store.AppliedReader` closes it. A **tracked** transaction's `GetNode`,
+`GetEdge`, `NodeExists`, `EdgesOf` and `Neighbours` resolve through
+`AppliedNode`/`AppliedEdge`/`AppliedEdgesOf`, which read at the applied epoch
+under a read lock — the same view `validateReadsLocked` will use. The unique
+owner lookups were already on it: `UniqueNodeOwner` has resolved liveness
+through `nodeExistsLocked` since it was written.
+
+What a caller gets in exchange is a read of state that is committed but not yet
+durable. A crash losing that write loses this transaction's commit with it — the
+commit is ordered after it in the same log, and replay stops at the first bad
+frame — so a durable outcome never rests on a read that did not itself survive.
+An **untracked** transaction is deliberately left alone: it has no read set, so
+nothing it reads can refuse it, and there is no reason to show it state the disk
+has not accepted yet. Plain reads outside a transaction are unaffected and go on
+seeing only what is durable.
+
+The in-memory backend implements the capability too, where it is the ordinary
+read — one lock, no epochs, applied and visible are the same state. A capability
+only one backend offered would be one the tracked path took on disk and not in
+memory, and then the oracle would stop testing what the disk store does.
+
 ### 6.8 Edge cardinality, and why it is not an index
 
 A unique property key names an entity by a value. That is right for an edge
@@ -1307,7 +1345,14 @@ flowchart TD
     E --> G["4. ORDER<br/><i>skip if already ascending</i>"]
     F --> G
     G --> H["5. WINDOW<br/><i>Offset / Limit</i>"]
+    H -.->|"bound, when nothing<br/>between can remove a row"| B
+    H -.-> E
 ```
+
+The window is the last step, but it does not only run last: when nothing between
+a step and the window can remove a candidate, the bound is handed back to that
+step so it can stop producing. §7.3a gives the exact conditions and what they
+refuse.
 
 ### 7.2 Driver selection
 
@@ -1477,6 +1522,72 @@ now the shared-memory one. Measured interleaved with a flat control: **572–671
 an undeclared key — costs a scan of *every entry under its key*. Before residual
 costing, a query driven down to a single candidate still did work proportional to
 the graph to eliminate it.
+
+### 7.3a Stopping early: pushing a window into the pipeline
+
+`Offset`/`Limit` used to be the last step and only the last step: the pipeline
+produced every row, sorted them, and copied ten out. A query asking for ten rows
+off a 90 000-node label paid for 90 000 — the cost tracked the graph, not the
+answer.
+
+Two places now stop early, and both are gated on the same two conditions:
+**nothing between them and the window may remove a candidate**, and **the rows
+must be taken from the front**.
+
+**Into the driver.** `nodeDriverNeed` allows it only for an ascending,
+unfiltered, label-driven query — which is not a narrow special case but the only
+one that qualifies, because with no filters nothing else can drive. The label
+postings are merged rather than concatenated (§7.2), so they arrive in order and
+the merge simply stops after `Offset+Limit`. The type re-filter that would
+normally follow is skipped for this driver, because it re-resolves labels the
+driver already resolved against the records.
+
+It is refused for:
+
+| Case | Why |
+|---|---|
+| any property filter | a filter removes candidates, so the tenth candidate is not the tenth row |
+| an explicit `IDs` list | resolved in the caller's order, not ascending |
+| `Order: Desc` | the rows come from the far end; every ordered driver is ascending |
+| edge queries with `SrcIDs`/`DstIDs` | an endpoint restriction removes candidates exactly as a filter does |
+
+**Into the residual pass.** A filtered query cannot bound its driver, so the
+bound moves one step later. `NarrowNodesUntil` evaluates the residual filters
+over a **prefix** of the candidates, stops as soon as enough have survived, and
+**doubles the prefix** when they have not.
+
+The doubling is what protects the adaptivity. §7.3's whole argument is that
+probe-versus-build is decided per step *against the current candidate count*;
+narrowing a prefix keeps that decision, but makes it once per prefix. A fixed
+prefix would therefore pay the fixed part of that decision `N/chunk` times on a
+query that ends up draining everything. Doubling makes it `log N` times, which
+bounds the downside at a small constant factor of the single-pass cost while
+keeping the whole of the early-stop win.
+
+`MatchAny` takes neither. A candidate set driven by one filter is not a superset
+of the answer under `MatchAny` (§7.3), so there is nothing to narrow and nothing
+whose prefix means anything.
+
+**Measured**, interleaved against a control per CONTRIBUTING §1, on the 100 000-
+node benchmark fixture:
+
+| Query | Before | After |
+|---|---|---|
+| `Types + Limit 10`, disk | 17 952 B, 121 allocs | **160 B, 2 allocs** |
+| `Types + Limit 10`, memory | 7 416 B, 16 allocs | **240 B, 3 allocs** |
+| `Types + prefix filter + Limit 10`, disk | 19.1 MB, 90 818 allocs | **722 KB, 6 allocs** |
+| `Types + prefix filter + Limit 10`, memory | 9.55 MB, 559 allocs | **1.44 MB, 7 allocs** |
+
+Times moved with them — roughly 22 µs → 0.4 µs and 24 ms → 1.3 ms on the disk
+arm — but the allocation counts are the number to trust: they are deterministic,
+and the machine these ran on was not quiet.
+
+**What `QueryPlan.Candidates` now means.** A driver that stopped early never
+learned its own full size, so `Candidates` is what the query examined rather
+than what existed. Filling the field in properly would mean running the driver
+again unbounded, which would make asking for the plan cost more than the query.
+`ResidualStep.Probe` has always been documented as a forecast rather than a
+fact; this is the same trade, stated in the same place.
 
 ### 7.4 Comparison semantics — the sharpest edge in the system
 
@@ -2212,6 +2323,60 @@ lock — O(V+E) per snapshot in time and resident bytes. That is deliberate. It 
 the oracle the disk backend is tested against, so its answers have to be
 obviously correct by construction; a second versioning scheme would be a second
 thing that can be wrong in the same way.
+
+### 10.3a Iteration
+
+Every read on `GraphReader` answers with a slice. That is the right shape for a
+lookup and the wrong one for a graph: `QueryNodeIDs(NodeQuery{})` on a million
+nodes builds a million-element slice before the caller sees the first ID, and a
+bulk export then holds it for the whole of the export.
+
+`store.Scanner` is the other shape — `ScanNodes`, `ScanEdges` and
+`ScanNodesByType`, each an `iter.Seq2[ID, error]`. Both bundled backends
+implement it, on their `Snapshot` and not on the live store.
+
+**Why only over a snapshot.** It is the answer to the question a live iterator
+cannot answer: what a scan should do when a writer changes the graph underneath
+it. A snapshot has already fixed that (§10.3). It also makes the scan cheap — a
+delta layer a compaction has superseded is never written to again, so iterating
+one takes no lock at all. This is the same rule algorithms already follow.
+
+**Why `Seq2` and not `Seq`.** A scan can fail partway: the snapshot behind it
+can be closed or can expire while the caller is still pulling. The error is the
+last thing the sequence yields, and the ID beside it is not a result. Swallowing
+it would make a scan that stopped early indistinguishable from one that
+finished, which is the difference between a partial export and a complete one.
+Stopping early is `break`; nothing has to be closed.
+
+**Ascending, on both backends.** The same order the equivalent query returns, so
+a scan can replace one without changing what the consumer writes — `bulk`
+streams a source that implements `Scanner` and enumerates one that does not, and
+the two produce byte-identical dumps.
+
+**How the disk scan is bounded.** The obvious implementation — range the delta
+map, yield each ID, then walk the image — cannot be written, because a snapshot
+whose view the store is still writing to reads under `s.mu`, and yielding to
+caller code while holding it deadlocks against a caller that reads the store
+from inside its own loop. So a scan resolves a **batch** under the lock,
+releases it, and yields the batch; the lock is held for a fixed number of
+records at a time and never across caller code. The batch starts at 32 and
+doubles to 512, so a caller taking one ID and breaking does not pay to resolve
+five hundred, and a caller draining the graph reaches the full batch after five
+of them.
+
+**What it costs, honestly.** A scan is not O(1). The delta half has to be
+gathered and sorted up front — a map cannot be ranged across a lock release, and
+the result is promised ascending. What it is not is O(V+E): the image, which is
+the large half, is walked in place. So peak memory is the delta plus one batch
+rather than the graph, which is the whole win on a compacted store and is also
+when it matters. It is measured at 6 allocations for a full walk, and 6 for a
+walk stopped at the first ID — the number that matters being that neither grows
+with the graph.
+
+The in-memory backend materialises and sorts instead. A snapshot there is
+already a copy of the whole graph (§10.3), so streaming over it would save
+nothing, and what the oracle owes the disk store is an answer that is obviously
+right rather than one that is cheap.
 
 ### 10.4 Traversal budgets
 
@@ -3762,6 +3927,17 @@ Any change must preserve these. Each is enforced by tests.
 1. **No query language.** The planner is driven by the `NodeQuery` struct, not
    parsed text. There *is* a cost model — exact equality cardinality, sized
    ranges, residuals costed per strategy — inspectable via `ExplainNodeQuery`.
+1a. **A window is not always pushed down, and iteration is snapshot-only.** A
+   `Limit` reaches the driving step only for an ascending, unfiltered,
+   label-driven query, and reaches the residual pass only for an ascending
+   `MatchAll` one; the ordered-index driver emits value order rather than ID
+   order, and `MatchAny` builds a full match set to intersect, so neither can
+   take a bound (§7.3a). Both refuse it rather than approximating, so a
+   descending or `MatchAny` query still costs what it always did.
+   `store.Scanner` is offered over a `Snapshot` and not over a live store
+   (§10.3a) — which is the answer to what a live iterator should do when a
+   writer changes the graph beneath it, not an omission — and there is no
+   streaming form of a *filtered* query, only of the three enumerations.
 2. **Statistics are computed on demand, never persisted, and have no
    distribution.** Everything the planner costs it reads live from the indexes,
    so nothing can be stale and nothing is written to disk (§14.11). A range or
@@ -3827,7 +4003,10 @@ Any change must preserve these. Each is enforced by tests.
     will do it in the background (§9.5); left off, which is the default, it is
     the caller's loop around `Graph.ShouldCompact`. Nothing else caps the delta:
     everything written since the last compaction stays in memory and is replayed
-    at every open.
+    at every open. It also sets the floor on what iteration costs — a scan walks
+    the image in place but has to gather and sort the delta's IDs first (§10.3a),
+    so a store that never compacts gives up the streaming as well as the
+    memory.
 14. **A compaction still stalls writers for its pin and its commit** — ~17–20 ms
     on a 100 000-record store, down from the whole rebuild (§9.4). The remainder
     is the record scan, which is under the lock because the delta layer is

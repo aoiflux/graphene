@@ -513,3 +513,169 @@ func TestPropertyIndex_IdempotentRegistration(t *testing.T) {
 		t.Fatalf("NodesByProperty = %v, want exactly [%d]", ids, id)
 	}
 }
+
+// A window changes how many rows a query returns and nothing else.
+//
+// That is not free any more. The window is pushed into the label driver, which
+// stops the driving set short, and into the residual pass, which stops
+// evaluating filters once enough candidates have survived — so a query with a
+// limit now runs different code from the same query without one. The forced
+// scan cannot police that: it takes the same window through the same push-down,
+// so a bug in either would show up identically on both sides.
+//
+// The oracle here is the query itself, unwindowed. Whatever it returns, the
+// windowed form has to return the corresponding slice of it, for every query in
+// the planner's table and at several offsets — including offsets past the end,
+// where a bounded pass has the most room to lose its place.
+func runWindowParity(t *testing.T, f *plannerFixture) {
+	t.Helper()
+	windows := []struct{ offset, limit int }{
+		{0, 1}, {0, 5}, {0, 1000}, {3, 7}, {5, 2}, {50, 5}, {10000, 5},
+	}
+
+	for name, q := range plannerNodeQueries() {
+		if q.Limit != 0 || q.Offset != 0 {
+			continue // already windowed; its own parity case covers it
+		}
+		t.Run("node/"+name, func(t *testing.T) {
+			full, err := f.g.QueryNodeIDs(q)
+			if err != nil {
+				t.Fatalf("unwindowed query: %v", err)
+			}
+			for _, w := range windows {
+				windowed := q
+				windowed.Offset, windowed.Limit = w.offset, w.limit
+				got, err := f.g.QueryNodeIDs(windowed)
+				if err != nil {
+					t.Fatalf("offset %d limit %d: %v", w.offset, w.limit, err)
+				}
+				want := store.ApplyNodeQueryWindow(append([]store.NodeID(nil), full...), w.offset, w.limit)
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("offset %d limit %d: got %v, the unwindowed answer sliced is %v",
+						w.offset, w.limit, got, want)
+				}
+			}
+		})
+	}
+
+	for name, q := range plannerEdgeQueries(f.anchors) {
+		if q.Limit != 0 || q.Offset != 0 {
+			continue
+		}
+		t.Run("edge/"+name, func(t *testing.T) {
+			full, err := f.g.QueryEdgeIDs(q)
+			if err != nil {
+				t.Fatalf("unwindowed query: %v", err)
+			}
+			for _, w := range windows {
+				windowed := q
+				windowed.Offset, windowed.Limit = w.offset, w.limit
+				got, err := f.g.QueryEdgeIDs(windowed)
+				if err != nil {
+					t.Fatalf("offset %d limit %d: %v", w.offset, w.limit, err)
+				}
+				want := store.ApplyEdgeQueryWindow(append([]store.EdgeID(nil), full...), w.offset, w.limit)
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("offset %d limit %d: got %v, the unwindowed answer sliced is %v",
+						w.offset, w.limit, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestQueryPlanner_WindowParityMemory(t *testing.T) {
+	runWindowParity(t, buildPlannerFixture(t, graphene.NewInMemory(), false))
+}
+
+func TestQueryPlanner_WindowParityDiskDeltaOnly(t *testing.T) {
+	g, err := graphene.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer g.Close()
+	runWindowParity(t, buildPlannerFixture(t, g, false))
+}
+
+// The layer state the merge breaks on first, and therefore the one a bounded
+// merge breaks on first too.
+func TestQueryPlanner_WindowParityDiskSplitLayers(t *testing.T) {
+	g, err := graphene.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer g.Close()
+	runWindowParity(t, buildPlannerFixture(t, g, true))
+}
+
+func TestQueryPlanner_WindowParityDiskFullyCompacted(t *testing.T) {
+	g, err := graphene.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer g.Close()
+	f := buildPlannerFixture(t, g, false)
+	if err := g.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	runWindowParity(t, f)
+}
+
+// The residual pass evaluates a prefix of the candidates at a time and stops
+// when enough have survived, doubling the prefix as it goes. Everything above
+// runs on a few hundred candidates, which the first prefix covers whole — so
+// the part that has to hold its place across prefixes is exactly the part those
+// tests cannot reach.
+//
+// This builds a set several prefixes deep whose matches are all at the far end,
+// so a window can only be filled by crossing every boundary. The filter is a
+// contains, deliberately: an equality would drive the query from the property
+// index and hand the residual pass the answer rather than the search.
+func TestResidual_BoundedPassCrossesChunkBoundaries(t *testing.T) {
+	backends(t, func(t *testing.T, g *graphene.Graph) {
+		const n, matches = 3000, 40
+		for i := range n {
+			id, err := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}})
+			if err != nil {
+				t.Fatalf("AddNode %d: %v", i, err)
+			}
+			tier := "cold"
+			if i >= n-matches {
+				tier = "hot"
+			}
+			if err := g.IndexNodeProperties(id, map[string][]byte{
+				"tier": []byte(fmt.Sprintf("%s-%04d", tier, i)),
+			}); err != nil {
+				t.Fatalf("IndexNodeProperties: %v", err)
+			}
+		}
+
+		q := store.NodeQuery{
+			Types:   []store.NodeType{store.NodeTypeCase},
+			Filters: []store.PropertyFilter{{Key: "tier", Op: store.PropertyOpContains, Value: []byte("hot")}},
+		}
+		full, err := g.QueryNodeIDs(q)
+		if err != nil {
+			t.Fatalf("unwindowed: %v", err)
+		}
+		if len(full) != matches {
+			t.Fatalf("the fixture matched %d nodes, want %d", len(full), matches)
+		}
+
+		for _, w := range []struct{ offset, limit int }{
+			{0, 1}, {0, 5}, {0, matches}, {0, matches + 10}, {5, 5}, {matches - 1, 5}, {matches, 5},
+		} {
+			windowed := q
+			windowed.Offset, windowed.Limit = w.offset, w.limit
+			got, err := g.QueryNodeIDs(windowed)
+			if err != nil {
+				t.Fatalf("offset %d limit %d: %v", w.offset, w.limit, err)
+			}
+			want := store.ApplyNodeQueryWindow(append([]store.NodeID(nil), full...), w.offset, w.limit)
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("offset %d limit %d: got %d ids %v, want %d %v",
+					w.offset, w.limit, len(got), got, len(want), want)
+			}
+		}
+	})
+}

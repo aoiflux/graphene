@@ -1342,3 +1342,76 @@ Past that, `bulk` is the answer and per-entity atomicity is what it costs. A
 transaction that spilled to the WAL incrementally would remove the ceiling; at
 these numbers it is not yet worth the complexity, and this is the measurement to
 re-run before deciding otherwise.
+
+### v0.7.0 — a window that costs the window
+
+Before this, `Offset`/`Limit` was applied only at the end: the pipeline produced
+every row, ordered it, and copied ten out. The measurements below are what that
+cost, and what it costs now that the bound reaches back into the driving step
+and the residual pass (TECHNICAL_DETAILS §7.3a).
+
+Interleaved against a HEAD worktree with the control alternating, per
+CONTRIBUTING §1, on the 100 000-node fixture. **Read the allocation columns.**
+The machine was not quiet — several builds and test runs were competing for it —
+and the time column moved by a factor of three between rounds on *both* arms.
+Allocation counts are deterministic and did not move at all across five rounds.
+
+`BenchmarkQueryNodes_TypeLimit10_*` — ten rows off a label, no filter:
+
+| Arm | ns/op (median of 5) | B/op | allocs/op |
+|---|---:|---:|---:|
+| disk, before | 21 560 | 17 952 | 121 |
+| **disk, after** | **423** | **160** | **2** |
+| memory, before | 15 534 | 7 416 | 16 |
+| **memory, after** | **977** | **240** | **3** |
+
+`BenchmarkQueryNodes_TypeFilterLimit10_*` — ten rows off a label, narrowed by a
+prefix filter the property index cannot drive from:
+
+| Arm | ns/op (median of 3) | B/op | allocs/op |
+|---|---:|---:|---:|
+| disk, before | 43 116 988 | 19 118 154 | 90 818 |
+| **disk, after** | **1 296 228** | **722 016** | **6** |
+| memory, before | 51 303 314 | 9 551 867 | 559 |
+| **memory, after** | **5 473 468** | **1 442 912** | **7** |
+
+Two other benchmarks moved without being the target, both from the same change —
+label postings merged rather than concatenated and deduplicated through a map,
+which also retires the sort at the end of a labelled query:
+
+| Benchmark | Before | After |
+|---|---|---|
+| `QueryEdges_ByType_Disk` | 241 352 B, 1 038 allocs | 5 248 B, 53 allocs |
+| `QueryEdges_ByType_Memory` | 108 024 B, 31 allocs | 1 248 B, 3 allocs |
+| `NodesByType_Selective_Disk` | 4 136 B, 5 allocs | 896 B, 1 alloc |
+| `QueryNodes_PropertyRange_Disk` | 9 269 040 B, 573 allocs | 4 539 704 B, 43 allocs |
+
+The last of those is the full-scan driver, which no longer builds a `seen` map
+the delta/image disjointness already made redundant.
+
+**Checked for regressions**, since the shared paths were touched: every other
+query benchmark reported an identical allocation count on both arms. Two whose
+medians looked worse on the noisy run — `QueryNodes_PropertyEqual_Disk` and
+`QueryNodes_TwoEqualities_Memory` — were re-measured at `-benchtime=20000x`
+interleaved over five rounds and came out flat (194.5 ns vs 202.8 ns, and 473.3
+ns vs 468.9 ns; new arm first in both). That is what the short-run spread was:
+the machine, not the change.
+
+### v0.7.0 — the tracked-transaction livelock, measured
+
+`BeginTracked` under six concurrent writers incrementing one counter, twelve
+increments each, giving up after 2 000 conflicts. The read ran at the visible
+epoch and the validation at the applied one, which group commit holds apart for
+the whole of a commit's fsync:
+
+| Arm | conflicts | writers that gave up |
+|---|---:|---:|
+| `SetSyncOnCommit(true)` — the default | 15 877 | 5 of 6 |
+| `SetSyncOnCommit(false)` | 1 046 | 0 |
+
+The sync is the entire window, which is what identified the cause. With the read
+moved onto the applied view (`store.AppliedReader`) the default configuration
+converges; the test that produced these numbers is the convergence assertion in
+`tests/graphene_tx_read_test.go`, and the deterministic reproduction is
+`disk/applied_test.go`, which constructs the applied-but-not-visible state
+directly rather than racing for it.

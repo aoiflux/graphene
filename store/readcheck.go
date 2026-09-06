@@ -360,3 +360,44 @@ func ownerDesc(found bool, id uint64) string {
 }
 
 func quoteKey(k string) string { return "\"" + k + "\"" }
+
+// AppliedReader is an optional capability: reads resolved against the newest
+// applied state rather than the newest visible one.
+//
+// It exists for tracked transactions, and it exists because without it they do
+// not converge. A backend with group commit applies a batch under its write
+// lock and publishes it only once the fsync that makes it durable returns, so
+// for the length of that wait an ordinary read is an epoch behind what the
+// store already holds — deliberately, because that is the durability boundary
+// doing its job. Read-set validation cannot be behind: it runs under the write
+// lock and has to see every applied write, or it would refuse a transaction
+// over a write that had, in fact, already happened.
+//
+// So a tracked read and the validation of that read have to be taken from the
+// same view, and it has to be the newer one. When they are not, a
+// read-modify-write retry loop re-reads the same stale value for the whole of
+// the durability wait, is refused on it again, and under a handful of
+// concurrent writers never finishes: every attempt is rejected by a write the
+// reader is not permitted to see, so no attempt can ever incorporate it. That
+// is a livelock rather than slowness, and no amount of retrying escapes it.
+//
+// What a caller gets in exchange is a read of state that is committed but not
+// yet durable. A crash losing that write loses this transaction's commit with
+// it — the commit is ordered after it in the same log and replay stops at the
+// first bad frame — so a durable outcome never rests on a read that did not
+// itself survive. Reads outside a tracked transaction are unaffected, and go on
+// seeing only what is durable.
+//
+// A store that does not implement it still works. Tracked reads fall back to
+// the ordinary ones, which is correct, and on a backend with a visibility gap,
+// slow to converge.
+type AppliedReader interface {
+	// AppliedNode is GetNode against the newest applied state.
+	AppliedNode(id NodeID) (*Node, error)
+
+	// AppliedEdge is GetEdge against the newest applied state.
+	AppliedEdge(id EdgeID) (*Edge, error)
+
+	// AppliedEdgesOf is EdgesOf against the newest applied state.
+	AppliedEdgesOf(id NodeID, dir Direction, edgeTypes []EdgeType) ([]*Edge, error)
+}

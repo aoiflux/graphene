@@ -41,3 +41,22 @@ func (s *Store) validateReadsLocked(checks []store.ReadCheck) error {
 		},
 	}.Validate(checks)
 }
+
+// --- store.AppliedReader ---
+//
+// This backend has one lock and no epochs, so applied and visible are the same
+// state and these are the ordinary reads. It implements the capability anyway,
+// because one the two backends do not both offer is one the tracked-transaction
+// path would take on the disk store and not here — and the oracle would stop
+// testing what the disk store actually does.
+
+// AppliedNode implements store.AppliedReader.
+func (s *Store) AppliedNode(id store.NodeID) (*store.Node, error) { return s.GetNode(id) }
+
+// AppliedEdge implements store.AppliedReader.
+func (s *Store) AppliedEdge(id store.EdgeID) (*store.Edge, error) { return s.GetEdge(id) }
+
+// AppliedEdgesOf implements store.AppliedReader.
+func (s *Store) AppliedEdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]*store.Edge, error) {
+	return s.EdgesOf(id, dir, edgeTypes)
+}

@@ -131,6 +131,105 @@ A backend that does not implement the new `store.CheckedTransactor` refuses a
 transaction carrying reads rather than committing it unprotected. Both bundled
 backends implement it.
 
+### A query's cost tracks its answer, not the graph
+
+`Offset`/`Limit` used to be a step at the end of the pipeline and nothing more.
+The engine produced every row, sorted them, and copied ten out — so ten rows off
+a 100 000-node label cost the label. Nothing streamed either: there was no
+iterator anywhere in the module, and enumerating a graph meant materialising one
+ID per record before the caller saw the first one.
+
+**Label postings are merged rather than concatenated.** The delta's postings and
+the image's are both ascending and duplicate-free, and were being appended
+together and deduplicated through a map. Merging them drops the copy and the map
+— but the point is that the result is now *ordered*, which is what makes
+everything below sound: the label driver reports its candidates as ascending, and
+labelled queries skip the sort they used to end with.
+
+**A window is pushed back into the pipeline.** Where nothing between a step and
+the window can remove a row, the bound is handed to that step so it stops
+producing:
+
+| Query, 100 000-node fixture | Before | After |
+|---|---|---|
+| `Types + Limit 10`, disk | 17 952 B, 121 allocs | **160 B, 2 allocs** |
+| `Types + Limit 10`, memory | 7 416 B, 16 allocs | **240 B, 3 allocs** |
+| `Types + prefix filter + Limit 10`, disk | 19.1 MB, 90 818 allocs | **722 KB, 6 allocs** |
+| `Types + prefix filter + Limit 10`, memory | 9.55 MB, 559 allocs | **1.44 MB, 7 allocs** |
+
+The filtered case cannot bound its driver — a filter removes candidates, so the
+tenth candidate is not the tenth row — so the bound moves one step later: the
+residual pass evaluates a prefix of the candidates, stops when enough survive,
+and doubles the prefix when they do not. The doubling is what keeps §7.3's
+per-step probe-versus-build costing meaningful while bounding the repeated work
+at a small constant factor.
+
+Four cases refuse the bound rather than approximating it, and go on costing what
+they always did: a descending query, one driven from an explicit ID list, a
+`MatchAny` query, and an edge query restricted by endpoint. The ordered-index
+driver emits value order rather than ID order, so it cannot take one either.
+
+**Iteration, over a snapshot.** `store.Scanner` adds `ScanNodes`, `ScanEdges` and
+`ScanNodesByType`, each an `iter.Seq2[ID, error]`:
+
+```go
+snap, _ := g.Snapshot()
+defer snap.Close()
+
+for id, err := range snap.(store.Scanner).ScanNodes() {
+    if err != nil {
+        return err // closed or expired mid-scan
+    }
+    // ... break whenever you like
+}
+```
+
+It is offered over a `Snapshot` and not a live store, which is the answer to what
+a scan should do when a writer changes the graph beneath it rather than an
+omission. `Seq2` rather than `Seq` because a scan can fail partway and a scan
+that stopped early must not look like one that finished. IDs arrive ascending on
+both backends — the same order the equivalent query returns — so a scan
+substitutes for one: `bulk` now streams a source that implements `Scanner` and
+enumerates one that does not, and the two produce byte-identical dumps.
+
+The disk implementation resolves a batch under the store lock and yields it
+outside, never holding the lock across caller code; the batch starts at 32 and
+doubles to 512, so taking one ID does not pay to resolve five hundred. Peak
+memory is the delta plus one batch rather than the graph — 6 allocations for a
+full walk and 6 for a walk stopped at the first ID, neither growing with the
+graph. A snapshot also enumerates its property entries now, which is what lets it
+back a complete `bulk` export.
+
+### Fixed: `BeginTracked` livelocked under contention
+
+A read-modify-write retry loop with a few concurrent writers never finished. The
+transaction read at the visible epoch while its read set was validated at the
+applied one, and group commit leaves those apart for the whole of a commit's
+fsync — with the store lock released. So a transaction read the old value, was
+refused by a writer it was not permitted to see, retried, read the *same* old
+value because the fsync was still outstanding, and was refused again. With
+several writers there is always a commit in flight, so no attempt could ever
+incorporate the write refusing it. Measured at 15 877 conflicts with five of six
+writers starved; with `SetSyncOnCommit(false)`, which closes the window, 1 046
+conflicts and none starved.
+
+A tracked transaction's reads now resolve through the new `store.AppliedReader` —
+the same view its validation will use. The exchange is that such a read can see
+state that is committed but not yet durable; a crash losing that write loses this
+transaction's commit with it, since the commit is ordered after it in the same
+log and replay stops at the first bad frame. Untracked transactions and ordinary
+reads are unchanged and go on seeing only what is durable.
+
+### Fixed: an export could write a dump that could not be imported
+
+The property index is not versioned and its entries can outlive their records —
+indexing a node that has been deleted leaves one, and so does `ReindexKeep` on an
+update. `bulk` copied them out verbatim, so the dump named an entity it never
+defined and the import of it failed with `ErrOutOfOrder`, after the operator had
+a file they believed was a backup. Property entries whose entity is not there are
+now dropped, which is one lookup per entry rather than a set of everything
+exported — the export is streamed precisely so it does not hold the graph.
+
 ### Fixed
 
 - **A node updated inside a transaction disappeared for concurrent readers.**
@@ -173,6 +272,20 @@ backends implement it.
 - `BenchmarkTxUpdate_Disk_NoSync_*` isolates the transactional write path from
   the fsync, which dominates `BenchmarkConcurrentCommits` by an order of
   magnitude on a loaded machine.
+- `QueryPlan.Candidates` is now "candidates examined" rather than "size of the
+  driving set". A driver that stopped at the window never learned its own full
+  size, and running it again unbounded to fill the field in would make asking
+  for the plan cost more than the query. `ResidualStep.Probe` has always been
+  documented as a forecast rather than a fact; this is the same trade.
+- `TestQueryPlanner_WindowParity*` compares every windowed query against the
+  *unwindowed* one sliced, because the existing forced-scan oracle takes the
+  same window through the same push-down and would agree with a bug in it.
+  `TestResidual_BoundedPassCrossesChunkBoundaries` builds a candidate set
+  several prefixes deep whose matches are all at the far end, which is the only
+  way to reach the code that has to hold its place across them.
+- `TestAppliedReader_*` constructs the applied-but-not-visible state directly
+  rather than racing for it: the window it covers is open only while a commit
+  waits on its fsync, so a test that raced would pass on a fast disk.
 
 ---
 

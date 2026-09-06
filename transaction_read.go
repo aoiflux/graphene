@@ -340,7 +340,7 @@ func (tx *Tx) GetNode(id store.NodeID) (*store.Node, error) {
 		return n, nil
 	}
 
-	n, err := tx.g.GetNode(id)
+	n, err := tx.readNode(id)
 	if err != nil {
 		if isNotFound(err) {
 			tx.record(store.ReadCheck{Kind: store.ReadNode, ID: uint64(id)})
@@ -375,7 +375,7 @@ func (tx *Tx) NodeExists(id store.NodeID) (bool, error) {
 		return true, nil
 	}
 
-	exists := tx.g.nodeExists(id)
+	exists := tx.readNodeExists(id)
 	tx.record(store.ReadCheck{Kind: store.ReadNodeExists, ID: uint64(id), Exists: exists})
 	return exists, nil
 }
@@ -400,7 +400,7 @@ func (tx *Tx) GetEdge(id store.EdgeID) (*store.Edge, error) {
 		return e, nil
 	}
 
-	e, err := tx.g.GetEdge(id)
+	e, err := tx.readEdge(id)
 	if err != nil {
 		if isNotFound(err) {
 			tx.record(store.ReadCheck{Kind: store.ReadEdge, ID: uint64(id)})
@@ -444,7 +444,7 @@ func (tx *Tx) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.Ed
 	}
 	ov := tx.overlayFor()
 
-	base, err := tx.g.EdgesOf(id, dir, edgeTypes)
+	base, err := tx.readEdgesOf(id, dir, edgeTypes)
 	if err != nil && !isNotFound(err) {
 		return nil, err
 	}
@@ -608,11 +608,65 @@ func (tx *Tx) UniqueEdgeOwner(key string, value []byte) (store.EdgeID, bool, err
 		Value:  bytes.Clone(value),
 	})
 	if found {
-		if e, err := tx.g.GetEdge(owner); err == nil && ov.edgeGone(e) {
+		if e, err := tx.readEdge(owner); err == nil && ov.edgeGone(e) {
 			return store.InvalidEdgeID, false, nil
 		}
 	}
 	return owner, found, nil
+}
+
+// --- where a transaction's reads come from ---
+//
+// A tracked transaction reads from the view its commit will be validated
+// against, and an untracked one reads from the ordinary one. That difference is
+// the whole of store.AppliedReader, and its doc comment is where the reasoning
+// is: a tracked read taken from a view older than the validator's cannot ever
+// satisfy the validator while a commit is in flight, and a retry loop built on
+// one does not terminate.
+//
+// An untracked transaction is deliberately left alone. It has no read set, so
+// nothing it reads can refuse it, and there is no reason to show it state the
+// disk has not accepted yet.
+
+// appliedReads returns the backend's applied-state reader, or nil when this
+// transaction should not or cannot use one.
+func (tx *Tx) appliedReads() store.AppliedReader {
+	if !tx.tracked {
+		return nil
+	}
+	ar, _ := tx.g.GraphStore.(store.AppliedReader)
+	return ar
+}
+
+func (tx *Tx) readNode(id store.NodeID) (*store.Node, error) {
+	if ar := tx.appliedReads(); ar != nil {
+		return ar.AppliedNode(id)
+	}
+	return tx.g.GetNode(id)
+}
+
+func (tx *Tx) readEdge(id store.EdgeID) (*store.Edge, error) {
+	if ar := tx.appliedReads(); ar != nil {
+		return ar.AppliedEdge(id)
+	}
+	return tx.g.GetEdge(id)
+}
+
+func (tx *Tx) readEdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]*store.Edge, error) {
+	if ar := tx.appliedReads(); ar != nil {
+		return ar.AppliedEdgesOf(id, dir, edgeTypes)
+	}
+	return tx.g.EdgesOf(id, dir, edgeTypes)
+}
+
+// readNodeExists is Graph.nodeExists against the same view, materialising the
+// record only when the backend has no applied-state reader to ask.
+func (tx *Tx) readNodeExists(id store.NodeID) bool {
+	if ar := tx.appliedReads(); ar != nil {
+		_, err := ar.AppliedNode(id)
+		return err == nil
+	}
+	return tx.g.nodeExists(id)
 }
 
 // nodeExists asks the backend directly when it can answer without building the

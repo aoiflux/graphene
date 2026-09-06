@@ -416,6 +416,23 @@ func comparePropertyValues(actual []byte, expected []byte) int {
 	return bytes.Compare(actual, expected)
 }
 
+// QueryWindowNeed reports how many leading candidates an offset/limit window
+// can possibly keep, or 0 when it keeps all of them.
+//
+// It is what lets a driving step stop early. Stopping is only sound when
+// nothing between the driver and the window can remove a candidate and the
+// driver already emits in the requested order — the planner decides that, and
+// this only does the arithmetic.
+func QueryWindowNeed(offset, limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return offset + limit
+}
+
 // ApplyNodeQueryWindow applies offset/limit pagination over sorted node IDs.
 // Offset <= 0 means start from 0. Limit <= 0 means no upper bound.
 func ApplyNodeQueryWindow(ids []NodeID, offset, limit int) []NodeID {
@@ -577,7 +594,17 @@ type QueryPlan struct {
 	// no filter — an ID list, labels, adjacency or a scan.
 	DriverFilters FilterMask
 
-	Candidates int // size of the driving set
+	// Candidates is how many candidates the driving step produced — which is
+	// the size of the driving set only when the driver produced all of it.
+	//
+	// A window can be pushed into the driver, and then it stops as soon as it
+	// has offset+limit candidates and never learns how many more there were.
+	// Reporting the bounded number is the honest choice: it is what the query
+	// actually examined, and the alternative — running the driver again
+	// unbounded to fill this field in — would make asking for the plan cost
+	// more than the query. ResidualStep.Probe is documented the same way, as a
+	// forecast rather than a fact, for the same reason.
+	Candidates int
 	Residuals  []ResidualStep
 	Results    int
 }

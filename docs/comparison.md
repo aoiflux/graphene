@@ -67,6 +67,8 @@ that backend's data layout.
 | Pattern expression    | Programmatic `Pattern` structs (VF2 matcher) | Gizmo traversal chains                                      | Cypher `MATCH` patterns with arbitrary depth    |
 | Parameterised queries | N/A (Go type-safe API)                       | Gizmo functions                                             | Cypher parameters (`$param`)                    |
 | Aggregation           | Not built-in (caller aggregates results)     | Limited (via Gizmo)                                         | Full — `COUNT`, `SUM`, `AVG`, `COLLECT`, etc.   |
+| Streaming results     | Yes — `store.Scanner` over a `Snapshot` yields `iter.Seq2` | No — results materialise | Yes — driver-level result streaming |
+| Limit pushed into the plan | Yes, where nothing after the driver can remove a row | No | Yes |
 
 ---
 

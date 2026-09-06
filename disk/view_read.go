@@ -451,50 +451,88 @@ func (r reader) incidentEdgeIDsForAll(ids []store.NodeID, dir store.Direction) [
 	return out
 }
 
-// nodesByType returns the live node IDs carrying t.
+// nodesByType returns the live node IDs carrying t, ascending.
 //
 // The delta postings and the image's label index are candidate sources; each
 // candidate is re-resolved against this reader, because a posting may name a
 // node the reader cannot see, one whose label was since removed, or one that
 // was deleted.
-func (r reader) nodesByType(t store.NodeType) []store.NodeID {
-	candidates := make([]store.NodeID, len(r.v.delta.nodesByType[t]))
-	copy(candidates, r.v.delta.nodesByType[t])
+//
+// Both sources are already ascending and duplicate-free — the CSR by
+// construction (buildLabelIndex walks the records in ID order) and the delta
+// because indexNodeLabels maintains a sorted set — so this merges them rather
+// than concatenating and deduping through a map. That drops the copy and the
+// map, and, the reason it was done, makes the result ordered: it is what lets
+// the label driver report sortedAsc and skip the sort at the end of every
+// labelled query.
+func (r reader) nodesByType(t store.NodeType) []store.NodeID { return r.nodesByTypeN(t, 0) }
+
+// nodesByTypeN is nodesByType stopped after n live IDs, ascending. n <= 0 means
+// all of them.
+//
+// Stopping early is the point of the merge rather than a bonus from it: a
+// concatenate-and-dedupe has to touch both postings in full before it can name
+// the first ID, so `Limit: 10` over a large label cost the label. A merge names
+// them in order, so ten is ten.
+func (r reader) nodesByTypeN(t store.NodeType, n int) []store.NodeID {
+	d := r.v.delta.nodesByType[t]
+	var c []store.NodeID
 	if r.v.csr != nil {
-		candidates = append(candidates, r.v.csr.NodesByType(t)...)
+		c = r.v.csr.NodesByType(t)
 	}
-	seen := make(map[store.NodeID]struct{}, len(candidates))
-	out := make([]store.NodeID, 0, len(candidates))
-	for _, id := range candidates {
-		if _, ok := seen[id]; ok {
-			continue
+	out := make([]store.NodeID, 0, mergeCap(len(d)+len(c), n))
+	for i, j := 0, 0; i < len(d) || j < len(c); {
+		if n > 0 && len(out) == n {
+			break
 		}
-		if !r.nodeHasLabel(id, t) {
-			continue
+		var id store.NodeID
+		if j >= len(c) || (i < len(d) && d[i] <= c[j]) {
+			id = d[i]
+			// An ID both sources carry is one candidate, not two.
+			if j < len(c) && c[j] == id {
+				j++
+			}
+			i++
+		} else {
+			id = c[j]
+			j++
 		}
-		seen[id] = struct{}{}
-		out = append(out, id)
+		if r.nodeHasLabel(id, t) {
+			out = append(out, id)
+		}
 	}
 	return out
 }
 
-func (r reader) edgesByType(t store.EdgeType) []store.EdgeID {
-	candidates := make([]store.EdgeID, len(r.v.delta.edgesByType[t]))
-	copy(candidates, r.v.delta.edgesByType[t])
+// edgesByType is nodesByType for edges, and merges for the same reason.
+func (r reader) edgesByType(t store.EdgeType) []store.EdgeID { return r.edgesByTypeN(t, 0) }
+
+// edgesByTypeN is nodesByTypeN for edges.
+func (r reader) edgesByTypeN(t store.EdgeType, n int) []store.EdgeID {
+	d := r.v.delta.edgesByType[t]
+	var c []store.EdgeID
 	if r.v.csr != nil {
-		candidates = append(candidates, r.v.csr.EdgesByType(t)...)
+		c = r.v.csr.EdgesByType(t)
 	}
-	seen := make(map[store.EdgeID]struct{}, len(candidates))
-	out := make([]store.EdgeID, 0, len(candidates))
-	for _, id := range candidates {
-		if _, ok := seen[id]; ok {
-			continue
+	out := make([]store.EdgeID, 0, mergeCap(len(d)+len(c), n))
+	for i, j := 0, 0; i < len(d) || j < len(c); {
+		if n > 0 && len(out) == n {
+			break
 		}
-		if !r.edgeHasLabel(id, t) {
-			continue
+		var id store.EdgeID
+		if j >= len(c) || (i < len(d) && d[i] <= c[j]) {
+			id = d[i]
+			if j < len(c) && c[j] == id {
+				j++
+			}
+			i++
+		} else {
+			id = c[j]
+			j++
 		}
-		seen[id] = struct{}{}
-		out = append(out, id)
+		if r.edgeHasLabel(id, t) {
+			out = append(out, id)
+		}
 	}
 	return out
 }
@@ -553,62 +591,70 @@ func (r reader) edgeCount() uint64 {
 	return total
 }
 
-// allNodeIDs returns every live node ID. The planner's last-resort driver.
-func (r reader) allNodeIDs() []store.NodeID {
+// deltaLiveNodeIDs returns the node IDs the delta resolves to a live record at
+// this reader's epoch, in map order.
+//
+// Split out of allNodeIDs because the scan needs the two halves apart: the
+// delta's cannot be walked across a lock release, so a scan gathers it once,
+// while the image's is an indexed array a scan resumes into.
+func (r reader) deltaLiveNodeIDs() []store.NodeID {
 	out := make([]store.NodeID, 0, len(r.v.delta.nodes))
-	seen := make(map[store.NodeID]struct{}, len(r.v.delta.nodes))
 	for id, ver := range r.v.delta.nodes {
-		if n, ok := ver.at(r.epoch); !ok || n == nil {
-			continue
+		if n, ok := ver.at(r.epoch); ok && n != nil {
+			out = append(out, id)
 		}
-		seen[id] = struct{}{}
-		out = append(out, id)
 	}
+	return out
+}
+
+func (r reader) deltaLiveEdgeIDs() []store.EdgeID {
+	out := make([]store.EdgeID, 0, len(r.v.delta.edges))
+	for id, ver := range r.v.delta.edges {
+		if e, ok := ver.at(r.epoch); ok && e != nil {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// imageNodeLen is one past the last image record index, or zero with no image.
+func (r reader) imageNodeLen() int {
 	if r.v.csr == nil {
-		return out
+		return 0
 	}
-	for i := 1; i < len(r.v.csr.nodes); i++ {
+	return len(r.v.csr.nodes)
+}
+
+func (r reader) imageEdgeLen() int {
+	if r.v.csr == nil {
+		return 0
+	}
+	return len(r.v.csr.edges)
+}
+
+// allNodeIDs returns every live node ID. The planner's last-resort driver.
+//
+// The image half skips anything the delta has an opinion about, which is what
+// makes the two halves disjoint and is why this needs no dedupe of its own.
+func (r reader) allNodeIDs() []store.NodeID {
+	out := r.deltaLiveNodeIDs()
+	for i := 1; i < r.imageNodeLen(); i++ {
 		id := r.v.csr.nodes[i].ID
-		if id == store.InvalidNodeID {
+		if id == store.InvalidNodeID || r.deltaNodeKnown(id) {
 			continue
 		}
-		if r.deltaNodeKnown(id) {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
 		out = append(out, id)
 	}
 	return out
 }
 
 func (r reader) allEdgeIDs() []store.EdgeID {
-	out := make([]store.EdgeID, 0, len(r.v.delta.edges))
-	seen := make(map[store.EdgeID]struct{}, len(r.v.delta.edges))
-	for id, ver := range r.v.delta.edges {
-		if e, ok := ver.at(r.epoch); !ok || e == nil {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	if r.v.csr == nil {
-		return out
-	}
-	for i := 1; i < len(r.v.csr.edges); i++ {
+	out := r.deltaLiveEdgeIDs()
+	for i := 1; i < r.imageEdgeLen(); i++ {
 		id := r.v.csr.edges[i].ID
-		if id == store.InvalidEdgeID {
+		if id == store.InvalidEdgeID || r.deltaEdgeKnown(id) {
 			continue
 		}
-		if r.deltaEdgeKnown(id) {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
 		out = append(out, id)
 	}
 	return out
@@ -642,4 +688,15 @@ func (r reader) edgeLabelCandidateCount(types []store.EdgeType) int {
 		}
 	}
 	return total
+}
+
+// mergeCap sizes a merge's result: the sum of its inputs, or the bound when the
+// caller asked for fewer. Both postings are upper bounds — a candidate can
+// still fail to resolve — so this over-allocates by the same margin the
+// unbounded merge always has.
+func mergeCap(size, n int) int {
+	if n > 0 && n < size {
+		return n
+	}
+	return size
 }

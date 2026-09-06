@@ -53,3 +53,41 @@ func (s *Store) validateReadsLocked(checks []store.ReadCheck) error {
 		},
 	}.Validate(checks)
 }
+
+// --- store.AppliedReader ---
+//
+// The same view validateReadsLocked uses, offered to the reads whose answers it
+// will later be validating. store.AppliedReader says why they have to match.
+//
+// writerLocked under a read lock rather than an exclusive one: its own comment
+// asks for exclusivity because every mutator that calls it holds the write lock
+// anyway, but what it needs is that no mutation is half-applied, and a read
+// lock excludes writers just as well. UniqueNodeOwner has resolved liveness
+// this way since it was written.
+
+// AppliedNode implements store.AppliedReader.
+func (s *Store) AppliedNode(id store.NodeID) (*store.Node, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if n, ok := s.writerLocked().node(id); ok {
+		return n, nil
+	}
+	return nil, &store.ErrNotFound{Kind: "node", ID: uint64(id)}
+}
+
+// AppliedEdge implements store.AppliedReader.
+func (s *Store) AppliedEdge(id store.EdgeID) (*store.Edge, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if e, ok := s.writerLocked().edge(id); ok {
+		return e, nil
+	}
+	return nil, &store.ErrNotFound{Kind: "edge", ID: uint64(id)}
+}
+
+// AppliedEdgesOf implements store.AppliedReader.
+func (s *Store) AppliedEdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]*store.Edge, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.writerLocked().edgesOf(id, dir, edgeTypes), nil
+}

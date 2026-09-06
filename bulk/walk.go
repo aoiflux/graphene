@@ -19,6 +19,63 @@ import (
 	"github.com/aoiflux/graphene/store"
 )
 
+// eachNodeID visits every node ID src offers, in ascending order.
+//
+// A source that implements store.Scanner — which is what both bundled backends'
+// Snapshot does — is streamed, so the export holds one batch of IDs instead of
+// one per node in the graph. Anything else is enumerated into a slice first,
+// which is what every source did before and what a third-party store still
+// gets. Both orders are ascending, so which path ran is not observable in the
+// dump.
+func eachNodeID(src Source, visit func(store.NodeID) error) error {
+	if sc, ok := src.(store.Scanner); ok {
+		for id, err := range sc.ScanNodes() {
+			if err != nil {
+				return fmt.Errorf("bulk: enumerate nodes: %w", err)
+			}
+			if err := visit(id); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	ids, err := src.QueryNodeIDs(store.NodeQuery{})
+	if err != nil {
+		return fmt.Errorf("bulk: enumerate nodes: %w", err)
+	}
+	for _, id := range ids {
+		if err := visit(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// eachEdgeID is eachNodeID for edges.
+func eachEdgeID(src Source, visit func(store.EdgeID) error) error {
+	if sc, ok := src.(store.Scanner); ok {
+		for id, err := range sc.ScanEdges() {
+			if err != nil {
+				return fmt.Errorf("bulk: enumerate edges: %w", err)
+			}
+			if err := visit(id); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	ids, err := src.QueryEdgeIDs(store.EdgeQuery{})
+	if err != nil {
+		return fmt.Errorf("bulk: enumerate edges: %w", err)
+	}
+	for _, id := range ids {
+		if err := visit(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // encoder is the per-format half of an export.
 //
 // Methods are called in the order the package doc gives — header, nodes, edges,
@@ -36,11 +93,12 @@ type encoder interface {
 
 // walk exports src through enc.
 //
-// The two ID enumerations happen up front and the records are fetched one at a
-// time. That split is deliberate: the ID lists are one uint64 per record and
-// the hydrated records are not, so materialising the first and streaming the
-// second is what keeps an export's memory proportional to the graph's shape
-// rather than to its contents.
+// The records are fetched one at a time, never all at once: a hydrated record
+// carries its properties and a dump of a large graph would not fit if they were
+// all held. The IDs used to be materialised up front, one uint64 per record,
+// which is the cheap half of the same problem but still O(V+E) — so a source
+// that can stream them is streamed instead, and the export then holds one batch
+// of IDs rather than all of them. See eachNodeID.
 func walk(src Source, enc encoder, opts Options) (Summary, error) {
 	var sum Summary
 
@@ -56,11 +114,7 @@ func walk(src Source, enc encoder, opts Options) (Summary, error) {
 		return sum, err
 	}
 
-	nodeIDs, err := src.QueryNodeIDs(store.NodeQuery{})
-	if err != nil {
-		return sum, fmt.Errorf("bulk: enumerate nodes: %w", err)
-	}
-	for _, id := range nodeIDs {
+	if err := eachNodeID(src, func(id store.NodeID) error {
 		n, err := src.GetNode(id)
 		if err != nil {
 			// A record that vanished between the enumeration and the fetch is a
@@ -68,32 +122,34 @@ func walk(src Source, enc encoder, opts Options) (Summary, error) {
 			// an export of a live store possible at all; exporting from a
 			// Snapshot is how a caller gets one instant instead.
 			if isNotFound(err) {
-				continue
+				return nil
 			}
-			return sum, fmt.Errorf("bulk: read node %d: %w", id, err)
+			return fmt.Errorf("bulk: read node %d: %w", id, err)
 		}
 		if err := enc.node(n); err != nil {
-			return sum, err
+			return err
 		}
 		sum.Nodes++
+		return nil
+	}); err != nil {
+		return sum, err
 	}
 
-	edgeIDs, err := src.QueryEdgeIDs(store.EdgeQuery{})
-	if err != nil {
-		return sum, fmt.Errorf("bulk: enumerate edges: %w", err)
-	}
-	for _, id := range edgeIDs {
+	if err := eachEdgeID(src, func(id store.EdgeID) error {
 		e, err := src.GetEdge(id)
 		if err != nil {
 			if isNotFound(err) {
-				continue
+				return nil
 			}
-			return sum, fmt.Errorf("bulk: read edge %d: %w", id, err)
+			return fmt.Errorf("bulk: read edge %d: %w", id, err)
 		}
 		if err := enc.edge(e); err != nil {
-			return sum, err
+			return err
 		}
 		sum.Edges++
+		return nil
+	}); err != nil {
+		return sum, err
 	}
 
 	if !opts.SkipProperties {
@@ -109,8 +165,27 @@ func walk(src Source, enc encoder, opts Options) (Summary, error) {
 			return sum, fmt.Errorf("%w: %T", ErrNoPropertyEntries, src)
 		}
 		{
+			// An entry whose entity is not there is dropped rather than written.
+			// The property index is not versioned and an entry can outlive its
+			// record — a node indexed after it was deleted leaves one, and so does
+			// ReindexKeep — so without this an export succeeds and the import of
+			// what it wrote fails with "referenced before it is defined", which is
+			// a dump that cannot be restored and says nothing about why.
+			//
+			// It is a lookup per entry, not a set of everything exported: the
+			// export is streamed precisely so it does not hold the graph, and
+			// building the set to check against would put it back. A record
+			// deleted between its export and this check is dropped too, which is
+			// the same tolerance the record loops above already apply.
 			var perr error
 			pe.ForEachNodeProperty(func(id store.NodeID, key string, value []byte) bool {
+				if _, err := src.GetNode(id); err != nil {
+					if isNotFound(err) {
+						return true
+					}
+					perr = fmt.Errorf("bulk: read node %d: %w", id, err)
+					return false
+				}
 				if perr = enc.nodeProperty(id, key, value); perr != nil {
 					return false
 				}
@@ -121,6 +196,13 @@ func walk(src Source, enc encoder, opts Options) (Summary, error) {
 				return sum, perr
 			}
 			pe.ForEachEdgeProperty(func(id store.EdgeID, key string, value []byte) bool {
+				if _, err := src.GetEdge(id); err != nil {
+					if isNotFound(err) {
+						return true
+					}
+					perr = fmt.Errorf("bulk: read edge %d: %w", id, err)
+					return false
+				}
 				if perr = enc.edgeProperty(id, key, value); perr != nil {
 					return false
 				}

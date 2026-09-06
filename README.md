@@ -319,6 +319,7 @@ example:
 - Query plans via `ExplainNodeQuery` / `ExplainEdgeQuery`.
 - Sort direction control with `Order: store.QueryOrderAsc|QueryOrderDesc`.
 - Custom type selectors for user-defined labels (for example `custom:7`).
+- Streaming enumeration over a snapshot, via `store.Scanner`.
 
 This keeps query behavior explicit, type-safe, and easy to compose inside Go
 code.
@@ -335,6 +336,39 @@ ids, _ := g.QueryNodeIDs(store.NodeQuery{
 })
 ```
 
+**A `Limit` costs the limit, not the graph.** It is not only applied at the end:
+where nothing between the driving step and the window can remove a row, the
+bound is handed back so the driver stops producing, and a filtered query stops
+narrowing once enough candidates have survived. Ten rows off a 100 000-node
+label went from 17 952 bytes and 121 allocations to 160 and 2; ten rows off the
+same label with a filter the index cannot serve, from 19.1 MB and 90 818
+allocations to 722 KB and 6. A descending query, a `MatchAny` query, or one
+driven from an explicit ID list still pays in full — those cannot take a bound
+soundly, and the planner refuses rather than approximating.
+
+**Iterating instead of materialising.** Every ordinary read answers with a
+slice, which is wrong for a whole graph. Take a snapshot and iterate:
+
+```go
+snap, _ := g.Snapshot()
+defer snap.Close()
+
+sc := snap.(store.Scanner)
+for id, err := range sc.ScanNodes() {
+  if err != nil {
+    return err // the snapshot was closed or expired mid-scan
+  }
+  // ... break whenever you like
+}
+```
+
+`ScanNodes`, `ScanEdges` and `ScanNodesByType` yield ascending IDs — the same
+order the equivalent query returns — so a scan substitutes for one without
+changing what a consumer writes. `bulk` already does: an export from a snapshot
+streams, and produces a byte-identical dump to one that enumerated. Iteration is
+offered over a snapshot rather than a live store because that is what fixes what
+a scan should do when a writer changes the graph beneath it.
+
 ## Indexing
 
 Queries are served from indexes, not from scans. What exists today:
@@ -343,7 +377,7 @@ Queries are served from indexes, not from scans. What exists today:
 | --------------------- | ---------------------------------------------------- | ------------------------------------------------- |
 | Primary (ID → record) | Hash map in memory; direct array offset in the CSR   | `GetNode`, `GetEdge`                              |
 | Adjacency             | CSR prefix-sum arrays, plus a delta overlay          | Neighbours, traversal, anchored relations, degree |
-| Label (type)          | Postings per label, built for both the delta and CSR | `NodesByType`, `EdgesByType`, `Types` filters     |
+| Label (type)          | Ascending postings per label, in both the delta and CSR, merged on read | `NodesByType`, `EdgesByType`, `Types` filters     |
 | Property (secondary)  | Sorted postings per `(key, value)` + reverse ID map  | Equality filters, `NodesByProperty`               |
 | Ordered (range)       | Sorted values per _declared_ key, ascending postings | `>`, `>=`, `<`, `<=`, `Between`, `Prefix`         |
 

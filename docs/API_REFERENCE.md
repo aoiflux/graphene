@@ -426,6 +426,15 @@ as it did. And it is **not** serialisability: a decision made from the *absence*
 of anything matching a predicate is not protected, which is why there is no
 tracked `QueryNodeIDs`. See TECHNICAL_DETAILS §6.7a.
 
+**The retry loop terminates.** A tracked read is taken from the same view its
+validation will use — the newest *applied* state, not the newest durable one —
+so a retry sees the write that refused the previous attempt. The one consequence
+worth knowing is that a tracked read can therefore return state that is
+committed but not yet on the platter. It cannot leave you with a durable result
+that rests on one: this transaction's own commit is ordered after that write in
+the same log, so a crash losing the write loses the commit too. Reads outside a
+tracked transaction are unaffected and see only what is durable.
+
 **IDs are returned immediately, before commit.** That is what makes `tx.AddEdge`
 above able to name `fileID`. They are *reserved*, not created — a transaction
 that is rolled back or fails burns the IDs it took, and a later write gets higher
@@ -665,6 +674,55 @@ ids, err := snap.QueryNodeIDs(store.NodeQuery{Types: []store.NodeType{store.Node
 This is what a multi-step read needs: a traversal is many reads, and on a live
 store a concurrent delete can leave it holding an edge to a node that no longer
 exists. Over a snapshot it cannot.
+
+### Iterating a snapshot instead of materialising it
+
+Every read above answers with a slice, which is the right shape for a lookup and
+the wrong one for a whole graph: `QueryNodeIDs(store.NodeQuery{})` builds one ID
+per record before you see the first. A snapshot also implements
+`store.Scanner`, which yields them one at a time:
+
+```go
+type Scanner interface {
+    ScanNodes() iter.Seq2[store.NodeID, error]
+    ScanEdges() iter.Seq2[store.EdgeID, error]
+    ScanNodesByType(t store.NodeType) iter.Seq2[store.NodeID, error]
+}
+```
+
+```go
+snap, _ := g.Snapshot()
+defer snap.Close()
+
+sc, ok := snap.(store.Scanner)
+if !ok {
+    return fmt.Errorf("this store does not stream")   // both bundled ones do
+}
+for id, err := range sc.ScanNodes() {
+    if err != nil {
+        return err          // the snapshot was closed or expired mid-scan
+    }
+    if done(id) {
+        break               // stopping is break; nothing has to be closed
+    }
+}
+```
+
+**Check the error.** The sequences are `Seq2` rather than `Seq` because a scan
+can fail partway — the snapshot behind it can be closed or can expire while you
+are still pulling — and a non-nil error is the last thing the sequence yields,
+with the ID beside it not a result. Ignoring it makes a scan that stopped early
+look exactly like one that finished.
+
+**IDs arrive ascending**, the same order the equivalent query returns, on both
+backends. So a scan substitutes for a query without changing what the consumer
+writes — `bulk` streams a source that implements `Scanner` and enumerates one
+that does not, and the two produce byte-identical dumps.
+
+**Iteration is offered over a snapshot and not over a live store.** That is the
+answer to what a scan should do when a writer changes the graph beneath it: a
+snapshot has already fixed it. It is also what makes the scan cheap — peak
+memory is one batch plus the uncompacted delta, rather than the graph.
 
 ### What is fixed and what is not
 

@@ -259,6 +259,42 @@ func BenchmarkQueryNodes_TypeLimit10_Disk(b *testing.B) {
 	}
 }
 
+// Ten rows off a label, narrowed by a filter the property index cannot drive
+// from. The label supplies the candidates and the residual pass evaluates the
+// filter over them — so the question this asks is whether the residual pass
+// stops once it has ten survivors or evaluates the whole label first.
+func BenchmarkQueryNodes_TypeFilterLimit10_Memory(b *testing.B) {
+	f := memGraph()
+	q := store.NodeQuery{
+		Types:   []store.NodeType{store.NodeTypeMicroArtefact},
+		Filters: []store.PropertyFilter{{Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("bucket-00")}},
+		Limit:   10,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryNodes_TypeFilterLimit10_Disk(b *testing.B) {
+	f := diskGraph()
+	q := store.NodeQuery{
+		Types:   []store.NodeType{store.NodeTypeMicroArtefact},
+		Filters: []store.PropertyFilter{{Key: "bucket", Op: store.PropertyOpPrefix, Value: []byte("bucket-00")}},
+		Limit:   10,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.QueryNodeIDs(q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // =============================================================================
 // Property index — equality (index-accelerated) vs. non-equality (scan)
 // =============================================================================

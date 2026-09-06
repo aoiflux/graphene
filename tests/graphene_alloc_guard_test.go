@@ -83,7 +83,17 @@ func TestAllocGuards_ReadPath(t *testing.T) {
 	assertAllocsAtMost(t, "EdgeExists", 3, func() { g.EdgeExists(mid, ids[101], nil) })
 	assertAllocsAtMost(t, "EdgesOf", 6, func() { g.EdgesOf(mid, store.DirectionBoth, nil) })
 	assertAllocsAtMost(t, "Neighbours", 9, func() { g.Neighbours(mid, store.DirectionBoth, nil) })
-	assertAllocsAtMost(t, "NodesByType", 5, func() { g.NodesByType(store.NodeTypeMicroArtefact) })
+	// One allocation: the result. The label postings are merged rather than
+	// concatenated and deduped through a map, so the copy and the map are gone
+	// and this is the floor a slice-returning read can reach.
+	assertAllocsAtMost(t, "NodesByType", 2, func() { g.NodesByType(store.NodeTypeMicroArtefact) })
+
+	// A window on a labelled query must cost the window. The driver stops at
+	// offset+limit, so this is bounded by the ten rows asked for and not by the
+	// two hundred that carry the label — the whole point of the push-down, and
+	// the count that would climb back first if the driver stopped honouring it.
+	limited := store.NodeQuery{Types: []store.NodeType{store.NodeTypeMicroArtefact}, Limit: 10}
+	assertAllocsAtMost(t, "QueryNodeIDs with Limit 10", 4, func() { g.QueryNodeIDs(limited) })
 	assertAllocsAtMost(t, "BFSIDs depth 3", 6, func() {
 		g.BFSIDs(mid, 3, store.DirectionOutbound, nil)
 	})
@@ -119,5 +129,49 @@ func TestAllocGuards_AdjacencyReader(t *testing.T) {
 	}
 	assertAllocsAtMost(t, "IncidentEdges into a warm buffer", 0, func() {
 		buf, _ = adj.IncidentEdges(buf[:0], mid, store.DirectionBoth, nil)
+	})
+}
+
+// TestAllocGuards_Scan pins what iteration costs.
+//
+// A scan exists so a caller can visit a graph without holding it, so the number
+// that matters is not the total but that it does not grow with the graph: the
+// disk implementation resolves a fixed batch at a time and reuses one buffer
+// across batches, so a full walk of two hundred nodes allocates what a walk of
+// two hundred thousand would.
+func TestAllocGuards_Scan(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector allocates; these counts are not the engine's under it")
+	}
+	g, _ := allocGuardFixture(t)
+
+	snap, err := g.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snap.Close() }()
+	sc, ok := snap.(store.Scanner)
+	if !ok {
+		t.Fatal("a disk snapshot must implement store.Scanner")
+	}
+
+	assertAllocsAtMost(t, "ScanNodes, drained", 8, func() {
+		for _, err := range sc.ScanNodes() {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	assertAllocsAtMost(t, "ScanNodes, stopped at the first id", 8, func() {
+		for range sc.ScanNodes() {
+			break
+		}
+	})
+	assertAllocsAtMost(t, "ScanNodesByType, drained", 8, func() {
+		for _, err := range sc.ScanNodesByType(store.NodeTypeMicroArtefact) {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 	})
 }
