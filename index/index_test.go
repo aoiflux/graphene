@@ -1,7 +1,10 @@
 package index
 
 import (
+	"fmt"
 	"testing"
+
+	"github.com/aoiflux/graphene/store"
 )
 
 // --- PropertyIndex ---
@@ -95,5 +98,44 @@ func TestPropertyIndex_RemoveEdge(t *testing.T) {
 
 	if got := pi.EdgesByProperty("algo", []byte("tlsh")); len(got) != 1 || got[0] != 11 {
 		t.Fatalf("algo=tlsh after RemoveEdge(10): got %v, want [11]", got)
+	}
+}
+
+// The streaming walk owes the same order as the materialising one.
+//
+// Entries live in per-shard maps and Go randomises map iteration on every
+// range, so an unsorted walk enumerates one unchanged index differently on
+// every call. NodeEntries has always sorted; ForEachNodeProperty did not, and
+// the difference showed up as two exports of the same graph disagreeing about
+// the order of their property lines — about one run in seven on a key with 200
+// distinct values, which is why the fixture here has 200 of them.
+//
+// Repeated, because a single agreeing run proves nothing against a randomised
+// map: the first version of this walk passed one round in six.
+func TestPropertyIndex_StreamingWalkMatchesNodeEntries(t *testing.T) {
+	pi := NewPropertyIndex()
+	for i := range 600 {
+		pi.IndexNode(store.NodeID(i+1), "bucket", []byte(fmt.Sprintf("bucket-%04d", i%200)))
+		pi.IndexNode(store.NodeID(i+1), "sha256", []byte(fmt.Sprintf("%04x", i)))
+	}
+
+	want := pi.NodeEntries()
+	for round := range 20 {
+		got := make([]NodePropEntry, 0, len(want))
+		pi.ForEachNodeProperty(func(id store.NodeID, key string, value []byte) bool {
+			got = append(got, NodePropEntry{ID: id, Key: key, Value: append([]byte(nil), value...)})
+			return true
+		})
+		if len(got) != len(want) {
+			t.Fatalf("round %d: walked %d entries, NodeEntries has %d", round, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].ID != want[i].ID || got[i].Key != want[i].Key ||
+				string(got[i].Value) != string(want[i].Value) {
+				t.Fatalf("round %d: entry %d is (%d, %q, %q), NodeEntries has (%d, %q, %q)",
+					round, i, got[i].ID, got[i].Key, got[i].Value,
+					want[i].ID, want[i].Key, want[i].Value)
+			}
+		}
 	}
 }

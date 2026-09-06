@@ -239,6 +239,18 @@ type OrderedIndexDeclarer interface {
 	// DeclareOrderedEdgeProperty is the edge-property equivalent.
 	DeclareOrderedEdgeProperty(key string) error
 
+	OrderedIndexReporter
+}
+
+// OrderedIndexReporter is the read half of OrderedIndexDeclarer: which keys are
+// declared, without the power to declare one.
+//
+// It is split out because a declaration belongs to the store while a view of the
+// store does not get to change it, and a consumer that only wants to know —
+// an export writing the declarations into a dump header, a report naming them —
+// should be able to ask a Snapshot instead of having to hold the store as well.
+// Every OrderedIndexDeclarer satisfies it.
+type OrderedIndexReporter interface {
 	// OrderedNodeProperties returns the declared node keys, sorted.
 	OrderedNodeProperties() []string
 
@@ -328,6 +340,13 @@ type CompositeIndexDeclarer interface {
 	// DeclareCompositeEdgeProperties is the edge-property equivalent.
 	DeclareCompositeEdgeProperties(keys []string) error
 
+	CompositeIndexReporter
+}
+
+// CompositeIndexReporter is the read half of CompositeIndexDeclarer, split out
+// for the same reason OrderedIndexReporter is: a Snapshot can say what the store
+// declared without being able to declare anything itself.
+type CompositeIndexReporter interface {
 	// CompositeNodeProperties returns the declared node key tuples, each in its
 	// own declared order and the whole in a stable order.
 	CompositeNodeProperties() [][]string

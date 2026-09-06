@@ -192,12 +192,19 @@ type edgeBatcher interface {
 // header reads the declarations off a source that reports them. A source that
 // does not is not an error: the dump simply carries none, and an import of it
 // leaves the destination's own declarations alone.
+//
+// The assertion is on the reporter halves and not on the declarers, because a
+// Snapshot is the source an export should be taking — it streams, and it fixes
+// what the dump is a dump of — and a view is deliberately not allowed to
+// declare. Asserting the full declarer here meant a snapshot source silently
+// wrote a header with no declarations in it, so the dump imported without its
+// ordered and composite indexes.
 func declarationsOf(src Source) (ordNodes, ordEdges []string, compNodes, compEdges [][]string) {
-	if d, ok := src.(store.OrderedIndexDeclarer); ok {
+	if d, ok := src.(store.OrderedIndexReporter); ok {
 		ordNodes = d.OrderedNodeProperties()
 		ordEdges = d.OrderedEdgeProperties()
 	}
-	if d, ok := src.(store.CompositeIndexDeclarer); ok {
+	if d, ok := src.(store.CompositeIndexReporter); ok {
 		compNodes = d.CompositeNodeProperties()
 		compEdges = d.CompositeEdgeProperties()
 	}

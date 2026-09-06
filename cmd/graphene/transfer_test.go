@@ -11,8 +11,12 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/aoiflux/graphene"
+	"github.com/aoiflux/graphene/store"
 )
 
 // gzipped reports whether a file starts with the gzip magic number, which is
@@ -180,5 +184,69 @@ func TestGzipSubgraphExport(t *testing.T) {
 	}
 	if n := counts(t, dst)[0]; n != 3 {
 		t.Errorf("the scoped export round-tripped %d nodes, want 3", n)
+	}
+}
+
+// `export graph` reads through a snapshot rather than the live store, so the
+// dump is of one graph and bulk streams the enumeration instead of materialising
+// every ID first. A view cannot declare an index, only report what the store
+// declared — so the thing to check is that the declarations still reach the
+// dump, because losing them is silent: the import succeeds and the restored
+// store simply answers range and composite queries the slow way.
+func TestExportGraphCarriesDeclarations(t *testing.T) {
+	src := t.TempDir()
+	g, err := graphene.Open(src)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	id, err := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
+	if err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+	if err := g.IndexNodeProperties(id, map[string][]byte{
+		"sha256": []byte("aa11"),
+		"case":   []byte("c1"),
+		"bucket": []byte("b1"),
+	}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if err := g.DeclareOrderedProperty("sha256"); err != nil {
+		t.Fatalf("declare ordered: %v", err)
+	}
+	if err := g.DeclareCompositeProperties([]string{"case", "bucket"}); err != nil {
+		t.Fatalf("declare composite: %v", err)
+	}
+	if err := g.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	dump := filepath.Join(t.TempDir(), "graph.jsonl")
+	dst := filepath.Join(t.TempDir(), "restored")
+	if out, errb, code := exec(t, "export", "graph", "-to", dump, src); code != 0 {
+		t.Fatalf("export exited %d\n%s\n%s", code, out, errb)
+	}
+	if out, errb, code := exec(t, "import", "graph", "-from", dump, dst); code != 0 {
+		t.Fatalf("import exited %d\n%s\n%s", code, out, errb)
+	}
+
+	back, err := graphene.Open(dst)
+	if err != nil {
+		t.Fatalf("open the restored store: %v", err)
+	}
+	defer back.Close()
+
+	ord, _ := back.OrderedProperties()
+	if !slices.Contains(ord, "sha256") {
+		t.Errorf("the ordered declaration did not survive the export: %v", ord)
+	}
+	comp, _ := back.CompositeProperties()
+	found := false
+	for _, keys := range comp {
+		if slices.Equal(keys, []string{"case", "bucket"}) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the composite declaration did not survive the export: %v", comp)
 	}
 }

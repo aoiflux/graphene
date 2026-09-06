@@ -161,8 +161,14 @@ func runExportGraph(cx *Context, o *exportOpts) (Result, error) {
 	// Through the same writer `export subgraph` uses, so the two cannot disagree
 	// about what a jsonl export is, about refusing to overwrite, or about the
 	// order the gzip and file handles are closed in.
-	sum, err := writeExport(o.format, o.to, o.gzip, cx.Graph().GraphStore,
+	src, closeSrc := exportSource(cx.Graph())
+	sum, err := writeExport(o.format, o.to, o.gzip, src,
 		bulk.Options{SkipProperties: o.skipProps})
+	// The view is released whether or not the export worked, and its error is
+	// kept only when there is no better one to report.
+	if cerr := closeSrc(); err == nil {
+		err = cerr
+	}
 	if err != nil {
 		return r, err
 	}
@@ -180,6 +186,29 @@ func runExportGraph(cx *Context, o *exportOpts) (Result, error) {
 			"A store built from this dump answers no property query.")
 	}
 	return r, nil
+}
+
+// exportSource is the whole graph, as something bulk can stream.
+//
+// A snapshot rather than the store itself, for two reasons. bulk enumerates
+// through store.Scanner when its source offers one and otherwise materialises
+// every ID first — one uint64 per node and per edge, all of them, before the
+// first record is written — and Scanner is offered over a view and not over a
+// live store, for the reason store/scan.go gives. And a view fixes what the
+// dump is a dump of: the export reads one graph rather than whatever each read
+// happens to find, which matters most here, because a whole-graph export is the
+// longest read the tool makes.
+//
+// A backend that cannot provide a view falls back to the store, which is what
+// this command did before and is correct, only heavier. It does not arise
+// through the CLI, which opens the disk backend — but failing the export over
+// it would be the wrong answer to it.
+func exportSource(g *graphene.Graph) (bulk.Source, func() error) {
+	snap, err := g.Snapshot()
+	if err != nil {
+		return g.GraphStore, func() error { return nil }
+	}
+	return snap, snap.Close
 }
 
 // --- import graph ---

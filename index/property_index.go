@@ -519,17 +519,27 @@ func (p *PropertyIndex) EdgeCardinality(key string, value []byte) int {
 	return n
 }
 
-// ForEachNodeEntry calls fn for every (id, value) registered under key, holding
-// only a read lock and allocating nothing. Return false from fn to stop early.
+// ForEachNodeEntry calls fn for every (id, value) registered under key, in
+// (value, id) order, holding only a read lock. Return false from fn to stop
+// early.
 //
-// This is the scan path for operators the index cannot answer directly (prefix,
-// contains, and the ordered comparisons). It touches only the buckets belonging
-// to key, unlike NodeEntries which materialises the entire index.
+// It touches only the buckets belonging to key, unlike NodeEntries which
+// materialises the entire index — but it does allocate the key's distinct values
+// to order them, for the reason postings.forEach gives.
 func (p *PropertyIndex) ForEachNodeEntry(key string, fn func(id store.NodeID, value []byte) bool) {
 	sh := p.shardFor(key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	sh.nodes.forEach(key, fn)
+}
+
+// forEachNodeEntryBuf is ForEachNodeEntry with the value buffer carried in, for
+// a walk that spans keys. See postings.forEachBuf.
+func (p *PropertyIndex) forEachNodeEntryBuf(key string, dst []string, fn func(id store.NodeID, value []byte) bool) []string {
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	return sh.nodes.forEachBuf(key, dst, fn)
 }
 
 // ForEachNodeValue calls fn once per distinct value under key, with that value's
@@ -560,6 +570,14 @@ func (p *PropertyIndex) ForEachEdgeEntry(key string, fn func(id store.EdgeID, va
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	sh.edges.forEach(key, fn)
+}
+
+// forEachEdgeEntryBuf is forEachNodeEntryBuf for edge properties.
+func (p *PropertyIndex) forEachEdgeEntryBuf(key string, dst []string, fn func(id store.EdgeID, value []byte) bool) []string {
+	sh := p.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	return sh.edges.forEachBuf(key, dst, fn)
 }
 
 // NodeEntries returns all indexed node property entries, ordered by
@@ -629,7 +647,16 @@ func (p *PropertyIndex) EdgeEntries() []EdgePropEntry {
 
 // sortedBucketValues fills dst with bucket's distinct values in ascending order,
 // reusing dst's capacity across keys.
+//
+// It sizes the buffer to the bucket up front rather than letting append double
+// into it. Reuse alone is not enough when one key holds most of the index: the
+// first key it meets grows the slice by doubling and pays about twice the bytes
+// it ends up holding, which on the export path was 7 MB of a 100 000-entry key.
+// Sized once, the walk allocates the widest key's values and nothing after.
 func sortedBucketValues[T entityID](bucket map[string][]T, dst []string) []string {
+	if cap(dst) < len(bucket) {
+		dst = make([]string, 0, len(bucket))
+	}
 	dst = dst[:0]
 	for v := range bucket {
 		dst = append(dst, v)
@@ -1086,19 +1113,47 @@ func (p *postings[T]) forEachValue(key string, fn func(value []byte, ids []T) bo
 	}
 }
 
+// forEach visits every (id, value) under key, values in ascending byte order and
+// ids ascending within each value — the order NodeEntries produces, because this
+// is NodeEntries' streaming form and owes the same contract for the reason that
+// function's comment gives at length.
+//
+// The sort is not optional. Entries live in a map, Go randomises map iteration,
+// and an export walks this to write its property section: without it two dumps
+// of one unchanged graph differ in the order of their property lines, so an
+// export cannot tell a caller which of the two is the graph. It reproduced about
+// one run in seven on a 200-value key.
+//
+// forEachValue above deliberately does not sort. Its callers are filter scans
+// that read only the value and do not care in which order they reject it, and
+// they are the hot path this one is not: the only callers of forEach are
+// ForEachNodeProperty and ForEachEdgeProperty. The sort is over distinct values
+// while the walk it orders visits every entry under each of them, so it is the
+// smaller term either way.
 func (p *postings[T]) forEach(key string, fn func(id T, value []byte) bool) {
+	p.forEachBuf(key, nil, fn)
+}
+
+// forEachBuf is forEach with the value buffer supplied, so a walk over several
+// keys sorts into one slice instead of one per key. It returns the buffer,
+// grown to whatever the largest key needed — the same reuse NodeEntries makes
+// across its keys, and it matters for the same reason: the buffer is as long as
+// a key's distinct values, which on a high-cardinality key is most of the index.
+func (p *postings[T]) forEachBuf(key string, dst []string, fn func(id T, value []byte) bool) []string {
 	bucket := p.byKey[key]
 	if bucket == nil {
-		return
+		return dst
 	}
-	for value, ids := range bucket {
+	dst = sortedBucketValues(bucket, dst)
+	for _, value := range dst {
 		raw := unsafeBytes(value)
-		for _, id := range ids {
+		for _, id := range bucket[value] {
 			if !fn(id, raw) {
-				return
+				return dst
 			}
 		}
 	}
+	return dst
 }
 
 // forEachAll visits every (id, key, value) triple in the index, copying each
@@ -1247,13 +1302,20 @@ func deleteSorted[T entityID](ids []T, id T) ([]T, bool) {
 // The streaming counterpart to NodeEntries, and the one a bulk export wants:
 // NodeEntries materialises every triple in the index at once, which on a large
 // store is a slice proportional to everything that was ever indexed. This walks
-// the same triples one key at a time and allocates only the key list.
+// the same triples one key at a time, holding the key list and one buffer of
+// distinct values — reused across keys, so it grows to the widest key and not to
+// the index — rather than every triple.
+//
+// The order is the contract and not a convenience. An export writes its property
+// section from this walk, and two dumps of one unchanged graph that disagree
+// about the order of their property lines are two different dumps.
 //
 // The value slice is owned by the index: read it, do not retain or mutate it.
 func (p *PropertyIndex) ForEachNodeProperty(fn func(id store.NodeID, key string, value []byte) bool) {
+	var vals []string
 	for _, key := range p.nodePropKeys() {
 		stop := false
-		p.ForEachNodeEntry(key, func(id store.NodeID, value []byte) bool {
+		vals = p.forEachNodeEntryBuf(key, vals, func(id store.NodeID, value []byte) bool {
 			if !fn(id, key, value) {
 				stop = true
 				return false
@@ -1268,9 +1330,10 @@ func (p *PropertyIndex) ForEachNodeProperty(fn func(id store.NodeID, key string,
 
 // ForEachEdgeProperty is ForEachNodeProperty for edge properties.
 func (p *PropertyIndex) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value []byte) bool) {
+	var vals []string
 	for _, key := range p.edgePropKeys() {
 		stop := false
-		p.ForEachEdgeEntry(key, func(id store.EdgeID, value []byte) bool {
+		vals = p.forEachEdgeEntryBuf(key, vals, func(id store.EdgeID, value []byte) bool {
 			if !fn(id, key, value) {
 				stop = true
 				return false

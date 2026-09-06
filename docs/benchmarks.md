@@ -1487,3 +1487,59 @@ Allocation counts are identical everywhere. Bytes grow by one buffer's width —
 both directions on a loaded machine, which is why the allocation columns are the
 ones quoted; see CONTRIBUTING §1.
 
+
+### v0.7.0 — what streaming an export actually saves
+
+`export graph` used to hand `bulk` the live store, which is not a `store.Scanner`,
+so the export materialised every node and edge ID before writing a record. It
+now hands it a snapshot, which is. Both arms write the same JSONL dump of the
+100 000-node fixture to `io.Discard`, three iterations, three rounds:
+
+| Source | B/op | allocs/op |
+|---|---:|---:|
+| the live store — enumerate | 366 528 557 | 2 104 132 |
+| a snapshot — stream | 351 647 970 | 2 104 080 |
+
+**14.9 MB, or 4.1% of the export's total memory**, and the allocation count is
+flat. That is the honest size of it: the enumeration's own cost drops from
+O(V+E) IDs to one batch, but an export is dominated by hydrating and encoding
+every record — 2.1 million allocations of which the enumeration is a handful —
+so the saving is a slice, not a scaling change. It grows with the graph while
+the batch does not, which is the reason to take it; the record cost grows with
+the graph too, which is the reason it stays small as a fraction.
+
+Times were 0.69–1.39 s/op across both arms with the ranges overlapping, i.e.
+noise on a loaded machine (CONTRIBUTING §1), so no timing is quoted.
+
+The second thing the snapshot buys is not a number: the dump is of one graph.
+Reading through the store, each of the export's reads saw whatever was there
+when it ran.
+
+#### The property walk had to be sorted first, and the sort paid for itself
+
+The export above was not reproducible. `PropertyIndex.ForEachNodeProperty` — the
+streaming form of `NodeEntries`, and what writes a dump's property section —
+ranged the per-value map directly, so two exports of one unchanged graph
+disagreed about the order of their property lines about one run in seven on a
+key with 200 distinct values. `NodeEntries` has always sorted, and its comment
+explains at length why the order is a contract; the streaming form was written
+without it. Found by the end-to-end gate, pinned by
+`TestPropertyIndex_StreamingWalkMatchesNodeEntries` and
+`TestScan_ExportIsReproducible`, both of which repeat because one agreeing run
+proves nothing against a randomised map.
+
+Sorting costs a slice of each key's distinct values. Reusing one buffer across
+keys is not enough on its own — the first key grows it by doubling and pays
+about twice what it ends up holding — so `sortedBucketValues` now sizes to the
+bucket up front. That is a net win, because `NodeEntries` and `EdgeEntries`
+already shared the helper and were doing the doubling too:
+
+| Benchmark | B/op before | B/op after | allocs/op |
+|---|---:|---:|---:|
+| `NodeEntries/nodes=10000` | 1 950 514 | 1 467 033 | 20 014 → 20 005 |
+| `NodeEntries/nodes=50000` | 10 742 601 | 7 219 813 | 100 021 → 100 005 |
+
+**33% fewer bytes on the larger case**, on the path `Compact` uses to write the
+CSR index section. The export's own numbers above are measured after this
+change; the sort adds about 1.6 MB to a 366 MB export, which the sizing pays
+back several times over elsewhere.

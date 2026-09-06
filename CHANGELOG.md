@@ -200,6 +200,27 @@ full walk and 6 for a walk stopped at the first ID, neither growing with the
 graph. A snapshot also enumerates its property entries now, which is what lets it
 back a complete `bulk` export.
 
+A snapshot reports the store's index declarations too — the read half of the
+declarer interfaces, split out as `store.OrderedIndexReporter` and
+`store.CompositeIndexReporter`, because a view may say what was declared and must
+not declare anything itself. Without it a dump taken through a snapshot carried
+an empty header and imported with no ordered or composite indexes, which is a
+silent loss rather than a failure: the import succeeds and the restored store
+answers range and composite queries the slow way. `graphene export graph` now
+reads through a snapshot, so a whole-graph export streams its enumeration and
+dumps one graph rather than whatever each read happens to find.
+
+**Fixed: an export was not reproducible.** `PropertyIndex.ForEachNodeProperty`
+is the streaming form of `NodeEntries` and writes a dump's property section, but
+it ranged the per-value map directly instead of ordering it. Two exports of one
+unchanged graph therefore disagreed about the order of their property lines
+about one run in seven on a key with 200 distinct values — the same class of
+defect `NodeEntries` sorts to avoid, and whose reasoning that function's comment
+already gave. It now walks values in order. The buffer that orders them is sized
+to the key rather than grown by doubling, which makes `NodeEntries` and
+`EdgeEntries` cheaper as well: 33% fewer bytes on a 50 000-entry index, on the
+path `Compact` writes the CSR index section from.
+
 ### The shortest path can now be the cheapest one
 
 `ShortestPath` returns a path with the fewest edges, which is the right answer

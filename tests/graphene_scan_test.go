@@ -17,6 +17,7 @@ package graphene_test
 
 import (
 	"bytes"
+	"fmt"
 	"slices"
 	"testing"
 
@@ -61,12 +62,29 @@ func scanFixture(t *testing.T, g *graphene.Graph) {
 			t.Fatalf("DeleteNode: %v", err)
 		}
 	}
+	// Many distinct values per key, not one. The property section of a dump is
+	// written by walking the index by key and then by value, and a walk that did
+	// not order the values would still agree with itself on a key holding a
+	// single value — so a fixture with one value asserts nothing about the order
+	// and the tests below would pass over a randomised walk.
 	for i := 1; i < len(ids); i += 23 {
 		if err := g.IndexNodeProperties(ids[i], map[string][]byte{
-			"sha256": []byte("hash"),
+			"sha256": fmt.Appendf(nil, "hash-%04d", i),
+			"case":   fmt.Appendf(nil, "case-%02d", i%37),
+			"bucket": fmt.Appendf(nil, "bucket-%03d", i%53),
 		}); err != nil {
 			t.Fatalf("IndexNodeProperties: %v", err)
 		}
+	}
+
+	// Declared indexes, so the fixture has declarations for a dump header to
+	// carry. Without them every header is empty and a source that reports no
+	// declarations is indistinguishable from one that reports them all.
+	if err := g.DeclareOrderedProperty("sha256"); err != nil {
+		t.Fatalf("DeclareOrderedProperty: %v", err)
+	}
+	if err := g.DeclareCompositeProperties([]string{"case", "bucket"}); err != nil {
+		t.Fatalf("DeclareCompositeProperties: %v", err)
 	}
 }
 
@@ -336,6 +354,113 @@ func TestScan_BulkExportThroughASnapshotIsIdentical(t *testing.T) {
 		if !bytes.Equal(direct.Bytes(), streamed.Bytes()) {
 			t.Errorf("the streamed dump differs from the enumerated one: %d bytes vs %d",
 				streamed.Len(), direct.Len())
+		}
+	})
+}
+
+// A declaration belongs to the store, not to the view: a Snapshot reports what
+// the store declared and has no way to declare anything itself. That split is
+// what lets an export take a snapshot — the streaming source — and still write
+// the declarations into its dump header.
+//
+// It is asserted separately from the byte-comparison above because that test
+// only bites when there is something in the header to lose, which is a property
+// of the fixture rather than of the code under test.
+func TestScan_SnapshotReportsTheStoresDeclarations(t *testing.T) {
+	backends(t, func(t *testing.T, g *graphene.Graph) {
+		scanFixture(t, g)
+
+		wantOrdNodes, wantOrdEdges := g.OrderedProperties()
+		wantCompNodes, wantCompEdges := g.CompositeProperties()
+		if len(wantOrdNodes) == 0 || len(wantCompNodes) == 0 {
+			t.Fatalf("the fixture declares nothing, so this asserts nothing")
+		}
+
+		snap, err := g.Snapshot()
+		if err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		ord, ok := snap.(store.OrderedIndexReporter)
+		if !ok {
+			t.Fatalf("%T does not report its ordered declarations", snap)
+		}
+		comp, ok := snap.(store.CompositeIndexReporter)
+		if !ok {
+			t.Fatalf("%T does not report its composite declarations", snap)
+		}
+		if _, ok := snap.(store.OrderedIndexDeclarer); ok {
+			t.Errorf("%T can declare an ordered index; a view must not", snap)
+		}
+		if _, ok := snap.(store.CompositeIndexDeclarer); ok {
+			t.Errorf("%T can declare a composite index; a view must not", snap)
+		}
+
+		if got := ord.OrderedNodeProperties(); !slices.Equal(got, wantOrdNodes) {
+			t.Errorf("ordered node keys = %v, store says %v", got, wantOrdNodes)
+		}
+		if got := ord.OrderedEdgeProperties(); !slices.Equal(got, wantOrdEdges) {
+			t.Errorf("ordered edge keys = %v, store says %v", got, wantOrdEdges)
+		}
+		if got := comp.CompositeNodeProperties(); !tuplesEqual(got, wantCompNodes) {
+			t.Errorf("composite node keys = %v, store says %v", got, wantCompNodes)
+		}
+		if got := comp.CompositeEdgeProperties(); !tuplesEqual(got, wantCompEdges) {
+			t.Errorf("composite edge keys = %v, store says %v", got, wantCompEdges)
+		}
+
+		// A closed view answers from nothing, the same way its scans and its
+		// property walk do, rather than from a store the caller has let go of.
+		if err := snap.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if got := ord.OrderedNodeProperties(); got != nil {
+			t.Errorf("a closed snapshot reported ordered node keys %v", got)
+		}
+		if got := comp.CompositeNodeProperties(); got != nil {
+			t.Errorf("a closed snapshot reported composite node keys %v", got)
+		}
+	})
+}
+
+func tuplesEqual(a, b [][]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !slices.Equal(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// Two dumps of one unchanged graph must be the same dump.
+//
+// This is the assertion the byte-comparison above rests on and does not make:
+// comparing a streamed dump against an enumerated one says nothing if neither
+// is reproducible. The property section is where it was not — entries live in
+// per-shard maps, Go randomises map iteration, and the streaming walk did not
+// order the values it visited, so two exports of one store disagreed about the
+// order of their property lines roughly one run in seven.
+//
+// Repeated, because that is the only way a randomised order fails a comparison.
+func TestScan_ExportIsReproducible(t *testing.T) {
+	backends(t, func(t *testing.T, g *graphene.Graph) {
+		scanFixture(t, g)
+
+		var first bytes.Buffer
+		if _, err := bulk.ExportJSONL(&first, g.GraphStore, bulk.Options{}); err != nil {
+			t.Fatalf("export: %v", err)
+		}
+		for round := range 12 {
+			var again bytes.Buffer
+			if _, err := bulk.ExportJSONL(&again, g.GraphStore, bulk.Options{}); err != nil {
+				t.Fatalf("export: %v", err)
+			}
+			if !bytes.Equal(first.Bytes(), again.Bytes()) {
+				t.Fatalf("round %d: two exports of an unchanged graph differ (%d bytes vs %d)",
+					round, again.Len(), first.Len())
+			}
 		}
 	})
 }

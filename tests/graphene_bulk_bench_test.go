@@ -18,12 +18,14 @@ package graphene_test
 
 import (
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"sort"
 	"testing"
 
 	"github.com/aoiflux/graphene"
+	"github.com/aoiflux/graphene/bulk"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -355,4 +357,45 @@ func BenchmarkBulkRead_Shuffled_SortedWalk_Disk(b *testing.B) {
 			}
 		})
 	}
+}
+
+// --- Export enumeration -------------------------------------------------
+
+// The two ways an export can enumerate what it is exporting.
+//
+// bulk streams a source that implements store.Scanner and materialises every ID
+// up front on one that does not — one uint64 per node and per edge, all of them,
+// before the first record is written. Scanner is offered over a view and not
+// over a live store, so which of the two an export gets is decided entirely by
+// what it is handed: `graphene export graph` passes a snapshot for this reason.
+//
+// Both write the same dump. The difference is in bytes and not in time, because
+// both fetch every record one at a time and that dominates — which is the
+// honest way to report it.
+func benchmarkExport(b *testing.B, src bulk.Source) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := bulk.ExportJSONL(io.Discard, src, bulk.Options{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkExport_JSONL_Store_Disk(b *testing.B) {
+	f := diskGraph()
+	benchmarkExport(b, f.g.GraphStore)
+}
+
+func BenchmarkExport_JSONL_Snapshot_Disk(b *testing.B) {
+	f := diskGraph()
+	snap, err := f.g.Snapshot()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer snap.Close()
+	if _, ok := snap.(store.Scanner); !ok {
+		b.Fatalf("%T is not a store.Scanner, so this measures nothing", snap)
+	}
+	benchmarkExport(b, snap)
 }

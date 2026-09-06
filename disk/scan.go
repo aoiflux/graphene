@@ -331,3 +331,48 @@ func (sn *snapshot) edgeExists(id store.EdgeID) bool {
 	}
 	return r.edgeExists(id)
 }
+
+// --- Declarations ---
+
+// A snapshot reports the store's declarations but cannot make one: the read
+// half of the declarer interfaces, and not the write half. A declaration is a
+// property of the store rather than of a view of it — the ordered index a key
+// is answered from is the one the store holds now, whatever epoch this snapshot
+// pins — so there is nothing here to fix at snapshot time and nothing a view
+// would be entitled to change.
+//
+// They exist because a snapshot is meant to be usable as a bulk.Source, and an
+// export writes the declarations into its dump header. Without them the header
+// came out empty and the dump imported with no ordered or composite indexes,
+// which is a silent loss rather than a failure.
+//
+// A closed or expired snapshot reports nothing, matching what the property walk
+// above does rather than answering from a view the caller has let go of.
+
+func (sn *snapshot) OrderedNodeProperties() []string {
+	if _, _, err := sn.use(); err != nil {
+		return nil
+	}
+	return sn.s.OrderedNodeProperties()
+}
+
+func (sn *snapshot) OrderedEdgeProperties() []string {
+	if _, _, err := sn.use(); err != nil {
+		return nil
+	}
+	return sn.s.OrderedEdgeProperties()
+}
+
+func (sn *snapshot) CompositeNodeProperties() [][]string {
+	if _, _, err := sn.use(); err != nil {
+		return nil
+	}
+	return sn.s.CompositeNodeProperties()
+}
+
+func (sn *snapshot) CompositeEdgeProperties() [][]string {
+	if _, _, err := sn.use(); err != nil {
+		return nil
+	}
+	return sn.s.CompositeEdgeProperties()
+}

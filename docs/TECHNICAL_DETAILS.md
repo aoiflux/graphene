@@ -2478,6 +2478,24 @@ already a copy of the whole graph (§10.3), so streaming over it would save
 nothing, and what the oracle owes the disk store is an answer that is obviously
 right rather than one that is cheap.
 
+**What a snapshot reports, and what it may not do.** A scan is only half of what
+makes a view usable as a `bulk.Source`. The other half is the header: an export
+writes the store's ordered and composite declarations into the dump so the
+import can rebuild the same indexes. Those live on the store and not on the
+view — the ordered index a key is answered from is the one the store holds now,
+whatever epoch the snapshot pins — so `store.OrderedIndexReporter` and
+`store.CompositeIndexReporter` were split out of the declarer interfaces as
+their read halves, and both snapshots implement them by forwarding. A view
+deliberately does not satisfy the declarers: it may say what was declared and
+may not declare. A closed or expired snapshot reports nothing, matching what its
+scans and its property walk do rather than answering from a store the caller has
+let go of.
+
+The consequence of getting this wrong was silent, which is why it is stated
+here: `bulk` asserted the full declarer, so a dump taken through a snapshot came
+out with an empty header, imported without complaint, and left the restored
+store answering range and composite queries by scanning.
+
 ### 10.4 Traversal budgets
 
 Depth was the only limit a traversal took, and depth bounds nothing once a hub is

@@ -123,3 +123,41 @@ func (sn *snapshot) ForEachEdgeProperty(fn func(id store.EdgeID, key string, val
 		return fn(id, key, value)
 	})
 }
+
+// --- Declarations ---
+
+// The reference backend's half of the rule disk/scan.go states: a snapshot
+// reports what the store declared and cannot declare anything itself, and a
+// closed one reports nothing.
+
+func (sn *snapshot) OrderedNodeProperties() []string {
+	s, err := sn.live()
+	if err != nil {
+		return nil
+	}
+	return s.OrderedNodeProperties()
+}
+
+func (sn *snapshot) OrderedEdgeProperties() []string {
+	s, err := sn.live()
+	if err != nil {
+		return nil
+	}
+	return s.OrderedEdgeProperties()
+}
+
+func (sn *snapshot) CompositeNodeProperties() [][]string {
+	s, err := sn.live()
+	if err != nil {
+		return nil
+	}
+	return s.CompositeNodeProperties()
+}
+
+func (sn *snapshot) CompositeEdgeProperties() [][]string {
+	s, err := sn.live()
+	if err != nil {
+		return nil
+	}
+	return s.CompositeEdgeProperties()
+}

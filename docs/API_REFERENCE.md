@@ -724,6 +724,15 @@ answer to what a scan should do when a writer changes the graph beneath it: a
 snapshot has already fixed it. It is also what makes the scan cheap — peak
 memory is one batch plus the uncompacted delta, rather than the graph.
 
+**A snapshot reports declarations but cannot make one.** It satisfies
+`store.OrderedIndexReporter` and `store.CompositeIndexReporter` — the read half
+of the declarer interfaces — so a consumer that only wants to know which keys
+are indexed can ask the view rather than having to hold the store as well. That
+is what lets a snapshot back a complete `bulk` export: the declarations reach
+the dump header, and the import rebuilds the same indexes. It is deliberately
+not an `OrderedIndexDeclarer`; a declaration belongs to the store, and a view
+does not get to change it.
+
 ### What is fixed and what is not
 
 **Fixed:** nodes, edges, adjacency, labels, and everything derived from them —
