@@ -111,18 +111,23 @@ that backend's data layout.
 | Concurrent write safety    | Mutex-protected delta writes                             | Backend-dependent                                      | Full concurrent transactional writes |
 | Multi-process access       | One writer, many readers — enforced by an OS lock on the store directory (flock / LockFileEx) | Backend-dependent; most embedded KV stores are single-process | Client/server: any number of processes |
 | Reader freshness           | A read-only store is a snapshot fixed at open; reopen to advance | Backend-dependent | Live |
-| Optimistic locking         | No                                                       | No                                                     | Yes                                  |
+| Optimistic locking         | Yes — `BeginTracked` validates a read set at commit       | No                                                     | Yes                                  |
 
 **On "ACID" for Graphene.** `Begin()` buffers creates, updates and deletes and
 commits them through one framed WAL write with an `fsync`, so a transaction is
 **atomic** (all or nothing, including a node deletion's edge cascade) and
-**durable** (survives power loss once committed). It is **not isolated**: there
-is no snapshot, no read view, and no conflict detection. Two concurrent
-transactions touching the same entity both apply, last write winning. Consistency
-is enforced structurally — no edge can commit without live endpoints — rather
-than by user-defined constraints.
+**durable** (survives power loss once committed). It is **partly isolated**:
+`Snapshot()` gives a fixed read view, and `BeginTracked()` records what a
+transaction read and refuses the commit if any of it moved, so a read-modify-write
+cannot lose an update. That is optimistic concurrency control over identified
+records, not serialisability — a decision made from the absence of anything
+matching a predicate is still unprotected, and two transactions touching the same
+entity without tracking still both apply, last write winning. Consistency is
+enforced structurally — no edge can commit without live endpoints — and by the
+declared constraints (unique property keys, edge cardinality), which are recorded
+in the store rather than in the process.
 
-So: A and D yes, C structurally, I no.
+So: A and D yes, C structurally plus declared constraints, I opt-in and bounded.
 
 ---
 

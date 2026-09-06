@@ -125,7 +125,7 @@ func InspectCSR(path string) (CSRInfo, error) {
 				known := false
 				switch s.Magic {
 				case csrSectionPropIndex, csrSectionOrderedKeys, csrSectionEntityHash, csrSectionAttestation,
-					csrSectionTombstones:
+					csrSectionTombstones, csrSectionComposite:
 					known = true
 				}
 				info.Sections = append(info.Sections, CSRSectionInfo{

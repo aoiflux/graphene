@@ -714,17 +714,32 @@ func resolveProps(props map[string][]byte) ([]propEntry, error) {
 
 // ApplyTransaction implements store.Transactor.
 func (s *Store) ApplyTransaction(ops []store.TxOp) error {
-	if err := s.mustWrite(); err != nil {
-		return err
-	}
-	return s.ApplyTransactionAs(ops, store.TxContext{})
+	return s.applyTransaction(ops, nil, store.TxContext{})
 }
 
 // ApplyTransactionAs implements store.ActorTransactor.
 func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error {
+	return s.applyTransaction(ops, nil, ctx)
+}
+
+// ApplyTransactionChecked implements store.CheckedTransactor.
+func (s *Store) ApplyTransactionChecked(ops []store.TxOp, checks []store.ReadCheck, ctx store.TxContext) error {
+	return s.applyTransaction(ops, checks, ctx)
+}
+
+// applyTransaction validates the read set, resolves the operations and applies
+// them, all under one exclusive hold.
+//
+// The read set is validated first and against the store as it stands *before*
+// any operation resolves, because that is the state the reads were taken
+// against. Failing there costs nothing: nothing has been touched, and the same
+// argument that makes a resolution failure safe makes this one safe.
+func (s *Store) applyTransaction(ops []store.TxOp, checks []store.ReadCheck, ctx store.TxContext) error {
 	if err := s.mustWrite(); err != nil {
 		return err
 	}
+	// No operations means nothing to protect, so the read set has nothing to
+	// protect it from: a transaction that changes nothing cannot lose a write.
 	if len(ops) == 0 {
 		return nil
 	}
@@ -734,6 +749,10 @@ func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error 
 	s.mu.Lock()
 	unlock := sync.OnceFunc(s.mu.Unlock)
 	defer unlock()
+
+	if err := s.validateReadsLocked(checks); err != nil {
+		return err
+	}
 
 	actions, err := s.resolveTransaction(ops)
 	if err != nil {
@@ -801,6 +820,11 @@ func (s *Store) ApplyTransactionAs(ops []store.TxOp, ctx store.TxContext) error 
 	// reader as well as to the log: every record in it becomes visible together
 	// when the epoch is published, and until then none of it is.
 	epoch := s.nextEpoch()
+	// Applied but not yet visible: the lock is released below and the epoch is
+	// published only after the durability wait, so until then a concurrent
+	// reader is running an epoch behind this one. See retainLocked.
+	s.unpublished.Add(1)
+	defer s.unpublished.Add(-1)
 	for _, a := range actions {
 		switch a.kind {
 		case txActionPutNode:

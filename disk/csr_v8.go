@@ -285,7 +285,7 @@ func checkCriticalSections(sections []csrSection) error {
 		}
 		switch s.Magic {
 		case csrSectionPropIndex, csrSectionOrderedKeys, csrSectionEntityHash, csrSectionAttestation,
-			csrSectionTombstones:
+			csrSectionTombstones, csrSectionComposite:
 			// Understood.
 		default:
 			return fmt.Errorf("deserialiseCSR: file carries critical section %q, which this build does not understand — "+

@@ -218,6 +218,7 @@ none of them is created unless the corresponding option is set:
 | `graphene.grants` | `Options.Roles` | privilege changes |
 | `graphene.checkpoints` | on `PublishCheckpoint` | anchoring |
 | `graphene.labels` | on `DeclareTypeNames` | the custom-label name table (§4.5) |
+| `graphene.schema` | on any `Declare*` | the declaration catalogue (§4.6) |
 
 The four ledgers are each hash-chained and independently readable; see
 [FORENSICS.md](FORENSICS.md).
@@ -527,6 +528,89 @@ Only the custom range can be named, and a name that could not round-trip through
 `ParseNodeType` is refused — a built-in name, a bare numeric, anything shaped
 like `custom:7`. The property being defended is that a type parses back to what
 it prints as, which is the whole reason the mechanism is trustworthy.
+
+### 4.6 The declaration catalogue
+
+`graphene.schema` records every declaration a store carries: ordered keys,
+composite tuples, unique property keys, and unique edge types.
+
+**Why it exists.** A declaration tells the engine something it cannot derive.
+Before this file, telling it did not survive. Ordered and composite declarations
+were written into the image, so they came back after a compaction and vanished
+after a bare reopen; unique property keys and edge cardinality constraints were
+written nowhere at all. The lost optimisation was the mild half. The sharp half
+was that two processes could open one directory enforcing different rules, both
+believing they held the guarantee — and the one that had not declared would
+write exactly the duplicates the other existed to refuse.
+
+**Why a sidecar.** A WAL record would be durable at declare time and then
+destroyed by the operation that makes a store permanent: compaction truncates the
+log, which is what happens to the key-rotation timeline and what §11a.2 warns
+against generally. A new WAL record type is also a one-way format break, because
+replay treats an unknown type as an error rather than skipping it (§4.3). And a
+CSR section alone is what GORD and GCMP already are — their reopen hole is the
+defect being fixed. A sidecar has none of those problems and travels with a
+backup for free, because backup copies the directory (§4).
+
+**Format.** UTF-8, LF, one declaration per line, tab-separated, sorted whole by
+byte order after the header so that two stores with the same schema produce
+identical bytes. Property keys are escaped (`\`, `	`, `
+`, ``), so the
+file imposes no restriction of its own on what a key may contain. A composite
+tuple keeps its declared key order inside its line, because that order is part of
+its identity: `(a,b)` and `(b,a)` are two declarations and both survive.
+
+```
+graphene-schema v1
+!unique-edge-type	32768
+!unique-node	sha256
+composite-node	case	bucket
+ordered-node	score
+```
+
+**The `!` prefix marks a line critical**, mirroring `csrSectionCritial` in the
+image's section table and reusing its argument. An unrecognised *critical* kind
+refuses the open: it was written by a build that knew a constraint this one does
+not, and reading the line as though it were absent would drop that constraint
+silently. An unrecognised *optional* kind is skipped, because a reader ignoring
+it still answers every query correctly. That is §2.3's optimisation-versus-
+constraint split, written into the file.
+
+**Applied in two places, and the split matters.** Ordered and composite
+declarations are applied *before* the image loads, so their structures are built
+by the incremental path as entries arrive rather than backfilled over them
+afterwards — the argument `csr_io.go` already makes for GORD. Constraints are
+applied *after* the WAL replays, because they validate against the data and the
+data is not complete until then. Both go straight to the index rather than
+through the public `Declare*` methods, which is what lets a read-only store get
+its declarations: those methods refuse a read-only store, correctly, because they
+are writes, and this is not one.
+
+**Nothing is written at open.** An open is not a writer, and `OpenReadOnly` and
+`OpenLive` leave the directory untouched.
+
+**Union with GORD and GCMP cannot conflict.** All four kinds are monotone: the
+image sections say "declared as of the last compaction", the sidecar says
+"declared, ever". A union cannot lose a declaration, and unlike a label table —
+where one number can be given two names, which is why §4.5 is strict — there is
+no key here that could hold two values.
+
+**Validation at open is load-bearing.** Because the record outlives the process,
+a store's data can stop satisfying a constraint the file names: an older build,
+or a process that never declared, could have written duplicates. `Open` therefore
+re-validates, and `disk.ConstraintPolicy` chooses what happens when it fails.
+`ConstraintRefuse` is the default and fails the open naming every violated
+declaration — the same check `DeclareUniqueProperty` makes, at the same moment,
+because a store that opens believing a constraint it does not keep has the
+guarantee and none of the behaviour. `ConstraintDrop` opens without the violated
+declarations and reports them through `DroppedDeclarations()`; it exists because
+a store that cannot be opened cannot be repaired, and it is the default for
+`OpenReadOnly` and `OpenLive`, which enforce nothing anyway.
+
+**Not bound into the snapshot root.** The root describes the graph; a declaration
+writes no record and produces no commit, so binding it would move the root for a
+reason the chain could not explain. The catalogue is outside the image and so
+outside the CSR digest too.
 
 ---
 
@@ -1008,16 +1092,89 @@ the key in between, and there is nothing to repair from there, so the whole
 transaction is refused with `ErrWriteConflict` and the caller retries against
 what the winner wrote. A single-writer caller never sees it.
 
-That is optimistic concurrency control over exactly one predicate, and it is the
-write half of what a general read-set conflict check would give (§16, limitation
-9). The delta's per-record `nodeVersion.epoch` (§10.3) is the stamp a general
-form would read; nothing here forecloses it.
+That is optimistic concurrency control over exactly one predicate, and it was for
+a long time the write half of what a general read-set conflict check would give.
+The general form now exists — `BeginTracked` and `store.ReadCheck`, §6.7a — and
+the upsert path is unchanged by it: `Expect` still carries its own predicate,
+because an upsert resolves a key whether or not the transaction is tracking, and
+folding the two would have made every upsert pay for a read set it did not ask
+for.
 
 **Two upserts of one key in one transaction are one entity.** The index cannot
 say so, because nothing has been registered there yet, so the claim is tracked in
 two places: `Tx.claimed`, so the second call returns the ID the first reserved,
 and `txView.claims`, so resolution sees the transaction's own pending
 registrations before the index's.
+
+### 6.7a Reading inside a transaction
+
+Two separate features, and confusing them is the trap.
+
+**Read-your-own-writes** is an overlay in `package graphene`
+(`transaction_read.go`): the buffered ops replayed in order over whatever the
+store answers, so `tx.GetNode` returns what the transaction is about to commit.
+It is always on, builds nothing until the first read, and works on any backend —
+including one that cannot do transactions at all, because it is caller-side
+arithmetic over a plain reader. The backends already had this logic in `txView`,
+but only inside `resolveTransaction`, under the store lock, at commit; exposing
+that would have meant handing out a reader that holds a lock the caller does not
+know about.
+
+Three rules the overlay has to get right, each because a backend already does:
+
+- **A delete cascades to reads.** An edge is reported missing when the
+  transaction deleted it *or* deleted either endpoint. The cascade is resolved
+  per lookup rather than precomputed, because precomputing it means listing a
+  node's incident edges at buffer time — the read both backends refuse to make
+  early, on the grounds that the graph can still move before commit.
+- **An update does not move an edge's endpoints.** Both backends pin the current
+  `Src` and `Dst` over whatever an update carries, so the overlay does too;
+  otherwise a transaction reads back a record whose endpoints disagree with the
+  adjacency it is listed in.
+- **A unique claim is visible before it is registered.** `tx.UniqueNodeOwner`
+  consults the transaction's own claims first — from upserts *and* from
+  `IndexNodeProperties` on a declared-unique key — because the index cannot
+  answer for something nothing has told it about.
+
+**Read-set tracking** is opt-in, through `BeginTracked`. Each read that reached
+the store records a `store.ReadCheck`; `Commit` routes through
+`store.CheckedTransactor.ApplyTransactionChecked`, which re-reads every
+observation under the write lock *before* resolving any operation, and refuses
+the whole transaction with a `*store.ReadConflictError` wrapping
+`ErrWriteConflict` if one moved. It is opt-in because it can only add a failure:
+existing code that reads inside its transactions would begin seeing conflicts
+from commits that previously succeeded — having silently overwritten.
+
+**Validation re-reads; it does not stamp.** The obvious design is to record each
+record's version and compare stamps at commit, and the disk backend has one to
+hand in `nodeVersion.epoch` (§10.3). The in-memory backend does not: it keeps a
+single store-wide counter and nothing per record. A stamped read set would
+therefore have been disk-only, and the parity rule — the two backends accept and
+refuse exactly the same things — is not negotiable for a constraint. So a check
+carries an FNV-1a digest of what was observed, and validation recomputes it. The
+side effect is a better semantic than stamping: a record rewritten with identical
+bytes is deliberately *not* a conflict.
+
+The comparison itself lives in `store.ReadSetValidator`, driven by both backends
+through callbacks that read without locking. Neither owns the decision, which is
+the only way two entirely different storage layouts can be relied on to reach the
+same one. It also settles the one place they genuinely disagree: `EdgesOf` on a
+missing node is an error in memory and an empty set on disk, so both validators
+are written to the disk rule and the read set never inherits the difference.
+
+**What it is not.** Not serialisability, and no protection from phantoms. A
+transaction that read "no node carries this label" is not protected against one
+appearing, because a predicate over the whole graph cannot be validated by
+re-reading a bounded set. That is why the tracked reads stop at reads anchored to
+an identity — a node, an edge, one node's adjacency, one unique key — and why
+there is deliberately no tracked `QueryNodeIDs`. Offering one would be the
+overstated guarantee CONTRIBUTING §4 forbids.
+
+A backend that does not implement `CheckedTransactor` refuses a transaction
+carrying reads rather than committing it unprotected, on the same reasoning that
+makes `DeclareUniqueEdge` return an error instead of `nil`: a constraint the
+store quietly does not enforce hands the caller the guarantee they asked for and
+none of the behaviour.
 
 ### 6.8 Edge cardinality, and why it is not an index
 
@@ -2010,10 +2167,36 @@ a snapshot cost O(everything written since the last compaction).
 
 Three structures cannot express a version — the adjacency lists, the label
 postings, and the property index. For those the rule is: remove an entry when no
-snapshot is open, leave it when one is. Leaving it is always safe because every
-read re-resolves each candidate against its own epoch, so a stale posting costs a
-filtered-out candidate and never a wrong result. `VerifyIndexes` checks the
-direction that still has teeth — that nothing a read *needs* is missing.
+reader can still be behind, leave it when one can. Leaving it is always safe
+because every read re-resolves each candidate against its own epoch, so a stale
+posting costs a filtered-out candidate and never a wrong result. `VerifyIndexes`
+checks the direction that still has teeth — that nothing a read *needs* is
+missing.
+
+**"No reader can be behind" is not "no snapshot is open",** and reading it as the
+latter was a bug — the one this release fixes. A plain read runs at
+`visibleEpoch`, and group commit leaves `visibleEpoch` trailing `mutEpoch` for
+the whole of a transaction's durability wait, *with the store lock released
+across it* (§9). A writer that truncated a chain to its newest version in that
+window deleted the version those readers were entitled to, and `at()` reports "no
+opinion" for a chain whose every entry is newer than the reader's epoch — which,
+with no image beneath it, is indistinguishable from the record never having
+existed. So a node updated inside a transaction did not read as *stale* to a
+concurrent reader; it read as **absent**, from `GetNode` and from its own label's
+posting alike, for the length of the fsync. `tests/graphene_visibility_test.go`
+is the regression test and fails on every build before this one.
+
+`retainLocked` now floors the retained epoch at `visibleEpoch` whenever any
+commit is applied but unpublished, tracked by a counter on the store. The
+qualifier is what keeps the common case free: a single-record mutator advances
+both epochs under the lock, so the gap it opens is closed before anything can
+observe it, and its chains still collapse to a single version. A chain under a
+*transactional* writer settles at two — 24 bytes per record that has been
+updated at least once, and no extra allocation, because the retained version is
+the previous head rather than a new one. Interleaved A/B on
+`BenchmarkTxUpdate_Disk_NoSync_*` shows no time regression and one allocation
+*fewer* per single-record transaction, the superseded label posting no longer
+being deleted and immediately re-added.
 
 A compaction publishes a new view with a fresh delta layer and leaves the old one
 untouched, so an open snapshot keeps working and the garbage collector reclaims
@@ -2952,8 +3135,15 @@ proportional to N's own entries — **686× faster** on a populated index.
 1. Decide whether it is derivable from records (like label postings) or
    caller-supplied (like property entries). Derivable indexes should be rebuilt
    at load, not persisted.
-2. If persisted, add a section to the CSR with its own magic and bounds checks,
-   and bump the format version.
+2. If persisted, add a section to the CSR with its own magic and bounds checks.
+   **The format version does not move**: v8's section table exists so a new
+   section is added by writing one more directory entry, and a reader that does
+   not know the magic skips it unless it is marked critical (§4.1). Add the magic
+   to `checkCriticalSections` and to `InspectCSR`'s known list in the same change,
+   or `graphene csr` reports the section as unrecognised.
+   If what you are persisting is caller *intent* rather than index content —
+   a declaration, a constraint — it belongs in the catalogue sidecar instead
+   (§4.6), which changes at a different cadence from the image.
 3. Add its consistency checks to `VerifyIndexes` and its repair to
    `RebuildIndexes`.
 4. Teach the planner to drive from it, if it can bound a result set.
@@ -3587,15 +3777,16 @@ Any change must preserve these. Each is enforced by tests.
 5. **Ranges on an undeclared key use the scan rule**, which is not a total order.
    Declare the key and use `index/encoding` for ranges that must be both fast and
    well-defined.
-6. **Index declarations survive a compaction, not a bare reopen.** Ordered keys
-   (GORD) and composite tuples (GCMP) are written to the CSR image (§4.1) and
-   re-declared on open, so a store that has compacted since declaring reopens
-   with them intact. Anything declared on a store that has *not* compacted since
-   lives only in memory: re-declare, or compact before closing.
-   `OrderedProperties()` and `CompositeProperties()` report what is currently
-   declared — including after a reopen, where a GCMP tuple this build will not
-   accept is skipped rather than refused, since the section is optional and a
-   reader ignoring it entirely still answers every query correctly.
+6. ~~**Index declarations survive a compaction, not a bare reopen.**~~ **Closed.**
+   Every declaration is now recorded in `graphene.schema` (§4.6) as it is made
+   and re-applied by every `Open`, including a read-only one. Ordered keys
+   (GORD) and composite tuples (GCMP) are still written to the CSR image as well,
+   so an engine predating the catalogue still finds them after a compaction; the
+   two sources are unioned, which cannot conflict because both are monotone.
+   `OrderedProperties()` and `CompositeProperties()` report what is actually
+   declared — a GCMP tuple or a catalogue line this build will not accept is
+   skipped rather than refused, since neither is a constraint and a reader
+   ignoring one still answers every query correctly.
 7. **A composite index serves only a fully pinned tuple.** Its postings are keyed
    by the whole tuple, so a declaration over three keys does nothing for a query
    fixing two (§6.4a). It is also opt-in for a measured reason: on the disk
@@ -3605,15 +3796,25 @@ Any change must preserve these. Each is enforced by tests.
    index, because it cannot read the blob.
 9. **A sequence of plain calls is not a transaction** (§10.1). `Snapshot()`
    gives a consistent read view (§10.3); it does not make a *write* sequence
-   atomic, which is what `Begin()` is for. There is no general read-set conflict
-   detection either: `Tx` records no read set, so a transaction that decided
-   something from a read is not protected by anything. The one exception is an
-   upsert's key, which *is* re-checked under the write lock and refuses with
-   `ErrWriteConflict` (§6.7).
-9a. **Unique-key declarations do not survive a reopen.** Unlike ordered keys and
-   composite tuples, they are not written into the image, so each process that
-   opens the store must re-declare them. Declaring is idempotent and re-validates
-   the data, so the cost is one pass over the key's values at `Open` (§6.6).
+   atomic, which is what `Begin()` is for. ~~There is no general read-set
+   conflict detection either.~~ **Partly closed.** `BeginTracked` records what a
+   transaction read and refuses the commit if it moved (§6.7a), which covers
+   read-modify-write over identified records. It is **not** serialisability and
+   does not exclude phantoms: a decision made from the *absence* of anything
+   matching a predicate is still unprotected, and there is deliberately no
+   tracked `QueryNodeIDs`.
+9a. ~~**Unique-key declarations do not survive a reopen.**~~ **Closed.** They are
+   recorded in `graphene.schema` (§4.6) and re-applied by every `Open`, so a
+   process that does not re-declare no longer gets a store with the constraint
+   quietly absent — which was the sharper half of the defect, because two
+   processes could hold one directory enforcing different rules. The declaration
+   is still validated at `Open`, which costs one pass over the key's values
+   (§6.6), and that pass is now load-bearing: a store whose data stopped
+   satisfying a recorded constraint is refused rather than opened without it.
+   `disk.ConstraintPolicy` chooses between refusing and opening with the
+   violated declarations dropped and reported; a writable open refuses, and
+   `OpenReadOnly`/`OpenLive` drop, because a reader enforces nothing and reading
+   a damaged store is what it opened one to do.
 9b. **A unique constraint is not a uniqueness *index*.** It reuses the hash
    postings rather than adding a structure, so it constrains registration and
    answers `NodeByProperty` in one lookup, but it does not make anything faster

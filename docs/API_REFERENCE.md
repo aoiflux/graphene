@@ -335,6 +335,25 @@ func (tx *Tx) Ops() int                  // total buffered operations
 func (tx *Tx) Atomic() bool
 ```
 
+Reads, which see the transaction's own buffered writes:
+
+```go
+func (g *Graph) BeginTracked() *Tx      // Begin, plus read-set conflict detection
+
+func (tx *Tx) GetNode(id store.NodeID) (*store.Node, error)
+func (tx *Tx) GetEdge(id store.EdgeID) (*store.Edge, error)
+func (tx *Tx) NodeExists(id store.NodeID) (bool, error)
+func (tx *Tx) EdgesOf(id store.NodeID, dir store.Direction,
+    edgeTypes []store.EdgeType) ([]*store.Edge, error)
+func (tx *Tx) Neighbours(id store.NodeID, dir store.Direction,
+    edgeTypes []store.EdgeType) ([]store.NeighbourResult, error)
+func (tx *Tx) UniqueNodeOwner(key string, value []byte) (store.NodeID, bool, error)
+func (tx *Tx) UniqueEdgeOwner(key string, value []byte) (store.EdgeID, bool, error)
+
+func (tx *Tx) Tracked() bool             // true only for BeginTracked
+func (tx *Tx) Reads() int                // observations in the read set
+```
+
 `AddNodes` and `AddEdges` are each atomic, but they are **two** transactions. A
 graph is nodes *and* the edges between them, and that pairing is exactly what the
 slice APIs cannot commit together:
@@ -358,6 +377,54 @@ if err := tx.Commit(); err != nil {
     // nothing was written; the store is exactly as it was
 }
 ```
+
+#### Reading inside a transaction
+
+A transaction sees the graph as it will be once it commits — its own additions,
+its own updates, its own deletions and the edges they cascade to:
+
+```go
+tx := g.Begin()
+id := tx.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}})
+n, _ := tx.GetNode(id)                 // found, though nothing is committed yet
+```
+
+This works on every backend and changes nothing about how a transaction can
+fail.
+
+#### `BeginTracked` — read-modify-write that cannot lose an update
+
+A plain read inside a transaction is unprotected: it happens while you are still
+buffering, and what you decided from can move before `Commit` takes the lock.
+`BeginTracked` records every read that reached the store and re-checks it under
+that lock:
+
+```go
+for {
+    tx := g.BeginTracked()
+    n, err := tx.GetNode(id)
+    if err != nil {
+        return err
+    }
+    tx.UpdateNode(advance(n))
+
+    err = tx.Commit()
+    if errors.Is(err, store.ErrWriteConflict) {
+        continue                       // someone won the race; re-read and retry
+    }
+    return err
+}
+```
+
+A record that changed, disappeared or appeared, an incident-edge set that moved,
+or a unique key that changed hands refuses the whole transaction and writes
+nothing. The error is a `*store.ReadConflictError` naming what moved, wrapping
+`store.ErrWriteConflict`.
+
+It is opt-in because it can only add a failure — `Begin` keeps behaving exactly
+as it did. And it is **not** serialisability: a decision made from the *absence*
+of anything matching a predicate is not protected, which is why there is no
+tracked `QueryNodeIDs`. See TECHNICAL_DETAILS §6.7a.
 
 **IDs are returned immediately, before commit.** That is what makes `tx.AddEdge`
 above able to name `fileID`. They are *reserved*, not created — a transaction
@@ -806,11 +873,11 @@ are not comparable.
 Equality lookups are unaffected either way. `PropertyOpContains` cannot be served
 by any ordering and remains a scan.
 
-A declaration is written into the CSR image when the store compacts, and
-re-applied on open, so a store that has compacted since declaring reopens with
-its ordered keys intact. A key declared on a store that has *not* compacted since
-lives only in memory — re-declare it, or `Compact()` before closing.
-`OrderedProperties()` reports what is currently declared.
+A declaration is recorded in `graphene.schema` beside the image as it is made
+and re-applied by every `Open`, including a read-only one, so an ordered key
+survives a bare reopen. It is still written into the CSR image at compaction as
+well, so an engine predating the catalogue finds it there. `OrderedProperties()`
+reports what is currently declared.
 
 **Declaring a key also changes how the planner costs it.** A range or prefix on a
 declared key can be sized, so it competes with the other drivers on cost; on an
@@ -867,10 +934,10 @@ repeated key, an empty key, or more than 64. A one-key composite is refused
 because it is the single-key postings under another name, maintained twice to
 answer one question.
 
-Declarations are written into the CSR image when the store compacts and
-re-applied on open, on the same terms as §9a: they survive a compaction, not a
-bare reopen with no compaction since. `CompositeProperties()` reports what is
-currently declared.
+Declarations are recorded in `graphene.schema` and re-applied by every `Open`,
+and written into the CSR image at compaction as well, so they survive both a
+compaction and a bare reopen. `CompositeProperties()` reports what is currently
+declared.
 
 ---
 
@@ -915,9 +982,17 @@ if err := g.DeclareUniqueProperty("k"); err != nil {
   is declared in that case.
 - **Declaring a key already declared is a no-op**, so this belongs at every
   `Open`.
-- **Declarations live in memory.** Unlike an ordered key, which is written into
-  the image at compaction, a unique key must be re-declared by each process that
-  opens the store. Declaring at `Open` is the contract, not a convenience.
+- **Declarations are durable.** The key is recorded in `graphene.schema` beside
+  the image and re-applied by every `Open`, so a process that does not re-declare
+  no longer gets a store with the constraint quietly absent. Re-declaring stays
+  idempotent, so declaring at `Open` still works — it is now a habit rather than
+  the contract.
+- **`Open` re-validates.** Because the record outlives the process, the data can
+  stop satisfying a recorded constraint — an older build could have written the
+  duplicates. A writable `Open` refuses such a store, naming every violation.
+  `disk.ConstraintPolicy` is the escape hatch: `ConstraintDrop` opens without the
+  violated declarations and reports them through `DroppedDeclarations()`, and it
+  is the default for `OpenReadOnly` and `OpenLive`, which enforce nothing anyway.
 - **A backend that cannot enforce it returns an error**, unlike the ordered and
   composite declarations which return `nil`. Those are optimisations; a store
   ignoring one still answers every query correctly. This is a promise about what
@@ -1144,9 +1219,11 @@ The cost is a scan of that adjacency per constrained write — O(out-degree of
 src), cheap for the ownership edges this exists for, and worth knowing about
 before declaring a type whose sources are hubs.
 
-Declarations live in memory and must be re-declared at every `Open`, exactly as
-with unique property keys. A backend that cannot enforce the constraint returns
-an error rather than accepting the declaration. `graphene debug unique-edge -type
+Declarations are recorded in `graphene.schema` and re-applied by every `Open`,
+exactly as with unique property keys — including the re-validation, and the
+`disk.ConstraintPolicy` that decides what a violated one does to the open. A
+backend that cannot enforce the constraint returns an error rather than accepting
+the declaration. `graphene debug unique-edge -type
 <t> <dir>` answers "can I?" from the shell.
 
 ---
@@ -2623,8 +2700,8 @@ structure, not cost. Measure with the benchmark suite instead.
 9. Spread concurrent property writes across keys; expect no scaling on `Add*`.
 10. `Compact()` between phases of bulk work — never per write.
 11. Declare ordered keys for the ranges you filter on — it is what lets the
-    planner both *serve* and *cost* them. They survive a compaction; re-declare
-    after a reopen with no compaction since.
+    planner both *serve* and *cost* them. They are durable: declare once, not at
+    every `Open`.
 12. Declare a composite for a conjunction of equality filters you run often and
     whose keys are weak individually (§9b). Check it with `ExplainNodeQuery`:
     `driver=composite` means it is being used, `driver=equality` means it is not.

@@ -622,12 +622,35 @@ func resolveProps(props map[string][]byte) []propEntry {
 
 // ApplyTransaction implements store.Transactor.
 func (s *Store) ApplyTransaction(ops []store.TxOp) error {
+	return s.applyTransaction(ops, nil)
+}
+
+// ApplyTransactionChecked implements store.CheckedTransactor.
+//
+// The TxContext is accepted and dropped, exactly as the note above explains for
+// ActorTransactor: there is nowhere here to record an actor. This backend does
+// implement CheckedTransactor, because unlike attribution the guarantee is one
+// it can actually keep — validation needs a write lock and a way to re-read,
+// both of which it has.
+func (s *Store) ApplyTransactionChecked(ops []store.TxOp, checks []store.ReadCheck, _ store.TxContext) error {
+	return s.applyTransaction(ops, checks)
+}
+
+func (s *Store) applyTransaction(ops []store.TxOp, checks []store.ReadCheck) error {
+	// No operations means nothing to protect, so the read set has nothing to
+	// protect it from: a transaction that changes nothing cannot lose a write.
 	if len(ops) == 0 {
 		return nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Before resolution, and so against the state the reads were taken against.
+	// Nothing has been touched yet, which is what makes failing here free.
+	if err := s.validateReadsLocked(checks); err != nil {
+		return err
+	}
 
 	actions, err := s.resolveTransaction(ops)
 	if err != nil {

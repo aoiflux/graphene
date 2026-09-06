@@ -11,6 +11,7 @@ package graphene_test
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/aoiflux/graphene"
@@ -295,11 +296,15 @@ func TestUnique_EdgeKeysAreDeclaredIndependently(t *testing.T) {
 	})
 }
 
-// Constraints are enforced from the declaration onward, in the process that
-// declared them — so a reopened store that re-declares gets its data validated
-// again, which is what makes "declare at every Open" load-bearing rather than
-// merely harmless.
-func TestUnique_DeclarationsDoNotSurviveAReopen(t *testing.T) {
+// A unique declaration is a property of the store, not of the process that made
+// it. It used to be the other way round: the declaration lived in memory, so a
+// process that opened the store and forgot to re-declare got no constraint and
+// no indication there had ever been one — and could write the duplicates the
+// declaring process existed to refuse.
+//
+// Re-declaring is still idempotent and still re-validates, so "declare at every
+// Open" remains correct; it is no longer load-bearing.
+func TestUnique_DeclarationSurvivesAReopen(t *testing.T) {
 	dir := t.TempDir()
 
 	g, err := graphene.Open(dir)
@@ -323,16 +328,19 @@ func TestUnique_DeclarationsDoNotSurviveAReopen(t *testing.T) {
 	}
 	defer re.Close()
 
-	if nodeKeys, _ := re.UniqueProperties(); len(nodeKeys) != 0 {
-		t.Fatalf("a reopened store reports %v as unique; declarations are documented as in-memory", nodeKeys)
+	nodeKeys, _ := re.UniqueProperties()
+	if !slices.Contains(nodeKeys, "k") {
+		t.Fatalf("a reopened store reports %v as unique, want k", nodeKeys)
 	}
-	// Re-declaring absorbs the entries written before the reopen.
-	if err := re.DeclareUniqueProperty("k"); err != nil {
-		t.Fatalf("re-declaration after reopen: %v", err)
-	}
+	// Reported and enforced, against the entries written before the reopen.
 	other := mustNode(t, re)
 	if err := re.IndexNodeProperties(other, map[string][]byte{"k": []byte("ver:1")}); !errors.Is(err, store.ErrUniqueViolation) {
-		t.Fatalf("the re-declared constraint did not absorb pre-existing entries: %v", err)
+		t.Fatalf("the reopened constraint did not cover pre-existing entries: %v", err)
+	}
+	// Re-declaring is still a no-op, so the documented "declare at every Open"
+	// habit keeps working.
+	if err := re.DeclareUniqueProperty("k"); err != nil {
+		t.Fatalf("re-declaration after reopen: %v", err)
 	}
 }
 

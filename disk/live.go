@@ -97,7 +97,7 @@ var ErrNotLiveReader = errors.New("disk: store was not opened as a live reader")
 //
 // The view is fixed until Refresh is called.
 func OpenLive(dir string) (*Store, error) {
-	return OpenWithOptions(dir, Options{LiveReader: true})
+	return OpenWithOptions(dir, Options{LiveReader: true, Constraints: ConstraintDrop})
 }
 
 // IsLiveReader reports whether this store can be advanced with Refresh.

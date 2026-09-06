@@ -3,6 +3,179 @@
 Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 `git log` for those.
 
+## Unreleased — v0.7.0
+
+### Declarations are now a property of the store, not of the process
+
+A declaration tells the engine something it cannot work out for itself, and it
+did not survive being told. Ordered keys and composite tuples were written into
+the CSR image, so they came back after a compaction and vanished after a bare
+reopen. Unique property keys and edge cardinality constraints were written
+nowhere at all: every process that opened a store had to re-declare them, and one
+that forgot got a store with no constraints and no indication there had ever been
+any.
+
+The lost optimisation was the mild half. The sharp half was that **two processes
+could open one directory enforcing different rules**, both believing they held
+the guarantee — and the one that had not declared would write exactly the
+duplicates the other existed to refuse.
+
+Every declaration is now recorded in `graphene.schema` beside the image as it is
+made, and re-applied by every `Open`:
+
+```go
+g, _ := graphene.Open(dir)
+g.DeclareUniqueProperty("sha256")
+g.Close()
+
+g, _ = graphene.Open(dir)          // no re-declaration
+_, err := g.AddNode(dup)           // still refused
+```
+
+It covers all four kinds — ordered keys, composite tuples, unique property keys,
+unique edge types — and applies to a read-only store too, which previously got
+none of the writer's declarations, so a declared range query silently became a
+scan for one process and not the other.
+
+**No format change.** `graphene.schema` is a sidecar, like `graphene.labels`: an
+older engine ignores a file it does not know about, a v0.7.0 store opens
+unchanged in v0.5.x and v0.6.0, and backup carries it with no change because
+backup copies the directory. Ordered and composite declarations are still written
+into the image at compaction as well, so an older engine keeps finding them
+there. The two sources are unioned, which cannot conflict: both are monotone.
+
+The file is plain text, sorted, and deterministic — two stores with the same
+schema produce identical bytes — and property keys are escaped, so it imposes no
+restriction on what a key may contain.
+
+### Behaviour change: an `Open` can now refuse a store that violates its own catalogue
+
+Because the record outlives the process, a store's data can stop satisfying a
+constraint the file names — an older build, or a process that never declared,
+could have written the duplicates. `Open` therefore re-validates, and by default
+**refuses**, naming every violation rather than the first. That is the same check
+`DeclareUniqueProperty` has always made, at the same moment; a store that came up
+believing a constraint it did not keep would have the guarantee and none of the
+behaviour.
+
+A store that cannot be opened cannot be repaired, so there is an escape hatch:
+
+```go
+g, err := graphene.OpenWithOptions(dir, disk.Options{Constraints: disk.ConstraintDrop})
+// opens without the violated declarations; s.DroppedDeclarations() names them
+```
+
+`OpenReadOnly` and `OpenLive` default to `ConstraintDrop`, because a reader
+enforces nothing and reading a damaged store is what it opened one to do.
+
+### Transactions can read, and can be refused over what they read
+
+`Tx` was a write-only buffer, so read-modify-write — the most common shape there
+is — could not be made atomic. You read a node, decided from it, wrote it back,
+and nothing checked that the record you decided from was still the record you
+were overwriting. Two workers advancing the same node's state lost one of the two
+updates, silently.
+
+Transactions now read:
+
+```go
+tx := g.Begin()
+id := tx.AddNode(&store.Node{...})
+n, _ := tx.GetNode(id)              // sees its own buffered write
+edges, _ := tx.EdgesOf(src, store.DirectionOutbound, nil)
+```
+
+`GetNode`, `GetEdge`, `NodeExists`, `EdgesOf`, `Neighbours`, `UniqueNodeOwner`
+and `UniqueEdgeOwner` all answer as the transaction will look once committed:
+buffered writes visible, deletes gone — including the edges a node deletion
+cascades to — and unique claims resolving to what this transaction claimed them
+for. This works on every backend and changes no failure mode.
+
+`BeginTracked` adds the conflict check:
+
+```go
+for {
+    tx := g.BeginTracked()
+    n, err := tx.GetNode(id)
+    if err != nil { return err }
+    tx.UpdateNode(advance(n))
+    err = tx.Commit()
+    if errors.Is(err, store.ErrWriteConflict) { continue }  // re-read and retry
+    return err
+}
+```
+
+Every read that reached the store is recorded, and re-read under the write lock
+before anything is applied. If a record changed, disappeared, appeared, or a
+unique key moved, the transaction is refused whole and nothing is written. The
+error is a `*store.ReadConflictError` naming the observation that moved, and it
+wraps `ErrWriteConflict`, so the retry loop callers already write for upserts
+works unchanged.
+
+Adjacency is tracked as a set, contents included, which makes "does this node
+already have such an edge — if not, create one" safe. Where a store-level
+constraint fits, it is still the better answer: see `DeclareUniqueEdge`.
+
+**Opt-in, deliberately.** `Begin` behaves exactly as before and records nothing.
+Tracking can only *add* a failure, and code that upgraded and started reading
+inside its transactions should not begin failing at commit without asking for it.
+
+**What it is not.** Not serialisability, and no protection from phantoms. A
+transaction that read "nothing carries this label" is not protected against
+something appearing — a predicate over the whole graph cannot be validated by
+re-reading a bounded set — which is why there is no tracked `QueryNodeIDs`.
+Validation compares a digest of what was observed rather than a version stamp,
+so a record rewritten with identical bytes is deliberately not a conflict.
+
+A backend that does not implement the new `store.CheckedTransactor` refuses a
+transaction carrying reads rather than committing it unprotected. Both bundled
+backends implement it.
+
+### Fixed
+
+- **A node updated inside a transaction disappeared for concurrent readers.**
+  The disk backend publishes a transaction's epoch only after the fsync that
+  covers it, and releases the store lock before that wait so concurrent commits
+  share one sync. Version retention did not account for it: a writer discarded
+  the superseded version, and the superseded label posting, whenever no
+  *snapshot* was open — but every plain reader in that window is running an
+  epoch behind, and what it was entitled to see had just been deleted. So
+  `GetNode` returned "not found" and `NodesByType` omitted it, for a live record,
+  for the length of the fsync. Not stale: **absent**. This affects every release
+  that has had transactions, is trivially reproducible with one committing
+  goroutine and one reading one, and is why `tests/graphene_visibility_test.go`
+  exists. Retention is now floored at the visible epoch while any commit is
+  unpublished; a chain settles at two versions instead of one under a
+  transactional writer, and single-record mutators are unaffected because they
+  publish under the lock. Measured: no time regression, one allocation fewer.
+- **`OpenWithOptions` never loaded the label table.** A store opened with
+  `disk.StrictOptions` rendered every custom label as a number. Every open path
+  now loads both sidecars.
+- **`DeclareOrderedNodeProperty`, `DeclareOrderedEdgeProperty` and the two
+  composite declarers took no store lock**, so two goroutines declaring
+  concurrently raced. They now take the write lock, which they need anyway to
+  write the catalogue atomically with the in-memory declaration.
+- **The label table was written without an fsync.** A rename promotes whatever is
+  on the medium, and without the sync that can be a prefix — which comes back as
+  a truncated table and therefore as a mislabelling.
+- **`GCMP` was missing from the CSR's known-section lists**, so `graphene csr`
+  reported the composite section as unrecognised, and a future build marking it
+  critical would have been refused for the wrong reason.
+
+### Internal
+
+- `FuzzDecodeCatalogue` covers the new parser from the start, rather than joining
+  `readCompositeSection` on the list of hand-rolled readers that have none.
+- Read-set comparison lives in `store.ReadSetValidator`, driven by both backends
+  rather than implemented in each. Two entirely different storage layouts cannot
+  be relied on to reach the same verdict if each owns its own copy of the
+  reasoning — and a read set is a constraint, where a divergence is a lost write.
+- `BenchmarkTxUpdate_Disk_NoSync_*` isolates the transactional write path from
+  the fsync, which dominates `BenchmarkConcurrentCommits` by an order of
+  magnitude on a loaded machine.
+
+---
+
 ## v0.6.0 "Armchair" — structure, aggregates, and names
 
 Three additions, all of them things a caller was working around, and one fix to

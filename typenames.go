@@ -227,8 +227,11 @@ func parseTypeNameLine(text string) (kind string, value uint16, name string, err
 
 // writeTypeNames replaces the label table atomically.
 //
-// Written to a temporary and renamed, because a half-written label table is a
-// mislabelling that survives — and .tmp is what backup already skips.
+// Written to a temporary, fsynced and renamed, because a half-written label
+// table is a mislabelling that survives — and .tmp is what backup already skips.
+// The fsync matters for the same reason the catalogue's does (disk/schema.go):
+// a rename promotes whatever is on the medium, and without the sync that can be
+// a prefix.
 func writeTypeNames(dir string, nodes map[store.NodeType]string, edges map[store.EdgeType]string) error {
 	var b strings.Builder
 	b.WriteString(typeNamesHeader)
@@ -244,7 +247,8 @@ func writeTypeNames(dir string, nodes map[store.NodeType]string, edges map[store
 
 	final := filepath.Join(dir, typeNamesFileName)
 	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+	if err := writeFileDurable(tmp, []byte(b.String())); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("write %s: %w", typeNamesFileName, err)
 	}
 	if err := os.Rename(tmp, final); err != nil {
@@ -252,4 +256,29 @@ func writeTypeNames(dir string, nodes map[store.NodeType]string, edges map[store
 		return fmt.Errorf("write %s: %w", typeNamesFileName, err)
 	}
 	return nil
+}
+
+// writeFileDurable writes data to path and fsyncs it before returning, so the
+// rename that follows promotes bytes that are actually on the medium rather
+// than a prefix of them.
+//
+// The directory entry itself is not synced here — the primitive for that is
+// platform-specific and lives with the disk store, which is the layer that owns
+// the directory. What this closes is the failure that matters for a table read
+// at every Open: a rename promoting a file whose contents never left the cache,
+// which comes back as a truncated table and therefore as a mislabelling.
+func writeFileDurable(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

@@ -718,10 +718,20 @@ func (s *Store) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.
 	if _, ok := s.nodes[id]; !ok {
 		return nil, &store.ErrNotFound{Kind: "node", ID: uint64(id)}
 	}
+	return s.edgesOfLocked(id, dir, edgeTypes), nil
+}
 
+// edgesOfLocked is EdgesOf's walk without the lock and without the missing-node
+// error: an absent node is the empty incident set. Caller must hold s.mu.
+//
+// It is split out for read-set validation, which runs with the write lock
+// already held and must treat a missing node the same way the disk backend's
+// does — that backend's EdgesOf returns no error for one, and a read set that
+// inherited the difference would validate differently on the two backends.
+func (s *Store) edgesOfLocked(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) []*store.Edge {
 	a := s.adj[id]
 	if a == nil {
-		return nil, nil
+		return nil
 	}
 
 	var edgeIDs []store.EdgeID
@@ -749,7 +759,7 @@ func (s *Store) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.
 		}
 		result = append(result, e)
 	}
-	return result, nil
+	return result
 }
 
 // IncidentEdges implements store.AdjacencyReader. It mirrors EdgesOf's ordering

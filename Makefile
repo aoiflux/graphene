@@ -46,6 +46,7 @@ FUZZTIME  ?= 30s
 # Fuzz targets, as package:name pairs.
 FUZZ_TARGETS := ./disk/:FuzzDeserialiseCSR \
                 ./disk/:FuzzWALReplay \
+                ./disk/:FuzzDecodeCatalogue \
                 ./store/:FuzzParseNodeType \
                 ./store/:FuzzParseEdgeType \
                 ./merkle/:FuzzProofSoundness \

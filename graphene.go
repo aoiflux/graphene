@@ -79,14 +79,31 @@ func Open(dir string) (*Graph, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The label table, if the store carries one. A disagreement with what
-	// this process already believes is an error rather than a resolution —
-	// see typenames.go.
-	if err := loadTypeNames(s); err != nil {
+	if err := loadSidecars(s); err != nil {
 		s.Close()
 		return nil, err
 	}
 	return &Graph{GraphStore: s}, nil
+}
+
+// loadSidecars applies the sidecar tables that this layer owns.
+//
+// Today that is the label table alone: the declaration catalogue is read and
+// applied inside disk.OpenWithOptions, because it has to land in two places —
+// the ordered and composite declarations before the image loads, the
+// constraints after the WAL replays — and neither point is reachable from here.
+// It also has to reach a read-only store, whose Declare methods correctly
+// refuse.
+//
+// It stays a named function anyway, because every Open path calls it and the
+// bug it replaced was OpenWithOptions calling none of this: a store opened with
+// disk.StrictOptions rendered every custom label as a number.
+//
+// The label table is strict. A table disagreeing with what this process already
+// believes is an error rather than a resolution, because picking one silently is
+// the confident wrong answer it exists to prevent.
+func loadSidecars(gs store.GraphStore) error {
+	return loadTypeNames(gs)
 }
 
 // OpenReadOnly returns a Graph that can query dir but never write to it, holding
@@ -111,10 +128,7 @@ func OpenReadOnly(dir string) (*Graph, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The label table, if the store carries one. A disagreement with what
-	// this process already believes is an error rather than a resolution —
-	// see typenames.go.
-	if err := loadTypeNames(s); err != nil {
+	if err := loadSidecars(s); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -149,10 +163,7 @@ func OpenLive(dir string) (*Graph, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The label table, if the store carries one. A disagreement with what
-	// this process already believes is an error rather than a resolution —
-	// see typenames.go.
-	if err := loadTypeNames(s); err != nil {
+	if err := loadSidecars(s); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -201,6 +212,10 @@ func (g *Graph) IsLive() bool {
 func OpenWithOptions(dir string, opts disk.Options) (*Graph, error) {
 	s, err := disk.OpenWithOptions(dir, opts)
 	if err != nil {
+		return nil, err
+	}
+	if err := loadSidecars(s); err != nil {
+		s.Close()
 		return nil, err
 	}
 	return &Graph{GraphStore: s}, nil
@@ -406,11 +421,17 @@ func (g *Graph) OrderedProperties() (nodeKeys, edgeKeys []string) {
 // without one is about to repair it, and one duplicate per pass is not a repair
 // a person can finish. Nothing is declared when the graph does not satisfy it.
 //
-// Declaring a key already declared is a no-op, so this belongs at every Open.
-// Declarations live in memory: unlike an ordered key, which is written into the
-// image at compaction, a unique key must be re-declared by each process that
-// opens the store. Declaring at Open is therefore not a convenience but the
-// contract.
+// Declaring a key already declared is a no-op, so this belongs at every Open —
+// though it is no longer load-bearing there. The declaration is recorded in
+// graphene.schema beside the image and re-applied by every Open, including a
+// read-only one, so a process that forgets to declare no longer gets a store
+// with the constraint quietly absent.
+//
+// Because the record outlives the process, an Open re-validates: a store whose
+// data stopped satisfying a recorded constraint — an older build wrote the
+// duplicates, say — is refused rather than opened without it. See
+// disk.ConstraintPolicy for the escape hatch that lets such a store be opened
+// and repaired.
 //
 // **Unlike the ordered and composite declarations, this returns an error on a
 // backend that cannot enforce it.** Those two are optimisations, and a store
@@ -475,9 +496,9 @@ func (g *Graph) UniqueProperties() (nodeKeys, edgeKeys []string) {
 // declared when the graph does not already satisfy the rule.
 //
 // Declaring a type already declared is a no-op, so this belongs at every Open.
-// Declarations live in memory and must be re-declared by each process that opens
-// the store — as with DeclareUniqueProperty, that is the contract rather than a
-// convenience.
+// As with DeclareUniqueProperty the declaration is recorded in graphene.schema
+// and re-applied by every Open, so it no longer has to be re-made by each
+// process — and an Open re-validates it against the data.
 //
 // The constraint is answered from the source node's outbound adjacency rather
 // than from an index, so nothing new is stored and nothing can go stale — but
@@ -660,11 +681,12 @@ func edgeIDsToUint64(ids []store.EdgeID) []uint64 {
 // files the entity into the composite too, and the composite holds that entity's
 // values for each of its keys. Declare the tuples your queries actually use.
 //
-// Declarations survive a compaction — they are written into the CSR image and
-// re-applied on open — but not a reopen with no compaction since. Returns an
-// error for a tuple that cannot be indexed: fewer than two keys, a repeated key,
-// an empty key, or more than 64. Backends without the extension ignore this and
-// keep intersecting.
+// Declarations survive both a compaction and a bare reopen: they are recorded in
+// graphene.schema beside the image, and written into the CSR image as well so
+// that an engine predating the catalogue still finds them. Returns an error for
+// a tuple that cannot be indexed: fewer than two keys, a repeated key, an empty
+// key, or more than 64. Backends without the extension ignore this and keep
+// intersecting.
 func (g *Graph) DeclareCompositeProperties(keys []string) error {
 	d, ok := g.GraphStore.(store.CompositeIndexDeclarer)
 	if !ok {

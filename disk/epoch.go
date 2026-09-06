@@ -211,7 +211,35 @@ func (g *snapshotRegistry) retain() (epoch uint64, ok bool) {
 }
 
 // retainLocked is the store's view of the same question. Caller holds s.mu.
-func (s *Store) retainLocked() (uint64, bool) { return s.snaps.retain() }
+//
+// A snapshot is not the only reader that can be behind. Every plain read runs
+// at visibleEpoch, and group commit leaves visibleEpoch trailing mutEpoch for
+// the whole of a transaction's durability wait — during which the lock is
+// released and readers run freely. A writer that truncated a chain to its
+// newest version in that window would delete the version those readers are
+// entitled to see, and they would find a live record missing rather than stale:
+// at() reports "no opinion" for a chain whose every entry is newer than the
+// reader's epoch, and with no image beneath it that is indistinguishable from
+// the record never having existed.
+//
+// So while any commit is unpublished, the floor is visibleEpoch, and ok is true
+// however many snapshots are open — the three structures that cannot express a
+// version have the same exposure as the chains do.
+//
+// When nothing is in flight the answer is the old one, and that is what keeps
+// the common case cheap: a single-record mutator advances both epochs under the
+// lock, so the gap it opens is closed before anything can observe it, and its
+// chains still collapse to one version.
+func (s *Store) retainLocked() (uint64, bool) {
+	oldest, held := s.snaps.retain()
+	if s.unpublished.Load() == 0 {
+		return oldest, held
+	}
+	if visible := s.visibleEpoch.Load(); !held || visible < oldest {
+		return visible, true
+	}
+	return oldest, true
+}
 
 // --- Snapshot ---
 

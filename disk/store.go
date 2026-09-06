@@ -51,6 +51,17 @@ type Store struct {
 	mutEpoch     atomic.Uint64
 	visibleEpoch atomic.Uint64
 
+	// unpublished counts commits that have applied their records and released
+	// the lock but have not yet advanced visibleEpoch — that is, the group-commit
+	// gap described above, made observable to the write path.
+	//
+	// It exists because version retention has to know about it. While it is
+	// non-zero a reader can still be running at an older epoch, so a superseded
+	// version and the postings beside it are still needed; while it is zero the
+	// gap is closed before the lock is released and nothing can observe one. See
+	// retainLocked, which is the only reader of this.
+	unpublished atomic.Int64
+
 	// snaps tracks open snapshots so version chains know how far back to keep
 	// history, and so an operator can see a leaked one. Guarded by mu.
 	snaps snapshotRegistry
@@ -224,6 +235,11 @@ type Store struct {
 	// mutation against the Open that configured it has a worse problem than this
 	// field.
 	readOnly bool
+
+	// dropped names the constraints the catalogue recorded that the data did not
+	// satisfy at open, and which were therefore not applied. Always empty under
+	// ConstraintRefuse, which fails the open instead. Guarded by mu.
+	dropped []DroppedDeclaration
 
 	// unclean records that the previous exclusive holder of this directory did
 	// not close cleanly. Informational: the store opens either way, because WAL
@@ -493,6 +509,20 @@ type Options struct {
 	// See LiveReader for the mode that does advance, and what it gives up to.
 	ReadOnly bool
 
+	// Constraints decides what an open does when graphene.schema names a
+	// constraint the data does not satisfy — a real case, because a store
+	// written by a build that did not read the catalogue could have accumulated
+	// duplicates under a key another build declared unique.
+	//
+	// The zero value refuses, which is right for a writable store: it is the
+	// same check DeclareUniqueProperty already makes, at the same moment, and a
+	// store that comes up believing a constraint it does not keep has handed the
+	// caller the guarantee and none of the behaviour. OpenReadOnly and OpenLive
+	// default it to ConstraintDrop instead — enforcement is meaningless without
+	// writes, and reading a damaged store is exactly what a reader opens one to
+	// do. See DroppedDeclarations.
+	Constraints ConstraintPolicy
+
 	// LiveReader opens a read-only store that can be advanced with Refresh,
 	// taking **no process lock at all**. It implies ReadOnly.
 	//
@@ -697,7 +727,7 @@ func Open(dir string) (*Store, error) {
 // Options.ReadOnly, which explains why, and lock.go for what the lock does and
 // does not promise.
 func OpenReadOnly(dir string) (*Store, error) {
-	return OpenWithOptions(dir, Options{ReadOnly: true})
+	return OpenWithOptions(dir, Options{ReadOnly: true, Constraints: ConstraintDrop})
 }
 
 // OpenWithOptions is Open with signing and verification configured.
@@ -887,6 +917,18 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	// which is why it is published here rather than lazily.
 	s.publishView(&view{delta: newDeltaLayer()})
 
+	// The declaration catalogue, read before the image and before any entry
+	// lands. Only the structural half is applied here: an ordered or composite
+	// declaration made now is maintained by the entries as they arrive, rather
+	// than backfilled over them afterwards, which is the argument csr_io.go
+	// already makes for the image's GORD section. The constraints wait until the
+	// data is complete — see below. Nothing is written: an open is not a writer.
+	catalogue, err := readCatalogue(dir)
+	if err != nil {
+		return fail("disk.Open: %w", err)
+	}
+	s.applyCatalogueStructure(catalogue)
+
 	// Try to load existing CSR.
 	csrPath := filepath.Join(dir, csrFileName)
 	if _, err := os.Stat(csrPath); err == nil {
@@ -920,6 +962,16 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := s.replayWAL(); err != nil {
 		return fail("disk.Open: replay WAL: %w", err)
 	}
+
+	// The catalogue's constraints, now that every record exists. These validate
+	// against the data, so they could not run before the replay: a unique key
+	// checked against a half-replayed store would pass on a graph that does not
+	// exist yet.
+	dropped, err := s.applyCatalogueConstraints(catalogue, opts.Constraints)
+	if err != nil {
+		return fail("disk.Open: %w", err)
+	}
+	s.dropped = dropped
 
 	// Open deliberately does NOT run VerifyIndexes.
 	//
@@ -1056,6 +1108,10 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 	}
 
 	epoch := s.nextEpoch()
+	// Applied but not yet visible from here until publishEpoch below. See the
+	// field's comment and retainLocked.
+	s.unpublished.Add(1)
+	defer s.unpublished.Add(-1)
 	s.commitNodesBatch(epoch, stored)
 	sync := s.syncOnCommit
 	unlock()
@@ -1232,6 +1288,8 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	}
 
 	epoch := s.nextEpoch()
+	s.unpublished.Add(1)
+	defer s.unpublished.Add(-1)
 	s.commitEdgesBatch(epoch, stored)
 	sync := s.syncOnCommit
 	unlock()
@@ -1289,8 +1347,15 @@ func (s *Store) DeclareOrderedNodeProperty(key string) error {
 	if err := s.mustWrite(); err != nil {
 		return err
 	}
+	// The lock is here for the catalogue, not for the index: the sharded index
+	// has its own locking, but the sidecar is written from what the store has
+	// declared, so two declarations racing could each write a file missing the
+	// other's key. It also closes a pre-existing race this method has always
+	// had with itself.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.propIdx.DeclareOrderedNodeKey(key)
-	return nil
+	return s.persistCatalogueLocked()
 }
 
 // DeclareOrderedEdgeProperty implements store.OrderedIndexDeclarer.
@@ -1298,8 +1363,10 @@ func (s *Store) DeclareOrderedEdgeProperty(key string) error {
 	if err := s.mustWrite(); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.propIdx.DeclareOrderedEdgeKey(key)
-	return nil
+	return s.persistCatalogueLocked()
 }
 
 // OrderedNodeProperties implements store.OrderedIndexDeclarer.
@@ -1323,7 +1390,7 @@ func (s *Store) DeclareUniqueNodeProperty(key string) error {
 	if len(conflicts) > 0 {
 		return &store.UniqueViolationsError{Kind: "node", Key: key, Conflicts: conflicts}
 	}
-	return nil
+	return s.persistCatalogueLocked()
 }
 
 // DeclareUniqueEdgeProperty implements store.UniqueIndexDeclarer.
@@ -1337,7 +1404,7 @@ func (s *Store) DeclareUniqueEdgeProperty(key string) error {
 	if len(conflicts) > 0 {
 		return &store.UniqueViolationsError{Kind: "edge", Key: key, Conflicts: conflicts}
 	}
-	return nil
+	return s.persistCatalogueLocked()
 }
 
 // UniqueNodeProperties implements store.UniqueIndexDeclarer.
@@ -1386,7 +1453,12 @@ func (s *Store) DeclareCompositeNodeProperties(keys []string) error {
 	if err := s.mustWrite(); err != nil {
 		return err
 	}
-	return s.propIdx.DeclareCompositeNodeKeys(keys)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.propIdx.DeclareCompositeNodeKeys(keys); err != nil {
+		return err
+	}
+	return s.persistCatalogueLocked()
 }
 
 // DeclareCompositeEdgeProperties implements store.CompositeIndexDeclarer.
@@ -1394,7 +1466,12 @@ func (s *Store) DeclareCompositeEdgeProperties(keys []string) error {
 	if err := s.mustWrite(); err != nil {
 		return err
 	}
-	return s.propIdx.DeclareCompositeEdgeKeys(keys)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.propIdx.DeclareCompositeEdgeKeys(keys); err != nil {
+		return err
+	}
+	return s.persistCatalogueLocked()
 }
 
 // CompositeNodeProperties implements store.CompositeIndexDeclarer.

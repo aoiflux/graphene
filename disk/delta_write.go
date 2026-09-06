@@ -13,11 +13,18 @@ package disk
 //
 // Three structures cannot express a version — the adjacency lists, the label
 // postings, and the property index — so for them the choice is between removing
-// an entry (cheap, and wrong for any snapshot that still needs it) and leaving
-// it (correct, and paid for by a filtered-out candidate on read). The rule is
-// the same in each case: remove when no snapshot is open, leave when one is.
-// That is sound because a snapshot opened *later* reads at a higher epoch and
+// an entry (cheap, and wrong for any reader that still needs it) and leaving it
+// (correct, and paid for by a filtered-out candidate on read). The rule is the
+// same in each case: remove when no reader can be behind, leave when one can.
+// That is sound because a reader that starts *later* runs at a higher epoch and
 // should not see the removed entry anyway.
+//
+// "No reader can be behind" is what retainLocked's second return value means,
+// and it is not the same as "no snapshot is open". A plain read runs at
+// visibleEpoch, which trails mutEpoch for the length of a transaction's
+// durability wait — with the lock released across it. Removing a superseded
+// posting in that window took a live record out of its own label's posting for
+// every reader in it, which is why the condition is the wider one.
 
 import (
 	"github.com/aoiflux/graphene/store"
@@ -193,8 +200,12 @@ func (s *Store) indexNodeLabels(d *deltaLayer, id store.NodeID, labels []store.N
 
 // unindexNodeLabels removes id from the delta postings for each of its labels.
 //
-// Only called when no snapshot is open; see the file comment for why. With one
-// open the posting is left in place and the read path's re-resolution drops it.
+// Only called when no reader can be behind; see the file comment for why.
+// Otherwise the posting is left in place and the read path's re-resolution
+// drops it. Leaving it is a no-op whenever the new version carries the same
+// label, because the posting is a sorted set and the index call that follows
+// re-adds what this would have removed — so the cost falls only on an update
+// that actually drops a label.
 func (s *Store) unindexNodeLabels(d *deltaLayer, id store.NodeID, labels []store.NodeType) {
 	for _, lbl := range labels {
 		ids, removed := store.DeleteSortedID(d.nodesByType[lbl], id)

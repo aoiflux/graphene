@@ -67,6 +67,19 @@ type Tx struct {
 	// been registered there yet.
 	claimed map[txClaim]uint64
 
+	// tracked turns on read-set recording. Reads work either way; this decides
+	// whether Commit is allowed to refuse because of one.
+	tracked bool
+
+	// checks is the read set, in the order the reads were made, and seen keeps
+	// it free of duplicates. Both stay nil on an untracked transaction.
+	checks []store.ReadCheck
+	seen   map[readKey]struct{}
+
+	// ov indexes the buffered ops for reading. Built on the first read and not
+	// before, so a write-only transaction pays nothing for it.
+	ov *txOverlay
+
 	done bool
 	// err latches the first buffering error. AddNode/AddEdge return IDs rather
 	// than errors for ergonomics, so a problem detected while buffering has to
@@ -94,6 +107,42 @@ func (g *Graph) Begin() *Tx {
 	if tr, ok := g.GraphStore.(store.Transactor); ok {
 		tx.tr = tr
 	}
+	return tx
+}
+
+// BeginTracked starts a transaction that records what it reads, and is refused
+// if any of it changed before the commit.
+//
+// This is what makes read-modify-write safe:
+//
+//	for {
+//	    tx := g.BeginTracked()
+//	    n, err := tx.GetNode(id)
+//	    if err != nil { return err }
+//	    tx.UpdateNode(advance(n))
+//	    err = tx.Commit()
+//	    if errors.Is(err, store.ErrWriteConflict) { continue } // someone won; re-read
+//	    return err
+//	}
+//
+// Without the tracking, that loop's Commit cannot tell whether the node it
+// decided from is still the node it is overwriting. With it, a change to any
+// record the transaction read — or to any of them disappearing — refuses the
+// whole transaction with store.ErrWriteConflict, and the retry sees what the
+// winner wrote. Nothing is applied on a refusal.
+//
+// It is opt-in rather than the default because it can only ever *add* a
+// failure: existing code that reads inside a transaction would start seeing
+// conflicts from commits that previously succeeded, having silently overwritten.
+//
+// What it does not give is serialisability. Reads are checked, not
+// predicates: a transaction that found no node under a label is not protected
+// against one appearing. See store.ReadCheck for the full statement, and note
+// that a backend that cannot validate a read set refuses such a commit outright
+// rather than applying it unprotected.
+func (g *Graph) BeginTracked() *Tx {
+	tx := g.Begin()
+	tx.tracked = true
 	return tx
 }
 
@@ -556,6 +605,16 @@ func (tx *Tx) Commit() error {
 	}
 
 	if tx.tr != nil {
+		if len(tx.checks) > 0 {
+			// A read set is a constraint, not a hint: committing without
+			// validating it would hand back the guarantee the caller asked for
+			// and none of the behaviour. Both bundled backends implement this.
+			ct, ok := tx.tr.(store.CheckedTransactor)
+			if !ok {
+				return fmt.Errorf("Tx.Commit: %T cannot validate a read set; use Begin rather than BeginTracked, or accept the risk explicitly", tx.g.GraphStore)
+			}
+			return ct.ApplyTransactionChecked(tx.ops, tx.checks, tx.actor)
+		}
 		// Route through the attributed path only when there is something to
 		// attribute, so a backend that implements both interfaces sees exactly
 		// the call it saw before As existed.
@@ -563,6 +622,9 @@ func (tx *Tx) Commit() error {
 			return at.ApplyTransactionAs(tx.ops, tx.actor)
 		}
 		return tx.tr.ApplyTransaction(tx.ops)
+	}
+	if len(tx.checks) > 0 {
+		return fmt.Errorf("Tx.Commit: %T does not implement store.Transactor, so a read set cannot be validated under a write lock it does not have", tx.g.GraphStore)
 	}
 	return tx.commitFallback()
 }
@@ -581,6 +643,9 @@ func (tx *Tx) Rollback() error {
 	}
 	tx.done = true
 	tx.ops = nil
+	tx.checks = nil
+	tx.seen = nil
+	tx.ov = nil
 	return nil
 }
 

@@ -41,7 +41,7 @@ func (s *Store) DeclareUniqueEdgeType(t store.EdgeType) error {
 		return &store.EdgeCardinalityViolationsError{Type: t, Conflicts: conflicts}
 	}
 	s.uniqueEdgeTypes.Declare(t)
-	return nil
+	return s.persistCatalogueLocked()
 }
 
 // UniqueEdgeTypes implements store.EdgeCardinalityDeclarer.

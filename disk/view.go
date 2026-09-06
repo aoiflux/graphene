@@ -89,16 +89,20 @@ func (v *edgeVersion) at(epoch uint64) (e *store.Edge, ok bool) {
 	return nil, false
 }
 
-// truncateNodeChain drops versions no open snapshot can still reach.
+// truncateNodeChain drops versions no reader can still reach.
 //
-// retain is the oldest epoch any live snapshot reads at; ok is false when there
-// are none, which is the common case and the one worth being cheap: with no
-// snapshot open every chain is exactly one version long, so the memory profile
-// is the plain map this replaced plus a three-word header per entry.
+// retain is the oldest epoch any reader can still be running at, and ok is
+// false when there is no such floor at all — see retainLocked, which decides
+// both. That case is the common one and the one worth being cheap: with no
+// snapshot open and no commit in flight every chain is exactly one version
+// long, so the memory profile is the plain map this replaced plus a three-word
+// header per entry.
 //
-// With snapshots open, everything above retain is kept (a newer snapshot may
-// want it) along with the first version at or below it (the oldest snapshot
-// wants exactly that one). Everything past that is unreachable by definition.
+// With a floor, everything above retain is kept (a newer reader may want it)
+// along with the first version at or below it (the oldest reader wants exactly
+// that one). Everything past that is unreachable by definition. A chain under a
+// committing writer therefore settles at two versions rather than one, which is
+// the whole of what the correctness fix costs.
 func truncateNodeChain(head *nodeVersion, retain uint64, ok bool) {
 	if !ok {
 		head.prev = nil
