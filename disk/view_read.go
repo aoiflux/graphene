@@ -130,12 +130,12 @@ func (r reader) edgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.
 // incidentEdges walks the same sequence as edgesOf but appends IDs to the
 // caller's buffer instead of materialising edge records.
 func (r reader) incidentEdges(dst []store.IncidentEdge, id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) []store.IncidentEdge {
-	add := func(eid store.EdgeID, src, dstNode store.NodeID) {
+	add := func(eid store.EdgeID, src, dstNode store.NodeID, weight float32) {
 		nb := dstNode
 		if src != id {
 			nb = src
 		}
-		dst = append(dst, store.IncidentEdge{Edge: eid, Neighbour: nb})
+		dst = append(dst, store.IncidentEdge{Edge: eid, Neighbour: nb, Weight: weight})
 	}
 
 	dOut, dIn := r.deltaEdgeIDs(id, dir)
@@ -148,7 +148,7 @@ func (r reader) incidentEdges(dst []store.IncidentEdge, id store.NodeID, dir sto
 			if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, e) {
 				continue
 			}
-			add(eid, e.Src, e.Dst)
+			add(eid, e.Src, e.Dst, e.Weight)
 		}
 	}
 	appendDelta(dOut)
@@ -167,7 +167,7 @@ func (r reader) incidentEdges(dst []store.IncidentEdge, id store.NodeID, dir sto
 				if edgeTypes != nil && !storeEdgeMatchesFilter(edgeTypes, de) {
 					continue
 				}
-				add(eid, de.Src, de.Dst)
+				add(eid, de.Src, de.Dst, de.Weight)
 				continue
 			}
 			rec, found := r.v.csr.GetEdge(eid)
@@ -177,7 +177,7 @@ func (r reader) incidentEdges(dst []store.IncidentEdge, id store.NodeID, dir sto
 			if edgeTypes != nil && !rawEdgeMatchesFilter(edgeTypes, rec.Labels) {
 				continue
 			}
-			add(eid, rec.Src, rec.Dst)
+			add(eid, rec.Src, rec.Dst, rec.Weight)
 		}
 	}
 	appendCSR(cOut)

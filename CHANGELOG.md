@@ -200,6 +200,75 @@ full walk and 6 for a walk stopped at the first ID, neither growing with the
 graph. A snapshot also enumerates its property entries now, which is what lets it
 back a complete `bulk` export.
 
+### The shortest path can now be the cheapest one
+
+`ShortestPath` returns a path with the fewest edges, which is the right answer
+only when the edges are interchangeable. When they carry a similarity, a
+duration or a size, fewest is not cheapest — and the engine had no way to say
+so. There is now Dijkstra and A\*:
+
+```go
+gap := func(e store.IncidentEdge) float64 { return 1 - float64(e.Weight) }
+
+path, err := g.ShortestWeightedPath(src, dst, nil, gap)
+path, err  = g.AStarPath(src, dst, nil, gap, estimateRemaining)
+```
+
+with `…Ctx` forms taking a context and a `store.Budget`, whose `MaxNodes` counts
+nodes *settled* — reached with their final cost — so it keeps meaning what it
+means for every other walk.
+
+**The cost comes from the caller, and this is the design decision.** The obvious
+alternative was to read `Edge.Weight` as a distance, and it is wrong twice over:
+`Weight` is documented as a similarity score for `EdgeTypeSimilarTo` and encoded
+as one in the Merkle leaf, so reading it as a distance makes "more similar" mean
+"further away"; and no single reading suits every caller anyway. A selector
+taking `*store.Edge` would have been the other obvious shape, and would force a
+`GetEdge` per relaxation — the per-record catastrophe the adjacency extension
+exists to avoid. So `store.IncidentEdge` grew a `Weight` field instead, on the
+same argument that put `Neighbour` there: the store already holds the edge
+record while filtering, so copying a float32 out is free.
+
+That field is additive — all three construction sites use keyed literals — and
+was measured against a control identical but for it: **allocation counts
+unchanged on every traversal benchmark**, bytes up by one buffer entry's width
+(24 B/op on a 3-hop BFS, 8 B out of 1.2 MB on a deep DFS).
+
+**The search is unidirectional, and that costs something.** A bidirectional BFS
+may stop at the first node both frontiers reach, because for an unweighted walk
+that meeting is on a shortest path by construction. It is not, once edges have
+costs — the first meeting is merely the first. Making bidirectional Dijkstra
+correct means continuing past it with a different termination proof, so
+`ShortestWeightedPath` does not do that. The consequence is measured and
+reported rather than buried: on the benchmark fixture a weighted path runs ~15×
+slower than the unweighted one, because it settles every node cheaper than the
+destination instead of meeting in the middle. `docs/benchmarks.md` has the
+numbers. A\* is the answer where an estimate exists — on a grid it is worth 2.8×
+in time and 38% in memory, for the identical path.
+
+**What it refuses, and what it cannot.** A nil cost function is an error rather
+than a default unit cost, because a unit cost is exactly `ShortestPath` and
+quietly returning the unweighted answer would hide the mistake for as long as
+the weights happened not to matter. A negative or NaN cost is refused at the
+relaxation that produces it: Dijkstra is not approximately wrong with a negative
+edge, it is wrong, and a plausible bad path is worse than an error. That check
+covers costs the search *uses* — it stops when the destination settles, so an
+edge in a corner it never examined is never costed, and the path returned is
+unaffected by one.
+
+**A\* asks something in return.** `store.NodeHeuristic` must never overestimate
+the remaining cost. One that does returns a dearer path and no error, because
+catching it would mean computing the answer the estimate exists to avoid. A node
+is settled once and never reopened, which under an inconsistent heuristic is
+what turns the guarantee into "a path" rather than "the cheapest path";
+reopening would restore optimality at the price of unbounded re-expansion, and
+that trade is not made. A nil heuristic is exactly Dijkstra.
+
+Where several routes tie for cheapest, which one comes back is unspecified: it
+follows the order the backend reports incident edges in, which is not a promise
+the store makes across layer states. The cost is determined by the graph; the
+shape, among equals, is not.
+
 ### Fixed: `BeginTracked` livelocked under contention
 
 A read-modify-write retry loop with a few concurrent writers never finished. The
@@ -283,6 +352,34 @@ exported — the export is streamed precisely so it does not hold the graph.
   `TestResidual_BoundedPassCrossesChunkBoundaries` builds a candidate set
   several prefixes deep whose matches are all at the far end, which is the only
   way to reach the code that has to hold its place across them.
+- `traversal/heap.go` is a hand-rolled binary min-heap rather than
+  `container/heap`, whose interface costs an indirect call per comparison and
+  whose `Push` takes `any` — boxing every element, which would put one
+  allocation on the inner loop once per relaxed edge. The queue uses lazy
+  deletion rather than decrease-key, because a decrease-key heap needs a
+  position index and that per-node allocation is the whole saving.
+- The weighted search has an oracle of its own: a naive Bellman-Ford written
+  against the public API, in the spirit of `referenceBFS`. It walks `EdgesOf`
+  rather than `Neighbours`, deliberately — `Neighbours` reports one result per
+  distinct neighbour, so an oracle built on it cannot see the two parallel
+  edges of unequal cost that are the case the feature exists for.
+- `TestAllocGuards_Paths` asserts a *slope*, not a ceiling. A ceiling on a
+  200-node chain would mostly measure the fixture, since the path is the graph
+  and materialising it dominates; the property the searches actually promise is
+  that cost tracks the path and not the walk, so it runs each search to two
+  depths and checks the difference is the records. It also replaces a number
+  nobody could fail: `BenchmarkShortestPath` recorded 37 allocs/op and had no
+  `b.ReportAllocs()`, let alone a guard, while this release refactored the tail
+  it shares with the weighted search.
+- `BenchmarkWalk_Grid_*` has its own fixture because the shared one cannot host
+  it: 1 000 inbound edges into a single hub put every node within two hops of
+  every other, so any distance-based estimate overestimates — and an
+  overestimating heuristic does not make A* slower, it makes it wrong. The
+  admissibility check in the benchmark setup caught exactly that, and compares
+  costs rather than hop counts, which was the original error.
+- Both "applies to every walk" tables — the deadline table in
+  `traversal/guard_test.go` and `TestBudget_AppliesToEveryTraversal` — gained
+  the two new walks. Their whole point is that a walk they miss is unbounded.
 - `TestAppliedReader_*` constructs the applied-but-not-visible state directly
   rather than racing for it: the window it covers is open only while a commit
   waits on its fsync, so a test that raced would pass on a fast disk.

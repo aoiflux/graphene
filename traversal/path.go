@@ -211,20 +211,28 @@ func reconstructPath(
 		cur = v.parent
 	}
 
-	// Records are materialised only now, for the path itself — not for the far
-	// larger set of nodes the bidirectional search had to touch to find it.
+	return materialisePath(g, allIDs, allEdges)
+}
+
+// materialisePath turns a path of IDs into a path of records.
+//
+// Shared by the unweighted and weighted searches, which agree on exactly this
+// much: both spend their time on IDs and both fetch records only for the path
+// they ended up with — not for the far larger set of nodes they had to touch
+// to find it. Everything before this point differs between them.
+func materialisePath(g store.GraphReader, ids []store.NodeID, edges []store.EdgeID) (*PathResult, error) {
 	result := &PathResult{
-		Nodes: make([]*store.Node, 0, len(allIDs)),
-		Edges: make([]*store.Edge, 0, len(allEdges)),
+		Nodes: make([]*store.Node, 0, len(ids)),
+		Edges: make([]*store.Edge, 0, len(edges)),
 	}
-	for _, id := range allIDs {
+	for _, id := range ids {
 		n, err := g.GetNode(id)
 		if err != nil {
 			return nil, err
 		}
 		result.Nodes = append(result.Nodes, n)
 	}
-	for _, eid := range allEdges {
+	for _, eid := range edges {
 		e, err := g.GetEdge(eid)
 		if err != nil {
 			return nil, err

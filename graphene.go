@@ -916,8 +916,46 @@ func (g *Graph) ProvenanceChain(origin store.NodeID, maxDepth int, edgeTypes []s
 
 // ShortestPath finds the shortest undirected path between src and dst using
 // bidirectional BFS.
+//
+// Shortest here means fewest edges. When the edges are not interchangeable —
+// a similarity score, a transfer size, a duration — the path with the fewest
+// of them is not the cheapest one, and ShortestWeightedPath is the question
+// being asked instead.
 func (g *Graph) ShortestPath(src, dst store.NodeID, edgeTypes []store.EdgeType) (*traversal.PathResult, error) {
 	return traversal.ShortestPath(g.GraphStore, src, dst, edgeTypes)
+}
+
+// ShortestWeightedPath finds the cheapest undirected path between src and dst,
+// where the cost of each step is whatever cost reports for it.
+//
+// The cost comes from the caller rather than from the edge, because the engine
+// has no single notion of distance to offer: store.Edge.Weight is a similarity
+// score for EdgeTypeSimilarTo and zero for everything else, and reinterpreting
+// it as a distance would make "more similar" mean "further away". The selector
+// is handed each step with the edge weight already in it, so the common
+// readings cost nothing to express:
+//
+//	// closer means more similar
+//	g.ShortestWeightedPath(a, b, nil, func(e store.IncidentEdge) float64 {
+//		return 1 - float64(e.Weight)
+//	})
+//
+// cost must not be nil, and must return a non-negative, deterministic value;
+// see store.EdgeCost. Returns traversal.ErrNoPath when the two nodes are not
+// connected.
+func (g *Graph) ShortestWeightedPath(src, dst store.NodeID, edgeTypes []store.EdgeType, cost store.EdgeCost) (*traversal.PathResult, error) {
+	return traversal.ShortestWeightedPath(g.GraphStore, src, dst, edgeTypes, cost)
+}
+
+// AStarPath is ShortestWeightedPath guided by a heuristic estimating the
+// remaining cost from each node to dst.
+//
+// A heuristic that never overestimates returns the same path Dijkstra would,
+// sooner. One that overestimates returns a worse path and reports no error, so
+// store.NodeHeuristic states the obligation; pass nil when there is no estimate
+// to make, which is plain Dijkstra.
+func (g *Graph) AStarPath(src, dst store.NodeID, edgeTypes []store.EdgeType, cost store.EdgeCost, heuristic store.NodeHeuristic) (*traversal.PathResult, error) {
+	return traversal.AStarPath(g.GraphStore, src, dst, edgeTypes, cost, heuristic)
 }
 
 // FindPatterns searches for all subgraphs matching pattern within scope.
@@ -1012,6 +1050,20 @@ func (g *Graph) ProvenanceChainCtx(ctx context.Context, origin store.NodeID, max
 // ShortestPathCtx is ShortestPath bounded by budget and cancellable through ctx.
 func (g *Graph) ShortestPathCtx(ctx context.Context, src, dst store.NodeID, edgeTypes []store.EdgeType, budget store.Budget) (*traversal.PathResult, error) {
 	return traversal.ShortestPathCtx(ctx, g.GraphStore, src, dst, edgeTypes, budget)
+}
+
+// ShortestWeightedPathCtx is ShortestWeightedPath bounded by budget and
+// cancellable through ctx.
+//
+// Budget.MaxNodes counts nodes settled — reached with their final cost — which
+// is the weighted reading of "nodes visited"; see traversal.
+func (g *Graph) ShortestWeightedPathCtx(ctx context.Context, src, dst store.NodeID, edgeTypes []store.EdgeType, cost store.EdgeCost, budget store.Budget) (*traversal.PathResult, error) {
+	return traversal.ShortestWeightedPathCtx(ctx, g.GraphStore, src, dst, edgeTypes, cost, budget)
+}
+
+// AStarPathCtx is AStarPath bounded by budget and cancellable through ctx.
+func (g *Graph) AStarPathCtx(ctx context.Context, src, dst store.NodeID, edgeTypes []store.EdgeType, cost store.EdgeCost, heuristic store.NodeHeuristic, budget store.Budget) (*traversal.PathResult, error) {
+	return traversal.AStarPathCtx(ctx, g.GraphStore, src, dst, edgeTypes, cost, heuristic, budget)
 }
 
 // FindPatternsCtx is FindPatterns bounded by budget and cancellable through

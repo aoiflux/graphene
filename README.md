@@ -231,6 +231,9 @@ Scale validation covered by stress tests:
   type between any two nodes — the rule for bulk relationships, where a unique
   key on every edge is not affordable.
 - Traversal toolkit: BFS, DFS, provenance chain, shortest path.
+- **Weighted shortest paths**: `ShortestWeightedPath` (Dijkstra) and `AStarPath`,
+  with the cost of a step supplied by the caller — the engine has no single
+  notion of distance to impose, and `Edge.Weight` means similarity, not length.
 - Query primitives: type lookups, property lookups, degree/connectivity checks.
 - **Aggregates**: counts by label and by indexed value, and `NeighbourFrequency`
   — rank what a set of nodes point at, by how many of them point at it.

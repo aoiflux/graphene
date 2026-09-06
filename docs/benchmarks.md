@@ -1415,3 +1415,75 @@ converges; the test that produced these numbers is the convergence assertion in
 `tests/graphene_tx_read_test.go`, and the deterministic reproduction is
 `disk/applied_test.go`, which constructs the applied-but-not-visible state
 directly rather than racing for it.
+
+### v0.7.0 — weighted shortest paths
+
+New functionality, so there is no before-and-after: these are the numbers as
+recorded, on the shared disk fixture (100 000 nodes, a chain plus a +13 stride
+plus a 1 000-edge hub) at `-benchtime=200x -count=3`, medians.
+
+The cost function is the similarity *gap*, `1 - Weight`, not the weight. The
+fixture puts 0.5 on chain edges and 0.9 on strides because `Weight` is a
+similarity score, so reading it directly as a distance inverts the graph — the
+strides, which are the shortcuts, become the expensive edges. The gap reading
+prices a stride at 0.1 against a chain hop's 0.5, which is the topology the
+unweighted search sees.
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `Walk_ShortestPath_Disk` (unweighted, bidirectional) | 587 000 | 422 032 | 111 |
+| `Walk_ShortestWeightedPath_Disk` (Dijkstra) | 9 006 000 | 4 135 776 | 194 |
+
+**The 15× is the algorithm, not an inefficiency, and it is reported rather than
+buried.** A bidirectional BFS meets in the middle after about fifteen hops. A
+weighted search cannot stop at a meeting — the first meeting is not necessarily
+on the cheapest path — so it is unidirectional, and settles every node cheaper
+than the destination before it settles the destination. On this fixture that is
+most of the graph. Callers who need a bound have `store.Budget`, whose
+`MaxNodes` counts nodes settled; callers who can estimate the remaining distance
+have A\*.
+
+#### A\* against Dijkstra, on a graph a heuristic can speak about
+
+The shared fixture cannot host this comparison: its 1 000 inbound edges into one
+hub put every node within two hops of every other, so any estimate based on how
+far apart two nodes look is an overestimate — and an overestimating heuristic
+does not make A\* slower, it makes it wrong. The first draft of the A\*
+benchmark asserted otherwise; the admissibility check written into the benchmark
+setup is what caught it, and it compares **costs**, not hop counts, because
+comparing hops was the original mistake.
+
+So A\* is measured on a 100 × 100 four-connected lattice (10 000 nodes, 19 800
+edges, compacted), corner to corner, with two edge cost classes (0.5 and 1.0)
+alternating by row and column so the cheapest route is not simply the straight
+one. Manhattan distance times the cheapest edge is admissible there by
+construction, and consistent.
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `Walk_Grid_Dijkstra` | 4 384 780 | 1 612 096 | 493 |
+| `Walk_Grid_AStar` | 1 539 218 | 994 240 | 466 |
+
+**2.8× faster and 38% less memory, for the identical path** — the benchmark
+fails rather than reports if the two costs differ.
+
+#### The `IncidentEdge` field, measured against a control
+
+`store.IncidentEdge` grew from 16 to 24 bytes to carry the edge weight, which
+touches the buffer every traversal in the package reuses. HEAD was not a usable
+control (it predates Phase 3 as well), so the comparison is against a copy of
+this tree with the `Weight` field and its three fill sites removed and nothing
+else changed, interleaved over four rounds at `-benchtime=400x`.
+
+| Benchmark | allocs/op | B/op without | B/op with |
+|---|---:|---:|---:|
+| `Neighbours1Hop_Disk` | 8 → 8 | 504 | 504 |
+| `BFS3Hop_Memory` | 17 → 17 | 832 | 856 |
+| `BFS3Hop_Disk` | 39 → 39 | 2 432 | 2 456 |
+| `Walk_DFS_Deep` | 126 → 126 | 1 216 416 | 1 216 424 |
+
+Allocation counts are identical everywhere. Bytes grow by one buffer's width —
+24 B/op on a 3-hop BFS, 8 B out of 1.2 MB on a deep DFS. Timings were noise in
+both directions on a loaded machine, which is why the allocation columns are the
+ones quoted; see CONTRIBUTING §1.
+

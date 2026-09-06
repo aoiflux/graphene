@@ -790,7 +790,7 @@ func (s *Store) IncidentEdges(dst []store.IncidentEdge, id store.NodeID, dir sto
 			if e.Src != id {
 				nb = e.Src
 			}
-			dst = append(dst, store.IncidentEdge{Edge: eid, Neighbour: nb})
+			dst = append(dst, store.IncidentEdge{Edge: eid, Neighbour: nb, Weight: e.Weight})
 		}
 	}
 

@@ -1379,6 +1379,77 @@ func (g *Graph) ShortestPath(src, dst store.NodeID, edgeTypes []store.EdgeType) 
 func (g *Graph) FindPatterns(pattern *traversal.Pattern, scope []store.NodeID, maxMatches int) ([]traversal.SubgraphMatch, error)
 ```
 
+### Weighted paths: the cheapest route, not the shortest
+
+`ShortestPath` returns a path with the fewest edges. When the edges are not
+interchangeable — a similarity score, a transfer size, a duration — fewest is
+not cheapest, and `ShortestWeightedPath` is the question being asked instead.
+
+```go
+func (g *Graph) ShortestWeightedPath(src, dst store.NodeID, edgeTypes []store.EdgeType,
+    cost store.EdgeCost) (*traversal.PathResult, error)
+func (g *Graph) AStarPath(src, dst store.NodeID, edgeTypes []store.EdgeType,
+    cost store.EdgeCost, heuristic store.NodeHeuristic) (*traversal.PathResult, error)
+
+func (g *Graph) ShortestWeightedPathCtx(ctx context.Context, src, dst store.NodeID,
+    edgeTypes []store.EdgeType, cost store.EdgeCost, budget store.Budget) (*traversal.PathResult, error)
+func (g *Graph) AStarPathCtx(ctx context.Context, src, dst store.NodeID,
+    edgeTypes []store.EdgeType, cost store.EdgeCost, heuristic store.NodeHeuristic,
+    budget store.Budget) (*traversal.PathResult, error)
+```
+
+They return the same `*traversal.PathResult` and the same `traversal.ErrNoPath`,
+and read the graph the same undirected way, so one can be swapped for the other
+and the answers compared.
+
+**The cost comes from you.** The engine has no single notion of distance to
+offer: `Edge.Weight` is a similarity score for `EdgeTypeSimilarTo` and zero for
+everything else, so reading it as a distance would make "more similar" mean
+"further away". The selector is handed each step with the weight already in it,
+so the usual readings cost nothing to express:
+
+```go
+// closer means more similar
+gap := func(e store.IncidentEdge) float64 { return 1 - float64(e.Weight) }
+path, err := g.ShortestWeightedPath(a, b, nil, gap)
+
+// every hop the same — this is ShortestPath, and is why a nil cost is refused
+// rather than defaulted to it
+hops := func(store.IncidentEdge) float64 { return 1 }
+```
+
+A cost needing more than the weight can materialise the edge inside the
+selector, but that is a store read per relaxation and will dominate the walk.
+
+**What is refused.** `cost` must not be nil (`traversal.ErrNilCost`), and must
+return a non-negative, non-NaN value (`traversal.ErrNegativeCost`). Dijkstra is
+not merely inaccurate with a negative edge, it is wrong — so it is an error
+rather than a silently bad path. The check covers costs the search *uses*: it
+stops when the destination settles, so an edge it never examined is never
+checked, and the path it returns is unaffected by one.
+
+**Where several routes tie for cheapest**, which one comes back is unspecified —
+it follows the order the backend reports incident edges in, which is not a
+promise the store makes across layer states. The cost is determined by the
+graph; the shape, among equals, is not.
+
+**Cost of the walk.** A weighted search is unidirectional, because a
+bidirectional one cannot stop at the first meeting once edges have costs. It is
+therefore substantially more expensive than `ShortestPath` on a large graph —
+roughly 15× on the benchmark fixture — since it settles every node cheaper than
+the destination rather than meeting in the middle. Two things help: a
+`store.Budget`, whose `MaxNodes` counts nodes settled; and `AStarPath`, if you
+can estimate the remaining distance.
+
+**A\* asks something of you in return.** `store.NodeHeuristic` must never
+overestimate the remaining cost. One that does returns a dearer path and *no
+error*, because catching it would mean computing the answer the estimate exists
+to avoid. It should also be consistent — `h(a) <= cost(a,b) + h(b)` — since a
+node is settled once and never reopened. Returning 0 everywhere is always valid
+and is exactly Dijkstra, which is also what a nil heuristic means. On a grid
+where Manhattan distance is admissible, the estimate is worth 2.8× in time and
+38% in memory.
+
 ### Bounded and cancellable walks
 
 ```go
@@ -1477,7 +1548,7 @@ type Pattern struct { Nodes []PatternNode; Edges []PatternEdge }
 type SubgraphMatch struct { Mapping []store.NodeID }
 ```
 
-- `ShortestPath` returns `traversal.ErrNoPath` when no path exists.
+- `ShortestPath`, `ShortestWeightedPath` and `AStarPath` return `traversal.ErrNoPath` when no path exists.
 - `FindPatterns`: `scope` limits candidate nodes (pass a BFS result's IDs);
   `maxMatches` of `0` means unlimited.
 

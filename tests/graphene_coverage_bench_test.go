@@ -251,6 +251,197 @@ func BenchmarkWalk_ShortestPath_Disk(b *testing.B) {
 	}
 }
 
+// The weighted searches, on the same fixture and endpoints as
+// BenchmarkWalk_ShortestPath_Disk above so the three numbers are comparable.
+//
+// The cost function is the similarity *gap*, not the weight. That is not a
+// stylistic choice: the fixture puts 0.5 on chain edges and 0.9 on the +13
+// strides because Weight is a similarity score, so reading the weight directly
+// as a distance inverts the graph — the strides, which are the shortcuts,
+// become the expensive edges, and the search grinds down the chain one hop at a
+// time. The gap reading (1 - weight) makes a stride cost 0.1 against a chain
+// hop's 0.5, which is the same topology the unweighted search sees.
+func benchSimilarityGap(e store.IncidentEdge) float64 { return 1 - float64(e.Weight) }
+
+func BenchmarkWalk_ShortestWeightedPath_Disk(b *testing.B) {
+	f := diskGraph()
+	src, dst := f.ids[0], f.ids[200]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.ShortestWeightedPath(src, dst, nil, benchSimilarityGap); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// A weighted grid, because A* needs a graph a heuristic can say something about
+// -----------------------------------------------------------------------------
+//
+// The shared fixture cannot host this benchmark. Its 1000 inbound edges into
+// one hub put every node within two hops of every other, which makes any
+// estimate based on how far apart two nodes look — the only structure that
+// fixture has — an overestimate, and an overestimating heuristic does not make
+// A* slower, it makes it wrong. The first draft of this benchmark asserted
+// otherwise and the check below is what caught it.
+//
+// A grid has the property the hub destroys: distance in the graph is bounded
+// below by distance in the layout, so Manhattan distance times the cheapest
+// edge is admissible by construction, and consistent too.
+
+const (
+	gridSide     = 100 // gridSide × gridSide nodes
+	gridFastCost = 0.5 // the cheapest edge, and so the heuristic's scale
+)
+
+var (
+	gridFixtureOnce sync.Once
+	gridFixture     *benchFixture
+	gridFixtureDir  string
+)
+
+// gridGraph returns a gridSide × gridSide 4-connected lattice on disk,
+// compacted, with two classes of edge cost.
+//
+// Costs come from the same similarity-gap reading the other weighted benchmarks
+// use, so a "fast" edge carries a high similarity. Alternating them by row and
+// column means the cheapest route is not simply the straight one, which is what
+// keeps the search from being a formality.
+func gridGraph() *benchFixture {
+	gridFixtureOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "graphene-bench-grid-*")
+		if err != nil {
+			panic(err)
+		}
+		gridFixtureDir = dir
+		g, err := graphene.Open(dir)
+		if err != nil {
+			panic(err)
+		}
+
+		n := gridSide * gridSide
+		nodes := make([]*store.Node, n)
+		for i := range nodes {
+			nodes[i] = &store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}}
+		}
+		ids, err := g.AddNodes(nodes)
+		if err != nil {
+			panic(fmt.Sprintf("grid fixture: AddNodes: %v", err))
+		}
+
+		at := func(r, c int) store.NodeID { return ids[r*gridSide+c] }
+		edges := make([]*store.Edge, 0, 2*n)
+		link := func(a, b store.NodeID, fast bool) {
+			w := float32(0)
+			if fast {
+				w = 1 - gridFastCost
+			}
+			edges = append(edges, &store.Edge{
+				Src: a, Dst: b,
+				Labels: []store.EdgeType{store.EdgeTypeSimilarTo},
+				Weight: w,
+			})
+		}
+		for r := 0; r < gridSide; r++ {
+			for c := 0; c < gridSide; c++ {
+				if c+1 < gridSide {
+					link(at(r, c), at(r, c+1), r%3 == 0)
+				}
+				if r+1 < gridSide {
+					link(at(r, c), at(r+1, c), c%3 == 0)
+				}
+			}
+		}
+		if _, err := g.AddEdges(edges); err != nil {
+			panic(fmt.Sprintf("grid fixture: AddEdges: %v", err))
+		}
+		if err := g.Compact(); err != nil {
+			panic(fmt.Sprintf("grid fixture: Compact: %v", err))
+		}
+		gridFixture = &benchFixture{g: g, ids: ids, midNode: at(gridSide/2, gridSide/2)}
+	})
+	return gridFixture
+}
+
+// gridManhattan is the admissible, consistent heuristic for the grid: the
+// fewest edges that can separate two cells, each priced at the cheapest edge
+// the graph contains. It cannot overestimate, because no route can use fewer
+// edges than the layout requires or a cheaper edge than the cheapest one.
+func gridManhattan(ids []store.NodeID, dst store.NodeID) store.NodeHeuristic {
+	base := ids[0]
+	dr, dc := int(dst-base)/gridSide, int(dst-base)%gridSide
+	return func(id store.NodeID) float64 {
+		r, c := int(id-base)/gridSide, int(id-base)%gridSide
+		d := 0
+		if r > dr {
+			d += r - dr
+		} else {
+			d += dr - r
+		}
+		if c > dc {
+			d += c - dc
+		} else {
+			d += dc - c
+		}
+		return float64(d) * gridFastCost
+	}
+}
+
+func BenchmarkWalk_Grid_Dijkstra(b *testing.B) {
+	f := gridGraph()
+	src, dst := f.ids[0], f.ids[len(f.ids)-1]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.ShortestWeightedPath(src, dst, nil, benchSimilarityGap); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkWalk_Grid_AStar is the same query with the estimate, and the pair is
+// the whole argument for A*: Dijkstra settles a ball around the source because
+// it has no reason to prefer a direction, and a guided search walks at the
+// target instead.
+func BenchmarkWalk_Grid_AStar(b *testing.B) {
+	f := gridGraph()
+	src, dst := f.ids[0], f.ids[len(f.ids)-1]
+	h := gridManhattan(f.ids, dst)
+
+	// Checked once, outside the timer, and by cost rather than by hop count: an
+	// inadmissible heuristic returns a dearer path without complaining, and a
+	// benchmark of a wrong answer measures nothing. Comparing hops instead is
+	// the mistake this check was written to catch, and did.
+	want, err := f.g.ShortestWeightedPath(src, dst, nil, benchSimilarityGap)
+	if err != nil {
+		b.Fatal(err)
+	}
+	got, err := f.g.AStarPath(src, dst, nil, benchSimilarityGap, h)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if wc, gc := benchPathCost(want), benchPathCost(got); gc != wc {
+		b.Fatalf("the heuristic is not admissible on this fixture: A* cost %v, Dijkstra %v", gc, wc)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.g.AStarPath(src, dst, nil, benchSimilarityGap, h); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchPathCost(p *traversal.PathResult) float64 {
+	total := 0.0
+	for _, e := range p.Edges {
+		total += benchSimilarityGap(store.IncidentEdge{Edge: e.ID, Weight: e.Weight})
+	}
+	return total
+}
+
 // =============================================================================
 // Pattern matching and subgraph extraction
 // =============================================================================

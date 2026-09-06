@@ -120,6 +120,13 @@ func TestBudget_AppliesToEveryTraversal(t *testing.T) {
 		if _, err := g.ShortestPathCtx(context.Background(), ids[0], ids[len(ids)-1], nil, tight); !errors.Is(err, store.ErrBudgetExceeded) {
 			t.Errorf("ShortestPathCtx: want ErrBudgetExceeded, got %v", err)
 		}
+		unit := func(store.IncidentEdge) float64 { return 1 }
+		if _, err := g.ShortestWeightedPathCtx(context.Background(), ids[0], ids[len(ids)-1], nil, unit, tight); !errors.Is(err, store.ErrBudgetExceeded) {
+			t.Errorf("ShortestWeightedPathCtx: want ErrBudgetExceeded, got %v", err)
+		}
+		if _, err := g.AStarPathCtx(context.Background(), ids[0], ids[len(ids)-1], nil, unit, nil, tight); !errors.Is(err, store.ErrBudgetExceeded) {
+			t.Errorf("AStarPathCtx: want ErrBudgetExceeded, got %v", err)
+		}
 
 		pattern := &traversal.Pattern{
 			Nodes: []traversal.PatternNode{

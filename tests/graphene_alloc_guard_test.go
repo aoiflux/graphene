@@ -175,3 +175,69 @@ func TestAllocGuards_Scan(t *testing.T) {
 		}
 	})
 }
+
+// TestAllocGuards_Paths pins what a path search costs in allocations, and it is
+// a slope rather than a ceiling.
+//
+// A ceiling on this fixture would mostly measure the fixture: a 200-node chain
+// makes a 200-node path, and materialising it is one *store.Node plus one
+// *store.Edge per element — so the count is dominated by the answer's size and
+// would barely move if the search itself started allocating per node examined.
+// What the searches actually promise is that the cost tracks the path and not
+// the walk, so that is what is asserted: run the same search to two different
+// depths and check the difference is the records, with the search's own
+// allocation constant.
+//
+// The bar this replaces was a benchmark number nobody could fail: 37 allocs/op
+// on BenchmarkShortestPath, recorded and then unguarded while Phase 4
+// refactored the tail both searches now share.
+func TestAllocGuards_Paths(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector allocates; these counts are not the engine's under it")
+	}
+	g, ids := allocGuardFixture(t)
+
+	const near, far = 20, 180
+
+	// perNode is what materialisePath must cost and nothing more: GetNode and
+	// GetEdge each return a pointer, so two allocations per step of the path.
+	// The slack is for the frontier and heap buffers, which double as the walk
+	// deepens and so contribute a handful of allocations across the whole span,
+	// not a share of each node.
+	const perNode = 2.2
+
+	measure := func(name string, run func(dst store.NodeID)) (float64, float64) {
+		shortRun := testing.AllocsPerRun(100, func() { run(ids[near]) })
+		longRun := testing.AllocsPerRun(100, func() { run(ids[far]) })
+
+		grew := longRun - shortRun
+		if ceiling := perNode * float64(far-near); grew > ceiling {
+			t.Errorf("%s: %.0f more allocs for %d more path nodes (%.2f each), ceiling is %.2f — "+
+				"the search is allocating per node examined, not per node returned",
+				name, grew, far-near, grew/float64(far-near), perNode)
+		}
+
+		// What is left after the records is the search itself: its maps, its
+		// queue, and the result. Constant, and small.
+		overhead := shortRun - perNode*float64(near)
+		if overhead > 30 {
+			t.Errorf("%s: %.0f allocs beyond the path records on a %d-node path, ceiling is 30",
+				name, overhead, near)
+		}
+		return shortRun, longRun
+	}
+
+	measure("ShortestPath", func(dst store.NodeID) { g.ShortestPath(ids[0], dst, nil) })
+
+	cost := func(store.IncidentEdge) float64 { return 1 }
+	measure("ShortestWeightedPath", func(dst store.NodeID) {
+		g.ShortestWeightedPath(ids[0], dst, nil, cost)
+	})
+
+	// A nil heuristic must cost nothing over Dijkstra — weightedPath tests for
+	// nil rather than calling an always-zero function precisely so that it does
+	// not, and this is what would notice if that changed.
+	measure("AStarPath with a nil heuristic", func(dst store.NodeID) {
+		g.AStarPath(ids[0], dst, nil, cost, nil)
+	})
+}

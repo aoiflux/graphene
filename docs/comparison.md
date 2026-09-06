@@ -79,7 +79,7 @@ that backend's data layout.
 | BFS (k-hop neighbourhood)   | Built-in (`traversal.BFS`)                                                     | Via Gizmo `g.V().In/Out().All()` chains | Cypher `MATCH (n)-[*1..k]->(m)`                           |
 | DFS                         | Built-in (`traversal.DFS`, `ProvenanceChain`)                                  | Via Gizmo traversal                     | Cypher with path expansion                                |
 | Shortest path               | Bidirectional BFS (`traversal.ShortestPath`)                                   | Via Gizmo `shortestPath`                | Cypher `shortestPath()` and `allShortestPaths()` built-in |
-| Weighted shortest path      | Not yet (weight available on edges, no Dijkstra)                               | No                                      | Via Graph Data Science (GDS) library                      |
+| Weighted shortest path      | Dijkstra and A\* (`ShortestWeightedPath`, `AStarPath`) with a caller-supplied cost | No                                      | Via Graph Data Science (GDS) library                      |
 | Subgraph / pattern matching | VF2-inspired backtracking (`traversal.FindSubgraphMatches`) with label pruning | No dedicated pattern matcher            | Native via Cypher `MATCH` — core feature                  |
 | Provenance / ancestor walk  | Dedicated `ProvenanceChain` (inbound DFS, cycle-safe)                          | Via Gizmo In() chain                    | Cypher `MATCH (n)<-[*]-(root)`                            |
 | Variable-depth path         | Configurable `maxDepth`                                                        | Via recursive Gizmo calls               | Cypher `*` quantifier with range `[*minHops..maxHops]`    |

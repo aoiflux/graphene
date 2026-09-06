@@ -596,12 +596,63 @@ type AdjacencyReader interface {
 	NodeExists(id NodeID) bool
 }
 
-// IncidentEdge is one step out of a node: the edge and the node it leads to.
-// For a self-loop, Neighbour is the node itself.
+// IncidentEdge is one step out of a node: the edge, the node it leads to, and
+// the edge's weight. For a self-loop, Neighbour is the node itself.
 type IncidentEdge struct {
 	Edge      EdgeID
 	Neighbour NodeID
+
+	// Weight is the edge record's Weight, carried here for the same reason
+	// Neighbour is: the store has the edge in hand while filtering, so copying
+	// a float32 out costs nothing, while a weighted traversal that had to fetch
+	// it would pay a GetEdge per relaxation.
+	//
+	// It keeps Edge.Weight's meaning — a similarity score for EdgeTypeSimilarTo,
+	// zero otherwise — and is not a traversal cost. Turning one into the other
+	// is the caller's job, through an EdgeCost.
+	Weight float32
 }
+
+// EdgeCost turns one incident step into a traversal cost. Lower is cheaper.
+//
+// It exists because a graph carries no single notion of distance: the same
+// edges are a hop count to one caller, a similarity gap to another, and a
+// latency to a third. Rather than reinterpret Edge.Weight — which is documented
+// as a similarity score and encoded as one in the Merkle leaf — a weighted
+// walk takes the reading from its caller.
+//
+// The contract is what Dijkstra needs to be correct:
+//
+//   - Non-negative. A negative cost makes a settled node re-openable and the
+//     algorithm simply wrong; it is refused rather than silently mishandled.
+//   - Deterministic. Two calls on the same step return the same cost, or the
+//     path reported is not the path that was costed.
+//   - Cheap. It runs once per incident edge examined, on the inner loop.
+//
+// A cost needing more than the weight can materialise the edge inside the
+// selector, but that is a store read per relaxation and will dominate the walk.
+// The common readings need no such thing: a hop count is
+//
+//	func(store.IncidentEdge) float64 { return 1 }
+//
+// and a similarity gap is
+//
+//	func(e store.IncidentEdge) float64 { return 1 - float64(e.Weight) }
+type EdgeCost func(IncidentEdge) float64
+
+// NodeHeuristic estimates the remaining cost from a node to the destination,
+// for a heuristic-guided search. Lower means closer.
+//
+// It must be non-negative, and it must never overestimate the true remaining
+// cost — an estimate that is too large makes the search skip the cheapest path
+// and return a more expensive one, silently. It should also be consistent
+// (h(a) <= cost(a,b) + h(b)), which is what allows a node to be settled once
+// and never revisited; an admissible but inconsistent estimate can still
+// return a suboptimal path under that rule.
+//
+// Returning 0 for every node is always valid and reduces the search to plain
+// Dijkstra, which is the right fallback when no estimate is available.
+type NodeHeuristic func(NodeID) float64
 
 // DegreeCounter is an optional extension implemented by stores that can count
 // incident edges without materialising them. Callers should type-assert against

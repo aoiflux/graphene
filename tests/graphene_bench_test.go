@@ -58,6 +58,9 @@ func TestMain(m *testing.M) {
 	if diskFixtureDir != "" {
 		os.RemoveAll(diskFixtureDir)
 	}
+	if gridFixtureDir != "" {
+		os.RemoveAll(gridFixtureDir)
+	}
 	if orderedDskDir != "" {
 		os.RemoveAll(orderedDskDir)
 	}

@@ -348,6 +348,7 @@ func BenchmarkShortestPath(b *testing.B) {
 	for i := 0; i < chainLen-1; i++ {
 		g.GraphStore.AddEdge(&store.Edge{Src: ids[i], Dst: ids[i+1], Labels: []store.EdgeType{store.EdgeTypeSimilarTo}})
 	}
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		g.ShortestPath(ids[0], ids[chainLen-1], nil)

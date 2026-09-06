@@ -257,6 +257,11 @@ func TestGuard_GenerousDeadlineDoesNotChangeTheWalk(t *testing.T) {
 	}
 }
 
+// unitCost is the cost function for guard tests: every edge costs one, so a
+// weighted walk covers the same ground an unweighted one does and the only
+// thing under test is the budget.
+func unitCost(store.IncidentEdge) float64 { return 1 }
+
 // TestGuard_DeadlineAppliesToEveryWalk checks the guard is doing this for all of
 // them and not just BFS. The four loop shapes charge through different methods —
 // visitNode, crossEdge, step, descend — and the cadence split lives in tick, so
@@ -286,6 +291,14 @@ func TestGuard_DeadlineAppliesToEveryWalk(t *testing.T) {
 		},
 		"ShortestPathCtx": func() error {
 			_, err := ShortestPathCtx(context.Background(), s, ids[0], last, nil, tight)
+			return err
+		},
+		"ShortestWeightedPathCtx": func() error {
+			_, err := ShortestWeightedPathCtx(context.Background(), s, ids[0], last, nil, unitCost, tight)
+			return err
+		},
+		"AStarPathCtx": func() error {
+			_, err := AStarPathCtx(context.Background(), s, ids[0], last, nil, unitCost, nil, tight)
 			return err
 		},
 	}

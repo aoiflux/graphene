@@ -133,9 +133,9 @@ with no dependencies. *Needs* names the blocking primitive from §6.
 | Unweighted shortest path | **built** | — | — | Bidirectional BFS, 37 allocs/op |
 | Subgraph pattern matching | **built** | — | — | `FindSubgraphMatches` |
 | Cycle detection | **built** | — | — | `HasCycle`, guarded to `MaxRecursionDepth` |
-| Dijkstra (source-target, single-source) | open | low | P6 | **Best first algorithm.** `Edge.Weight` already exists and is durable; only its *semantics* need generalising |
-| A* | open | low | P3 | Needs a per-node heuristic value — the property-column gap exactly |
-| Yen's k-shortest paths | open | medium | Dijkstra | Nearly free once Dijkstra exists |
+| Dijkstra (source-target) | **built** | — | — | `ShortestWeightedPath`, v0.7.0. Unidirectional — a bidirectional search may not stop at the first meeting once edges have costs. Single-source (all targets) is still open |
+| A* | **built** | — | — | `AStarPath`, v0.7.0. Takes the heuristic as `func(NodeID) float64` from the caller, so it did not have to wait for the property column (P3) |
+| Yen's k-shortest paths | open | medium | — | Dijkstra now exists, so this is unblocked |
 | Bellman-Ford + negative cycle | open | low | P6 | Only interesting if negative weights are admitted — a data-model question |
 | Delta-stepping (parallel SSSP) | open | high | P4 | Pointless before an executor exists |
 | Minimum weight spanning tree | open | low | P6 | Prim's over a CSR is a textbook fit |
@@ -196,7 +196,7 @@ Nothing in §5 is hard. What is missing is the layer underneath it.
 | **P3** | Node property columns | Properties are an opaque msgpack blob. There is nowhere to put one `float64` per node — what PageRank reads and writes, what A* needs for a heuristic, and what every algorithm needs to *return* into. The only write-back path today is `IndexNodeProperty` with caller-encoded bytes: an index entry, not a column | medium | centrality, community, embeddings |
 | **P4** | Parallel executor | There are exactly two goroutines in library code — the auto-compactor and the signal handler — and neither does query work. GDS is parallel by default. An immutable pinned `Snapshot` makes a bounded worker pool over ID ranges trivially safe; the safety argument is already paid for | medium | betweenness, closeness, Louvain, delta-stepping |
 | **P5** | Raw CSR span access | Traversal reaches adjacency through `IncidentEdges`, one call per node. Ten PageRank iterations over ten million edges is a hundred million interface dispatches. A direct-span fast path would be much faster — but it exists only on the disk backend, which breaks the parity rule that `memory.Store` is the oracle | medium | all of them, by a constant factor |
-| **P6** | General edge weight contract | `Edge.Weight float32` exists and is durable — but it is documented as a similarity score for `SimilarTo`, zero otherwise. Similarity is *higher-is-better*; a shortest path needs *lower-is-better* cost. Reinterpreting the field silently would be a data-model change wearing an algorithm costume | low | Dijkstra, A*, MST, Yen |
+| **P6** | General edge weight contract | **Resolved in v0.7.0, by not reinterpreting the field.** Cost is a caller-supplied `store.EdgeCost` selector, so `Edge.Weight` keeps its similarity meaning and its Merkle leaf encoding. `store.IncidentEdge` carries the weight, so the selector costs no store read — and, measured against a control, no allocation either | — | MST, Yen |
 | **P7** | Adjacency sorted by neighbour ID | Spans are in build order. Sorted by neighbour ID, every set intersection — triangle count, Jaccard, common neighbours, all four link-prediction scores — becomes a linear merge instead of a hash build. It would also make `neighbours()` deduplication free, retiring `neighbourDedupeLinear` | low | similarity, link prediction, triangles |
 
 ### P7 had a deadline, and it dissolved
@@ -248,7 +248,7 @@ CONTRIBUTING §3 already sets. Ordered by what a wrong answer would cost.
 | **RQ4** | Does a pointer-free arena change the mmap verdict? | Re-run the Phase 2 mmap spike against a genuinely pointer-free layout. **Note:** what shipped is not that layout — records still hold `[]NodeType` and `[]byte`, so this needs the `(off, len uint32)` records built first | Whether larger-than-memory — the one genuine storage gap — becomes reachable. Both prior spikes measured the wrong pair |
 | **RQ5** | At what hop depth does index-free adjacency beat an indexed relational join? | Build the same graph in SQLite and in Graphene; measure k-hop neighbourhood at k = 1…6 | Nothing internal — but it is the number the category argues about and nobody publishes |
 | **RQ6** | Does the arena's GC win grow under algorithm workloads? | Extend `tests/gc_bench_test.go` with a mutator allocating large float arrays, as PageRank does, rather than timing an idle heap. Keep `debug.SetGCPercent(-1)` — without it the figure measures the trigger rate, which is the defect that voided the original spike's GC column | How much of the measured **−21.4% at 512-byte blobs** is left on the table. The verdict itself is taken: the arena is kept |
-| **RQ7** | Should `Edge.Weight` be reinterpreted, or should weight be a caller-supplied selector? | A design question, not a measurement: prototype both signatures against Dijkstra and see which one lies less | P6, and with it the whole weighted path-finding group. A selector keeps the durable format honest at the cost of an allocation per call |
+| **RQ7** | Should `Edge.Weight` be reinterpreted, or should weight be a caller-supplied selector? | **Answered in v0.7.0: a selector.** `store.EdgeCost` takes a `store.IncidentEdge`, not an `*Edge` — the store already holds the edge record while filtering, so the weight travels out for free and no `GetEdge` per relaxation is needed. The predicted allocation per call did not materialise: measured against a control identical but for the field, allocation counts are unchanged on every traversal benchmark | Closed |
 
 ---
 

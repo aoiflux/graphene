@@ -1679,6 +1679,106 @@ results under a depth limit; performance is a wash; and DFS is recursive, so
 stack depth tracks graph depth. DFS is right where it is used —
 `ProvenanceChain` follows a single chain and terminates early.
 
+### 8.2a Weighted shortest paths — Dijkstra, and why not bidirectional
+
+`ShortestPath` is a bidirectional BFS that stops at the first node both
+frontiers have reached. That termination is sound only because every edge counts
+the same: the first meeting is on a shortest path by construction. Give the
+edges costs and it stops being true — the first meeting is merely the first, and
+a cheaper route can still be one long hop away on either side.
+
+Bidirectional Dijkstra exists, but it is a different algorithm with a different
+proof: it must continue past the meeting until the two settled frontiers'
+distances provably cannot improve on the best joint path found so far. That is
+not a weight bolted onto the existing search, so `ShortestWeightedPath` is
+**unidirectional**. What carries over from `path.go` is the provenance map and
+the record-materialising tail (`materialisePath`, shared by both); the
+two-frontier machinery does not.
+
+The consequence is a real and measurable cost, recorded rather than hidden: on
+the benchmark fixture a weighted path over 200 nodes runs ~15× slower than the
+unweighted one, because a bidirectional search meets after about fifteen hops
+while Dijkstra settles every node cheaper than the destination. `docs/benchmarks.md`
+carries the numbers, and A* is the answer when the caller has an estimate.
+
+**Cost is a selector, not a field.** `Edge.Weight` is documented as a similarity
+score for `EdgeTypeSimilarTo` and zero otherwise, and it is encoded that way in
+the Merkle leaf. Reinterpreting it as a distance would make "more similar" mean
+"further away", so the reading comes from the caller:
+
+```go
+type EdgeCost func(IncidentEdge) float64
+```
+
+The obvious alternative — a selector taking `*store.Edge` — would force a
+`GetEdge` per relaxation, which is the catastrophe §6.9 documents avoiding
+(73.8 µs against 14.22 ns for materialising records merely to count them).
+Instead `IncidentEdge` gained a `Weight` field, on the same argument that put
+`Neighbour` there: the store has the edge record in hand while filtering, so
+copying a float32 out of it is free. Measured against a control identical but
+for that field, allocation counts are unchanged on every traversal benchmark and
+byte counts grow by the width of the reused buffer — 24 B/op on a 3-hop BFS, 8 B
+out of 1.2 MB on a deep DFS.
+
+**No neighbour dedupe.** Every other walk in the package calls
+`walker.beginExpansion` and drops the second edge reaching a neighbour already
+seen in this expansion, matching what `Neighbours` reports. A weighted walk must
+not: two parallel edges between the same pair are two different costs, and
+taking whichever adjacency happened to report first returns a path that is not
+the cheapest while reporting that it is. Every incident edge is relaxed, and the
+relaxation discards the dearer one.
+
+**A hand-rolled heap.** `container/heap` takes the collection as an interface
+and calls back through `Len`/`Less`/`Swap`, so every comparison is an indirect
+call, and its `Push` takes `any` — boxing every element, which puts one
+allocation on the inner loop, once per relaxed edge. `traversal/heap.go` is a
+binary min-heap generic over its payload with the priority a plain `float64`
+field: no dispatch, no boxing, and a caller can preallocate.
+
+The queue uses **lazy deletion** rather than decrease-key: a node is pushed once
+per improvement found and stale pops are discarded by a `settled` flag. A
+decrease-key heap needs a position index — a per-node allocation, which is the
+whole saving.
+
+**Refusals.** A negative cost makes a settled node re-openable, so Dijkstra is
+simply wrong with one; it is refused with `ErrNegativeCost` at the relaxation
+that produces it, at a cost of one comparison. The test is written `!(c >= 0)`
+rather than `c < 0` so that NaN — which fails every comparison and would make
+the queue ordering arbitrary rather than wrong-but-explicable — is caught by the
+same branch. A nil selector is refused too, rather than defaulting to a unit
+cost: a unit cost is exactly `ShortestPath`, and quietly returning the
+unweighted answer would hide the caller's mistake for as long as the weights
+happened not to matter.
+
+The refusal covers costs the search **uses**, and cannot cover more than that:
+the walk stops when the destination settles, so a negative edge in a corner it
+never examined is never seen. The path returned is still correct — that edge
+played no part in it — and checking otherwise would mean costing every edge in
+the graph before answering.
+
+**Budget.** `MaxNodes` is charged when a node is *settled* (popped with its
+final cost), not when it is discovered. A weighted search discovers a node once
+per improvement found, and charging those would make the same limit stop this
+walk far earlier than a BFS over the same graph, so "nodes visited" would mean
+two different things. `MaxEdges` is charged per edge examined, as elsewhere.
+
+**A\*, and the obligation it puts on the caller.** `AStarPath` orders the queue
+by distance-so-far plus `NodeHeuristic`'s estimate of the distance remaining. An
+estimate that never overestimates returns the same answer sooner; one that
+overestimates returns a dearer path **and no error**, because detecting that
+would mean computing the answer the heuristic exists to avoid computing.
+
+A node is settled once and never reopened. For a plain Dijkstra, or a consistent
+heuristic, that rule costs nothing — nodes settle in non-decreasing distance
+order. Under an *inconsistent* heuristic a settled node can be reached again at
+a genuinely smaller distance, and declining to reopen it is what keeps every
+node expanded at most once. Reopening would restore the optimal answer at the
+price of re-expansion cascades that nothing bounds; this package does not make
+that trade, which is why `NodeHeuristic` states consistency as an obligation.
+`TestAStarPath_InconsistentHeuristicCostsCorrectness` pins the resulting
+behaviour with a graph where a broken heuristic returns 11 and Dijkstra returns
+3, so the doc and the code cannot drift apart silently.
+
 ### 8.3 Pattern matching
 
 `FindSubgraphMatches` matches a small `Pattern` against a scope by backtracking,

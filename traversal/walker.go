@@ -52,7 +52,7 @@ func (w *walker) incidentEdges(id store.NodeID, dir store.Direction, edgeTypes [
 		if e.Src != id {
 			nb = e.Src
 		}
-		buf = append(buf, store.IncidentEdge{Edge: e.ID, Neighbour: nb})
+		buf = append(buf, store.IncidentEdge{Edge: e.ID, Neighbour: nb, Weight: e.Weight})
 	}
 	w.edgeBuf = buf
 	return buf, nil
