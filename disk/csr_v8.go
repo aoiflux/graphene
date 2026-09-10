@@ -232,11 +232,12 @@ func VerifyCSRDigest(path string) (DigestStatus, [csrDigestSize]byte, error) {
 // same three answers, in memory bounded by the header and one copy buffer.
 //
 // The file is hashed as it is read rather than read whole first. An image is the
-// size of the graph, and the callers here are `graphene store csr -verify` —
-// which reads nothing but the header for everything else it prints — and the
-// final check of every backup. Both are things an operator reaches for because a
-// machine is already in trouble, which is the worst moment to ask for the
-// store's footprint a second time.
+// size of the graph, and the caller that matters is the final check of every
+// backup: it was the only whole-image read a backup made after the copy, on an
+// operation an operator reaches for because a machine is already in trouble,
+// which is the worst moment to ask for the store's footprint a second time. The
+// CLI verification commands share this leg, but their roots check still parses
+// the image whole, so they are bounded here and not yet overall.
 //
 // Reading in pieces is safe because the engine never rewrites an image in place:
 // a compaction writes a temporary file and renames it over the old one, so the

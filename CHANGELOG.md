@@ -289,6 +289,88 @@ chunks of ten thousand, so the cap belongs above them. At 65 536 the same
 measurement is +864 B/op and +1 alloc/op, both inside run-to-run noise, and a
 corrupt marker is still bounded by a constant rather than by the log's size.
 
+### Fixed: a backup read back the whole image it had just streamed
+
+A backup copies every file of the store through a fixed buffer, and the
+program's plan recorded both backup and restore as streaming on the strength of
+reading the code. This release's residency instruments gained
+`BenchmarkRSS_Restore`, which samples the process during a backup and then a
+restore of the same store, so that the claim stays measured. The restore is
+streaming: **0.27 MiB** of peak growth against a 44 MiB store. The backup was
+not. It ends by re-verifying the digest of the copied image — the check that
+makes "the backup succeeded" a statement about the bytes in the destination
+rather than the bytes sent there — and that check read the file whole. A backup
+grew the process by **44.32 MiB on a 44.01 MiB store**: the entire image,
+allocated a second time, on the one operation an operator runs *because* the
+machine is short of memory.
+
+The digest is now computed as the file is read. The two regions it excludes —
+the digest field itself and the compaction timestamp, which records when the
+image was written and is not content — are zeroed in a copy of the header
+before it is hashed, and the body streams through the hash from there. One
+definition of the covered bytes now serves both this and the whole-buffer form
+`VerifyOnOpen` uses on an image it already holds, so the two cannot drift, and a
+thirteen-case table plus a fuzz target compare them byte for byte over every
+shape the pair can tell apart: files shorter than a header, files that predate
+the digest, a tampered body, a changed timestamp. A file that fails to *read* is
+reported as an error and never as "carries no digest" — a damaged disk and a
+pre-v8 image are different answers, and only one of them is safe to act on.
+
+Measured on the same 44 MiB image, three interleaved rounds against the tree
+without the change: a backup went from **46.24 MB/op to 119 KB/op** and the
+digest check alone from **46.16 MB/op to 34 KB/op** — one 32 KiB copy buffer
+and the hash state — with wall clock inside run-to-run spread on both, the
+streamed form marginally ahead in every round because a buffered read has no
+file-sized allocation to fault in. The guard is
+`TestVerifyCSRDigest_DoesNotReadTheImageWhole`, which bounds what one call
+allocates at a megabyte against an eight-megabyte image; reintroducing the
+whole read fails it and nothing else does.
+
+`store csr -verify`, `debug hash-check` and `debug integrity` share the leg and
+are bounded on it, not overall: their roots check still parses the image, which
+is the whole-image verifier a later phase replaces with one over a mapping.
+
+### Two promises about the store directory, written down before a mapping depends on them
+
+The next phase of this program maps the image instead of decoding it, and a
+mapped file has a failure mode a heap copy does not: when the bytes behind it
+change or vanish, the next access is not an error but a machine fault. §15 of
+`TECHNICAL_DETAILS.md` now states the two invariants that make a mapping safe
+to introduce, so that the contract exists before the code that needs it does.
+
+**A store file is never rewritten in place** (§15.13). Every replacement is
+written to a temporary file, fsynced, and renamed over the old name, so the
+bytes behind an open handle never change under it. Two things already rest on
+this — the streamed digest above, and a live reader parsing an image while a
+writer compacts — and a mapped image would rest on it absolutely.
+
+The two platforms honour it by opposite routes, and writing the invariant down
+is what found the difference. On unix the rename leaves the old inode alone and
+a held handle goes on reading the image it opened. On windows, renaming a file
+*over* another is refused while any handle to the target is open — with
+`FILE_SHARE_DELETE` and without it alike, because that flag permits renaming a
+file *aside*, which is a different operation. The reader is protected just as
+completely, by the compaction failing rather than by two files coexisting: a
+process holding `graphene.csr` open stalls a writer's compaction with `Access
+is denied`, the store is left untouched, and the next attempt succeeds once the
+reader lets go. For the mapping work this settles something the plan had only
+guessed: installing an image underneath a mapping cannot be a single rename on
+windows, so the old name has to be moved aside first and the new file put in
+its place second. `TestImage_AHeldHandleNeverSeesTheBytesChange` pins both
+routes.
+
+**The directory is the engine's to write, and no one else's, while a handle is
+open** (§15.14). This is an obligation on the caller rather than a property the
+engine can enforce: the write lock keeps other graphene processes out, and
+nothing keeps out `truncate`, an editor, or a backup tool that rewrites files in
+place. With the image read into the heap, breaking it costs a parse error at the
+next reopen. Under a mapping it costs the process, at whatever unrelated line of
+caller code happened to touch the slice — `SIGBUS` on unix,
+`EXCEPTION_IN_PAGE_ERROR` on windows, neither recoverable in Go. That is a
+*defined* outcome rather than a safe one, and it binds hardest on `OpenLive`
+readers, which take no lock at all. The subprocess test that asserts the fault
+waits for the mapping to exist.
+
 ### Declarations are now a property of the store, not of the process
 
 A declaration tells the engine something it cannot work out for itself, and it
@@ -688,6 +770,16 @@ exported — the export is streamed precisely so it does not hold the graph.
 - `TestAppliedReader_*` constructs the applied-but-not-visible state directly
   rather than racing for it: the window it covers is open only while a commit
   waits on its fsync, so a test that raced would pass on a fast disk.
+- `TestVerifyCSRDigest_DoesNotReadTheImageWhole` bounds
+  `runtime.MemStats.TotalAlloc` rather than sampling residency. The counter is
+  cumulative and exact, unaffected by when the collector runs, so a single
+  whole-file read shows up as one allocation the size of the file — and the
+  test refuses a fixture too small to tell, rather than passing on it.
+- `os.SameFile` cannot detect a replaced file on windows. Go's `fileStat` loads
+  the file identifier lazily, by path, so two stats of the same name taken
+  before and after a rename-over compare equal. The held-handle test re-reads
+  the bytes it holds instead of comparing identities, which asserts the property
+  directly on both platforms.
 
 ---
 

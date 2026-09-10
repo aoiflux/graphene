@@ -1749,3 +1749,117 @@ The bounded-memory claim has its own guard rather than a benchmark:
 6 000 and 60 000 record logs and reads **0.00 B/record**. Both fixtures are
 deliberately past the read buffer's cap — below it the buffer is sized to the log,
 and a smaller pair measures the buffer growing rather than the walk retaining.
+
+## Backup, its digest leg, and the residency of a restore (2026-09-11)
+
+Method as §1 of `CONTRIBUTING.md`: three interleaved rounds, alternating the
+working tree against a pristine `9e1db48` tree (the commit before the change),
+one fixture per process, medians reported with the full spread. Same machine
+block as the program baselines above. The fixture is the residency suite's own —
+50 000 nodes, 512-byte blobs, the consumer index shape — which compacts to a
+**44.01 MiB** image, so every row below can be read against the same store.
+
+### What the change touches, and what it does not
+
+`VerifyCSRDigest` hashes the image as it reads it instead of reading it whole.
+The whole-buffer form `VerifyOnOpen` uses on an image already in hand is
+unchanged in what it computes, and the two now share one definition of the
+covered bytes. On a measured store path the only caller is the final check of
+every backup; `store csr -verify`, `debug hash-check` and `debug integrity`
+share the leg. No read path and no write path is touched, so the point-lookup
+control is expected to read as noise, and does.
+
+### `BenchmarkRSS_Restore` — residency, 50k nodes, 44 MiB store
+
+Peak residency is sampled on a 1 ms ticker during the backup and again during
+the restore, each read against the settled residency just before it; the store
+stays open across both so the deltas are measured against a heap that cannot
+have shrunk for unrelated reasons.
+
+| | anon MiB | backup peak MiB | backup Δ MiB | restore Δ MiB | heap MiB | B/op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `9e1db48` | 176.9 (176.7–180.4) | 221.5 (221.4–224.6) | **44.30** (44.29–44.39) | 0.23 (0.10–0.30) | 118.2 | 46 613 632 |
+| with the change | 176.3 (176.1–176.9) | 176.7 (176.3–177.2) | **0.22** (0.18–0.25) | 0.26 (0.25–0.35) | 118.2 | 489 560 |
+
+The backup delta on the control tree *is* the image: 44.30 MiB of growth
+against a 44.01 MiB file, in all three rounds, with a spread of a tenth of a
+MiB. That is the whole-file read behind the copy's digest check, and it is what
+the plan had recorded as "verified streaming" from a reading of the code. The
+restore column is unchanged and was streaming all along — the restore is what
+the benchmark was named for, and the backup half is what it found. Steady-state
+residency and the live heap are identical to the tenth of a MiB on both sides;
+nothing is retained. The process-lifetime `peakMiB` column (499.9–603.8 on
+both arms) reports the fixture build and is omitted, as the benchmark's own
+comment says to.
+
+### `BenchmarkBackup_Quiescent` — wall clock and allocation
+
+A backup of the same store with nothing else running, ten per iteration set,
+the destination removed between them. This is the other half of the question
+`BenchmarkBackupCost` asks: not what a writer pays during a backup, but what
+the backup itself allocates.
+
+| | ms/op (median) | B/op (median) | allocs/op (median) |
+| --- | ---: | ---: | ---: |
+| `9e1db48` | 220.2 (194.2–308.6) | 46 243 476 | 139 |
+| with the change | 219.4 (187.8–219.6) | 119 390 | 132 |
+| delta | inside spread | **−46.12 MB, −99.7%** | −7 |
+
+### `BenchmarkVerifyCSRDigest` — the leg on its own
+
+| | ms/op (median) | B/op (median) | allocs/op (median) |
+| --- | ---: | ---: | ---: |
+| `9e1db48` | 54.8 (49.7–77.0) | 46 156 782 | 14 |
+| with the change | 48.5 (47.8–68.2) | 34 112 | 13 |
+| delta | −11% at the median, spreads overlap | **−46.12 MB, −99.93%** | −1 |
+
+What remains is one 32 KiB copy buffer and the hash state, and it does not move
+with the file: 34 089–34 134 bytes across the three rounds against a 44 MiB
+image. The wall-clock ordering favoured the streamed form in every round, which
+is the expected direction — the SHA-256 work is identical, and a buffered read
+has no file-sized allocation to fault in — but the spreads overlap and it is
+reported as a wash. Under the program's priority rule this change would have
+been taken at a wall-clock cost; it did not need one.
+
+Round 3 of both benchmarks was disturbed on both arms (308 ms and 77 ms on the
+control, 68 ms on the change) and is left in the spreads rather than re-run:
+the memory columns it contributed to are within 15 KB of the other two rounds
+on the change side and within 13 KB on the control side.
+
+### The control
+
+`BenchmarkPointLookupNode_Memory`, which this change cannot reach. A first set
+at `-benchtime=1s`, taken while the machine was busy, spread 46–107 ns on the
+change against 25–78 ns on the control — overlapping, and useless. Re-run at
+`-benchtime=2s` once the machine was quiet:
+
+| | ns/op (median) |
+| --- | ---: |
+| `9e1db48` | 25.20 (24.67–26.28) |
+| with the change | 25.10 (24.60–27.65) |
+
+Both sets are recorded because a control that had been quietly dropped for
+reading badly would not be a control.
+
+### Reproducing
+
+```sh
+git archive 9e1db48 | tar -x -C /tmp/control                      # a control tree, no worktree needed
+cp tests/rss_bench_test.go tests/graphene_backup_bench_test.go /tmp/control/tests/   # same instrument, both engines
+for i in 1 2 3; do
+  for tree in . /tmp/control; do
+    ( cd $tree && go test ./tests/ -tags=stress -run='^$' \
+        -bench='^(BenchmarkBackup_Quiescent|BenchmarkVerifyCSRDigest)$' -benchmem -benchtime=10x -count=1 )
+    ( cd $tree && go test ./tests/ -tags=stress -run='^$' \
+        -bench='^BenchmarkRSS_Restore$' -benchtime=1x -count=1 )
+  done
+done
+```
+
+The streaming claim has a guard rather than a benchmark:
+`TestVerifyCSRDigest_DoesNotReadTheImageWhole` bounds
+`runtime.MemStats.TotalAlloc` across one call at 1 MiB against an image it
+refuses to run on unless it is at least four times that. Reintroducing the
+whole read fails it and no other test; the thirteen-case differential table
+and `FuzzCSRDigestStream` (2.36 M executions, no divergence) are what hold the
+streamed and whole-buffer digests to the same bytes.

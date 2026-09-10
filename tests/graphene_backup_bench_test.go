@@ -28,12 +28,15 @@ package graphene_test
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aoiflux/graphene"
+	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -151,4 +154,69 @@ func BenchmarkBackupCost(b *testing.B) {
 			benchmarkBackupCost(b, size)
 		})
 	}
+}
+
+// =============================================================================
+// What a backup allocates, with nothing else running
+// =============================================================================
+
+// BenchmarkBackup_Quiescent is the other half of the question above: not what
+// a writer pays while a backup runs, but what the backup itself allocates. It
+// exists because the answer was once the whole image. A backup streams every
+// file through a copy buffer and then re-verifies the copied image's digest,
+// and that last leg read the image whole — so on the target workload a backup
+// allocated the store's footprint a second time, on the operation an operator
+// runs because the machine is already short of it. B/op is the figure to read.
+// The fixture is the residency suite's own, so the row can be read beside
+// BenchmarkRSS_Restore.
+func BenchmarkBackup_Quiescent(b *testing.B) {
+	dir := rssFixtureDir(b, rssNodes, rssBlob)
+	g, err := graphene.Open(dir)
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	defer g.Close()
+
+	fi, err := os.Stat(filepath.Join(dir, "graphene.csr"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	root := b.TempDir()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dst := filepath.Join(root, strconv.Itoa(i))
+		if _, err := g.Backup(dst); err != nil {
+			b.Fatalf("Backup: %v", err)
+		}
+		b.StopTimer()
+		os.RemoveAll(dst)
+		b.StartTimer()
+	}
+	b.StopTimer()
+	// Reported after the loop: ResetTimer deletes user-reported metrics.
+	b.ReportMetric(float64(fi.Size())/(1<<20), "imageMiB")
+}
+
+// BenchmarkVerifyCSRDigest is that leg on its own: the digest a compacted
+// image carries, checked against its contents. It is the check every backup
+// ends with and the one `store csr -verify` and `debug hash-check` begin with.
+func BenchmarkVerifyCSRDigest(b *testing.B) {
+	dir := rssFixtureDir(b, rssNodes, rssBlob)
+	fi, err := os.Stat(filepath.Join(dir, "graphene.csr"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		status, _, err := disk.VerifyCSRDigest(dir)
+		if err != nil {
+			b.Fatalf("VerifyCSRDigest: %v", err)
+		}
+		if status != disk.DigestMatch {
+			b.Fatalf("digest status %v, want match", status)
+		}
+	}
+	b.StopTimer()
+	// Reported after the loop: ResetTimer deletes user-reported metrics.
+	b.ReportMetric(float64(fi.Size())/(1<<20), "imageMiB")
 }

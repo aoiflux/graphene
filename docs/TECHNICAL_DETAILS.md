@@ -3519,6 +3519,13 @@ a store carrying real payloads is not a trade worth making. The 90%+ figure is
 real but it is the column that requires exactly the design rejected above — an
 offset table and a decode on every `GetNode`.
 
+Re-run 2026-09-11 on the tree carrying Phases 0–1 of the memory program, as
+that program's plan required before its own mapping work began: 19.4 / 33.6 /
+121.8 MiB of heap at the three blob sizes, mappable share **15.7 / 9.1 / 2.5%**.
+The table holds within noise and so does the verdict. What that program maps is
+the *record stream* — the right-hand column — which §14.13's arena layout made
+reachable without the decode this section rejects.
+
 **What the spike found instead.** With no property blobs at all, 19.4 MiB of heap
 sits over a 5.7 MiB image, and 14.1 MiB of that is the `nodes[]`/`edges[]`
 backing arrays — 56 bytes per `nodeRecord` and 80 per `rawEdge`, of which 48 are
@@ -3840,7 +3847,9 @@ cycle cost as the mean of 12 forced cycles with the image live:
 
 Its verdict was *no-go on P2, go on P1* — the resident share collapsing from
 42.9% to 5.2% as blobs grow (the same trap mmap fell into), against a GC cost
-said to be 6× to 25× lower and blob-independent.
+said to be 6× to 25× lower and blob-independent. Re-run 2026-09-11: the
+`current` column reproduces to within 16 bytes and `arena` byte for byte; only
+the GC columns move (2.66 / 4.49 / 9.25 ms), being wall clock on a different day.
 
 #### Three corrections, and only one of them is about the number
 

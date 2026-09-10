@@ -2997,7 +2997,7 @@ if s, ok := g.Forensics(); ok {
 | `VerifyNodeAttestation(v, na) error` | Check one |
 | `(*Store).ProveNode(id) (NodeInclusionProof, error)` | Inclusion proof for an entity |
 | `VerifyNodeInclusion(root, p) error` | Package-level; needs no store |
-| `VerifyCSRDigest(path)` / `VerifyCSRRoots(path)` | Whole-image checks |
+| `VerifyCSRDigest(path)` / `VerifyCSRRoots(path)` | Whole-image checks. The digest is hashed as the file is read, in memory bounded by one copy buffer; the roots check parses the image |
 | `VerifyChain(earlier, later) error` | That one snapshot follows another |
 
 ### Exporting a proof
