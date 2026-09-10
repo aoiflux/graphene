@@ -4037,6 +4037,55 @@ Any change must preserve these. Each is enforced by tests.
     inside one shard lock on every registration thereafter.
 12. **A transaction's records and its index entries become visible together.**
     One batch, one epoch (§5.1a).
+13. **A store file is never rewritten in place, so the bytes behind an open
+    handle never change under it.** Every replacement is written to a temporary
+    file, fsynced, and renamed over the old name; the log is only ever appended
+    to or replaced whole by that same sequence. Two things already rest on this:
+    `VerifyCSRDigest` hashes an image as it reads it rather than reading it
+    whole, and a live reader parses one while a writer may be compacting. A
+    memory-mapped image would rest on it absolutely — see §15.14.
+
+    The two platforms honour it by opposite routes, and the difference is
+    load-bearing rather than incidental. On unix the rename leaves the old inode
+    alone: a handle opened before a compaction goes on reading the image it
+    opened while the directory entry names a newer one, and the old file is
+    reclaimed when the last handle closes. On windows renaming a file *over*
+    another is refused outright while any handle to the target is open — with
+    `FILE_SHARE_DELETE` and without it alike, since that share flag permits
+    renaming a file *aside*, which is a different operation. The reader is
+    protected just as completely, by the compaction failing rather than by the
+    two files coexisting.
+
+    So on windows a process holding the image open — `graphene store csr
+    -verify` against a live store, or anything mapping it — stalls a writer's
+    compaction for as long as it holds on, and the writer sees `Access is
+    denied` on the rename. The compaction leaves the store untouched and
+    succeeds on the next attempt once the reader lets go. Installing an image
+    underneath a mapping therefore cannot be a single rename on windows: the old
+    name has to be renamed aside first and the new file put in its place second.
+    `TestImage_AHeldHandleNeverSeesTheBytesChange` pins both routes.
+14. **The store directory is the engine's to write, and no one else's, for as
+    long as a handle is open.** This is an obligation on the caller, not a
+    property the engine can enforce: the write lock keeps other *graphene*
+    processes out (§9.1a), and nothing keeps out `truncate`, an editor, a restore
+    into a live directory, or a backup tool that rewrites files in place.
+
+    What breaking it costs depends on how the image is held, and the difference
+    is worth stating before it becomes load-bearing. Read into the heap — the
+    only mode this version has — the damage is bounded and reported: the bytes
+    are already decoded, so a live handle keeps working, and the next refresh or
+    reopen fails with a parse error naming what it found. Under a memory-mapped
+    image the same act is not an error at all but a machine fault on the next
+    access to a page that no longer exists: `SIGBUS` on unix, an
+    `EXCEPTION_IN_PAGE_ERROR` on windows. Neither is recoverable in Go — there is
+    no way to turn a fault on a mapped page into an error return — so the process
+    dies, and it dies at whatever unrelated line of caller code happened to touch
+    the property slice.
+
+    That is a *defined* outcome rather than a safe one, and it is the reason the
+    invariant is written down here before any mapping exists to enforce it. It
+    binds hardest on `OpenLive` readers, which take no lock at all (§9.1c) and so
+    have no way of knowing a writer's directory is being edited beneath them.
 
 ---
 
@@ -4125,6 +4174,19 @@ Any change must preserve these. Each is enforced by tests.
     the image in place but has to gather and sort the delta's IDs first (§10.3a),
     so a store that never compacts gives up the streaming as well as the
     memory.
+
+    What has changed is that this is now *answerable in advance and refusable*.
+    `disk.PreflightOpen(dir)` reports what the log holds — its bytes, the records
+    a replay would apply, the records a rolled-back batch would make it buffer
+    and discard — reading the log once in memory bounded by a constant, so the
+    question can be asked about a store too large to open. `Options.MaxReplayBytes`
+    and `Options.MaxReplayRecords` turn the answer into a refusal: an `Open` over
+    either budget fails with `disk.ErrReplayBudget` naming both figures instead of
+    replaying into an out-of-memory kill. The engine cannot catch an OOM in Go, so
+    a bound can only ever mean refusing before allocating, never degrading while
+    allocating. **Both budgets cover the replay only** — the image is loaded by
+    the same `Open` and is not governed by either; gate on
+    `OpenEstimate.ImageBytes` yourself.
 14. **A compaction still stalls writers for its pin and its commit** — ~17–20 ms
     on a 100 000-record store, down from the whole rebuild (§9.4). The remainder
     is the record scan, which is under the lock because the delta layer is

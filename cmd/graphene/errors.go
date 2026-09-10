@@ -161,6 +161,15 @@ func classify(err error) (FaultKind, string) {
 	switch {
 	case errors.Is(err, disk.ErrStoreLocked):
 		return FaultLocked, hintFor(FaultLocked)
+	case errors.Is(err, disk.ErrReplayBudget):
+		// A refusal, not a defect: the store is intact and the budget is the
+		// caller's own. Without this it would land in FaultInternal with no
+		// hint, which is the outcome this switch exists to prevent — and the
+		// operator most likely to see it is one who set a budget precisely
+		// because they were worried about memory.
+		return FaultRefused, "the store is intact; this open was refused by a " +
+			"configured replay budget. `store info` reports what the log holds, " +
+			"and compacting the store is what makes the log small again."
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return FaultTimeout, hintFor(FaultTimeout)
 	case os.IsNotExist(underlying(err)):

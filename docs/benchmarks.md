@@ -1672,3 +1672,80 @@ make cpuprofile FILTER=BenchmarkRSS_Open    # where the time goes
 One fixture size per process, always: a process that builds several large
 fixtures reports the high-water mark of the largest, and the peak figures then
 say nothing about the smaller ones.
+
+## Pre-open cost query and the replay budget (2026-09-10)
+
+Method as §1 of `CONTRIBUTING.md`: three interleaved rounds, alternating the
+working tree against a pristine `HEAD` tree, one fixture per process, medians
+reported with the full spread. Same machine block as the program baselines above.
+
+### What the change touches, and what it does not
+
+`PreflightOpen` is new surface on no existing path, and the two `Options` fields
+are inert at their zero value — `checkReplayBudget` returns on its first branch.
+The one change on a measured path is replay's batch reservation, so that is what
+the arms below are chosen to exercise. Both fixtures write through the bulk
+writers, which batch in chunks of ten thousand, so both do reach it.
+
+### `BenchmarkColdOpen_UncompactedWAL_10k` — wall clock and allocation
+
+| | ns/op (median) | B/op (median) | allocs/op (median) |
+| --- | ---: | ---: | ---: |
+| HEAD | 33 038 200 | 25 071 216 | 378 181 |
+| with the change | 33 044 630 | 25 072 080 | 378 182 |
+| delta | +0.02% | **+864 B, +0.003%** | **+1** |
+
+Spreads overlap on all three: 31.4–34.0 ms against 32.9–34.9 ms on wall clock,
+and under 2 KB of range on bytes in both arms.
+
+### `BenchmarkRSS_Open_UncompactedWAL` — residency, 50k nodes
+
+| | anon MiB | file MiB | heap MiB | peak MiB |
+| --- | ---: | ---: | ---: | ---: |
+| HEAD | 181.2 (179.6–181.7) | 0 | 120.2 | 260.8 (250.1–271.4) |
+| with the change | 181.5 (181.4–182.4) | 0 | 120.2 | 281.5 (269.1–293.7) |
+
+Anonymous residency moves 0.3 MiB, inside `HEAD`'s own 2.1 MiB spread. The live
+heap figure is identical to the tenth of a MiB in all six runs. Nothing is
+file-backed on either side, which is unchanged and expected — no mapping exists
+yet.
+
+**The peak column says nothing and is printed anyway.** Its ranges overlap
+(269.1 against 271.4) and the ordering between the arms *reversed* between two
+sessions of this same A/B — an earlier set put `HEAD` at 286.7 and the change at
+266.4. The sampler ticks at 1 ms against an open lasting a few hundred, so three
+rounds cannot resolve a difference this size. Recorded rather than dropped,
+because a peak figure quoted without its spread would have supported either
+conclusion.
+
+### The measurement that chose a constant
+
+The batch reservation cap was 4096 first. At that value the same cold-open A/B
+read **+3.15 MB/op and +11 allocs/op** — consistently, across three rounds with a
+spread under 1 KB. A cap set below the batch sizes the engine actually writes
+does not bound memory, it *costs* memory: it replaces one exact allocation with a
+geometric growth sequence whose total is several times larger. The bulk writers
+batch in chunks of ten thousand, so the cap has to sit above them. At 65 536 the
+regression is gone and a corrupt marker is still bounded by a constant.
+
+Worth generalising: **a bound that is not measured against the workload it bounds
+can be a regression wearing the shape of a safety fix.** Both numbers were
+available for the same three rounds of work.
+
+### Reproducing
+
+```sh
+git archive HEAD | tar -x -C /tmp/head-control     # a control tree, no worktree needed
+for i in 1 2 3; do
+  ( cd . && go test ./tests/ -tags=stress -run='^$' \
+      -bench=BenchmarkColdOpen_UncompactedWAL_10k -benchmem -benchtime=10x -count=1 )
+  ( cd /tmp/head-control && go test ./tests/ -tags=stress -run='^$' \
+      -bench=BenchmarkColdOpen_UncompactedWAL_10k -benchmem -benchtime=10x -count=1 )
+done
+```
+
+The bounded-memory claim has its own guard rather than a benchmark:
+`TestPreflightOpen_MemoryDoesNotFollowTheLog` fits an allocation slope across
+6 000 and 60 000 record logs and reads **0.00 B/record**. Both fixtures are
+deliberately past the read buffer's cap — below it the buffer is sized to the log,
+and a smaller pair measures the buffer growing rather than the walk retaining.

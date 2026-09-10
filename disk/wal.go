@@ -89,6 +89,24 @@ const (
 	walHeaderSize     = 1 + 4 // type(1) + length(4)
 	walFooterSize     = 4     // crc32(4)
 	walRecordOverhead = walHeaderSize + walFooterSize
+
+	// walBatchPrealloc caps how many pending records a batch begin marker may
+	// have replay reserve up front. See the use site: the marker's declared
+	// count is a number from the file, and the bound that admits a legitimate
+	// batch is far too generous to also serve as an allocation limit.
+	//
+	// The value is chosen against measurement, not intuition. A cap has to sit
+	// above the batches this engine actually writes, because below them it
+	// replaces one exact allocation with a geometric growth sequence that
+	// allocates several times as many bytes in total — measured at +3.15 MB and
+	// +11 allocs on a cold open of a 10 000-node log when the cap was 4096, which
+	// is a memory regression on the very path the cap was added to protect. The
+	// bulk writers batch in chunks of ten thousand, so 65 536 clears them with
+	// room to spare and still bounds a corrupt marker at two megabytes instead of
+	// the gigabytes the size-derived rule permits. Anything past the cap grows by
+	// append, which costs a large batch a handful of growths against the I/O of
+	// reading it.
+	walBatchPrealloc = 65536
 )
 
 // WAL manages the write-ahead log file.
@@ -409,6 +427,27 @@ func (w *WAL) Size() int64 {
 		return 0
 	}
 	return fi.Size()
+}
+
+// replayBytes is Size less the container header: the records region alone, and
+// therefore the quantity replay bounds itself against.
+//
+// Separate from Size because the two differ by exactly 50 bytes on a modern log
+// and not at all on a headerless one — small enough to go unnoticed and large
+// enough that a budget compared against the wrong one refuses a store that has
+// not changed. Size is what an operator sees on disk; this is what an open pays.
+func (w *WAL) replayBytes() int64 {
+	return max(w.Size()-w.dataStart, 0)
+}
+
+// path is the file this log was opened on, or "" for a read-only store whose log
+// does not exist. Taken from the handle rather than stored, so it cannot drift
+// from the file actually open.
+func (w *WAL) path() string {
+	if w.file == nil {
+		return ""
+	}
+	return w.file.Name()
 }
 
 // stableSize reports the log's length with nothing in flight, so the figure
@@ -934,7 +973,22 @@ func replayRecordsFrom(r io.Reader, logSize int64, framing uint16, cb ReplayCall
 				return safe, fmt.Errorf("wal replay: batch begin declares %d records, more than %d bytes can hold",
 					batchCount, logSize)
 			}
-			pending = make([]pendingRecord, 0, batchCount)
+			// The declared count is a hint about how much to reserve, and it is a
+			// hint from the file. Reserving all of it turns the bound above into
+			// the only thing standing between a corrupt marker and a very large
+			// allocation — and that bound is generous by construction, because it
+			// has to admit a legitimate batch: logSize/9 on a 2 GiB log is 238
+			// million records, which at 32 bytes each reserves 7.6 GB before a
+			// single record of the batch has been read. Worse, the bound is
+			// skipped entirely when the log's size could not be determined, and
+			// then a four-byte field decides the allocation outright.
+			//
+			// Capping the reservation costs a genuine large batch a handful of
+			// append growths, which against the I/O of reading it is nothing, and
+			// it decides no outcome: a batch larger than the cap still replays,
+			// because append grows. What it removes is the file's ability to name
+			// a number and have it allocated.
+			pending = make([]pendingRecord, 0, min(int(batchCount), walBatchPrealloc))
 			body = body[:0]
 			continue
 

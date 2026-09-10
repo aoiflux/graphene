@@ -211,6 +211,84 @@ entries under keys in different shards is offered once per shard. Deduplicating 
 precisely the map this exists to avoid, and a caller that minds deduplicates what
 it keeps — which is bounded by what it is looking for rather than by the index.
 
+### What an `Open` will cost, answerable before it is paid
+
+`Open` is the one operation whose cost nobody could see in advance. An image is a
+file whose size is on disk. A log that was never compacted is a whole write
+history that is replayed into memory on every open, and the only way to find out
+how much was to try it — on a machine where trying it is the failure.
+
+`disk.PreflightOpen(dir)` answers it. It takes no lock, opens no store, replays
+nothing, and runs **in memory bounded by a constant** whatever the size of the
+store. That last part is the whole point, and it is what the two existing
+inspectors cannot do: `InspectCSR` reads the file and parses the entire graph,
+and `InspectWAL` keeps a descriptor per record. Either one, asked about a store
+that will not fit, does not fit either. Measured across a tenfold increase in log
+size, the new walk allocates **0.00 bytes per record**.
+
+It reports the two halves separately and deliberately — every `Image` field
+describes the compacted image, every `WAL` field the log — because on a store
+that has never been compacted the first half is empty and the second half is the
+entire cost. A single whole-store number would report its smallest value for the
+largest store.
+
+**The record count is replay's own, not an approximation of it.** A batch that
+never committed is read, verified, held and discarded, so its records are counted
+apart from the ones that land; a commit that disagrees with the body it follows
+discards its batch, which the walk knows because it recomputes the body checksum
+as the bytes stream past rather than buffering them. A checkpoint stops the count
+where it stops replay. The guard for all of this drives the real parser and
+compares, rather than asserting a constant.
+
+Three things it cannot know, all stated on the fields rather than left to be
+discovered: it decodes no payloads, it applies no signature policy, and a
+concurrent writer invalidates it. Every count is therefore an upper bound, which
+is the safe direction for a figure an `Open` is about to be gated on.
+
+**`Options.MaxReplayBytes` and `Options.MaxReplayRecords`** turn the answer into
+a refusal. Over either, `Open` fails with `disk.ErrReplayBudget` naming both the
+figure and the budget. The engine cannot catch an out-of-memory condition in Go,
+so a bound can only mean refusing before allocating, never degrading while
+allocating — and the refusal is placed before any ledger is opened, so a routine
+budget refusal does not append a hash-chained record of a crash that did not
+happen. Zero, and any negative value, is unlimited; `StrictOptions` sets neither,
+and a test now says so.
+
+The byte budget is compared against the log's *records region*, not its file
+size. The two differ by the 50-byte container header — small enough to go
+unnoticed, large enough to refuse a store that has not changed. The record budget
+costs a counting pass, so it is skipped outright whenever the log is too small to
+hold that many records (every compacted store) and otherwise stops one record
+past the budget. Both bound the replay and nothing else: the image is loaded by
+the same `Open` and is not covered.
+
+### Fixed: a corrupt batch marker could ask replay for gigabytes
+
+A WAL batch begins with a marker naming how many records follow, and replay
+reserved that many pending slots before reading one of them. The bound above that
+reservation has to admit a legitimate batch, so it is derived from the log's size
+— and a log's size is a poor allocation limit. At nine bytes a record, a 2 GiB log
+permits 238 million of them, and reserving that many asks for something over
+seven gigabytes. The marker's own checksum is no defence: it is computed over the
+bytes making the claim. Worse, the bound is skipped entirely when the log's size
+cannot be determined, and then a four-byte field decides the allocation outright.
+
+The reservation is now capped at 65 536 slots. This decides no outcome — a larger
+batch still replays, because a capped reservation is still grown by `append`.
+What it removes is the file's ability to name a number and have it allocated: a
+marker declaring ten million records now reserves 2 MB where it previously
+reserved 320 MB.
+
+**The cap was 4096 first, and measurement rejected it.** Below the batch sizes
+this engine actually writes, a cap does not save memory — it replaces one exact
+allocation with a geometric growth sequence that allocates several times as many
+bytes in total. Interleaved against the same tree without the change, a cold open
+of a 10 000-node log cost **+3.15 MB/op and +11 allocs/op**: a memory regression
+on precisely the path the cap was added to protect. The bulk writers batch in
+chunks of ten thousand, so the cap belongs above them. At 65 536 the same
+measurement is +864 B/op and +1 alloc/op, both inside run-to-run noise, and a
+corrupt marker is still bounded by a constant rather than by the log's size.
+
 ### Declarations are now a property of the store, not of the process
 
 A declaration tells the engine something it cannot work out for itself, and it

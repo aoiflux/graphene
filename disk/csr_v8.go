@@ -64,7 +64,9 @@ package disk
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -146,16 +148,28 @@ func computeCSRDigest(data []byte) [csrDigestSize]byte {
 	if len(data) < csrV8HeaderSize {
 		return sha256.Sum256(data)
 	}
-	var zeros [8]byte
+	hdr := csrDigestHeader(data)
 	h := sha256.New()
-	h.Write(data[:csrLastCompactOffset])
-	h.Write(zeros[:]) // lastCompactUnixNano — not content
-	h.Write(data[csrLastCompactOffset+8 : csrDigestOffset])
-	var digestZeros [csrDigestSize]byte
-	h.Write(digestZeros[:]) // the digest field cannot cover itself
-	h.Write(data[csrDigestOffset+csrDigestSize:])
+	h.Write(hdr[:])
+	h.Write(data[csrV8HeaderSize:])
 	var out [csrDigestSize]byte
 	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// csrDigestHeader returns the header as the digest covers it: the two fields
+// that are not content zeroed, everything else as written.
+//
+// Both the whole-buffer path and the streaming one hash this, rather than each
+// zeroing the header its own way. The digest is a stable identity for the file's
+// contents, so the two must agree byte for byte forever; a second copy of "which
+// bytes are excluded" is a place for them to stop agreeing years from now, in a
+// change that looks unrelated to either.
+func csrDigestHeader(data []byte) [csrV8HeaderSize]byte {
+	var out [csrV8HeaderSize]byte
+	copy(out[:], data[:csrV8HeaderSize])
+	clear(out[csrLastCompactOffset : csrLastCompactOffset+8]) // when it was written is not content
+	clear(out[csrDigestOffset : csrDigestOffset+csrDigestSize])
 	return out
 }
 
@@ -206,12 +220,65 @@ func VerifyCSRDigest(path string) (DigestStatus, [csrDigestSize]byte, error) {
 	if err != nil {
 		return DigestAbsent, [csrDigestSize]byte{}, err
 	}
-	data, err := os.ReadFile(p)
+	f, err := os.Open(p)
 	if err != nil {
 		return DigestAbsent, [csrDigestSize]byte{}, fmt.Errorf("verify csr digest: %w", err)
 	}
-	status, computed := csrDigestStatus(data)
-	return status, computed, nil
+	defer f.Close()
+	return csrDigestStatusOf(f)
+}
+
+// csrDigestStatusOf is csrDigestStatus over a stream: the same digest and the
+// same three answers, in memory bounded by the header and one copy buffer.
+//
+// The file is hashed as it is read rather than read whole first. An image is the
+// size of the graph, and the callers here are `graphene store csr -verify` —
+// which reads nothing but the header for everything else it prints — and the
+// final check of every backup. Both are things an operator reaches for because a
+// machine is already in trouble, which is the worst moment to ask for the
+// store's footprint a second time.
+//
+// Reading in pieces is safe because the engine never rewrites an image in place:
+// a compaction writes a temporary file and renames it over the old one, so the
+// bytes behind an open handle do not change under it. See invariant §15.13.
+//
+// It has to agree with csrDigestStatus exactly. The two are one check reached by
+// different callers, and a file whose digest verified through one and failed
+// through the other would be unexplainable to whoever had to act on it —
+// TestCSRDigest_StreamedMatchesWholeBuffer asserts the agreement over every
+// shape the pair can tell apart.
+func csrDigestStatusOf(r io.Reader) (DigestStatus, [csrDigestSize]byte, error) {
+	var (
+		none   [csrDigestSize]byte
+		header [csrV8HeaderSize]byte
+	)
+	switch _, err := io.ReadFull(r, header[:]); {
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		// Shorter than a v8 header. Not an error: it is the same DigestAbsent the
+		// whole-buffer check gives a file it does not recognise, and a pre-v8
+		// image is a file that was never covered rather than a broken one.
+		return DigestAbsent, none, nil
+	case err != nil:
+		return DigestAbsent, none, fmt.Errorf("verify csr digest: %w", err)
+	}
+	if binary.LittleEndian.Uint16(header[4:6]) < csrVersionSectioned {
+		return DigestAbsent, none, nil
+	}
+
+	stored, _ := readCSRDigest(header[:])
+	hdr := csrDigestHeader(header[:])
+	h := sha256.New()
+	h.Write(hdr[:])
+	if _, err := io.Copy(h, r); err != nil {
+		return DigestAbsent, none, fmt.Errorf("verify csr digest: %w", err)
+	}
+
+	var computed [csrDigestSize]byte
+	copy(computed[:], h.Sum(nil))
+	if stored == computed {
+		return DigestMatch, computed, nil
+	}
+	return DigestMismatch, computed, nil
 }
 
 // csrDigestStatus is VerifyCSRDigest against bytes already in hand.

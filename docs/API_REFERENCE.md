@@ -1911,6 +1911,64 @@ rather than silent:
 The in-memory backend has no directory to copy: `Backup` returns an error rather
 than succeeding silently.
 
+### Finding out what an open will cost, before paying it
+
+```go
+est, err := disk.PreflightOpen(dir)
+// est.ImageBytes          — the compacted image on disk
+// est.ImageHeapBytes      — modelled heap for the image alone (see below)
+// est.WALReplayBytes      — the log's records region: what a replay reads
+// est.WALRecords          — what a replay would apply
+// est.WALRecordsBuffered  — what it would read, hold, and discard
+```
+
+`Open` is the one operation whose cost nobody can see in advance. An image is a
+file whose size is on disk; a log that was never compacted is a whole write
+history that is replayed into memory on every open, and until now the only way to
+find out how much was to try. `PreflightOpen` takes no lock, opens no store, and
+runs **in memory bounded by a constant** — which is the point, because a question
+about a store too large to open is exactly the question worth asking.
+`InspectCSR` and `InspectWAL` cannot answer it: both spend memory proportional to
+the store to find out.
+
+It costs one addressed read of the image header plus **one sequential pass over
+the log**. Bounded memory, not bounded I/O — on a never-compacted store, a
+preflight followed by an open reads the log twice.
+
+Two budgets turn the answer into a refusal:
+
+```go
+s, err := disk.OpenWithOptions(dir, disk.Options{
+    MaxReplayBytes:   512 << 20,   // compared against est.WALReplayBytes
+    MaxReplayRecords: 5_000_000,   // zero, and any negative, is unlimited
+})
+if errors.Is(err, disk.ErrReplayBudget) { /* names both figures */ }
+```
+
+Four things to know before setting either.
+
+- **They bound the replay and nothing else.** The image is loaded by the same
+  `Open` and is not covered; on a compacted store it is the larger half. Gate on
+  `est.ImageBytes` yourself.
+- **`MaxReplayBytes` is compared against `WALReplayBytes`, not `WALBytes`** — the
+  records region, not the file. The two differ by the log's 50-byte container
+  header, which is small enough to go unnoticed and large enough to refuse a
+  store that has not changed.
+- **`MaxReplayRecords` costs a counting pass**, because how many records a log
+  holds is not a property of its size. The pass is skipped when the log is too
+  small to hold the budget's worth of records — every compacted store — and stops
+  as soon as the count passes the budget. `MaxReplayBytes` costs nothing and
+  bounds records implicitly, since no record is under nine bytes; prefer it.
+- **`ImageHeapBytes` models the image only, as retained heap.** WAL replay is not
+  in it, so it is *not* a whole-store figure, and on a never-compacted store it is
+  zero while the true cost is at its highest. Resident memory ran 1.19–1.54× live
+  heap on the one fixture measured, so read it as a floor.
+
+A refused `Open` is not a no-op on disk: the directory is created if missing, a
+stranded rebuilt log is adopted, and an empty log is given its container header.
+Nothing is replayed and no ledger is opened. `PreflightOpen` is the only
+genuinely non-mutating way to ask.
+
 ---
 
 ## 15. Visualization export
@@ -2926,6 +2984,7 @@ if s, ok := g.Forensics(); ok {
 | `Options.Audit` | Hash-chained record of operator actions in `graphene.audit` |
 | `Options.Retention` (`RetentionPolicy`) | Which retired WAL segments survive compaction |
 | `Options.Redaction` / `.RedactionPolicy` | Enable the redaction ledger; bound a single cascade |
+| `Options.MaxReplayBytes` / `.MaxReplayRecords` | Refuse an `Open` whose WAL replay exceeds the budget, with `ErrReplayBudget`, rather than replaying into an OOM (§14) |
 
 ### Snapshot roots, attestations, proofs
 

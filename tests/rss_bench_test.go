@@ -28,10 +28,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/aoiflux/graphene"
+	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -485,4 +487,101 @@ func BenchmarkRSS_Open_UncompactedWAL(b *testing.B) {
 	if diskMiB > 0 {
 		b.ReportMetric(float64(s.Total)/bytesPerMiB/diskMiB, "residentPerDisk")
 	}
+}
+
+// BenchmarkRSS_Restore measures what recovering a store costs the machine doing
+// the recovering.
+//
+// Backup and restore both copy through a fixed buffer with a running hash, so
+// the memory a recovery needs is a constant rather than the size of the store
+// being recovered. That property is the reason a backup taken from a machine
+// that is at its RAM ceiling can be restored at all, and it is exactly the kind
+// of property that is lost quietly: one io.ReadFile in a copy loop, added for a
+// good reason, and a recovery that used to need megabytes needs the whole
+// image. Nothing else in the suite would notice, because no other benchmark
+// touches this path.
+//
+// Read restoreDeltaMiB against storeMiB. Streamed, the first stays flat while
+// the second grows, and restoreDeltaPerStore falls towards zero. A restore that
+// materialised a file would track storeMiB instead.
+//
+// The backup half is sampled too. It has to run anyway to produce something to
+// restore, it makes the identical claim, and its cost is the one an operator
+// pays on a live store rather than on a spare machine.
+//
+// peakMiB from reportRSS answers a different question and must not be read as
+// this one: it is a process-lifetime high-water mark, so it reports the fixture
+// build. The sampler is what sees a transient, and it reports a floor on the
+// true peak — see samplePeakDuring.
+func BenchmarkRSS_Restore(b *testing.B) {
+	dir := rssFixtureDir(b, rssNodes, rssBlob)
+	storeBytes := rssStoreBytes(dir)
+
+	g, err := graphene.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer g.Close()
+
+	root, err := os.MkdirTemp("", "graphene-rss-restore-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+
+	// The store stays open across both halves so it is provably alive at the
+	// final reading. Were it closed and collected mid-run, the baselines below
+	// would be measured against a heap that shrank for reasons the operation
+	// under test had nothing to do with, and the deltas would understate.
+	before, _ := settledRSS(g)
+
+	b.ResetTimer()
+	var (
+		info disk.BackupInfo
+		berr error
+	)
+	backupDir := filepath.Join(root, "backup")
+	backupPeak, backupSamples := samplePeakDuring(func() { info, berr = g.Backup(backupDir) })
+	if berr != nil {
+		b.Fatalf("Backup: %v", berr)
+	}
+
+	afterBackup, _ := settledRSS(g)
+
+	var (
+		out  disk.RestoreInfo
+		rerr error
+	)
+	restorePeak, restoreSamples := samplePeakDuring(func() {
+		out, rerr = graphene.Restore(backupDir, filepath.Join(root, "restored"), disk.RestoreOptions{})
+	})
+	b.StopTimer()
+	if rerr != nil {
+		b.Fatalf("Restore: %v", rerr)
+	}
+	if backupSamples == 0 || restoreSamples == 0 {
+		b.Fatal("sampler took no readings; the peak figures would be meaningless")
+	}
+	if out.From.Bytes() != info.Bytes() {
+		b.Fatalf("restored %d bytes, the backup holds %d", out.From.Bytes(), info.Bytes())
+	}
+
+	b.ReportMetric(float64(storeBytes)/bytesPerMiB, "storeMiB")
+	b.ReportMetric(float64(info.Bytes())/bytesPerMiB, "backupMiB")
+
+	b.ReportMetric(float64(backupPeak.Total)/bytesPerMiB, "backupPeakMiB")
+	if backupPeak.Total > before.Total {
+		b.ReportMetric(float64(backupPeak.Total-before.Total)/bytesPerMiB, "backupDeltaMiB")
+	}
+	b.ReportMetric(float64(restorePeak.Total)/bytesPerMiB, "restorePeakMiB")
+	if restorePeak.Total > afterBackup.Total {
+		delta := restorePeak.Total - afterBackup.Total
+		b.ReportMetric(float64(delta)/bytesPerMiB, "restoreDeltaMiB")
+		if storeBytes > 0 {
+			b.ReportMetric(float64(delta)/float64(storeBytes), "restoreDeltaPerStore")
+		}
+	}
+	b.ReportMetric(float64(backupSamples+restoreSamples), "samples")
+
+	reportRSS(b, g)
 }

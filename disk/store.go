@@ -616,7 +616,61 @@ type Options struct {
 	// a store lock held, so an implementation must not block and must never
 	// call back into the store. See store.Metrics.
 	Metrics store.Metrics
+
+	// MaxReplayRecords and MaxReplayBytes bound the WAL replay an Open will
+	// perform. Zero — and any negative value — is unlimited, which is the
+	// historical behaviour. Exceeding either refuses the Open with
+	// ErrReplayBudget naming both the figure and the budget.
+	//
+	// The log is the half of an open whose cost nothing predicts. An image is a
+	// file whose size an operator can see; a log that was never compacted is a
+	// whole write history that is replayed into memory on every open, and §16's
+	// delta-growth limitation says so without offering a way to find out first.
+	// These are that way, and PreflightOpen is how to obtain both figures
+	// without opening anything.
+	//
+	// Three things to know before setting either.
+	//
+	// They bound replay and nothing else. The image is loaded by the same Open
+	// and is not covered — on a compacted store it is the larger half. Gate on
+	// OpenEstimate.ImageBytes yourself; a general memory budget is a separate
+	// piece of work.
+	//
+	// MaxReplayBytes is measured against the records region, not the file:
+	// OpenEstimate.WALReplayBytes, which is the log's size less its 50-byte
+	// container header. Feeding it WALBytes instead makes it refuse a store that
+	// has not changed.
+	//
+	// MaxReplayRecords costs a counting pass over the log, because the number of
+	// records in a log is not a property of its size. The pass is skipped
+	// entirely when the records region is too small to hold the budget's worth of
+	// records — which is every compacted store — and stops as soon as the count
+	// passes the budget, so its cost is set by the budget rather than by the log.
+	// Between those two, a store that is large but under budget pays one extra
+	// sequential read at open. MaxReplayBytes costs nothing and bounds records
+	// implicitly, since no record is smaller than nine bytes; prefer it unless
+	// you specifically need to admit a log that is large in bytes and small in
+	// records.
+	//
+	// A refused Open is not a no-op on disk. By the time either budget can be
+	// checked, the directory has been created if it was missing, a stranded
+	// rebuilt log has been adopted, and an empty log has been given its container
+	// header. Nothing is replayed and no ledger is opened, so nothing is recorded
+	// about the refusal — but PreflightOpen is the only genuinely non-mutating
+	// way to ask the question.
+	MaxReplayRecords int64
+	MaxReplayBytes   int64
 }
+
+// ErrReplayBudget reports an Open refused because the log exceeds
+// Options.MaxReplayRecords or Options.MaxReplayBytes.
+//
+// The engine cannot catch an out-of-memory condition in Go, so "fail
+// predictably" can only mean refusing before allocating rather than degrading
+// while allocating. This is that refusal for the replay half of an open. The
+// wrapped message names the figure and the budget, because a refusal that does
+// not say by how much cannot be acted on.
+var ErrReplayBudget = errors.New("disk: replaying this log would exceed the configured budget")
 
 // recordAudit appends an entry when auditing is enabled, and does nothing
 // otherwise.
@@ -741,8 +795,11 @@ func verifyImageOnOpen(csrPath string, opts Options) error {
 }
 
 // Open opens (or creates) a disk-backed Store rooted at dir.
-// On first use dir will be created. On restart, the WAL is replayed into the
-// delta layer; the existing CSR (if any) is memory-mapped.
+// On first use dir will be created. On restart, the existing CSR (if any) is
+// read into memory and parsed, and the WAL is replayed into the delta layer on
+// top of it. Neither is bounded by anything but the files themselves — see
+// Options.MaxReplayRecords and PreflightOpen, which is how to find out what an
+// open will cost before paying it.
 // Open takes an exclusive process-level lock on dir and fails with
 // ErrStoreLocked if another process — or another Store in this one — already
 // holds it. Use OpenReadOnly for a store you only intend to query.
@@ -826,6 +883,20 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err != nil {
 		lock.release()
 		return nil, err
+	}
+
+	// The replay budget, checked here and not later, for two reasons that both
+	// matter. The log handle is open, so its framing, container size and length
+	// are all known and the figures in the refusal are the real ones. And
+	// nothing has happened yet that a refusal would have to undo: no ledger is
+	// open, and in particular the hash-chained unclean-restart entry has not
+	// been written. A budget refusal is meant to be a routine, repeatable
+	// outcome, and a routine outcome that appends a forensic record of a crash
+	// that did not happen would be manufacturing history.
+	if err := checkReplayBudget(wal, opts); err != nil {
+		wal.Close()
+		lock.release()
+		return nil, fmt.Errorf("disk.Open: %w", err)
 	}
 
 	s := &Store{
