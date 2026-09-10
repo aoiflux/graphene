@@ -441,22 +441,21 @@ func (g *CSRGraph) EdgeCount() int {
 	return len(g.outEdges)
 }
 
-// Serialise writes the CSR to binary format v7 (csrVersionCurrent).
+// Serialise writes the CSR to the current binary format, csrVersionCurrent —
+// v8, the sectioned container.
 //
-// v7 is v6 minus the flat adjacency arrays: the reader never parsed them — it
-// rebuilds adjacency from the edge records — so they were ~21% of the file
-// written on every Compact and read by nobody.
+// The header and section directory are documented once, in csr_v8.go; this
+// comment does not restate them, because the copy that used to live here
+// described v7 long after v8 shipped. What is stable enough to state here is
+// the record stream between the header and the sections, unchanged since v7:
 //
-// Format:
-//
-//	[magic:4]["GCSR"][version:2=0x0007][nodeCount:8][edgeCount:8]
-//	[nodeSeqHW:8][edgeSeqHW:8][indexOffset:8]
 //	[nodeRecord * nodeCount] (each: id:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + propLen:4 + props:N)
 //	[rawEdge * edgeCount]    (each: id:8 + src:8 + dst:8 + labelCount:1 + labels:(currentLabelBytesPerValue*N) + weight:4 + propLen:4 + props:N)
-//	--- index section, at byte indexOffset (v6+) ---
-//	[magic:4]["GIDX"]
-//	[nodePropCount:8][entry * nodePropCount] (each: id:8 + keyLen:2 + key + valLen:4 + val)
-//	[edgePropCount:8][entry * edgePropCount]
+//
+// v7 was v6 minus the flat adjacency arrays: the reader never parsed them — it
+// rebuilds adjacency from the edge records — so they were ~21% of the file
+// written on every Compact and read by nobody. v8 kept that and moved the
+// property index out of a fixed offset and into a section.
 //
 // # What is persisted, and what is not
 //
@@ -474,8 +473,10 @@ func (g *CSRGraph) EdgeCount() int {
 // read: the reader has always rebuilt them and then used indexOffset to skip
 // whatever lay between. Roughly a fifth of the file was that skipped region.
 //
-// indexOffset makes the index section directly addressable, so the reader never
-// has to compute its position from the adjacency array sizes.
+// The property index is reached through the section directory. v6 and v7 gave
+// it a dedicated indexOffset field in the header so the reader never had to
+// compute its position from the adjacency array sizes; v8 writes that field as
+// zero and addresses every section, index included, through the directory.
 func (g *CSRGraph) Serialise() []byte {
 	return g.SerialiseWithIndex(nil, nil)
 }

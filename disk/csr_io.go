@@ -512,9 +512,17 @@ func checkIDCeiling(kind string, maxID uint64, records int) error {
 //     the high-water marks live in the same header an attacker controls, so the
 //     first rule alone still permits "seqHW = 2^62, one record with that ID".
 //
-// IDs are deliberately NOT bounded by the record count. They are monotonic and
-// never reused, so a long-lived store that has deleted heavily has a maxID far
-// above its live count, and that file is perfectly valid.
+//   - csrIDSparsityFactor bounds the highest ID against the record count that is
+//     actually present, with csrIDSparsityFloor as the minimum allowance. This
+//     is what stops one 13-byte record naming ID 2^26 from demanding the whole
+//     array; the absolute ceiling alone is no protection against that.
+//
+// The third rule is a *loose* bound on purpose, not an assertion that IDs track
+// the record count. They do not: IDs are monotonic and never reused, so a
+// long-lived store that has deleted heavily carries a maxID far above its live
+// count and that file is perfectly valid. 256 burned IDs per surviving record
+// is far past what deletions and rollbacks produce in practice, which is what
+// lets the bound reject a hostile file without rejecting a real one.
 func checkCSREntityIDs(nodes []nodeRecord, edges []rawEdge, version uint16, nodeSeqHW, edgeSeqHW uint64) error {
 	var maxNID, maxEID uint64
 	for i := range nodes {

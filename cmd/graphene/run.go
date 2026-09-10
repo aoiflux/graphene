@@ -11,9 +11,11 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/pprof"
 	"time"
 )
@@ -125,6 +127,17 @@ func invoke(c *Command, args []string, g *Globals, cfg *Config, stdout, stderr i
 			return fail(stderr, c.Path(), err)
 		}
 		defer stop()
+	}
+
+	if g.MemProfile != "" {
+		// Deferred so it runs after the command has produced its result but
+		// while the store is still open: a heap profile taken after Close would
+		// miss the structures the store was holding, which are the point.
+		defer func() {
+			if err := writeHeapProfile(g.MemProfile); err != nil {
+				fmt.Fprintln(stderr, "memprofile:", err)
+			}
+		}()
 	}
 
 	started := time.Now()
@@ -281,6 +294,25 @@ func fail(stderr io.Writer, path string, err error) int {
 		_, _ = io.WriteString(stderr, "  "+hint+"\n")
 	}
 	return exitFor(kind, VerdictNone, true)
+}
+
+// writeHeapProfile writes an in-use heap profile.
+//
+// The collection first is what makes the profile answer "what is still held"
+// rather than "what has not been collected yet"; without it the numbers include
+// garbage the collector simply has not reached, and two runs of the same command
+// disagree by whatever the GC happened to be doing.
+func writeHeapProfile(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	runtime.GC()
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // startProfile begins a CPU profile and returns its stopper.

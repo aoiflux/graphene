@@ -44,9 +44,16 @@ type Globals struct {
 	// how somebody ends up writing a pprof file into a directory they meant to
 	// inspect.
 	CPUProfile string
-	DryRun     bool
-	Confirm    bool
-	Timeout    time.Duration
+
+	// MemProfile is a pprof heap-profile output path. It is written after the
+	// command has finished and a collection has run, so it reports what the
+	// command still held rather than everything it ever allocated — the
+	// question a memory budget asks. `make allocprofile` answers the other one.
+	MemProfile string
+
+	DryRun  bool
+	Confirm bool
+	Timeout time.Duration
 
 	// Metrics attaches a store.Metrics sink at open time and appends a summary
 	// of what the engine did. See metrics.go for why this is a global flag
@@ -69,6 +76,7 @@ func bindGlobals(fs *flag.FlagSet, g *Globals) {
 	fs.BoolVar(&g.NoColor, "no-color", g.NoColor, "plain output even on a terminal")
 	fs.StringVar(&g.LogLevel, "log-level", g.LogLevel, "error | warn | info | debug")
 	fs.StringVar(&g.CPUProfile, "cpuprofile", g.CPUProfile, "write a pprof CPU profile to this path")
+	fs.StringVar(&g.MemProfile, "memprofile", g.MemProfile, "write a pprof heap profile to this path when the command finishes")
 	fs.BoolVar(&g.DryRun, "dry-run", g.DryRun, "report what would change, and change nothing")
 	fs.DurationVar(&g.Timeout, "timeout", g.Timeout, "give up starting new work after this")
 	fs.BoolVar(&g.Metrics, "metrics", g.Metrics,
@@ -81,12 +89,12 @@ func bindGlobals(fs *flag.FlagSet, g *Globals) {
 var globalNames = map[string]bool{
 	"json": true, "indent": true, "verbose": true, "quiet": true,
 	"no-color": true, "log-level": true, "cpuprofile": true,
-	"dry-run": true, "timeout": true, "metrics": true,
+	"memprofile": true, "dry-run": true, "timeout": true, "metrics": true,
 }
 
 // globalTakesValue distinguishes `-timeout 30s` from `-json`.
 var globalTakesValue = map[string]bool{
-	"log-level": true, "cpuprofile": true, "timeout": true,
+	"log-level": true, "cpuprofile": true, "memprofile": true, "timeout": true,
 }
 
 // applyEnv seeds the globals from the environment, before any flag is parsed.

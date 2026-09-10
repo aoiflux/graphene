@@ -414,3 +414,61 @@ func BenchmarkFootprint_DiskFileSize(b *testing.B) {
 	b.ReportMetric(float64(wal.Size())/(1<<20), "WAL_MiB")
 	b.ReportMetric(0, "ns/op")
 }
+
+// --- Which half is deleted decides whether Compact recovers anything ---
+//
+// The pair above deletes alternating IDs, so the highest ID always survives and
+// the dense arrays never shrink. That is one of two shapes, and the docs report
+// the other: deleting the *high* half lets Compact fall back to a lower maximum.
+//
+// The rebuild workload this engine is being sized for does neither. It deletes an
+// entire derived layer — the *low* IDs — and writes the replacement above them.
+// These two benchmarks measure that difference directly: same live count, same
+// live bytes, only the position of the surviving IDs differs. If the low-delete
+// arm costs materially more per live node after Compact, then Compact recovers
+// nothing for this workload and the ID high-water mark is a permanent leak.
+
+func benchmarkHalfDeletedAt(b *testing.B, deleteLow bool) {
+	b.Helper()
+
+	dir, err := os.MkdirTemp("", "graphene-fp-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	live := footprintNodes / 2
+	footprintOf(b, live, live, func() any {
+		g, err := graphene.Open(dir)
+		if err != nil {
+			b.Fatal(err)
+		}
+		buildFootprintGraph(g, footprintNodes, false, false)
+		if err := g.Compact(); err != nil {
+			b.Fatal(err)
+		}
+		lo, hi := live+1, footprintNodes // delete the high half by default
+		if deleteLow {
+			lo, hi = 1, live
+		}
+		for i := lo; i <= hi; i++ {
+			_ = g.DeleteNode(store.NodeID(i))
+		}
+		if err := g.Compact(); err != nil {
+			b.Fatal(err)
+		}
+		return g
+	})
+}
+
+// BenchmarkFootprint_Disk_LowHalfDeleted_Compacted is the rebuild shape: the
+// surviving IDs are the high ones, so maxID is unchanged by the deletion.
+func BenchmarkFootprint_Disk_LowHalfDeleted_Compacted(b *testing.B) {
+	benchmarkHalfDeletedAt(b, true)
+}
+
+// BenchmarkFootprint_Disk_HighHalfDeleted_Compacted is the shape the published
+// numbers measured: maxID falls with the deletion, so Compact can shrink.
+func BenchmarkFootprint_Disk_HighHalfDeleted_Compacted(b *testing.B) {
+	benchmarkHalfDeletedAt(b, false)
+}

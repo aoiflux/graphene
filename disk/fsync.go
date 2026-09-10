@@ -28,6 +28,22 @@ import (
 // before the close: a Close error after a successful Sync tells us nothing new,
 // but a Sync error is the one that means the data is not there.
 func writeFileSync(path string, data []byte, perm os.FileMode) error {
+	return writeFileSyncHooked(path, data, perm, nil)
+}
+
+// writeFileSyncHooked is writeFileSync with a seam between the write and the
+// sync, so a test can fail there.
+//
+// That instant is a distinct on-disk state and not a hypothetical one: the file
+// exists at full length in the page cache and none of it is guaranteed to be on
+// the medium. It is the state a compaction is in when it is about to write a
+// checkpoint marker vouching for bytes that may not survive a power loss, which
+// is the exact hazard the sync exists to close — so it has to be reachable.
+//
+// beforeSync is nil in production. An error from it aborts the write and the
+// partial file is left for the caller to remove, which is what a real sync
+// failure does too.
+func writeFileSyncHooked(path string, data []byte, perm os.FileMode, beforeSync func() error) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return err
@@ -35,6 +51,12 @@ func writeFileSync(path string, data []byte, perm os.FileMode) error {
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		return err
+	}
+	if beforeSync != nil {
+		if err := beforeSync(); err != nil {
+			f.Close()
+			return err
+		}
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()

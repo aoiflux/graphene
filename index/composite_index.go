@@ -333,15 +333,38 @@ func (c *compositeIndex[T]) cardinality(values []string) int {
 	return len(c.postings[tuple])
 }
 
-// verify re-derives the whole index from the member states it holds and reports
-// the first disagreement.
+// verify checks the postings against the member states it holds and reports the
+// first disagreement.
 //
 // A composite index is maintained incrementally from a stream of registrations,
 // and drift between the members and the postings is a wrong query answer rather
 // than a slow one: the planner drives straight from these postings and applies
 // no residual filter for the keys they cover, so a missing entry is a row the
-// query silently does not return. Both directions are therefore checked — every
-// tuple a member state implies is filed, and every filed entry is implied by one.
+// query silently does not return. Both directions are therefore established —
+// every tuple a member state implies is filed, and every filed entry is implied
+// by one.
+//
+// # Why the second direction is a count
+//
+// This used to re-derive the index: a map of tuple to a set of ids, built from
+// every member, then compared with the postings. That is a whole second copy of
+// the index held in the routine whose job is to be safe to run on a store that
+// is already close to its ceiling — and it is not necessary. The first loop
+// establishes implied ⊆ filed by probing rather than by remembering. Both sides
+// are then sets, so a matching count is equality:
+//
+//	implied ⊆ filed  ∧  |implied| = |filed|  ⟹  implied = filed
+//
+// |filed| is Σ len(ids), exact because the postings are checked to be strictly
+// ascending, and |implied| is the running count, exact because a member's
+// values are checked to be distinct per position and its tuples are therefore
+// distinct. The tuple-count check the old code ended with follows too: postings
+// lists are never empty and every implied tuple has an id filed under it, so the
+// two tuple sets are the same set.
+//
+// What the count cannot do is name the offender, so when it disagrees, the
+// diagnosis runs unimpliedEntry — a second walk with the same bound, paid only
+// by an index already known to be broken.
 func (c *compositeIndex[T]) verify(kind string, cc *store.CancelCheck) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -349,33 +372,10 @@ func (c *compositeIndex[T]) verify(kind string, cc *store.CancelCheck) error {
 	name := strings.Join(c.keys, ",")
 	width := len(c.keys)
 
-	implied := make(map[string]map[T]struct{})
-	counted := 0
-	for id, m := range c.members {
-		if err := cc.Step(); err != nil {
-			return err
-		}
-		if len(m.one) != width {
-			return errIndexf("%s composite index (%s): entity %v holds %d positions, want %d",
-				kind, name, id, len(m.one), width)
-		}
-		if !m.complete(width) {
-			continue
-		}
-		m.forEachTuple(width, 0, "", false, func(tuple string) {
-			set := implied[tuple]
-			if set == nil {
-				set = make(map[T]struct{})
-				implied[tuple] = set
-			}
-			if _, dup := set[id]; !dup {
-				set[id] = struct{}{}
-				counted++
-			}
-		})
-	}
-
-	for tuple, ids := range c.postings {
+	// Postings first: the second loop binary-searches these lists, which is
+	// only sound once they are known to be ascending.
+	filed := 0
+	for _, ids := range c.postings {
 		if err := cc.Step(); err != nil {
 			return err
 		}
@@ -388,26 +388,117 @@ func (c *compositeIndex[T]) verify(kind string, cc *store.CancelCheck) error {
 					kind, name, i)
 			}
 		}
-		set := implied[tuple]
-		for _, id := range ids {
-			if _, ok := set[id]; !ok {
-				return errIndexf("%s composite index (%s): entity %v is filed under a tuple its own values do not produce",
-					kind, name, id)
-			}
+		filed += len(ids)
+	}
+
+	counted := 0
+	var verr error
+	for id, m := range c.members {
+		if err := cc.Step(); err != nil {
+			return err
 		}
-		if len(set) != len(ids) {
-			return errIndexf("%s composite index (%s): a tuple holds %d entities but their values imply %d",
-				kind, name, len(ids), len(set))
+		if len(m.one) != width {
+			return errIndexf("%s composite index (%s): entity %v holds %d positions, want %d",
+				kind, name, id, len(m.one), width)
+		}
+		if err := m.verifyShape(width); err != nil {
+			return errIndexf("%s composite index (%s): entity %v %s", kind, name, id, err.Error())
+		}
+		if !m.complete(width) {
+			continue
+		}
+		m.forEachTuple(width, 0, "", false, func(tuple string) {
+			if verr != nil {
+				return
+			}
+			if !containsSorted(c.postings[tuple], id) {
+				verr = errIndexf("%s composite index (%s): entity %v holds values implying a tuple it is not filed under",
+					kind, name, id)
+				return
+			}
+			counted++
+		})
+		if verr != nil {
+			return verr
 		}
 	}
 
+	if counted != filed {
+		return c.unimpliedEntry(kind, name, width, counted, filed, cc)
+	}
 	if counted != c.entries {
 		return errIndexf("%s composite index (%s): entry count is %d but the member values imply %d",
 			kind, name, c.entries, counted)
 	}
-	if len(implied) != len(c.postings) {
-		return errIndexf("%s composite index (%s): %d tuples are filed but the member values imply %d",
-			kind, name, len(c.postings), len(implied))
+	return nil
+}
+
+// unimpliedEntry names the filed entry that verify's counts proved must exist.
+//
+// Only reached when the postings hold a pair no member's values produce, and it
+// re-walks them to say which one — the message the old set-rebuilding verify
+// gave for free. Bounded like the rest: one member's cross product at a time,
+// nothing accumulated. Caller holds c.mu.
+func (c *compositeIndex[T]) unimpliedEntry(kind, name string, width, counted, filed int, cc *store.CancelCheck) error {
+	for tuple, ids := range c.postings {
+		if err := cc.Step(); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			m := c.members[id]
+			if m == nil {
+				return errIndexf("%s composite index (%s): entity %v is filed but holds no member values",
+					kind, name, id)
+			}
+			if len(m.one) != width || !m.complete(width) {
+				return errIndexf("%s composite index (%s): entity %v is filed but does not hold a value at every position",
+					kind, name, id)
+			}
+			found := false
+			m.forEachTuple(width, 0, "", false, func(t string) {
+				if t == tuple {
+					found = true
+				}
+			})
+			if !found {
+				return errIndexf("%s composite index (%s): entity %v is filed under a tuple its own values do not produce",
+					kind, name, id)
+			}
+		}
+	}
+	// Unreachable while the walk above and verify's first loop agree on what
+	// they visit; reported rather than ignored, because a count that disagrees
+	// with nothing findable is itself the finding.
+	return errIndexf("%s composite index (%s): %d entries are filed but the member values imply %d, and every filed entry is implied",
+		kind, name, filed, counted)
+}
+
+// verifyShape checks the parts of a member state that forEachTuple trusts:
+// every position it can reach is within the declared width, and no position
+// holds the same value twice.
+//
+// Both were previously masked. The cross product is enumerated with no memory
+// of what it has produced, so a repeated value repeats a tuple; the old verify
+// deduplicated those into a set and so could not see it. A value stored beyond
+// the declared width is never enumerated at all, and drifts unnoticed.
+func (m *memberState) verifyShape(width int) error {
+	if m.filled>>uint(width) != 0 {
+		return fmt.Errorf("has a value beyond position %d", width-1)
+	}
+	for pos, extra := range m.more {
+		if pos < 0 || pos >= width {
+			return fmt.Errorf("holds extra values at position %d, outside the declared width %d", pos, width)
+		}
+		for i, v := range extra {
+			if m.filled&(1<<uint(pos)) != 0 && m.one[pos] == v {
+				return fmt.Errorf("holds the same value twice at position %d", pos)
+			}
+			for _, w := range extra[i+1:] {
+				if v == w {
+					return fmt.Errorf("holds the same value twice at position %d", pos)
+				}
+			}
+		}
 	}
 	return nil
 }

@@ -1,0 +1,163 @@
+Program baselines — memory optimisation program, Phase 0
+========================================================
+
+Machine     AMD Ryzen 9 5980HS, 16 cores, Windows 11 (amd64)
+Go          go1.26
+Commit      a54b9aa (v0.7.0, untagged) plus the Phase 0 instruments only
+Page size   4096
+Disk        NVMe SSD
+
+These are the numbers every later change in the program is compared against.
+Nothing in the engine has been modified to produce them: Phase 0 adds
+instruments and fixtures and touches no engine code, which is the point of
+shipping it alone.
+
+Fixture: the consumer's declared index shape — 8 unique keys (one an
+all-distinct 32-byte digest), 5 ordered keys, 2 composites, so 13 index entries
+per node. 512-byte property blobs. 50,000 nodes unless stated.
+
+
+RSS baselines, 50k nodes, 512 B blobs, count=3
+-----------------------------------------------
+
+  go test ./tests/ -tags=stress -run=^$ -bench='RSS_(Open|Scan|BulkWrite|Compact)$' \
+      -benchtime=1x -count=3
+
+  benchmark              rssMiB    anonMiB   fileMiB   heapMiB   diskMiB   resident/disk
+  RSS_Open                140.1      140.1         0     118.2     44.01           3.183
+  RSS_Open                182.3      182.3         0     118.2     44.01           4.142
+  RSS_Open                177.4      177.4         0     118.2     44.01           4.031
+  RSS_Scan                177.7      177.7         0     118.2         -               -
+  RSS_Scan                177.8      177.8         0     118.2         -               -
+  RSS_Scan                177.9      177.9         0     118.2         -               -
+  RSS_BulkWrite           185.6      185.6         0     120.3         -               -
+  RSS_BulkWrite           190.2      190.2         0     120.3         -               -
+  RSS_BulkWrite           184.0      184.0         0     120.3         -               -
+  RSS_Compact             185.7      185.7         0     118.4         -               -
+  RSS_Compact             188.6      188.6         0     118.4         -               -
+  RSS_Compact             187.2      187.2         0     118.4         -               -
+
+  RSS_Compact, transient:  peak 459.5 / 460.2 / 460.0 MiB
+                           delta over steady state +271.7 / +270.0 / +270.4 MiB
+                           732 / 799 / 805 samples at 1 ms
+
+Four readings worth carrying forward:
+
+1. resident-per-disk-byte is ~4.0x. The consumer measured 4,871 MiB against a
+   1.2 GiB store, which is 4.06x. The fixture reproduces the reported ratio, so
+   the shape being optimised here is the shape that was reported.
+
+2. RSS_Scan equals RSS_Open to within 0.3 MiB. Ten rows cost nothing; the whole
+   figure is paid at Open. Any work aimed at making reads cheaper is aimed at
+   the wrong term.
+
+3. fileMiB is 0 everywhere. Nothing in the engine is file-backed today, so the
+   entire resident cost is anonymous memory that a RAM ceiling constrains and
+   the kernel cannot evict. This is the number a mapped image moves.
+
+4. Compaction's transient peak is +270 MiB over steady state on a 44 MiB store
+   — 6.1x the store size, held for the duration. This is the term R1 bounds.
+
+First-run variance on RSS_Open (140 vs 182/177) is the run-to-run spread of a
+cold process; take the median, and prefer count>=3.
+
+
+Rebuild cycle — the identifier high-water mark
+-----------------------------------------------
+
+  GRAPHENE_RSS_NODES=20000 GRAPHENE_RSS_CYCLES=12 go test ./tests/ -tags=stress \
+      -run=^$ -bench=RSS_RebuildCycle -benchtime=1x -v
+
+Each cycle deletes every node the previous cycle wrote and writes the same
+number of fresh ones, then compacts. The live set is identical at the end of
+every cycle.
+
+  cycle  0  resident  108.44 MiB
+  cycle  1  resident  111.10 MiB  +2.66
+  cycle  2  resident  112.66 MiB  +1.56
+  cycle  3  resident  113.76 MiB  +1.10
+  cycle  4  resident  116.22 MiB  +2.46
+  cycle  5  resident  119.61 MiB  +3.39
+  cycle  6  resident  122.02 MiB  +2.42
+  cycle  7  resident  122.89 MiB  +0.87
+  cycle  8  resident  124.45 MiB  +1.56
+  cycle  9  resident  126.11 MiB  +1.66
+  cycle 10  resident  127.84 MiB  +1.73
+  cycle 11  resident  129.28 MiB  +1.44
+  cycle 12  resident  131.07 MiB  +1.79
+
+  MiBPerCycle       1.870   (all cycles)
+  MiBPerCycleTail   1.507   (second half, after any start-up cost is paid)
+  BPerBurnedID     79.02
+
+The line is straight. It does not flatten, and the tail slope is if anything
+lower than the average, so this is a per-cycle cost and not a fixed start-up
+one. 79 B of resident memory per identifier that was issued, deleted, and can
+never be reused — against a model that predicted 72 B, so the model holds.
+
+At the consumer's 1.5M nodes per rebuild that is ~119 MiB added per rebuild,
+permanently, on top of a live set that has not grown.
+
+
+Which half is deleted decides whether compaction recovers anything
+------------------------------------------------------------------
+
+  go test ./tests/ -tags=stress -run=^$ \
+      -bench='Footprint_Disk_(Low|High)HalfDeleted_Compacted' -benchtime=1x -count=3
+
+Same 50,000 live nodes, same live bytes, compacted afterwards in both arms.
+Only the position of the surviving identifiers differs.
+
+  deletion shape                       B/node    MiB total
+  low half   (the rebuild pattern)      530.8       25.31
+  low half                              530.9       25.32
+  low half                              531.5       25.34
+  high half  (what earlier docs measured) 378.8     18.06
+  high half                             378.8       18.06
+  high half                             378.8       18.06
+
+7.26 MiB apart for 50,000 burned identifiers: 152 B each, which decomposes
+exactly as 72 B for the node slot plus 80 B for the edge slot the cascade
+burned with it. Spread across runs is under 0.15%.
+
+The published "4.5x until Compact" figure deleted the high half, where the
+maximum identifier falls with the deletion and compaction can shrink the dense
+arrays. A derived-layer rebuild deletes the low half and writes above it, so the
+maximum only ever rises and compaction recovers none of this.
+
+
+Footprint slope guard
+---------------------
+
+  go test ./tests/ -run TestFootprintGuard -count=3
+
+  retained 1,547,728 B at 2,500 nodes / 4,707,160 B at 10,000 nodes -> 421 B/node
+  retained 1,534,072 B at 2,500 nodes / 4,696,968 B at 10,000 nodes -> 422 B/node
+  retained 1,533,736 B at 2,500 nodes / 4,696,952 B at 10,000 nodes -> 422 B/node
+
+Ceiling 1000 B/node. Three-key fixture, so not comparable to the RSS rows above,
+which carry thirteen.
+
+
+Instrument calibration
+----------------------
+
+The RSS reader is checked against known allocations before any of the above is
+believed:
+
+  TestRSSInstrument_ReadsSomething            reader returns usable fields
+  TestRSSInstrument_TracksAnonymousGrowth     256 MiB touched -> anon rises
+  TestRSSInstrument_SeparatesFileBackedResidency
+                                              128 MiB mapped and touched ->
+                                              file +89 MiB, anon +39 MiB
+
+The last one is the load-bearing check: without it a reader blind to mapped
+pages would report a mapped-image change as no improvement at all, and the
+measurement would veto a design on its own blind spot.
+
+Windows note: the anon/file split is derived as anon = min(PrivateUsage,
+WorkingSetSize), file = the remainder. PrivateUsage is commit charge rather than
+resident private bytes, so anon is overstated by the process's current
+over-commit — measured at ~39 MiB here, roughly fixed rather than scaling with
+the mapping, and one-sided in the safe direction. Linux publishes RssAnon and
+RssFile directly and needs no such derivation; darwin reports the peak only.

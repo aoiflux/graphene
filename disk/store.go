@@ -91,7 +91,10 @@ type Store struct {
 	// writer from knocking every in-flight point read off the fast path.
 	csrShadowed atomic.Int64
 
-	// Property index (in-memory; rebuilt from WAL on restart).
+	// Property index. Resident; restored from the image's GIDX section at open
+	// since v6, with only the entries logged after the last compaction replayed
+	// from the WAL on top. Before v6 it lived in the log alone, and every
+	// restart replayed the whole index.
 	propIdx *index.PropertyIndex
 
 	// live, and the three numbers a live reader advances over. Guarded by mu;
@@ -210,6 +213,24 @@ type Store struct {
 	//
 	// Set once, before the store is used.
 	afterPinHook func()
+
+	// compactStepHook runs immediately before each named durability step of a
+	// compaction and, by returning an error, makes that step fail. Nil in
+	// production, and reachable only from inside this package.
+	//
+	// A compaction's crash-safety is a property of the *order* of its steps, so
+	// the only way to test it is to stop at each one in turn and check what a
+	// reopen recovers. Without a seam, the two steps a test can reach are the
+	// two that happen to be reproducible by hand — writing a stray temp file and
+	// writing a checkpoint marker — and the rest are covered by argument.
+	//
+	// The step names are the compactStep* constants in compact.go. A hook that
+	// does not recognise a step must return nil: steps are added as the
+	// sequence grows, and a hook that failed on an unknown name would turn every
+	// such addition into an unrelated test failure.
+	//
+	// Set once, before the store is used.
+	compactStepHook func(step string) error
 
 	// afterBackupPinHook is the same seam for a backup: it runs between the pin
 	// and the first file copied, with no lock held, so a test can land a
@@ -496,6 +517,8 @@ type Options struct {
 	// This is the part to understand before relying on it. Open materialises the
 	// whole store into memory once — the delta layer and property index from a
 	// WAL replay, the CSR from one os.ReadFile — and nothing re-reads afterwards.
+	// (VerifyOnOpen reads the image once more, before the load and to decide
+	// whether to do it at all; that read is discarded and changes nothing here.)
 	// A read-only store therefore shows the graph as it stood when it opened, for
 	// as long as it lives. Reopen to advance.
 	//
@@ -666,21 +689,37 @@ func StrictOptions(signer store.Signer, verifier store.Verifier, actorID uint64)
 // verifyImageOnOpen runs the checks VerifyOnOpen asks for, in increasing order
 // of what they prove: the bytes are unchanged, the roots describe those bytes,
 // and a named key vouched for the result.
+//
+// The three legs stay separate and stay in this order — the digest matching is
+// no evidence the roots do, which is what catches an edit that repaired the
+// digest — but they read the image once between them and parse it once. Before,
+// each leg opened the file for itself and the last two parsed it again: on a
+// store whose image is most of the machine's memory, an opt-in integrity check
+// that costs four reads and three parses is one nobody can afford to leave on,
+// and a check that is turned off protects nothing.
 func verifyImageOnOpen(csrPath string, opts Options) error {
-	switch status, _, err := VerifyCSRDigest(csrPath); {
-	case err != nil:
-		return fmt.Errorf("verify image: %w", err)
-	case status == DigestMismatch:
+	data, err := os.ReadFile(csrPath)
+	if err != nil {
+		return fmt.Errorf("verify image: verify csr digest: %w", err)
+	}
+
+	switch status, _ := csrDigestStatus(data); status {
+	case DigestMismatch:
 		return fmt.Errorf("verify image: the compacted image does not match its own digest — " +
 			"it has changed since it was written")
-	case status == DigestAbsent:
+	case DigestAbsent:
 		// A pre-v8 image carries no digest. Not a failure: it is the honest
 		// answer for a file that was never covered, and refusing it would make
-		// enabling verification break every older store.
+		// enabling verification break every older store. Nothing further is
+		// checked, because a file this old carries no roots either.
 		return nil
 	}
 
-	if err := VerifyCSRRoots(csrPath); err != nil {
+	csr, section, err := deserialiseCSR(data)
+	if err != nil {
+		return fmt.Errorf("verify image: verify roots: %w", err)
+	}
+	if err := verifyCSRRootsOf(csr, section); err != nil {
 		if errors.Is(err, ErrNoSnapshotRoots) {
 			return nil
 		}
@@ -691,14 +730,6 @@ func verifyImageOnOpen(csrPath string, opts Options) error {
 	// nothing to check it against, which is not the same as it being absent.
 	if opts.Verifier == nil {
 		return nil
-	}
-	data, err := os.ReadFile(csrPath)
-	if err != nil {
-		return fmt.Errorf("verify image: %w", err)
-	}
-	csr, _, err := deserialiseCSR(data)
-	if err != nil {
-		return fmt.Errorf("verify image: %w", err)
 	}
 	if csr.attestation.Signature == nil {
 		return nil

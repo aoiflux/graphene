@@ -216,6 +216,17 @@ func VerifyCSRRoots(path string) error {
 	if err != nil {
 		return fmt.Errorf("verify roots: %w", err)
 	}
+	return verifyCSRRootsOf(csr, section)
+}
+
+// verifyCSRRootsOf is VerifyCSRRoots against an image already parsed.
+//
+// Split out for Open under VerifyOnOpen, which otherwise reads and parses the
+// same file once for the digest, once for the roots, once for the attestation
+// and once to load it. A parse is not just a read: deserialiseCSR presizes two
+// arenas at an eighth of the file each and copies every blob into them, so the
+// duplicate parses cost more than the duplicate reads did.
+func verifyCSRRootsOf(csr *CSRGraph, section *csrIndexSection) error {
 	stored, ok := csr.Roots()
 	if !ok {
 		return ErrNoSnapshotRoots

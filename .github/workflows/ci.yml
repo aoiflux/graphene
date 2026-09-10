@@ -105,23 +105,53 @@ jobs:
   #
   # A failure here writes the offending input to testdata/fuzz. That file is the
   # bug report: commit it, and it becomes a permanent regression test.
+  #
+  # The matrix is derived from the tree rather than written out here. It was
+  # written out here, and it drifted: three targets were added over time and the
+  # list kept naming four, so the schema catalogue and both merkle parsers were
+  # fuzzed by nobody while the job went on reporting success. A hand-maintained
+  # list of what to test is a list that silently shrinks relative to what exists.
+  fuzz-discover:
+    name: discover fuzz targets
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: List fuzz targets
+        id: list
+        run: |
+          entries=""
+          for pkg in $(go list ./...); do
+            for target in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep '^Fuzz' || true); do
+              entries="$entries{\"pkg\":\"$pkg\",\"target\":\"$target\"},"
+            done
+          done
+          # An empty matrix is a job that passes without running anything, which
+          # is the failure this whole arrangement exists to prevent.
+          if [ -z "$entries" ]; then
+            echo "no fuzz targets found; the discovery step is broken" >&2
+            exit 1
+          fi
+          echo "matrix={\"include\":[${entries%,}]}" >> "$GITHUB_OUTPUT"
+          echo "discovered: ${entries%,}"
+
   fuzz:
     name: fuzz parsers
+    needs: fuzz-discover
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - pkg: ./disk/
-            target: FuzzDeserialiseCSR
-          - pkg: ./disk/
-            target: FuzzWALReplay
-          - pkg: ./store/
-            target: FuzzParseNodeType
-          - pkg: ./store/
-            target: FuzzParseEdgeType
+      matrix: ${{ fromJSON(needs.fuzz-discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

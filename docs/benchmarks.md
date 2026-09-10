@@ -1543,3 +1543,132 @@ already shared the helper and were doing the doubling too:
 CSR index section. The export's own numbers above are measured after this
 change; the sort adds about 1.6 MB to a 366 MB export, which the sizing pays
 back several times over elsewhere.
+
+## Program baselines — memory optimisation program (2026-09-09)
+
+|              |                                                                                  |
+| ------------ | -------------------------------------------------------------------------------- |
+| **Date**     | 2026-09-09                                                                       |
+| **OS**       | Windows 11 (amd64), page size 4096, NVMe SSD                                     |
+| **Go**       | go1.26                                                                           |
+| **Hardware** | AMD Ryzen 9 5980HS, 16 cores                                                     |
+| **Baseline** | git `a54b9aa` plus Phase 0 instruments only — no engine code changed             |
+| **Suites**   | [rss](../tests/rss_bench_test.go) · [footprint](../tests/graphene_footprint_test.go) · [guard](../tests/footprint_guard_test.go) |
+| **Method**   | One fixture size per process; `-benchtime=1x -count=3`; medians reported          |
+| **Raw**      | [baseline-2026-09-09.txt](benchmarks/baseline-2026-09-09.txt)                     |
+
+### Why a new kind of measurement
+
+Every footprint number above this section is `runtime.MemStats.HeapAlloc`: the
+Go heap a graph retains. That is the right question for the optimisation work
+recorded above it and the wrong one for a budget expressed in machine RAM. It
+cannot see a memory-mapped image at all — those bytes are resident, and are not
+Go heap — it cannot see the runtime's own arenas and GC headroom, and it cannot
+see page cache. A change that moved bytes out of the heap and into a mapping
+would show as a large win on every existing number while the process occupied
+exactly as much RAM as before.
+
+So these baselines read the operating system's accounting instead, and keep two
+classes apart: **anonymous** pages, which are private, swap-backed, and what a
+RAM ceiling actually constrains, and **file-backed** pages, which are a view of
+something on disk and which the kernel can evict without swap. Reporting one
+combined figure would make a mapping change indistinguishable from no change.
+
+The instrument is calibrated before it is believed — see
+`TestRSSInstrument_SeparatesFileBackedResidency`, which maps and touches 128 MiB
+and fails if the reading does not land in the file class. A reader blind to
+mapped pages would veto the mapped-image design on its own blind spot.
+
+**Never measure residency under `-race`.** The detector allocates shadow memory
+for every byte the program touches, and that shadow is ordinary private
+anonymous memory — touching a 128 MiB mapping produces about 128 MiB of
+anonymous growth beside the file-backed growth, and no accounting separates the
+mapping from its shadow. The calibration test skips itself under the detector
+for exactly this reason. The race detector belongs on the concurrency tests, not
+on these.
+
+### The baseline, 50k nodes, consumer index shape
+
+Thirteen index entries per node — eight unique keys, one of them an all-distinct
+32-byte digest, five ordered, two composites — because at that shape the
+property index, not the graph, is the dominant resident term.
+
+| Operation | resident | anon | file | Go heap | on disk |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Open | 177.4 MiB | 177.4 | 0 | 118.2 | 44.0 MiB |
+| Scan, ten rows | 177.8 MiB | 177.8 | 0 | 118.2 | — |
+| Bulk write | 185.6 MiB | 185.6 | 0 | 120.3 | — |
+| Compact, steady state | 187.2 MiB | 187.2 | 0 | 118.4 | — |
+| Compact, transient peak | 460.0 MiB | — | — | — | — |
+
+Four things follow, and they reorder the work:
+
+**Resident is ~4.0× the store on disk.** The consumer that prompted this
+measured 4,871 MiB against a 1.2 GiB store — 4.06×. The fixture reproduces the
+reported ratio, so what is being optimised here is what was reported.
+
+**A ten-row read costs the same as opening.** `Scan` and `Open` agree to within
+0.3 MiB. The whole figure is paid at Open, and effort spent making reads cheaper
+is aimed at the wrong term.
+
+**Nothing is file-backed.** `fileMiB` is zero on every row: the entire resident
+cost today is anonymous memory the kernel cannot evict. That is the headroom a
+mapped image has to work with.
+
+**Compaction's transient peak is +270 MiB over steady state on a 44 MiB store**
+— 6.1× the store, held for the duration, sampled at 1 ms over ~780 samples.
+
+### The identifier high-water mark
+
+The cost that no estimate based on file size predicts. Each cycle deletes every
+node the previous cycle wrote, writes the same number of fresh ones, and
+compacts; the live set is identical at the end of every cycle, so anything that
+accumulates is the cost of identifiers that were issued and can never be reused.
+
+| cycle | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| resident MiB | 108.4 | 111.1 | 112.7 | 113.8 | 116.2 | 119.6 | 122.0 | 122.9 | 124.5 | 126.1 | 127.8 | 129.3 | 131.1 |
+
+Straight line, 20,000 nodes burned per cycle. It does not flatten, and the tail
+slope over the second half (1.507 MiB/cycle) is lower than the average
+(1.870), so this is a per-cycle cost rather than a one-off paid at the first
+rebuild — a distinction two endpoints cannot make, which is why the benchmark
+reports the whole series. **79.0 B of resident memory per burned identifier.**
+
+At 1.5M nodes per rebuild that is ~119 MiB added permanently per rebuild, on top
+of a live set that has not grown.
+
+### Compaction recovers this only if you delete the high half
+
+Same 50,000 live nodes, same live bytes, compacted in both arms. Only the
+position of the surviving identifiers differs.
+
+| deletion shape | B/node | MiB total |
+| --- | ---: | ---: |
+| low half — a derived-layer rebuild | 530.8 | 25.31 |
+| high half — what the numbers above measured | 378.8 | 18.06 |
+
+7.26 MiB apart for 50,000 burned identifiers: **152 B each**, decomposing
+exactly as 72 B for the node slot plus 80 B for the edge slot the delete cascade
+burned with it. Spread across three runs is under 0.15%.
+
+The [Memory footprint](#memory-footprint-p1) figure earlier in this document — 4.5×
+until `Compact` — deleted the *high* half, where the maximum identifier falls
+with the deletion and the dense arrays can shrink. A rebuild deletes the *low*
+half and writes above it, so the maximum only rises and compaction recovers none
+of it. The two measurements do not contradict each other; they measure different
+deletion shapes, and only one of them is the workload.
+
+### Reproducing
+
+```sh
+make rssbench                               # all five, default 50k
+make rssbench FILTER=RSS_Open RSS_NODES=1500000
+make rssbench FILTER=RSS_RebuildCycle RSS_CYCLES=40 RSS_COUNT=1
+make heapprofile FILTER=BenchmarkRSS_Open   # what is retained, by call site
+make cpuprofile FILTER=BenchmarkRSS_Open    # where the time goes
+```
+
+One fixture size per process, always: a process that builds several large
+fixtures reports the high-water mark of the largest, and the peak figures then
+say nothing about the smaller ones.

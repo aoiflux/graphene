@@ -187,17 +187,20 @@ func (d DigestStatus) String() string {
 // VerifyCSRDigest checks the digest stored in a CSR image against its contents,
 // and returns both the status and the digest computed from the bytes.
 //
-// Deliberately not run by Open. Hashing the whole image costs time proportional
-// to the file on every startup, and Open already declines to run VerifyIndexes
-// for the same reason — a check that makes every open slower gets disabled, and
-// a disabled check protects nothing. It is offered here, and through
-// `graphene csr -verify`, so that verifying is a decision rather than a tax.
+// Not run by a default Open. Hashing the whole image costs time proportional to
+// the file on every startup, and Open already declines to run VerifyIndexes for
+// the same reason — a check that makes every open slower gets disabled, and a
+// disabled check protects nothing. It is offered here, through
+// `graphene csr -verify`, and through Options.VerifyOnOpen, so that verifying is
+// a decision rather than a tax.
 //
 // What a match does and does not mean is worth stating plainly: it proves the
 // file has not changed since it was written. It does not prove who wrote it.
 // Anyone who can rewrite the body can rewrite the digest, so this detects
 // damage and accident, and detects tampering only for someone holding an
 // independently retained copy of the expected digest.
+//
+// path may be the store directory or the file.
 func VerifyCSRDigest(path string) (DigestStatus, [csrDigestSize]byte, error) {
 	p, err := resolveFile(path, csrFileName)
 	if err != nil {
@@ -207,22 +210,33 @@ func VerifyCSRDigest(path string) (DigestStatus, [csrDigestSize]byte, error) {
 	if err != nil {
 		return DigestAbsent, [csrDigestSize]byte{}, fmt.Errorf("verify csr digest: %w", err)
 	}
+	status, computed := csrDigestStatus(data)
+	return status, computed, nil
+}
+
+// csrDigestStatus is VerifyCSRDigest against bytes already in hand.
+//
+// Split out so a caller holding the image — Open under VerifyOnOpen — can ask
+// the question without reading the file a second time. It cannot fail: every
+// shape it does not understand is DigestAbsent, which is the honest answer for
+// a file that was never covered rather than an error.
+func csrDigestStatus(data []byte) (DigestStatus, [csrDigestSize]byte) {
 	if len(data) < csrV8HeaderSize {
-		return DigestAbsent, [csrDigestSize]byte{}, nil
+		return DigestAbsent, [csrDigestSize]byte{}
 	}
 	if binary.LittleEndian.Uint16(data[4:6]) < csrVersionSectioned {
-		return DigestAbsent, [csrDigestSize]byte{}, nil
+		return DigestAbsent, [csrDigestSize]byte{}
 	}
 
 	stored, ok := readCSRDigest(data)
 	if !ok {
-		return DigestAbsent, [csrDigestSize]byte{}, nil
+		return DigestAbsent, [csrDigestSize]byte{}
 	}
 	computed := computeCSRDigest(data)
 	if stored == computed {
-		return DigestMatch, computed, nil
+		return DigestMatch, computed
 	}
-	return DigestMismatch, computed, nil
+	return DigestMismatch, computed
 }
 
 // readCSRDigest returns the digest stored in a v8 image.

@@ -1285,24 +1285,36 @@ func (s *Store) VerifyIndexesCtx(ctx context.Context) error {
 		}
 	}
 
-	// The property index must not outlive the entities it describes.
-	for _, id := range s.propIdx.IndexedNodeIDs() {
+	// The property index must not outlive the entities it describes. Walked
+	// rather than listed, for the reason disk.Store's copy of this check
+	// records: nothing is kept, so nothing needs materialising.
+	var verr error
+	s.propIdx.ForEachIndexedNodeID(func(id store.NodeID) bool {
 		if err := cc.Step(); err != nil {
-			return err
+			verr = err
+			return false
 		}
 		if _, ok := s.nodes[id]; !ok {
-			return fmt.Errorf("property index: node %d has entries but does not exist", id)
+			verr = fmt.Errorf("property index: node %d has entries but does not exist", id)
+			return false
 		}
+		return true
+	})
+	if verr != nil {
+		return verr
 	}
-	for _, id := range s.propIdx.IndexedEdgeIDs() {
+	s.propIdx.ForEachIndexedEdgeID(func(id store.EdgeID) bool {
 		if err := cc.Step(); err != nil {
-			return err
+			verr = err
+			return false
 		}
 		if _, ok := s.edges[id]; !ok {
-			return fmt.Errorf("property index: edge %d has entries but does not exist", id)
+			verr = fmt.Errorf("property index: edge %d has entries but does not exist", id)
+			return false
 		}
-	}
-	return nil
+		return true
+	})
+	return verr
 }
 
 // RebuildIndexes implements store.IndexRebuilder. It recomputes the label
@@ -1343,26 +1355,39 @@ func (s *Store) RebuildIndexesCtx(ctx context.Context) error {
 
 	// Collect dangling property-index owners while we still hold the lock, but
 	// purge after releasing it: the property index has its own lock.
+	//
+	// Only the dead are kept, deduplicated across the key shards that can each
+	// offer the same entity — see the same scan in disk/verify.go.
 	var deadNodes []store.NodeID
+	var deadEdges []store.EdgeID
+	seenDead := map[uint64]struct{}{}
 	var cerr error
-	for _, id := range s.propIdx.IndexedNodeIDs() {
+	s.propIdx.ForEachIndexedNodeID(func(id store.NodeID) bool {
 		if cerr = cc.Step(); cerr != nil {
-			break
+			return false
 		}
 		if _, ok := s.nodes[id]; !ok {
-			deadNodes = append(deadNodes, id)
+			if _, dup := seenDead[uint64(id)]; !dup {
+				seenDead[uint64(id)] = struct{}{}
+				deadNodes = append(deadNodes, id)
+			}
 		}
-	}
-	var deadEdges []store.EdgeID
+		return true
+	})
 	if cerr == nil {
-		for _, id := range s.propIdx.IndexedEdgeIDs() {
+		clear(seenDead)
+		s.propIdx.ForEachIndexedEdgeID(func(id store.EdgeID) bool {
 			if cerr = cc.Step(); cerr != nil {
-				break
+				return false
 			}
 			if _, ok := s.edges[id]; !ok {
-				deadEdges = append(deadEdges, id)
+				if _, dup := seenDead[uint64(id)]; !dup {
+					seenDead[uint64(id)] = struct{}{}
+					deadEdges = append(deadEdges, id)
+				}
 			}
-		}
+			return true
+		})
 	}
 	s.mu.Unlock()
 	if cerr != nil {

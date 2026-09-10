@@ -196,23 +196,38 @@ func (s *Store) VerifyIndexesCtx(ctx context.Context) error {
 	}
 
 	// The property index must not outlive the entities it describes.
-	for _, id := range s.propIdx.IndexedNodeIDs() {
+	//
+	// Walked rather than listed: this check keeps nothing, so the answer to
+	// "which ids are indexed" only ever needed to exist one id at a time.
+	// ForEachIndexedNodeID may repeat an id across shards, which costs a second
+	// existence probe and changes no answer.
+	var verr error
+	s.propIdx.ForEachIndexedNodeID(func(id store.NodeID) bool {
 		if err := cc.Step(); err != nil {
-			return err
+			verr = err
+			return false
 		}
 		if !r.nodeExists(id) {
-			return fmt.Errorf("property index: node %d has entries but is not live", id)
+			verr = fmt.Errorf("property index: node %d has entries but is not live", id)
+			return false
 		}
+		return true
+	})
+	if verr != nil {
+		return verr
 	}
-	for _, id := range s.propIdx.IndexedEdgeIDs() {
+	s.propIdx.ForEachIndexedEdgeID(func(id store.EdgeID) bool {
 		if err := cc.Step(); err != nil {
-			return err
+			verr = err
+			return false
 		}
 		if !r.edgeExists(id) {
-			return fmt.Errorf("property index: edge %d has entries but is not live", id)
+			verr = fmt.Errorf("property index: edge %d has entries but is not live", id)
+			return false
 		}
-	}
-	return nil
+		return true
+	})
+	return verr
 }
 
 // anyEdgeVersion returns any retained record for the chain — they all agree on
@@ -346,26 +361,44 @@ func (s *Store) RebuildIndexesCtx(ctx context.Context) error {
 	// From here on the structure is whole again, so cancelling costs only the
 	// sweep. The scan runs under the lock and the removals do not, which is why
 	// the two loops are separate; both are interruptible.
+	//
+	// The scan keeps only the dead, and the dedupe set with it: the index is
+	// sharded by key, so an entity indexed under keys in two shards is offered
+	// twice, and removing it twice would take all sixteen shard locks a second
+	// time for nothing. Both structures are therefore proportional to the
+	// damage, not to the index — which matters most in the case that produces
+	// the most damage, an image whose records were lost while its entries
+	// survived.
 	var deadNodes []store.NodeID
+	var deadEdges []store.EdgeID
+	seenDead := map[uint64]struct{}{}
 	var cerr error
-	for _, id := range s.propIdx.IndexedNodeIDs() {
+	s.propIdx.ForEachIndexedNodeID(func(id store.NodeID) bool {
 		if cerr = cc.Step(); cerr != nil {
-			break
+			return false
 		}
 		if !r.nodeExists(id) {
-			deadNodes = append(deadNodes, id)
+			if _, dup := seenDead[uint64(id)]; !dup {
+				seenDead[uint64(id)] = struct{}{}
+				deadNodes = append(deadNodes, id)
+			}
 		}
-	}
-	var deadEdges []store.EdgeID
+		return true
+	})
 	if cerr == nil {
-		for _, id := range s.propIdx.IndexedEdgeIDs() {
+		clear(seenDead)
+		s.propIdx.ForEachIndexedEdgeID(func(id store.EdgeID) bool {
 			if cerr = cc.Step(); cerr != nil {
-				break
+				return false
 			}
 			if !r.edgeExists(id) {
-				deadEdges = append(deadEdges, id)
+				if _, dup := seenDead[uint64(id)]; !dup {
+					seenDead[uint64(id)] = struct{}{}
+					deadEdges = append(deadEdges, id)
+				}
 			}
-		}
+			return true
+		})
 	}
 	s.mu.Unlock()
 	if cerr != nil {

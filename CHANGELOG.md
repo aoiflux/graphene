@@ -5,6 +5,212 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### Measuring the thing the budget is written against
+
+A consumer sized for a 2 GB machine measured 9,290 MiB of peak RSS rebuilding a
+derived layer against a 1.2 GiB store, and 4,871 MiB for a read that touches ten
+rows. Nothing in this engine could have predicted either number, because nothing
+in it measured resident memory at all: the footprint suite reports
+`runtime.MemStats.HeapAlloc`, the Go heap a graph retains.
+
+That is the wrong instrument for a RAM ceiling in a way that would have quietly
+corrupted the work that follows. It cannot see a memory-mapped image — those
+bytes are resident and are not Go heap — so the single change most likely to fix
+this would have reported as a large win on every existing number while the
+process occupied exactly as much RAM as before.
+
+So this release opens with instruments and no engine changes at all. Nothing in
+`disk/`, `index/` or `store/` moved.
+
+**Process residency, split by class.** `tests/rss_test.go` reads the operating
+system's own accounting and keeps **anonymous** pages — private, swap-backed,
+what a ceiling constrains — apart from **file-backed** pages, which the kernel
+can evict without swap. Linux publishes both directly; Windows derives them from
+`WorkingSetSize` and `PrivateUsage`, one-sidedly and in the safe direction;
+darwin reports the peak only and says so rather than inventing a split. Standard
+library only, so the zero-cgo, zero-dependency closure is untouched.
+
+The reader is calibrated before anything is believed of it. One test maps and
+touches 128 MiB and fails if the reading does not land in the file class, because
+a reader blind to mapped pages would veto the mapped-image design on its own
+blind spot. Another skips itself under `-race` after finding that the detector's
+shadow memory is itself anonymous, which makes the split unmeasurable under it —
+worth knowing before someone reads a memory figure off a race-enabled run.
+
+**Five baselines** (`make rssbench`) on a fixture matching the reported index
+shape: eight unique keys, one an all-distinct 32-byte digest, five ordered, two
+composites. Open, a ten-row read, a bulk write, a compaction, and a rebuild
+cycle. Plus `make cpuprofile` and `make heapprofile`, and a `-memprofile` flag on
+the CLI beside the existing `-cpuprofile` — the heap profile is written after the
+command finishes but before the store closes, so it reports what was still held
+rather than everything ever allocated.
+
+**A regression guard that can fail.** `TestFootprintGuard_OpenSlope` asserts a
+*slope* — retained bytes per record, fitted across two fixture sizes — rather
+than a ceiling on the total. Fixed overhead cancels, so a change that adds a
+constant is free and a change that adds bytes per record is caught. A ceiling
+loose enough to be stable would have been loose enough to miss a doubling.
+
+### What the baselines say
+
+Four readings, on a 44 MiB store, that reorder the work ahead:
+
+- **Resident is ~4.0× the store on disk** — against the 4.06× the consumer
+  reported. The fixture reproduces the shape that was reported.
+- **A ten-row read costs the same as opening**, to within 0.3 MiB. The entire
+  figure is paid at `Open`; effort aimed at making reads cheaper is aimed at the
+  wrong term.
+- **Nothing is file-backed.** Every resident byte today is anonymous memory the
+  kernel cannot evict.
+- **Compaction's transient peak is +270 MiB over steady state** — 6.1× the store
+  size, held for the duration.
+
+### Deleting the low half is not the same as deleting the high half
+
+`docs/benchmarks.md` has reported since v0.6.0 that a half-deleted store costs
+4.5× until `Compact`. That measurement deleted the **high** half, where the
+maximum identifier falls with the deletion and the dense arrays shrink with it.
+
+A derived-layer rebuild does the opposite: it deletes the whole old layer — the
+**low** identifiers — and writes the replacement above them, so the maximum only
+ever rises. Two new benchmarks measure both arms with the same live count and the
+same live bytes, and they differ by **152 B per burned identifier**, which
+decomposes exactly as 72 B for the node slot plus 80 B for the edge slot the
+delete cascade burned with it. Compaction recovers none of it.
+
+`BenchmarkRSS_RebuildCycle` confirms it end to end and reports the whole series
+rather than two endpoints, because a one-off start-up cost and a per-cycle leak
+produce the same average and have completely different consequences at forty
+cycles. The line is straight over twelve cycles and does not flatten:
+**79 B of resident memory per identifier issued, deleted, and never reusable.**
+At 1.5M nodes per rebuild that is ~119 MiB added permanently per rebuild, on top
+of a live set that has not grown.
+
+Neither figure is a regression — both describe behaviour that has been there
+since the CSR image existed. What is new is that they are measured, and that the
+existing published number is now qualified by the deletion shape it assumed.
+
+### Compaction's ordering is now tested rather than argued
+
+Compaction's crash-safety is not a property of any one statement. It is a
+property of the *order* of about ten of them: the image is synced before the
+checkpoint marker, because the marker vouches for the image; the rename happens
+before the log is retired, because the log is what recovers the store if the
+rename does not survive. Each of those is a claim about what a reopen finds if
+the process dies at one exact point, and two of the ten were tested — the two a
+test could stage by hand. The rest were held up by the comments asserting them.
+
+`compactStepHook` makes every point reachable, and `TestCompact_FailsAtEveryStep`
+stops a compaction at each one across four store shapes chosen to drive all three
+`retireLog` branches — the branch that rotates the log whole, the one that carries
+a tail, and the one that keeps the log and writes no marker at all, which is the
+most dangerous difference in the file. Forty runs, each asserting the only thing
+that matters: a reopen finds every record that was committed, with its index
+entries intact and `VerifyIndexes` clean.
+
+The suite was checked against injected defects rather than trusted. Moving
+`retireLog` above the rename — the transposition the ordering exists to prevent —
+loses committed nodes on reopen, and the test says which ones.
+
+**A failed compaction no longer leaves the image behind.** The temporary image was
+deliberately left on the write, drain and rename error paths, on the reasoning
+that a stray temp file is ignored on the next open. It is, but the likeliest cause
+of a compaction failing is a full disk, and the second failure is then a
+multi-gigabyte carcass sitting in the directory the operator is trying to rescue.
+Removing it is one call, and the step suite asserts nothing is left behind at any
+of the ten points.
+
+### The list of fuzz targets is derived from the tree
+
+`make fuzz` kept its target list in a variable, the CI matrix kept a second copy,
+and both fell behind: two merkle targets were written and then never run for a
+release, while the local runner and the nightly job each went on reporting
+success. A list of what to test is the one list that must not be maintained by
+hand, so both now derive it — `make fuzz-targets` from `go test -list`, and the
+workflow from a discovery job that fails if the list comes back empty. The matrix
+went from four targets to nine on the first run.
+
+Two of those nine are new — `FuzzReadOrderedKeySection` and
+`FuzzReadCompositeSection`, the section readers that had none — and
+`FuzzDeserialiseCSR` is now seeded with twenty-five hostile images built from a
+valid one: truncated at each structural boundary, with `indexOffset` and
+`sectionTableOffset` set to the length, one under it, `MaxInt64`, past it and
+zero, with directory entries whose offset and length overflow when added, and with
+a GIDX value length one byte past what remains. The seed builder walks the
+directory with its own deliberately simpler code, so the corpus does not depend on
+the parser it exists to attack.
+
+### The zero-cgo, zero-dependency closure is asserted
+
+Both were true and neither was checked. `TestZeroCgo` walks the whole build
+closure — the engine's packages and the standard library's — and fails if any of
+them compiles a cgo file; `TestZeroExternalDependencies` reads `go.mod` and fails
+on any `require` line; and a third test asserts the exact set of files permitted
+to import `unsafe`, in both directions, so a new one has to be argued for rather
+than merely added.
+
+The cgo test forces `CGO_ENABLED=1` for its own query, which is the whole test.
+With cgo disabled, `go list` reports no cgo files for any package, so the check
+would have passed on every machine that had it turned off — a test that cannot
+fail, arrived at by an environment variable.
+
+### Verification no longer builds a second copy of what it is verifying
+
+`VerifyIndexes` is what an operator reaches for when something is already wrong,
+which on this engine usually means the store has outgrown the machine. It was
+allocating a full duplicate of the index to check the index.
+
+Three structures did it. The postings cross-check accumulated a
+`map[id]map[key-value]int` over every posting — the reverse index rebuilt, with a
+map header of its own per entity — and then compared it against the reverse index
+sitting beside it. Each composite index rebuilt its whole tuple-to-entities map
+from its members. And `IndexedNodeIDs` returned every indexed identifier as a
+slice, deduplicated through a map, to callers that kept only the ones they found
+*wrong* — in a healthy store, none of them.
+
+None of it was necessary, because both directions follow from probing and
+counting instead of remembering. Postings lists are strictly ascending, so an
+entity appears at most once under a key and value: "is it there" and "how many
+times" are the same question and one binary search answers it. Probing every
+reverse reference into the postings establishes that the reverse side is a subset
+of the forward side; both are sets, so once the totals agree they are the same
+set — which is exactly what "every posting has a reverse entry" was asking. The
+composite index is checked the same way.
+
+The count cannot name an offender, so when it disagrees a second walk goes and
+finds it, with the same bound and the same messages as before, paid only by an
+index already known to be broken.
+
+Measured on a 32,000-entry index, `Verify` now allocates **0 bytes**. The
+structure it replaced cost **410 bytes per indexed entry**, which is what the new
+guard measures when it is reintroduced. The guard asserts a slope rather than a
+ceiling, for the reason the alloc guards already record: a ceiling loose enough to
+be stable is loose enough to miss a doubling.
+
+Two of the corruptions the old shape could not report are now caught. A member
+holding the same value twice at one position repeats a tuple, and the rebuilt set
+quietly absorbed it; a member value stored past the composite's declared width is
+never enumerated and contradicted nothing. Both are now named.
+
+**`VerifyOnOpen` reads the image once.** Its three legs — the bytes are unchanged,
+the roots describe those bytes, a named key vouched for the result — each opened
+the file for itself, and the last two parsed it again from scratch. With a
+verifier configured, `Open` read a file that on the target workload is most of the
+machine's memory four times and decoded it three times. The legs still run in the
+same order and still prove three separate things (a digest that matches is no
+evidence the roots do, which is what catches an edit that repaired the digest);
+they now share one read and one parse, and `Open` is down to two reads and two
+decodes. Measured as a multiple of one read-and-parse of the same image, the check
+went from 3.03× to 1.91×.
+
+**API change, `index` package.** `PropertyIndex.IndexedNodeIDs` and
+`IndexedEdgeIDs` are replaced by `ForEachIndexedNodeID` and
+`ForEachIndexedEdgeID`, which take a callback and return nothing. The walk does
+*not* deduplicate: the index is sharded by property key, so an entity carrying
+entries under keys in different shards is offered once per shard. Deduplicating is
+precisely the map this exists to avoid, and a caller that minds deduplicates what
+it keeps — which is bounded by what it is looking for rather than by the index.
+
 ### Declarations are now a property of the store, not of the process
 
 A declaration tells the engine something it cannot work out for itself, and it

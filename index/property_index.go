@@ -800,43 +800,52 @@ func (sh *propertyShard) verify(cc *store.CancelCheck) error {
 	return nil
 }
 
-// IndexedNodeIDs returns every node ID that has at least one indexed entry.
-// Used by integrity checks to detect postings that outlived their entity.
-func (p *PropertyIndex) IndexedNodeIDs() []store.NodeID {
-	seen := make(map[store.NodeID]struct{})
-	var out []store.NodeID
+// ForEachIndexedNodeID calls fn for every node ID that has at least one indexed
+// entry, stopping early if fn returns false. Used by integrity checks to detect
+// postings that outlived their entity.
+//
+// Callback rather than a slice, and the difference is the whole point. The
+// callers keep only the ids they find *wrong* — a handful in a healthy store —
+// so returning every indexed id charged the check a map to deduplicate plus a
+// slice to hold the answer, both proportional to the entire index, to produce
+// something thrown away one element at a time. At the ~28M entries this engine
+// is being sized for that is over a gigabyte, spent by the routine whose job is
+// to be safe to run on a store that is already near its ceiling.
+//
+// # Ids repeat
+//
+// The index is sharded by key, so an entity carrying entries under keys that
+// hash to different shards is yielded once per such shard. Deduplicating here
+// is exactly the map this exists to avoid; a caller that minds deduplicates
+// what it keeps, which is bounded by what it is looking for rather than by the
+// index. The two callers in this tree keep only dead ids and do precisely that.
+//
+// A shard's read lock is held for the duration of that shard's walk, so fn must
+// not call back into the index.
+func (p *PropertyIndex) ForEachIndexedNodeID(fn func(store.NodeID) bool) {
 	for i := range p.shards {
 		sh := &p.shards[i]
 		sh.mu.RLock()
-		sh.nodes.forEachRefID(func(id store.NodeID) {
-			if _, dup := seen[id]; dup {
-				return
-			}
-			seen[id] = struct{}{}
-			out = append(out, id)
-		})
+		done := sh.nodes.forEachRefID(fn)
 		sh.mu.RUnlock()
+		if !done {
+			return
+		}
 	}
-	return out
 }
 
-// IndexedEdgeIDs returns every edge ID that has at least one indexed entry.
-func (p *PropertyIndex) IndexedEdgeIDs() []store.EdgeID {
-	seen := make(map[store.EdgeID]struct{})
-	var out []store.EdgeID
+// ForEachIndexedEdgeID is ForEachIndexedNodeID for edges; the same shard-repeat
+// caveat applies.
+func (p *PropertyIndex) ForEachIndexedEdgeID(fn func(store.EdgeID) bool) {
 	for i := range p.shards {
 		sh := &p.shards[i]
 		sh.mu.RLock()
-		sh.edges.forEachRefID(func(id store.EdgeID) {
-			if _, dup := seen[id]; dup {
-				return
-			}
-			seen[id] = struct{}{}
-			out = append(out, id)
-		})
+		done := sh.edges.forEachRefID(fn)
 		sh.mu.RUnlock()
+		if !done {
+			return
+		}
 	}
-	return out
 }
 
 // --- postings ---
@@ -961,14 +970,23 @@ func (p *postings[T]) dropRefs(id T) {
 	delete(p.refN, id)
 }
 
-// forEachRefID visits every id holding a reverse entry.
-func (p *postings[T]) forEachRefID(fn func(T)) {
+// forEachRefID visits every id holding a reverse entry, stopping early if fn
+// returns false. It reports whether the walk ran to the end.
+//
+// The two maps partition the ids by arity — verify checks that no id is in both
+// — so an id is visited exactly once per postings container.
+func (p *postings[T]) forEachRefID(fn func(T) bool) bool {
 	for id := range p.ref1 {
-		fn(id)
+		if !fn(id) {
+			return false
+		}
 	}
 	for id := range p.refN {
-		fn(id)
+		if !fn(id) {
+			return false
+		}
 	}
+	return true
 }
 
 func newPostings[T entityID]() postings[T] {
@@ -1182,8 +1200,33 @@ func unsafeBytes(s string) []byte {
 }
 
 // verify walks the postings and the reverse map and cross-checks them.
+//
+// # Why nothing is accumulated
+//
+// This used to build a map[T]map[propRef]int over every posting — the reverse
+// index rebuilt a second time, with a map header of its own per entity — and
+// then compare it with the reverse index already sitting beside it. At the
+// entry counts this engine is being budgeted for, that was the largest
+// allocation in the whole integrity check, made by the one routine an operator
+// reaches for when memory is already the problem. It also called internKey
+// under a read lock, which appends.
+//
+// It is not needed. Both directions follow from probing and counting:
+//
+//   - Every postings list is strictly ascending, checked below. So an entity
+//     appears at most once under a (key, value), and "is it there" and "how
+//     many times" are the same question — one binary search answers it.
+//   - Each entity's reverse refs are checked to be distinct, so the reverse
+//     side holds exactly Σ refCount entries.
+//   - Probing every reverse ref into the postings establishes reverse ⊆
+//     postings. Both are sets of (id, key, value), so once the totals agree
+//     they are the same set — which is what "every posting has a reverse entry"
+//     was asking, and it is now answered without holding either of them.
+//
+// A total that disagrees knows a posting is unreferenced but not which, so
+// unreferencedPosting goes and finds it. That walk is bounded too, and is paid
+// only by an index already known to be broken.
 func (p *postings[T]) verify(kind string, cc *store.CancelCheck) error {
-	seen := make(map[T]map[propRef]int)
 	total := 0
 
 	for key, bucket := range p.byKey {
@@ -1202,14 +1245,8 @@ func (p *postings[T]) verify(kind string, cc *store.CancelCheck) error {
 					return fmt.Errorf("%s index: key %q value %q postings not strictly ascending at %d (%d >= %d)",
 						kind, key, value, i, uint64(ids[i-1]), uint64(id))
 				}
-				refs := seen[id]
-				if refs == nil {
-					refs = make(map[propRef]int)
-					seen[id] = refs
-				}
-				refs[propRef{keyID: p.internKey(key), value: value}]++
-				total++
 			}
+			total += len(ids)
 		}
 	}
 
@@ -1235,40 +1272,118 @@ func (p *postings[T]) verify(kind string, cc *store.CancelCheck) error {
 	}
 
 	// Reverse map must agree with the postings, in both directions.
+	reverse := 0
 	var verr error
-	p.forEachRefID(func(id T) {
-		if verr != nil {
-			return
+	p.forEachRefID(func(id T) bool {
+		if err := cc.Step(); err != nil {
+			verr = err
+			return false
 		}
 		n := p.refCount(id)
 		if n == 0 {
 			verr = fmt.Errorf("%s index: id %d has an empty reverse entry", kind, uint64(id))
-			return
+			return false
 		}
-		fromPostings := seen[id]
-		if len(fromPostings) != n {
-			verr = fmt.Errorf("%s index: id %d has %d reverse refs but appears in %d postings",
-				kind, uint64(id), n, len(fromPostings))
-			return
+		if ref, dup := p.duplicateRef(id); dup {
+			verr = fmt.Errorf("%s index: id %d holds the reverse ref (%q=%q) twice",
+				kind, uint64(id), p.safeKeyName(ref.keyID), ref.value)
+			return false
 		}
 		p.forEachRef(id, func(ref propRef) bool {
-			if fromPostings[ref] != 1 {
-				verr = fmt.Errorf("%s index: id %d reverse ref (%q=%q) appears %d times in postings",
-					kind, uint64(id), p.keyName(ref.keyID), ref.value, fromPostings[ref])
+			if int(ref.keyID) >= len(p.keyNames) {
+				verr = fmt.Errorf("%s index: id %d has a reverse ref naming key id %d, but only %d keys are interned",
+					kind, uint64(id), ref.keyID, len(p.keyNames))
+				return false
+			}
+			key := p.keyName(ref.keyID)
+			if !containsSorted(p.byKey[key][ref.value], id) {
+				verr = fmt.Errorf("%s index: id %d reverse ref (%q=%q) has no matching posting",
+					kind, uint64(id), key, ref.value)
 				return false
 			}
 			return true
 		})
+		if verr != nil {
+			return false
+		}
+		reverse += n
+		return true
 	})
 	if verr != nil {
 		return verr
 	}
-	for id := range seen {
-		if !p.hasRefs(id) {
-			return fmt.Errorf("%s index: id %d appears in postings but has no reverse entry", kind, uint64(id))
-		}
+	if reverse != total {
+		return p.unreferencedPosting(kind, total, reverse, cc)
 	}
 	return nil
+}
+
+// duplicateRef reports a reverse ref an entity holds twice.
+//
+// Pairwise because the list is one entry per key the entity carries *in this
+// shard*, which is a handful — allocating a set to compare a handful of pairs
+// would cost more than the comparisons, and would do it once per entity.
+func (p *postings[T]) duplicateRef(id T) (propRef, bool) {
+	refs := p.refN[id]
+	for i, r := range refs {
+		for _, s := range refs[i+1:] {
+			if r == s {
+				return r, true
+			}
+		}
+	}
+	return propRef{}, false
+}
+
+// safeKeyName is keyName for error paths, where the id being reported may be
+// the very thing that is wrong.
+func (p *postings[T]) safeKeyName(id uint32) string {
+	if int(id) >= len(p.keyNames) {
+		return fmt.Sprintf("<key id %d>", id)
+	}
+	return p.keyNames[id]
+}
+
+// unreferencedPosting names the posting that verify's totals proved has no
+// reverse entry.
+//
+// Reached only when the reverse side is a proper subset of the postings, and it
+// re-walks them to say which posting is orphaned — the message the old
+// map-building verify gave for free. Nothing accumulates here either.
+func (p *postings[T]) unreferencedPosting(kind string, total, reverse int, cc *store.CancelCheck) error {
+	for key, bucket := range p.byKey {
+		keyID, interned := p.keyIDs[key]
+		for value, ids := range bucket {
+			if err := cc.Step(); err != nil {
+				return err
+			}
+			for _, id := range ids {
+				if !p.hasRefs(id) {
+					return fmt.Errorf("%s index: id %d appears in postings but has no reverse entry", kind, uint64(id))
+				}
+				if !interned {
+					return fmt.Errorf("%s index: key %q holds postings but was never interned", kind, key)
+				}
+				found := false
+				p.forEachRef(id, func(ref propRef) bool {
+					if ref.keyID == keyID && ref.value == value {
+						found = true
+						return false
+					}
+					return true
+				})
+				if !found {
+					return fmt.Errorf("%s index: id %d appears under (%q=%q) with no matching reverse ref",
+						kind, uint64(id), key, value)
+				}
+			}
+		}
+	}
+	// Unreachable while this walk and the probing loop agree on what they
+	// visit; reported rather than swallowed, because totals that disagree with
+	// nothing findable are themselves the finding.
+	return fmt.Errorf("%s index: %d postings entries are covered by %d reverse refs, and every posting is referenced",
+		kind, total, reverse)
 }
 
 // insertSorted inserts id into the ascending slice, reporting whether it was
@@ -1283,6 +1398,12 @@ func insertSorted[T entityID](ids []T, id T) ([]T, bool) {
 	copy(ids[pos+1:], ids[pos:])
 	ids[pos] = id
 	return ids, true
+}
+
+// containsSorted reports whether the ascending slice holds id.
+func containsSorted[T entityID](ids []T, id T) bool {
+	pos := sort.Search(len(ids), func(i int) bool { return ids[i] >= id })
+	return pos < len(ids) && ids[pos] == id
 }
 
 // deleteSorted removes id from the ascending slice, reporting whether it was

@@ -283,6 +283,14 @@ func FuzzDeserialiseCSR(f *testing.F) {
 	copy(negative, hostile)
 	binary.LittleEndian.PutUint64(negative[6:14], 1<<63+1)
 	f.Add(negative)
+	// Structurally plausible v8 images, each wrong in one specific way:
+	// truncated at every structural boundary, hostile indexOffset and
+	// sectionTableOffset, a directory entry whose Offset+Length wraps, and a
+	// GIDX value length past the end of the section. See fuzz_sections_test.go
+	// for why these have to be handed to the fuzzer rather than discovered.
+	for _, seed := range hostileCSRSeeds(f) {
+		f.Add(seed)
+	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		csr, section, err := deserialiseCSR(data)

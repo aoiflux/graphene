@@ -63,6 +63,47 @@ import (
 // second would spend a full build to write the same bytes.
 var ErrCompactionInProgress = errors.New("graphene: a compaction is already running")
 
+// The durability steps of a compaction, in the order they run.
+//
+// These name the points where a crash produces a *different* on-disk state, not
+// every statement in the sequence. That is the granularity crash-safety is
+// argued at — "the image is synced before the checkpoint is written", "the
+// rename happens before the log is retired" — so it is the granularity a test
+// has to be able to stop at. compactStepHook fires immediately before each.
+//
+// Steps may be added as the sequence grows; see compactStepHook on the reason a
+// hook must ignore names it does not know.
+const (
+	compactStepSerialise   = "serialise"    // before the image is built in memory
+	compactStepWriteTmp    = "write-tmp"    // before the temp image is created
+	compactStepSyncTmp     = "sync-tmp"     // written, not yet fsynced
+	compactStepDrainWAL    = "drain-wal"    // before the log is flushed for its end offset
+	compactStepRename      = "rename"       // before the temp image becomes the image
+	compactStepSyncDir     = "sync-dir"     // renamed, directory entry not yet durable
+	compactStepCheckpoint  = "checkpoint"   // before a "replay stops here" marker
+	compactStepRetireWhole = "retire-whole" // branch 1: nothing landed during the build
+	compactStepRetireTail  = "retire-tail"  // branch 2: the log is rebuilt over the tail
+	compactStepRetireKeep  = "retire-keep"  // branch 3: the log is kept as it stands
+)
+
+// fireCompactStep runs the step hook, if one is installed.
+func (s *Store) fireCompactStep(step string) error {
+	if s.compactStepHook == nil {
+		return nil
+	}
+	return s.compactStepHook(step)
+}
+
+// fireStep is the plan's copy of the same seam. build runs with no lock and no
+// store reference by design — see the file comment — so the hook travels with
+// the plan rather than being read back off the store from another goroutine.
+func (p *compactPlan) fireStep(step string) error {
+	if p.stepHook == nil {
+		return nil
+	}
+	return p.stepHook(step)
+}
+
 // compactPlan is everything a compaction reads from the store, captured under
 // the lock at a single epoch. Once built it shares nothing mutable with the
 // store; see the file comment for why each field is safe to hold.
@@ -91,6 +132,11 @@ type compactPlan struct {
 	// pin. Anything appended past it happened during the build and belongs to
 	// the log that survives the retire.
 	keyTimelineLen int
+
+	// stepHook is the store's compactStepHook, copied at the pin. Nil in
+	// production. A func value, so the plan still shares nothing mutable with
+	// the store.
+	stepHook func(step string) error
 }
 
 // Compact merges the delta layer into the CSR and truncates the WAL.
@@ -339,6 +385,8 @@ func (s *Store) compactPin() (*compactPlan, error) {
 		},
 	}
 
+	plan.stepHook = s.compactStepHook
+
 	s.compacting = true
 	return plan, nil
 }
@@ -352,10 +400,16 @@ func (s *Store) compactRelease() {
 
 // build turns the plan into a serialised image on disk, with no lock held.
 //
-// A failure here leaves a stray temp file and nothing else: the log is intact,
-// the image on disk is the previous one, and the store's view has not moved.
-// That is the same state the existing "a stray .tmp is ignored" open path
-// already handles.
+// A failure here changes nothing: the log is intact, the image on disk is the
+// previous one, and the store's view has not moved.
+//
+// It also leaves no temp file. The open path ignores a stray .tmp and always
+// has, so correctness never depended on removing it — but a failed compaction
+// of a large store leaves a temp file the size of the image, and the most
+// likely reason a compaction fails is that the disk is full. Keeping the
+// carcass around turns one recoverable failure into a machine with no room to
+// retry on. Removal is best-effort for exactly that reason: if it fails, the
+// open path is still correct, so there is nothing further to report.
 func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string, error) {
 	newCSR := Build(p.nodes, p.edges)
 	if err := ctx.Err(); err != nil {
@@ -371,6 +425,9 @@ func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string,
 	newCSR.commitSeqHW = p.commitSeqHW
 	newCSR.lastCompactUnixNano = p.compactedAt.UnixNano()
 
+	if err := p.fireStep(compactStepSerialise); err != nil {
+		return nil, "", err
+	}
 	data, err := newCSR.SerialiseWithPayload(p.payload)
 	if err != nil {
 		return nil, "", fmt.Errorf("compact: %w", err)
@@ -386,10 +443,35 @@ func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string,
 	// says "everything before this record is in the image"; if the image's
 	// blocks are still in the page cache when the power goes, that marker is a
 	// durable lie. The sync has to land before the checkpoint, not after.
-	if err := writeFileSync(tmpPath, data, 0600); err != nil {
+	if err := p.fireStep(compactStepWriteTmp); err != nil {
+		// Before the file exists, so there is nothing to clean up. The step is
+		// still worth stopping at: it is the boundary between "the compaction
+		// touched no file in the directory" and "it did".
+		return nil, "", err
+	}
+	beforeSync := func() error { return p.fireStep(compactStepSyncTmp) }
+	if err := writeFileSyncHooked(tmpPath, data, 0600, beforeSync); err != nil {
+		// This is the only statement in build that can have created the file,
+		// so cleaning up here covers every way build can fail with a temp file
+		// on disk. A partial write counts: writeFileSync truncates on open, so
+		// a failure part way through leaves a short file under the real name.
+		removeTmpImage(tmpPath)
 		return nil, "", fmt.Errorf("compact: write tmp CSR: %w", err)
 	}
 	return newCSR, tmpPath, nil
+}
+
+// removeTmpImage deletes a temp image that will never be installed.
+//
+// Best-effort by design. The caller is already returning an error, and the open
+// path treats a stray .tmp as absent, so a failure to remove costs disk space
+// and nothing else — reporting it would replace the error that actually
+// explains the failure with one about the cleanup after it.
+func removeTmpImage(tmpPath string) {
+	if tmpPath == "" {
+		return
+	}
+	_ = os.Remove(tmpPath)
 }
 
 // compactCommit installs the built image and retires the log behind it.
@@ -408,20 +490,39 @@ func (s *Store) compactCommit(p *compactPlan, newCSR *CSRGraph, tmpPath string) 
 	// fsync follows the marker for the two branches that write one, and is
 	// explicit in the third, which keeps a compaction at one fsync rather than
 	// two.
+	if err := s.fireCompactStep(compactStepDrainWAL); err != nil {
+		removeTmpImage(tmpPath)
+		return err
+	}
 	endOff, err := s.wal.drainedEnd()
 	if err != nil {
+		// Nothing has been installed, so the built image is now unreachable.
+		// Same reasoning as in build: an image-sized file left behind by a
+		// failure whose likeliest cause is a full disk.
+		removeTmpImage(tmpPath)
 		return fmt.Errorf("compact: wal flush: %w", err)
 	}
 
 	csrPath := filepath.Join(s.dir, csrFileName)
+	if err := s.fireCompactStep(compactStepRename); err != nil {
+		removeTmpImage(tmpPath)
+		return err
+	}
 	if err := os.Rename(tmpPath, csrPath); err != nil {
+		removeTmpImage(tmpPath)
 		return fmt.Errorf("compact: rename CSR: %w", err)
 	}
+	// Past this point the temp name no longer exists: the rename consumed it.
+	// Every later failure in this function leaves the *new* image installed and
+	// the log un-retired, which is the case the open path recovers by replay.
 	// And the rename itself. os.Rename is atomic with respect to a concurrent
 	// reader — either name resolves to one whole file or the other — but that
 	// is a different property from surviving a power loss, which needs the
 	// directory's own entries flushed. Before the WAL is retired below, because
 	// the log is what recovers the store if this fails.
+	if err := s.fireCompactStep(compactStepSyncDir); err != nil {
+		return err
+	}
 	if err := syncDir(s.dir); err != nil {
 		return fmt.Errorf("compact: %w", err)
 	}
@@ -470,6 +571,12 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 	// Nothing landed during the build. The log holds exactly what the image
 	// holds, so it is retired whole, exactly as it always was.
 	case tail <= 0:
+		if err := s.fireCompactStep(compactStepRetireWhole); err != nil {
+			return err
+		}
+		if err := s.fireCompactStep(compactStepCheckpoint); err != nil {
+			return err
+		}
 		if _, err := s.wal.checkpointAt(); err != nil {
 			return fmt.Errorf("compact: wal checkpoint: %w", err)
 		}
@@ -497,6 +604,12 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 	// obvious — the image holds every epoch up to the pin, the log holds every
 	// epoch after it, and neither holds both.
 	case !s.retention.Keeps() && p.walFraming == walFramingV2:
+		if err := s.fireCompactStep(compactStepRetireTail); err != nil {
+			return err
+		}
+		if err := s.fireCompactStep(compactStepCheckpoint); err != nil {
+			return err
+		}
 		markerOff, err := s.wal.checkpointAt()
 		if err != nil {
 			return fmt.Errorf("compact: wal checkpoint: %w", err)
@@ -539,6 +652,9 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 	// still needed and is issued on its own: the tail commits have to be durable
 	// before the epoch covering them is published.
 	default:
+		if err := s.fireCompactStep(compactStepRetireKeep); err != nil {
+			return err
+		}
 		if err := s.wal.Sync(); err != nil {
 			return fmt.Errorf("compact: wal sync: %w", err)
 		}
