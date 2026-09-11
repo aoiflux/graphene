@@ -31,10 +31,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"math"
 	"slices"
 
 	"github.com/aoiflux/graphene/merkle"
+	"github.com/aoiflux/graphene/store"
 )
 
 // Domain tags separating what a leaf describes. Without these an edge leaf and a
@@ -65,11 +67,12 @@ const (
 // the ID and labels did not change without ever being shown what was removed.
 // With the blob hashed inline there is no such comparison to make; the leaves
 // simply differ, and nothing says where.
+// It hashes the tag and the blob as two writes rather than concatenating them
+// into a buffer first: a property blob can be tens of megabytes, and copying it
+// to prefix one byte was the largest allocation on the leaf path.
 func propertiesHash(props []byte) merkle.Hash {
-	buf := make([]byte, 0, 1+len(props))
-	buf = append(buf, leafTagProperties)
-	buf = append(buf, props...)
-	return merkle.Hash(sha256.Sum256(buf))
+	var le leafEncoder
+	return le.propHash(props)
 }
 
 // GHSH section body versions, so roots can gain fields without disturbing the
@@ -125,42 +128,131 @@ type SnapshotRoots struct {
 // Zero reports whether no roots have been computed.
 func (s SnapshotRoots) Zero() bool { return s.Snapshot == merkle.Hash{} }
 
-// nodeLeafData returns the canonical bytes hashed for a node record.
-func nodeLeafData(n nodeRecord) []byte {
-	labels := slices.Clone(n.Labels)
-	slices.Sort(labels)
+// leafEncoder builds leaf bytes into scratch it reuses, so hashing an image's
+// worth of records allocates once rather than once per record.
+//
+// The old free functions allocated a fresh buffer and a fresh sorted label
+// slice for every leaf. That was invisible while the leaves were being
+// collected into a []merkle.Hash anyway — the slice dominated — and it is the
+// whole cost once they are not.
+//
+// A returned slice is valid only until the next call on the same encoder. Every
+// caller hands it straight to merkle.HashLeaf, which reads it and retains
+// nothing, and an encoder belongs to exactly one pass, so the lifetime is the
+// call.
+type leafEncoder struct {
+	buf     []byte
+	nlabels []store.NodeType
+	elabels []store.EdgeType
+	h       hash.Hash
+	sum     [merkle.Size]byte
+}
 
-	buf := make([]byte, 0, 1+8+2+len(labels)*2+4+len(n.Properties))
-	buf = append(buf, leafTagNode)
+// propTagBytes is the property-hash domain tag, as a slice a hasher can take
+// without allocating one per call.
+var propTagBytes = [...]byte{leafTagProperties}
+
+// propHash is propertiesHash against the encoder's own hasher.
+func (le *leafEncoder) propHash(props []byte) merkle.Hash {
+	if le.h == nil {
+		le.h = sha256.New()
+	}
+	le.h.Reset()
+	le.h.Write(propTagBytes[:])
+	le.h.Write(props)
+
+	// Summed into a field rather than into a local array: Sum is an interface
+	// call, so a local would escape and cost an allocation per record — the
+	// thing this encoder exists to avoid.
+	var out merkle.Hash
+	copy(out[:], le.h.Sum(le.sum[:0]))
+	return out
+}
+
+// node encodes a node leaf under the given body version: v3 and later commit to
+// a hash of the property blob, earlier versions to the blob itself.
+func (le *leafEncoder) node(version uint8, n nodeRecord) []byte {
+	le.nlabels = append(le.nlabels[:0], n.Labels...)
+	slices.Sort(le.nlabels)
+
+	buf := le.buf[:0]
+	if version >= snapshotBodyV3 {
+		buf = append(buf, leafTagNodeV2)
+	} else {
+		buf = append(buf, leafTagNode)
+	}
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(n.ID))
-	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(labels)))
-	for _, l := range labels {
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(le.nlabels)))
+	for _, l := range le.nlabels {
 		buf = binary.LittleEndian.AppendUint16(buf, uint16(l))
 	}
-	// Length-prefixed so a property blob cannot be shifted into an adjacent
-	// field: without it, moving a byte between labels and properties would leave
-	// the concatenation unchanged.
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(n.Properties)))
-	return append(buf, n.Properties...)
+	if version >= snapshotBodyV3 {
+		h := le.propHash(n.Properties)
+		buf = append(buf, h[:]...)
+	} else {
+		// Length-prefixed so a property blob cannot be shifted into an adjacent
+		// field: without it, moving a byte between labels and properties would
+		// leave the concatenation unchanged.
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(n.Properties)))
+		buf = append(buf, n.Properties...)
+	}
+	le.buf = buf
+	return buf
+}
+
+// edge encodes an edge leaf under the given body version.
+func (le *leafEncoder) edge(version uint8, e rawEdge) []byte {
+	le.elabels = append(le.elabels[:0], e.Labels...)
+	slices.Sort(le.elabels)
+
+	buf := le.buf[:0]
+	if version >= snapshotBodyV3 {
+		buf = append(buf, leafTagEdgeV2)
+	} else {
+		buf = append(buf, leafTagEdge)
+	}
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(e.ID))
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(e.Src))
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(e.Dst))
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(le.elabels)))
+	for _, l := range le.elabels {
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(l))
+	}
+	buf = binary.LittleEndian.AppendUint32(buf, math.Float32bits(e.Weight))
+	if version >= snapshotBodyV3 {
+		h := le.propHash(e.Properties)
+		buf = append(buf, h[:]...)
+	} else {
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e.Properties)))
+		buf = append(buf, e.Properties...)
+	}
+	le.buf = buf
+	return buf
+}
+
+// propEntry encodes a property-index entry leaf.
+func (le *leafEncoder) propEntry(id uint64, key string, val []byte) []byte {
+	buf := le.buf[:0]
+	buf = append(buf, leafTagPropEntry)
+	buf = binary.LittleEndian.AppendUint64(buf, id)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(key)))
+	buf = append(buf, key...)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(val)))
+	buf = append(buf, val...)
+	le.buf = buf
+	return buf
+}
+
+// nodeLeafData returns the canonical bytes hashed for a node record.
+func nodeLeafData(n nodeRecord) []byte {
+	var le leafEncoder
+	return le.node(snapshotBodyV1, n)
 }
 
 // edgeLeafData returns the canonical bytes hashed for an edge record.
 func edgeLeafData(e rawEdge) []byte {
-	labels := slices.Clone(e.Labels)
-	slices.Sort(labels)
-
-	buf := make([]byte, 0, 1+24+2+len(labels)*2+4+4+len(e.Properties))
-	buf = append(buf, leafTagEdge)
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(e.ID))
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(e.Src))
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(e.Dst))
-	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(labels)))
-	for _, l := range labels {
-		buf = binary.LittleEndian.AppendUint16(buf, uint16(l))
-	}
-	buf = binary.LittleEndian.AppendUint32(buf, math.Float32bits(e.Weight))
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e.Properties)))
-	return append(buf, e.Properties...)
+	var le leafEncoder
+	return le.edge(snapshotBodyV1, e)
 }
 
 // nodeLeafDataV2 is nodeLeafData with the property blob replaced by its hash.
@@ -170,37 +262,14 @@ func edgeLeafData(e rawEdge) []byte {
 // differ only in the property hash. That equality is the thing a property
 // redaction needs to be able to demonstrate.
 func nodeLeafDataV2(n nodeRecord) []byte {
-	labels := slices.Clone(n.Labels)
-	slices.Sort(labels)
-
-	buf := make([]byte, 0, 1+8+2+len(labels)*2+merkle.Size)
-	buf = append(buf, leafTagNodeV2)
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(n.ID))
-	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(labels)))
-	for _, l := range labels {
-		buf = binary.LittleEndian.AppendUint16(buf, uint16(l))
-	}
-	h := propertiesHash(n.Properties)
-	return append(buf, h[:]...)
+	var le leafEncoder
+	return le.node(snapshotBodyV3, n)
 }
 
 // edgeLeafDataV2 is edgeLeafData with the property blob replaced by its hash.
 func edgeLeafDataV2(e rawEdge) []byte {
-	labels := slices.Clone(e.Labels)
-	slices.Sort(labels)
-
-	buf := make([]byte, 0, 1+24+2+len(labels)*2+4+merkle.Size)
-	buf = append(buf, leafTagEdgeV2)
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(e.ID))
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(e.Src))
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(e.Dst))
-	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(labels)))
-	for _, l := range labels {
-		buf = binary.LittleEndian.AppendUint16(buf, uint16(l))
-	}
-	buf = binary.LittleEndian.AppendUint32(buf, math.Float32bits(e.Weight))
-	h := propertiesHash(e.Properties)
-	return append(buf, h[:]...)
+	var le leafEncoder
+	return le.edge(snapshotBodyV3, e)
 }
 
 // nodeLeafFor and edgeLeafFor pick the encoding a given snapshot body version
@@ -210,17 +279,13 @@ func edgeLeafDataV2(e rawEdge) []byte {
 // agree: an image whose root was computed from v1 leaves and whose proofs are
 // built from v2 leaves produces proofs that resolve to nothing.
 func nodeLeafFor(version uint8, n nodeRecord) []byte {
-	if version >= snapshotBodyV3 {
-		return nodeLeafDataV2(n)
-	}
-	return nodeLeafData(n)
+	var le leafEncoder
+	return le.node(version, n)
 }
 
 func edgeLeafFor(version uint8, e rawEdge) []byte {
-	if version >= snapshotBodyV3 {
-		return edgeLeafDataV2(e)
-	}
-	return edgeLeafData(e)
+	var le leafEncoder
+	return le.edge(version, e)
 }
 
 // NodeLeaves returns the leaf hash of every live node, in ascending ID order,
@@ -229,76 +294,122 @@ func edgeLeafFor(version uint8, e rawEdge) []byte {
 // Order is the file's own record order, which canonical serialisation already
 // fixes. A root computed from a different order would be a different root, so
 // this and the writer must agree — they do by both iterating Nodes.
+//
+// This materialises one hash per node, which is what an inclusion proof needs
+// and what a root does not. The root is computed by snapshotRootStream instead;
+// this is for prove.go, which has to hand merkle.BuildProof the whole level.
 func (g *CSRGraph) NodeLeaves(version uint8) []merkle.Hash {
 	out := make([]merkle.Hash, 0, g.NodeCount())
+	var le leafEncoder
 	for n := range g.Nodes() {
-		out = append(out, merkle.HashLeaf(nodeLeafFor(version, n)))
+		out = append(out, merkle.HashLeaf(le.node(version, n)))
 	}
 	return out
 }
 
 // EdgeLeaves returns the leaf hash of every live edge, in ascending ID order.
+//
+// It hashes the v1 encoding whatever version says, which is a bug of record:
+// node leaves moved to the separated property hash at snapshotBodyV3 and edge
+// leaves did not follow. It is left alone deliberately. The EdgeRoot of every
+// v3 image ever written was computed this way, so "fixing" it would change the
+// identity of every existing snapshot — a retained root is the one value
+// SECURITY.md tells a holder to keep, and this would silently invalidate all of
+// them. Changing it is a snapshotBodyV4, not a repair.
 func (g *CSRGraph) EdgeLeaves(version uint8) []merkle.Hash {
 	out := make([]merkle.Hash, 0, g.EdgeCount())
+	var le leafEncoder
 	for e := range g.Edges() {
-		out = append(out, merkle.HashLeaf(edgeLeafData(e)))
+		out = append(out, merkle.HashLeaf(le.edge(edgeLeafVersion(version), e)))
 	}
 	return out
 }
 
-// propEntryLeaves returns leaf hashes over the property-index entries, in the
-// canonical order NodeEntries/EdgeEntries already guarantee.
-func propEntryLeaves(nodeCount, edgeCount int, appendEntry func(i int, node bool) []byte) []merkle.Hash {
-	out := make([]merkle.Hash, 0, nodeCount+edgeCount)
-	for i := 0; i < nodeCount; i++ {
-		out = append(out, merkle.HashLeaf(appendEntry(i, true)))
-	}
-	for i := 0; i < edgeCount; i++ {
-		out = append(out, merkle.HashLeaf(appendEntry(i, false)))
-	}
-	return out
+// edgeLeafVersion is the encoding edge leaves are actually hashed under, which
+// is v1 at every body version. One function so that the writer, the streaming
+// root and EdgeLeaves cannot drift apart on it, and so that the day it becomes
+// a v4 there is one place to change.
+func edgeLeafVersion(uint8) uint8 { return snapshotBodyV1 }
+
+// snapshotRootStream computes the component roots as the records stream past on
+// their way into the image, rather than from arrays of leaves.
+//
+// The arrays were the largest allocation in the whole compaction after the
+// image buffer itself: 32 bytes per node, per edge and per property-index
+// entry, all live at once, all folded into ninety-six bytes and dropped. A
+// merkle.RootBuilder retains one hash per set bit of the count instead, so the
+// three of these together are under two hundred hashes for any store that
+// exists.
+//
+// The order leaves arrive in is the order the writer writes the records in,
+// which is the order NodeLeaves/EdgeLeaves/propEntryLeaves produced them in, so
+// the roots are unchanged. computeSnapshotRootsAs is the same walk driven from
+// a finished graph, which is how verification re-derives an image it did not
+// write.
+type snapshotRootStream struct {
+	version uint8
+	nodes   merkle.RootBuilder
+	edges   merkle.RootBuilder
+	index   merkle.RootBuilder
+	enc     leafEncoder
 }
 
-// computeSnapshotRoots builds the roots for an image about to be written.
-func computeSnapshotRoots(g *CSRGraph, payload csrPayload, prev merkle.Hash) SnapshotRoots {
-	return computeSnapshotRootsAs(snapshotBodyVersion, g, payload, prev)
+func newSnapshotRootStream(version uint8) *snapshotRootStream {
+	return &snapshotRootStream{version: version}
+}
+
+func (s *snapshotRootStream) addNode(n nodeRecord) {
+	s.nodes.AddLeafData(s.enc.node(s.version, n))
+}
+
+func (s *snapshotRootStream) addEdge(e rawEdge) {
+	s.edges.AddLeafData(s.enc.edge(edgeLeafVersion(s.version), e))
+}
+
+func (s *snapshotRootStream) addPropEntry(id uint64, key string, val []byte) {
+	s.index.AddLeafData(s.enc.propEntry(id, key, val))
+}
+
+// finish binds the three streamed roots with the tombstone root and the
+// predecessor. Tombstones stay materialised: there is one per deliberate
+// removal, which is a human-scale number, and they are hashed from a slice the
+// caller already holds.
+func (s *snapshotRootStream) finish(tombstones []Tombstone, prev merkle.Hash) SnapshotRoots {
+	r := SnapshotRoots{
+		NodeRoot:      s.nodes.Root(),
+		EdgeRoot:      s.edges.Root(),
+		IndexRoot:     s.index.Root(),
+		PrevRoot:      prev,
+		TombstoneRoot: merkle.Root(tombstoneLeaves(tombstones)),
+		BodyVersion:   s.version,
+	}
+	r.Snapshot = bindSnapshotRoot(r)
+	return r
 }
 
 // computeSnapshotRootsAs builds the roots under a specific body version.
 //
 // Verification needs this: an existing image must be re-derived the way it was
-// written, not the way this build would write it now.
+// written, not the way this build would write it now. It drives the same stream
+// the writer drives, from a graph and a payload already in hand, so a
+// verification costs the same constant memory a compaction does.
 func computeSnapshotRootsAs(version uint8, g *CSRGraph, payload csrPayload, prev merkle.Hash) SnapshotRoots {
-	r := SnapshotRoots{
-		NodeRoot:      merkle.Root(g.NodeLeaves(version)),
-		EdgeRoot:      merkle.Root(g.EdgeLeaves(version)),
-		PrevRoot:      prev,
-		TombstoneRoot: merkle.Root(tombstoneLeaves(payload.Tombstones)),
-		BodyVersion:   version,
+	s := newSnapshotRootStream(version)
+	for n := range g.Nodes() {
+		s.addNode(n)
 	}
-
-	idxLeaves := propEntryLeaves(len(payload.NodeProps), len(payload.EdgeProps), func(i int, node bool) []byte {
-		var id uint64
-		var key string
-		var val []byte
-		if node {
-			e := payload.NodeProps[i]
-			id, key, val = uint64(e.ID), e.Key, e.Value
-		} else {
-			e := payload.EdgeProps[i]
-			id, key, val = uint64(e.ID), e.Key, e.Value
-		}
-		buf := make([]byte, 0, 1+8+2+len(key)+4+len(val))
-		buf = append(buf, leafTagPropEntry)
-		buf = binary.LittleEndian.AppendUint64(buf, id)
-		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(key)))
-		buf = append(buf, key...)
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(val)))
-		return append(buf, val...)
-	})
-	r.IndexRoot = merkle.Root(idxLeaves)
-	r.Snapshot = bindSnapshotRoot(r)
-	return r
+	for e := range g.Edges() {
+		s.addEdge(e)
+	}
+	// Nodes then edges, which is the order the GIDX section is written in and
+	// therefore the order the index leaves were always hashed in.
+	for _, e := range payload.NodeProps {
+		s.addPropEntry(uint64(e.ID), e.Key, e.Value)
+	}
+	for _, e := range payload.EdgeProps {
+		s.addPropEntry(uint64(e.ID), e.Key, e.Value)
+	}
+	return s.finish(payload.Tombstones, prev)
 }
 
 // bindSnapshotRoot combines the component roots into the snapshot's identity.

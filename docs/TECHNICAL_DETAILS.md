@@ -4099,6 +4099,94 @@ spread thinly over many pages pays more than one whose records are dense.
 its records — by a ratio *and* by an absolute margin, so a small store is not
 flagged for holding one page — it names the pages and the multiple.
 
+### 14.16 Taken: the streamed image writer
+
+The second item of the memory program, and the one that removed the largest
+single allocation the engine made.
+
+**The defect.** `SerialiseWithPayload` built the whole image in a
+`bytes.Buffer` and returned a `[]byte` for compaction to hand to
+`writeFileSync`. On the store this program is aimed at that is a 1.2 GiB
+allocation — transiently closer to 1.8 GiB, because a `bytes.Buffer` that
+outgrows its capacity allocates a larger one and copies — held at the moment
+compaction is already holding a freshly built CSR and a plan. Nothing read the
+bytes twice.
+
+Beside it sat a second allocation nobody had counted: `computeSnapshotRootsAs`
+built a `[]merkle.Hash` of every leaf — one 32-byte entry per node, per edge and
+per property-index entry — folded the three arrays into three hashes and dropped
+them. At the consumer's shape that is another ~900 MB of hashes whose only use
+is to produce ninety-six bytes.
+
+**What shipped.** `SerialiseTo(dst io.ReadWriteSeeker, payload)` writes the same
+bytes through a 64 KiB buffer. `SerialiseWithPayload` is now a wrapper that
+streams into memory, so there is exactly one writer and the two cannot diverge.
+`merkle.RootBuilder` computes the RFC 6962 tree head one leaf at a time, holding
+one hash per set bit of the leaf count — at most 64, against the millions the
+array held — and the leaves are hashed as the records stream past on their way
+into the file. `writeStreamSync` is `writeFileSync` for a payload that is
+produced rather than held.
+
+The additional memory a serialisation costs is now stated rather than estimated:
+one 64 KiB buffer, three `RootBuilder` stacks, a leaf-encoding scratch sized by
+the largest single record, and the section directory.
+`TestSerialiseTo_AllocatesIndependentlyOfImageSize` asserts both halves of that —
+a ceiling, which catches a writer that holds the image, and a slope across an
+eight-fold size difference, which catches a per-record cost small enough to slip
+under the ceiling at test sizes and ruinous at the sizes this is for.
+
+**Why the file is read back.** The digest covers the header, and the header
+carries `sectionTableOffset`, which is not known until the last section has been
+placed. SHA-256 is sequential and the header is hashed first, so the digest
+cannot be teed off the write. The alternative was to compute the image's total
+size up front, which means a second implementation of every encoder, whose
+disagreement with the real one would corrupt an image silently. Reading the
+finished file back is a sequential pass over bytes still in the page cache, it
+costs one copy buffer, and it goes through the same `csrDigestHeader` every other
+digest path uses. Wall clock is the cheaper thing to spend, and under this
+program it is explicitly the cheaper thing to spend.
+
+**Why the bytes did not move.** The record order, the section order and the leaf
+order are unchanged, and `RootBuilder` is the same tree as `merkle.Root` rather
+than a cheaper one — `TestRootBuilder_EqualsRoot` sweeps every leaf count from 0
+to 1025 and `FuzzRootBuilderMatchesRoot` sweeps arbitrary ones.
+`disk/testdata/csr_v8_before_pages.bin`, the fixture written by the build before
+the page table, still reproduces byte for byte through the new writer, which
+makes it a cross-build guard for this change as well.
+
+**What the allocation guard found that reading did not.** Three costs that were
+invisible while a `[]merkle.Hash` was in the picture and dominant once it was
+gone, each caught by the guard rather than by inspection:
+
+- `merkle.HashLeaf` and `hashInternal` build a fresh SHA-256 state per call, so
+  folding a tree allocated once per leaf *and* once per internal node.
+  `RootBuilder` keeps one.
+- A `[Size]byte` local sliced into a `hash.Hash` method escapes, which is two
+  allocations for every internal node. The internal-node preimage is staged in a
+  builder field instead.
+- `io.CopyBuffer` hands off to an `*os.File`'s own `WriteTo` and allocates a
+  buffer past the one it was given. The digest pass reads in an explicit loop.
+
+Between them these were 2,570 allocations and 251 KB per image on a 576 KB
+fixture; afterwards, 70 allocations and 73 KB, of which 64 KB is the buffer.
+
+**What it bought.** On a 100,000-node store, three interleaved rounds: the
+transient peak a compaction adds over steady state fell from 555.1 MiB to
+**165.2 MiB** (−70.2%) and the process peak during it from 844.8 to 437.4 MiB,
+while the Go heap the store retains afterwards was 235.1 MiB in both arms — the
+control, and the point: what a store holds did not move, only what writing it
+costs while it runs. A compaction at 10,000 nodes allocates 4,793,200 B in
+10,144 calls where it allocated 9,149,776 B in 60,133. The image is
+byte-identical on every round. See
+[benchmarks.md](benchmarks.md#the-streamed-image-writer-2026-09-11).
+
+**What the mutation pass found.** That no byte test in the package crossed the
+output buffer — the largest image any of them wrote was 30 KB against a 64 KiB
+buffer, so a writer that duplicated every buffer's worth of bytes passed
+everything. `TestSerialiseTo_CrossesTheBufferCleanly` writes an image several
+buffers long and one whose single record is larger than the buffer, and parses
+both back.
+
 ---
 
 ## 15. Invariants
@@ -4341,6 +4429,14 @@ Any change must preserve these. Each is enforced by tests.
     the open path bounds at `touchedPages × 4096 ≤ max(65536, records × 256)`
     and refuses beyond it. `graphene store info` flags the gap when it is worth
     an operator's attention, naming the pages.
+24. **Writing an image reads it back once.** The body digest covers the header,
+    and the header carries `sectionTableOffset`, which is not final until the
+    last section has been placed — so the digest is computed over the finished
+    file rather than teed off the write (§14.16). That is one sequential pass
+    over bytes that are still in the page cache, on top of the write. It is a
+    wall-clock cost taken deliberately: the alternative is a second
+    implementation of every encoder to size the image up front, and a
+    disagreement between the two would corrupt an image silently.
 
 ---
 

@@ -75,7 +75,7 @@ var ErrCompactionInProgress = errors.New("graphene: a compaction is already runn
 // Steps may be added as the sequence grows; see compactStepHook on the reason a
 // hook must ignore names it does not know.
 const (
-	compactStepSerialise   = "serialise"    // before the image is built in memory
+	compactStepSerialise   = "serialise"    // before any of the image is produced
 	compactStepWriteTmp    = "write-tmp"    // before the temp image is created
 	compactStepSyncTmp     = "sync-tmp"     // written, not yet fsynced
 	compactStepDrainWAL    = "drain-wal"    // before the log is flushed for its end offset
@@ -471,16 +471,18 @@ func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string,
 	newCSR.commitSeqHW = p.commitSeqHW
 	newCSR.lastCompactUnixNano = p.compactedAt.UnixNano()
 
-	if err := p.fireStep(compactStepSerialise); err != nil {
-		return nil, "", err
-	}
-	data, err := newCSR.SerialiseWithPayload(p.payload)
-	if err != nil {
-		return nil, "", fmt.Errorf("compact: %w", err)
-	}
 	// The last place a cancellation is free. Past this the image is written and
 	// fsynced, and the caller has paid for it whether or not it is installed.
+	//
+	// This used to sit *after* serialisation, because serialisation was a
+	// separate step that produced an image-sized []byte for the write to
+	// consume. The write is the serialisation now — SerialiseTo streams into
+	// the temp file — so the last free moment is before it rather than between
+	// the two.
 	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if err := p.fireStep(compactStepSerialise); err != nil {
 		return nil, "", err
 	}
 
@@ -496,11 +498,14 @@ func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string,
 		return nil, "", err
 	}
 	beforeSync := func() error { return p.fireStep(compactStepSyncTmp) }
-	if err := writeFileSyncHooked(tmpPath, data, 0600, beforeSync); err != nil {
+	write := func(f *os.File) error { return newCSR.SerialiseTo(f, p.payload) }
+	if err := writeStreamSync(tmpPath, 0600, beforeSync, write); err != nil {
 		// This is the only statement in build that can have created the file,
 		// so cleaning up here covers every way build can fail with a temp file
-		// on disk. A partial write counts: writeFileSync truncates on open, so
-		// a failure part way through leaves a short file under the real name.
+		// on disk. A partial write counts: the file is truncated on open, so a
+		// failure part way through leaves a short file under the real name.
+		// A signer error arrives here too, now that signing happens inside the
+		// write rather than before it.
 		removeTmpImage(tmpPath)
 		return nil, "", fmt.Errorf("compact: write tmp CSR: %w", err)
 	}

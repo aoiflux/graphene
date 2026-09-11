@@ -27,28 +27,40 @@ import (
 // The file is truncated on open, as os.WriteFile does, and the sync happens
 // before the close: a Close error after a successful Sync tells us nothing new,
 // but a Sync error is the one that means the data is not there.
+//
+// For a payload the caller does not already hold, see writeStreamSync. The
+// compacted image goes that way now; what is left here are the small ones — a
+// backup manifest, a schema catalogue, a rebuilt log — where holding the bytes
+// costs nothing.
 func writeFileSync(path string, data []byte, perm os.FileMode) error {
-	return writeFileSyncHooked(path, data, perm, nil)
+	return writeStreamSync(path, perm, nil, func(f *os.File) error {
+		_, err := f.Write(data)
+		return err
+	})
 }
 
-// writeFileSyncHooked is writeFileSync with a seam between the write and the
-// sync, so a test can fail there.
+// writeStreamSync is writeFileSync for a payload that is produced rather than
+// held: write is handed the open file and streams into it.
 //
-// That instant is a distinct on-disk state and not a hypothetical one: the file
-// exists at full length in the page cache and none of it is guaranteed to be on
-// the medium. It is the state a compaction is in when it is about to write a
-// checkpoint marker vouching for bytes that may not survive a power loss, which
-// is the exact hazard the sync exists to close — so it has to be reachable.
+// It exists because a compacted image is the size of the graph, and the caller
+// that matters — compaction — had no use for the bytes except to pass them
+// here. Building them in memory first made the largest allocation in the engine
+// out of a value that was written once and dropped.
 //
-// beforeSync is nil in production. An error from it aborts the write and the
-// partial file is left for the caller to remove, which is what a real sync
-// failure does too.
-func writeFileSyncHooked(path string, data []byte, perm os.FileMode, beforeSync func() error) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+// The file is opened for reading as well as writing. SerialiseTo reads it back
+// to compute the digest, because the digest covers a header field that is not
+// final until the last section has been placed; see csr_write.go.
+//
+// Same durability contract as writeFileSync: truncated on open, synced before
+// the close, and the sync error is the one that means the data is not there. A
+// failure leaves the partial file for the caller to remove, exactly as a failed
+// writeFileSync does.
+func writeStreamSync(path string, perm os.FileMode, beforeSync func() error, write func(*os.File) error) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
+	if err := write(f); err != nil {
 		f.Close()
 		return err
 	}

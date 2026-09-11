@@ -3161,6 +3161,11 @@ Three of these are worth reading twice:
   roots unconditionally, so *every* store already pays for it, configured or not.
   What strict options add at compaction time is the audit entry and the segment
   rotation — fixed-cost durable writes.
+  The pass costs time, not memory: the roots are folded a leaf at a time by
+  `merkle.RootBuilder`, which retains one hash per set bit of the leaf count
+  rather than one per leaf, and the leaves are hashed as the records stream
+  into the image. A compaction holds a constant for the whole of writing it,
+  whatever the store's size (§14.16 of TECHNICAL_DETAILS.md).
 - **Verification is asymmetric, in the direction that matters.** Producing a
   proof is expensive and is paid by whoever owns the store; checking one is
   microseconds and is paid by the recipient, who did not choose to use this

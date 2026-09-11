@@ -1618,6 +1618,11 @@ mapped image has to work with.
 **Compaction's transient peak is +270 MiB over steady state on a 44 MiB store**
 — 6.1× the store, held for the duration, sampled at 1 ms over ~780 samples.
 
+> Superseded by [The streamed image writer](#the-streamed-image-writer-2026-09-11):
+> the transient is now bounded by a 64 KiB buffer rather than by the image, and
+> the same measurement at 100k nodes puts it at −70.2%. The figure here is what
+> the change was made against.
+
 ### The identifier high-water mark
 
 The cost that no estimate based on file size predicts. Each cycle deletes every
@@ -1761,6 +1766,106 @@ burned identifier** and fails; on this one it reports **12.7–13.1 B** across
 repeated runs and passes, against a ceiling of 24. The 72.0 is the predicted
 per-slot cost of a `nodeRecord` plus its two offsets, to the decimal, on a
 fixture with no edges.
+
+## The streamed image writer (2026-09-11)
+
+Method as §1 of `CONTRIBUTING.md`: interleaved rounds alternating the working
+tree against a pristine `HEAD` tree, one fixture per process, medians reported
+with the full spread. Same machine block as the program baselines above. `HEAD`
+is `262ea69`.
+
+The change: `SerialiseTo` streams the image into the file through one 64 KiB
+buffer instead of building it in a `bytes.Buffer`, and `merkle.RootBuilder`
+folds each snapshot root a leaf at a time instead of from a `[]merkle.Hash` of
+every leaf. The two allocations it removes are the image itself and 32 bytes per
+node, per edge and per property-index entry.
+
+### Compaction
+
+100,000 nodes, 512-byte blobs, the consumer index shape; three interleaved
+rounds; the peak is sampled on a ticker for the duration of `Compact()`.
+
+| metric | before | after | change |
+| --- | ---: | ---: | ---: |
+| compaction's transient peak over steady state | 555.1 MiB (554.7–571.7) | **165.2 MiB** (163.7–165.3) | **−70.2%** |
+| process peak during the compaction | 844.8 MiB (826.8–862.9) | **437.4 MiB** (437.2–438.7) | −48.2% |
+| resident after it settles | 275.5 MiB (275.3–311.5) | 268.9 MiB (268.7–271.9) | −2.4% |
+| Go heap after it settles | 235.1 MiB | 235.1 MiB | **±0.0%** |
+
+The last row is the control and the first is the claim: what a store *holds* is
+untouched, and what writing an image *costs while it runs* is a third of what it
+was. The new arm's spread is 1.6 MiB across three rounds against 17 MiB in the
+old one, which is what a bounded cost looks like next to one proportional to the
+image.
+
+### Allocation during a compaction
+
+`BenchmarkForensic_Compact`, which writes the store and compacts it, three
+interleaved rounds, medians. The allocation figures are identical to five
+significant figures across rounds, so only the change is interesting.
+
+| arm | before | after | change |
+| --- | ---: | ---: | ---: |
+| n=10,000 plain | 9,149,776 B/op, 60,133 allocs | **4,793,200 B/op, 10,144 allocs** | **−47.6% bytes, −83.1% allocations** |
+| n=10,000 attested | 9,149,757 B/op, 60,133 allocs | 4,793,200 B/op, 10,144 allocs | −47.6%, −83.1% |
+| n=10,000 full | 11,123,920 B/op, 60,181 allocs | 6,769,258 B/op, 10,195 allocs | −39.1%, −83.1% |
+| n=1,000 plain | 1,042,117 B/op, 6,103 allocs | 613,800 B/op, 1,111 allocs | −41.1%, −81.8% |
+
+Fifty thousand allocations per compaction disappear at n=10,000, which is five
+per node: the image buffer's growth, and — larger than expected — one SHA-256
+state per Merkle leaf and one per internal node, because `merkle.HashLeaf` and
+`hashInternal` build a hasher per call. `RootBuilder` keeps one.
+
+### Writing one image, measured directly
+
+`TestSerialiseTo_AllocatesIndependentlyOfImageSize` (untagged, in `make check`)
+writes two images and reports what each cost:
+
+| image | allocated while writing |
+| ---: | ---: |
+| 576,279 B | 74,576 B |
+| 4,617,781 B | 75,496 B |
+
+An eight-fold image costs **920 bytes more**, and 64 KiB of both figures is the
+output buffer. The test asserts a ceiling *and* a slope, because a ceiling alone
+passes for a per-record cost small enough at these sizes and ruinous at the
+program's target size.
+
+### What it cost
+
+| control | before | after | change |
+| --- | ---: | ---: | ---: |
+| `Footprint_DiskFileSize` | 175.0 B/node, 87.50 B/edge, 16.69 MiB | 175.0 B/node, 87.50 B/edge, 16.69 MiB | **±0.0%** |
+| `RSS_Open` process peak (4 rounds) | 542.7 MiB (540.0–576.9) | 404.7 MiB (404.1–404.9) | −25.4% |
+| `RSS_Open` settled resident | 140.3 MiB (140.1–177.3) | 137.7 MiB (137.5–137.8) | −1.9% |
+| `RSS_Open` Go heap | 118.4 MiB | 118.4 MiB | ±0.0% |
+| compaction wall clock, n=10,000 plain | 31.1 ms (20.3–35.5) | 21.3 ms (16.0–25.9) | spreads overlap |
+
+The on-disk form is **byte-identical** — the same three figures on every round,
+which is what "the record order, the section order and the leaf order did not
+move" looks like in a measurement rather than in an argument.
+
+`RSS_Open` is in this table as a control, not a claim: opening is a different
+code path, and its Go heap is 118.4 MiB in all eight runs. The peak moves because
+the benchmark builds its fixture — which compacts — before it opens. The first
+measurement pass put two of three `RSS_Open` anon readings in the new arm at
+173.9 and 179.1 MiB against a flat 140 in the old one; four further interleaved
+rounds did not reproduce it, and put the new arm at 137.5–137.8 against
+140.1–177.3. The figures above are those four rounds.
+
+**Wall clock is not resolved by this measurement.** The medians favour the new
+arm on every arm of the forensic benchmark, and the spreads overlap on all of
+them, so the honest reading is that a compaction did not get slower — not that
+it got faster. There is a real cost to account for: the digest is computed by
+reading the finished image back, one sequential pass over bytes still in the
+page cache. Against fifty thousand fewer allocations it does not show above this
+host's noise.
+
+**The point lookup is not reported.** No code on the read path changed — the
+diff is the writer, the Merkle builder and one fsync helper — and this host's
+noise floor made the reading useless anyway: `PointLookupNode_Memory`, which
+this change cannot touch, moved by more than 50% between arms in the same rounds
+that `PointLookupNode_Disk` moved 20%.
 
 ## Pre-open cost query and the replay budget (2026-09-10)
 

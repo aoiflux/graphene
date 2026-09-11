@@ -5,6 +5,71 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### Compaction writes the image instead of building it
+
+Serialisation built the whole file in a `bytes.Buffer` and handed back a
+`[]byte` for compaction to write. On a 1.2 GiB store that is a 1.2 GiB
+allocation — transiently closer to 1.8 GiB, because a buffer that outgrows its
+capacity allocates a larger one and copies — made at the moment compaction is
+already holding a freshly built CSR and the plan it came from. Nothing read the
+bytes twice.
+
+Beside it sat a second cost nobody had counted. Computing the snapshot roots
+built a `[]merkle.Hash` of every leaf — one 32-byte entry per node, per edge and
+per property-index entry — folded the three arrays into three hashes and dropped
+them. At that same shape it is another ~900 MB of hashes whose only purpose is
+to produce ninety-six bytes.
+
+`SerialiseTo` writes the same bytes through a 64 KiB buffer instead, and
+`merkle.RootBuilder` folds each root a leaf at a time as the records stream past
+on their way into the file, retaining one hash per set bit of the leaf count —
+at most 64 — rather than one per leaf. `SerialiseWithPayload` is now a wrapper
+that streams into memory, so there is one writer rather than two that could
+drift apart.
+
+What a serialisation costs is now a stated constant rather than an estimate: one
+64 KiB buffer, three builder stacks, a leaf-encoding scratch sized by the largest
+single record, and the section directory. Writing a 576 KB image allocates
+74,576 B; writing a 4.6 MB one allocates 75,496 B — **920 bytes more for eight
+times the image**, 64 KiB of both being the buffer.
+`TestSerialiseTo_AllocatesIndependentlyOfImageSize` asserts both the ceiling and
+the slope, because either alone passes for the wrong code.
+
+Measured against the tree before it, interleaved rounds:
+
+- **Compaction's transient peak falls 70.2%** — 555.1 MiB over steady state to
+  165.2 MiB, on a 100,000-node store — and the process peak during it falls
+  48.2%. What the store *holds* afterwards is unchanged to the decimal: 235.1 MiB
+  of Go heap in both arms, which is the control.
+- **A compaction allocates 47.6% fewer bytes and 83.1% fewer times**: at 10,000
+  nodes, 9,149,776 B and 60,133 allocations become 4,793,200 B and 10,144. Five
+  allocations per node disappear, and more of them than expected were Merkle
+  hashers rather than image bytes.
+- **The image is byte-identical**: 175.0 B/node, 87.50 B/edge, 16.69 MiB on every
+  round of both arms.
+- Wall clock is not resolved. The medians favour the new writer on every arm and
+  the spreads overlap, so a compaction did not get slower; it is not established
+  that it got faster.
+
+The on-disk format did not move. The record order, the section order and the leaf
+order are unchanged, and `RootBuilder` is the same RFC 6962 tree
+`merkle.Root` builds rather than a cheaper one —
+`TestRootBuilder_EqualsRoot` sweeps every leaf count from 0 to 1025 and
+`FuzzRootBuilderMatchesRoot` sweeps arbitrary ones. The fixture written by the
+build before the page table still reproduces byte for byte through the new
+writer.
+
+The cost is one extra sequential read of the file just written. The digest covers
+the header, the header carries the section-table offset, and that offset is not
+final until the last section is placed — so the digest is computed over the
+finished image rather than teed off the write. The alternative was a second
+implementation of every encoder to size the image up front, whose disagreement
+with the real one would corrupt an image silently. The bytes are still in the
+page cache, and wall clock is the cheaper thing to spend.
+
+`merkle` gains `RootBuilder`, with `Add`, `AddLeafData`, `Root`, `Len` and
+`Reset`. It is the public form of the same tree the package already computed.
+
 ### The CSR stores records in pages, so a burned identifier costs four bytes
 
 The two measurements above — 79 B of resident memory per identifier issued and
