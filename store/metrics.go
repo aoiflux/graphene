@@ -87,6 +87,17 @@ const (
 	// Bytes is how much log it applied — a reload, which re-reads the log from
 	// the start, shows up as a large one.
 	MetricRefresh
+
+	// MetricIDHeadroomLow is emitted by a completed compaction when the
+	// identifiers still unissued have fallen below Options.IDHeadroomWarn.
+	// Count is the highest identifier issued for that kind and Examined is the
+	// ceiling; the kind is named in Err's place by a separate audit entry, so a
+	// sink reading only metrics sees two emissions, nodes and edges, with
+	// different counts.
+	//
+	// Appended at the end: a kind's number is what a sink's own storage records,
+	// and inserting one anywhere else renumbers every kind after it.
+	MetricIDHeadroomLow
 )
 
 // String names the kind, for a sink that labels its output.
@@ -110,6 +121,8 @@ func (k MetricKind) String() string {
 		return "backup"
 	case MetricRefresh:
 		return "refresh"
+	case MetricIDHeadroomLow:
+		return "id-headroom-low"
 	default:
 		return "unknown"
 	}
@@ -131,6 +144,7 @@ func (k MetricKind) String() string {
 //	snapshot-close   nanoseconds held         —                        —
 //	backup           files copied             —                        bytes copied
 //	refresh          epochs advanced          —                        log bytes applied
+//	id-headroom-low  highest ID issued        the ID ceiling           -
 //
 // Duration is wall-clock for the operation, measured around the work rather than
 // around the whole call, and is zero for the two snapshot kinds. Err is non-nil

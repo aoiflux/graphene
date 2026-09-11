@@ -35,7 +35,6 @@ import (
 	"slices"
 
 	"github.com/aoiflux/graphene/merkle"
-	"github.com/aoiflux/graphene/store"
 )
 
 // Domain tags separating what a leaf describes. Without these an edge leaf and a
@@ -229,57 +228,22 @@ func edgeLeafFor(version uint8, e rawEdge) []byte {
 //
 // Order is the file's own record order, which canonical serialisation already
 // fixes. A root computed from a different order would be a different root, so
-// this and the writer must agree — they do by both walking the ID-indexed array.
+// this and the writer must agree — they do by both iterating Nodes.
 func (g *CSRGraph) NodeLeaves(version uint8) []merkle.Hash {
-	out := make([]merkle.Hash, 0, len(g.nodes))
-	for i := 1; i < len(g.nodes); i++ {
-		if g.nodes[i].ID == store.InvalidNodeID {
-			continue
-		}
-		out = append(out, merkle.HashLeaf(nodeLeafFor(version, g.nodes[i])))
+	out := make([]merkle.Hash, 0, g.NodeCount())
+	for n := range g.Nodes() {
+		out = append(out, merkle.HashLeaf(nodeLeafFor(version, n)))
 	}
 	return out
 }
 
 // EdgeLeaves returns the leaf hash of every live edge, in ascending ID order.
 func (g *CSRGraph) EdgeLeaves(version uint8) []merkle.Hash {
-	out := make([]merkle.Hash, 0, len(g.edges))
-	for i := 1; i < len(g.edges); i++ {
-		if g.edges[i].ID == store.InvalidEdgeID {
-			continue
-		}
-		out = append(out, merkle.HashLeaf(edgeLeafData(g.edges[i])))
+	out := make([]merkle.Hash, 0, g.EdgeCount())
+	for e := range g.Edges() {
+		out = append(out, merkle.HashLeaf(edgeLeafData(e)))
 	}
 	return out
-}
-
-// nodeLeafIndex returns the position of id among the live nodes, which is the
-// index an inclusion proof is built at.
-func (g *CSRGraph) nodeLeafIndex(id store.NodeID) (int, bool) {
-	if int(id) >= len(g.nodes) || g.nodes[id].ID == store.InvalidNodeID {
-		return 0, false
-	}
-	pos := 0
-	for i := 1; i < int(id); i++ {
-		if g.nodes[i].ID != store.InvalidNodeID {
-			pos++
-		}
-	}
-	return pos, true
-}
-
-// edgeLeafIndex is nodeLeafIndex for edges.
-func (g *CSRGraph) edgeLeafIndex(id store.EdgeID) (int, bool) {
-	if int(id) >= len(g.edges) || g.edges[id].ID == store.InvalidEdgeID {
-		return 0, false
-	}
-	pos := 0
-	for i := 1; i < int(id); i++ {
-		if g.edges[i].ID != store.InvalidEdgeID {
-			pos++
-		}
-	}
-	return pos, true
 }
 
 // propEntryLeaves returns leaf hashes over the property-index entries, in the

@@ -19,7 +19,11 @@ func layoutFixture(n int) *CSRGraph {
 			Labels: []store.EdgeType{store.EdgeTypeContains},
 		})
 	}
-	return Build(nodes, edges)
+	g, err := Build(nodes, edges)
+	if err != nil {
+		panic(err)
+	}
+	return g
 }
 
 // The index section must begin immediately after the last edge record.
@@ -65,7 +69,7 @@ func TestCSRLayout_LastRecordEndingAtSectionBoundaryParses(t *testing.T) {
 		if err != nil {
 			t.Fatalf("n=%d: %v", n, err)
 		}
-		if got := len(csr.nodes) - 1; got != n {
+		if got := csr.NodeCount(); got != n {
 			t.Fatalf("n=%d: parsed %d nodes", n, got)
 		}
 	}

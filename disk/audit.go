@@ -85,6 +85,17 @@ const (
 	AuditBackup
 	AuditRestore
 
+	// AuditIDHeadroomLow records that the store has issued most of the
+	// identifiers it can ever issue. Written once per kind per process by a
+	// completed compaction, naming the figure and the ceiling.
+	//
+	// It is in the chain rather than only in a metric because the remedy — an
+	// export and import into a fresh store — is planned work, and the question
+	// an operator asks months later is when this was first true.
+	//
+	// Appended at the end for the same reason the two above were.
+	AuditIDHeadroomLow
+
 	// AuditCustom is the caller's, whose meaning the engine does not interpret.
 	AuditCustom AuditKind = 1000
 )
@@ -115,6 +126,8 @@ func (k AuditKind) String() string {
 		return "backup"
 	case AuditRestore:
 		return "restore"
+	case AuditIDHeadroomLow:
+		return "id-headroom-low"
 	case AuditCustom:
 		return "custom"
 	default:

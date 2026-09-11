@@ -12,6 +12,7 @@ package main
 import (
 	"cmp"
 	"flag"
+	"fmt"
 	"slices"
 
 	"github.com/aoiflux/graphene"
@@ -123,11 +124,39 @@ func sortedCounts[T interface {
 	return out
 }
 
+// idHeadroomFinding is the headroom below which `store health` says so. It
+// matches disk.Options.IDHeadroomWarn's default rather than reading it, because
+// health inspects a store it did not configure — a store opened with a lower
+// threshold has chosen when to be told, and this is the command's own opinion.
+const idHeadroomFinding = 0.10
+
+// pctOf renders a headroom fraction at a fixed two decimal places.
+//
+// Not %g: a store at 99.9997% headroom and one at 9.9997% are the same number
+// of significant figures and completely different situations, and an operator
+// scanning a column wants them to line up.
+func pctOf(fraction float64) string {
+	return fmt.Sprintf("%.2f%%", fraction*100)
+}
+
 // addStorage renders StorageStats, shared with `debug stats` and `store health`.
 func addStorage(r *Result, ss store.StorageStats) {
 	img := r.Section("compacted image")
 	img.Add("nodes", Int(int64(ss.CSRNodes)))
 	img.Add("edges", Int(int64(ss.CSREdges)))
+
+	// Identifiers issued against identifiers addressable. It sits beside the
+	// record counts because that is where an operator will compare it with
+	// them, and the comparison is the point: a store whose records number in
+	// the thousands can have issued millions of identifiers, and only this
+	// pair shows it.
+	if ss.IDCeiling > 0 {
+		ids := r.Section("identifiers issued")
+		ids.AddNote("nodes", Uint(ss.HighestNodeID),
+			fmt.Sprintf("of %d (%s headroom)", ss.IDCeiling, pctOf(ss.NodeIDHeadroom)))
+		ids.AddNote("edges", Uint(ss.HighestEdgeID),
+			fmt.Sprintf("of %d (%s headroom)", ss.IDCeiling, pctOf(ss.EdgeIDHeadroom)))
+	}
 
 	d := r.Section("delta, written since the last compaction")
 	d.Add("nodes", Int(int64(ss.DeltaNodes)))
@@ -255,6 +284,29 @@ func runStoreHealth(cx *Context, o *healthOpts) (Result, error) {
 		// needs to be.
 		r.Find(SevInfo, "store.compaction_due",
 			"%s — `graphene maintenance compact -confirm` folds the delta into the image", why)
+	}
+
+	// The identifier space is the one resource compaction cannot give back:
+	// identifiers are never reused, and the remedy is an export and import into
+	// a fresh store. A warning rather than an error, because a store at 5%
+	// headroom works exactly as it did at 95%.
+	if st.HasStorage && st.Storage.IDCeiling > 0 {
+		for _, k := range []struct {
+			kind     string
+			issued   uint64
+			headroom float64
+		}{
+			{"node", st.Storage.HighestNodeID, st.Storage.NodeIDHeadroom},
+			{"edge", st.Storage.HighestEdgeID, st.Storage.EdgeIDHeadroom},
+		} {
+			if k.headroom >= idHeadroomFinding {
+				continue
+			}
+			r.Find(SevWarn, "store.id_headroom_low",
+				"%s identifiers: %d of %d issued, %s of the space left — identifiers are "+
+					"never reused, so the remedy is an export and import into a fresh store",
+				k.kind, k.issued, st.Storage.IDCeiling, pctOf(k.headroom))
+		}
 	}
 
 	// The forensic half needs the disk store underneath, which a Graph exposes

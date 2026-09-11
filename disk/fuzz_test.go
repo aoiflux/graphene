@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aoiflux/graphene/index"
@@ -65,30 +66,40 @@ func TestDeserialiseCSR_RejectsCountsLargerThanTheFile(t *testing.T) {
 	}
 }
 
-// An absolute ID ceiling alone is not a bound. Build sizes its arrays from the
-// highest ID, so one small record naming a large ID demands the whole ceiling's
-// worth of memory — which is how a ~60-byte file asked for roughly 15 GB while
-// satisfying every count check. The ID has to be bounded against how many
-// records the file actually carries.
+// An absolute ID ceiling alone is not a bound. Build materialises a whole page
+// of record slots for every page a record falls in, so records spread one per
+// page demand a page of memory each while satisfying every count check. The
+// pages have to be bounded against how many records the file actually carries.
+//
+// What this test asserted before the CSR was paged was the other half of the
+// same idea: one record naming an identifier just under the ceiling used to
+// demand the whole ceiling's worth of arrays, and is now a single page. That
+// file is legal now, and the case below is what replaced it.
 func TestDeserialiseCSR_RejectsSparseIDsInATinyFile(t *testing.T) {
-	// One node record, ID just under the absolute ceiling.
-	buf := make([]byte, csrV6HeaderSize)
-	copy(buf, "GCSR")
-	binary.LittleEndian.PutUint16(buf[4:6], csrVersionCurrent)
-	binary.LittleEndian.PutUint64(buf[6:14], 1)               // nodeCount
-	binary.LittleEndian.PutUint64(buf[14:22], 0)              // edgeCount
-	binary.LittleEndian.PutUint64(buf[22:30], maxCSREntityID) // nodeSeqHW, so the mark check passes
+	// Seventeen records, one per page: 69,632 slots against an allowance of
+	// max(65,536, 17*256) = 65,536.
+	nodes := make([]nodeRecord, 0, 17)
+	for i := 1; i <= 17; i++ {
+		nodes = append(nodes, nodeRecord{ID: store.NodeID(i << csrPageBits)})
+	}
+	g, err := Build(nodes, nil)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, _, err := deserialiseCSR(g.Serialise()); err == nil {
+		t.Fatal("an image with one record per page was accepted; Build would allocate a page for each")
+	} else if !strings.Contains(err.Error(), "too sparse") {
+		t.Fatalf("rejected for the wrong reason: %v", err)
+	}
 
-	rec := make([]byte, 13)
-	binary.LittleEndian.PutUint64(rec[0:8], maxCSREntityID-1) // the ID
-	rec[8] = 0                                                // no labels
-	binary.LittleEndian.PutUint32(rec[9:13], 0)               // no properties
-	buf = append(buf, rec...)
-	binary.LittleEndian.PutUint64(buf[38:46], uint64(len(buf)))
-
-	if _, _, err := deserialiseCSR(buf); err == nil {
-		t.Fatalf("a %d-byte file named ID %d and was accepted; Build would allocate from it",
-			len(buf), maxCSREntityID-1)
+	// And the far single record, which the page table made cheap, opens.
+	one, err := Build([]nodeRecord{{ID: maxCSREntityID - 1}}, nil)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	one.nodeSeqHW = maxCSREntityID
+	if _, _, err := deserialiseCSR(one.Serialise()); err != nil {
+		t.Fatalf("one record on one page was rejected: %v", err)
 	}
 }
 
@@ -105,7 +116,10 @@ func TestDeserialiseCSR_AcceptsLegitimatelySparseIDs(t *testing.T) {
 			Labels: []store.NodeType{store.NodeTypeMicroArtefact},
 		})
 	}
-	g := Build(nodes, nil)
+	g, err := Build(nodes, nil)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
 	g.nodeSeqHW = uint64(n * 50)
 
 	if _, _, err := deserialiseCSR(g.SerialiseWithIndex(nil, nil)); err != nil {
@@ -189,7 +203,10 @@ func csrSeed(t testingTB) []byte {
 	edges := []rawEdge{
 		{ID: 1, Src: 1, Dst: 2, Labels: []store.EdgeType{store.EdgeTypeContains}, Weight: 0.75},
 	}
-	g := Build(nodes, edges)
+	g, err := Build(nodes, edges)
+	if err != nil {
+		panic(err)
+	}
 	g.nodeSeqHW, g.edgeSeqHW = 2, 1
 	return g.SerialiseWithIndex(
 		[]index.NodePropEntry{
@@ -302,17 +319,21 @@ func FuzzDeserialiseCSR(f *testing.F) {
 		}
 
 		// A parse that succeeded must have produced something self-consistent:
-		// every edge endpoint must be addressable in the node array, or the
-		// adjacency arrays Build() derives from them would index out of range on
-		// first use rather than at parse time.
-		for i := 1; i < len(csr.edges); i++ {
-			e := csr.edges[i]
-			if e.ID == store.InvalidEdgeID {
-				continue
-			}
-			if uint64(e.Src) >= uint64(len(csr.nodes)) || uint64(e.Dst) >= uint64(len(csr.nodes)) {
-				t.Fatalf("edge %d accepted with endpoints outside the node array: src=%d dst=%d nodes=%d",
-					e.ID, e.Src, e.Dst, len(csr.nodes))
+		// every edge endpoint must have a materialised page, or the adjacency
+		// Build() derives from them would index out of range on first use rather
+		// than at parse time. Under the page table the endpoint's own page is
+		// materialised whether or not a node record occupies it, so what this
+		// asserts is that the slot exists — not that the node does.
+		// The invalid zero is the exception: its page is materialised like any
+		// other endpoint's, but nodeSlot refuses it on purpose so that it can
+		// never read as an entity that exists.
+		hasSlot := func(id store.NodeID) bool {
+			return id == store.InvalidNodeID || csr.nodeSlot(id) >= 0
+		}
+		for e := range csr.Edges() {
+			if !hasSlot(e.Src) || !hasSlot(e.Dst) {
+				t.Fatalf("edge %d accepted with endpoints outside the node slot space: src=%d dst=%d",
+					e.ID, e.Src, e.Dst)
 			}
 		}
 		if section != nil {

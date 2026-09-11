@@ -923,6 +923,33 @@ type StorageStats struct {
 	// process. It is not persisted, so a reopened store reports zero even if the
 	// image on disk was compacted moments earlier.
 	LastCompact time.Time
+
+	// HighestNodeID and HighestEdgeID are the largest identifiers the store has
+	// ever *issued*, not the largest it still holds. Identifiers are never
+	// reused and compaction preserves them, so these only ever rise — deleting
+	// the record that held the maximum does not lower them, and reopening the
+	// store does not either, because the marks are persisted in the image header.
+	//
+	// They are the numerator of the headroom below, and the reason a store has a
+	// finite lifetime measured in identifiers rather than in records.
+	HighestNodeID uint64
+	HighestEdgeID uint64
+
+	// IDCeiling is the highest identifier the storage format can address, per
+	// kind. Zero from a backend with no such limit.
+	IDCeiling uint64
+
+	// NodeIDHeadroom and EdgeIDHeadroom are the fraction of the identifier space
+	// still unissued, from 1.0 on a new store to 0.0 at the ceiling. Below the
+	// ceiling the store keeps working exactly as it did; at it, writes fail and
+	// the remedy is an export and import into a fresh store, which is a new
+	// store with new identifiers rather than a renumbering of this one.
+	//
+	// This is the figure to alarm on, because it moves with identifiers issued -
+	// a workload that rebuilds a derived layer burns them far faster than its
+	// record count suggests, and nothing else in these statistics shows that.
+	NodeIDHeadroom float64
+	EdgeIDHeadroom float64
 }
 
 // DeltaRecords is the total number of records held in memory since the last

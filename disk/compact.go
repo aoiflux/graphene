@@ -49,6 +49,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/aoiflux/graphene/merkle"
@@ -192,6 +193,9 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 	if err == nil {
 		err = s.compactCommit(plan, newCSR, tmpPath)
 	}
+	if err == nil {
+		s.warnIDHeadroom()
+	}
 	if s.metricsOn() {
 		s.record(store.Metric{
 			Kind:     store.MetricCompaction,
@@ -203,6 +207,51 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 		})
 	}
 	return err
+}
+
+// warnIDHeadroom reports a store approaching the end of its identifier space.
+//
+// Called after the commit rather than inside it, with no lock held: it reads
+// two atomic counters and a constant, and a metric sink is caller code that
+// must not run under the store lock (store/metrics.go). A compaction that
+// failed does not report — the figures would be the same, but an operator
+// reading an audit chain should not find a lifetime warning filed against an
+// operation that did not happen.
+//
+// The audit entry's failure is swallowed. The compaction succeeded; turning
+// that into an error because a warning could not be filed would be reporting
+// the wrong thing failed.
+func (s *Store) warnIDHeadroom() {
+	threshold := s.idHeadroomWarn
+	if threshold < 0 {
+		return
+	}
+	if threshold == 0 {
+		threshold = defaultIDHeadroomWarn
+	}
+	kinds := []struct {
+		name   string
+		issued uint64
+		warned *atomic.Bool
+	}{
+		{"node", s.nodeSeq.Load(), &s.nodeHeadroomWarned},
+		{"edge", s.edgeSeq.Load(), &s.edgeHeadroomWarned},
+	}
+	for _, k := range kinds {
+		if idHeadroom(k.issued) >= threshold || k.warned.Swap(true) {
+			continue
+		}
+		detail := fmt.Sprintf("%s identifiers: %d of %d issued, %.4f%% of the space remaining",
+			k.name, k.issued, uint64(maxCSREntityID), idHeadroom(k.issued)*100)
+		_ = s.recordAudit(AuditIDHeadroomLow, 0, detail)
+		if s.metricsOn() {
+			s.record(store.Metric{
+				Kind:     store.MetricIDHeadroomLow,
+				Count:    int64(k.issued),
+				Examined: int64(uint64(maxCSREntityID)),
+			})
+		}
+	}
 }
 
 // compactedRecords describes the image a compaction produced,
@@ -258,21 +307,13 @@ func (s *Store) compactPin() (*compactPlan, error) {
 	// record is gone). Either way the rebuilt CSR reclaims the space and never
 	// double-counts.
 	if cur.csr != nil {
-		for i := 1; i < len(cur.csr.nodes); i++ {
-			n := cur.csr.nodes[i]
-			if n.ID == store.InvalidNodeID {
-				continue
-			}
+		for n := range cur.csr.Nodes() {
 			if r.deltaNodeKnown(n.ID) {
 				continue
 			}
 			nodes = append(nodes, n)
 		}
-		for i := 1; i < len(cur.csr.edges); i++ {
-			e := cur.csr.edges[i]
-			if e.ID == store.InvalidEdgeID {
-				continue
-			}
+		for e := range cur.csr.Edges() {
 			if r.deltaEdgeKnown(e.ID) {
 				continue
 			}
@@ -411,7 +452,12 @@ func (s *Store) compactRelease() {
 // retry on. Removal is best-effort for exactly that reason: if it fails, the
 // open path is still correct, so there is nothing further to report.
 func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string, error) {
-	newCSR := Build(p.nodes, p.edges)
+	// Build refuses a duplicate identifier. Nothing is on disk yet, so the
+	// no-temp-file contract above holds for this path too.
+	newCSR, err := Build(p.nodes, p.edges)
+	if err != nil {
+		return nil, "", fmt.Errorf("compact: %w", err)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}

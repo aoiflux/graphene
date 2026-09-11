@@ -130,6 +130,7 @@ func (c *collector) report(r *Result) {
 		"  replay    epochs advanced               / -            / log bytes read",
 		"  compaction records in the image         / records read / image size",
 		"  backup    files copied                  / -            / bytes copied",
+		"  id-headroom-low highest ID issued       / ID ceiling   / -",
 		"replay is the one to watch: the log is bounded only by compaction, so",
 		"its size is also how long the next open takes.")
 }

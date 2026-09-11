@@ -43,11 +43,13 @@ import (
 // docs/benchmarks.md under "Program baselines". Each is named here with what it
 // covers so a later change to the layout has somewhere obvious to disagree.
 const (
-	// estNodeSlotBytes is what one node identifier costs whether or not a record
+	// estNodeSlotBytes is what one node slot costs whether or not a record
 	// occupies it: 56 B of nodeRecord plus one uint64 in each of outOffset and
-	// inOffset, both of which are indexed by ID rather than by count. Measured at
-	// 72 B per burned identifier, against 79 B of resident memory once the
-	// runtime's own overhead is counted.
+	// inOffset, both of which are indexed by slot. Measured at 72 B per burned
+	// identifier, against 79 B of resident memory once the runtime's own
+	// overhead is counted. Since the records were paged the count of slots is
+	// no longer the identifier space but the pages it touches, which is what
+	// imageHeapBytes models; the per-slot figure is unchanged.
 	estNodeSlotBytes = 72
 
 	// estEdgeSlotBytes is one rawEdge, which is 80 B by unsafe.Sizeof and was
@@ -139,12 +141,13 @@ type OpenEstimate struct {
 	// ImageNodeSeqHW and ImageEdgeSeqHW are the highest identifiers ever issued
 	// at the time the image was built.
 	//
-	// This is deliberately not CSRInfo.MaxNodeID, which is the highest
-	// identifier present and is the quantity that actually sizes the arrays (see
-	// Build). The highest present cannot be had from the header — it is only
-	// knowable by scanning every record, which is the parse this whole surface
-	// exists to avoid — and the high-water mark is an upper bound on it, which
-	// is the direction a budget wants to be wrong in.
+	// This is deliberately not CSRInfo.MaxNodeID, the highest identifier
+	// present. What sizes the arrays is neither: it is the pages the identifiers
+	// fall in (see Build), which the header cannot reveal at all. The highest
+	// present cannot be had from the header either — it is only knowable by
+	// scanning every record, which is the parse this whole surface exists to
+	// avoid — and the high-water mark bounds both the pages and the highest
+	// present from above, which is the direction a budget wants to be wrong in.
 	//
 	// The two coincide until a compaction retires the top of the identifier
 	// space, and the gap is measurable: 378.8 B/node with the high half deleted
@@ -427,6 +430,29 @@ func (e *OpenEstimate) readIndexSection(f *os.File, tableOffset uint64) {
 	}
 }
 
+// pagedSlots is how many record slots an image holds: one page of slots per
+// page its identifiers fall in, bounded above by the record count (no page
+// exists without a record in it) and by the identifier space itself.
+func pagedSlots(count int64, seqHW uint64) int64 {
+	space := int64(seqHW) + 1
+	pages := int64(seqHW>>csrPageBits) + 1
+	if count < pages {
+		pages = count
+	}
+	slots := pages * csrPageSlots
+	if slots > space {
+		slots = space
+	}
+	return slots
+}
+
+// directoryBytes is the page directory of one kind: one int32 per page of the
+// identifier space up to the high-water mark. It is the term that does follow
+// the identifier space rather than the records — 4 MiB per kind at the ceiling.
+func directoryBytes(seqHW uint64) int64 {
+	return (int64(seqHW>>csrPageBits) + 1) * 4
+}
+
 // imageHeapBytes is the model behind ImageHeapBytes, kept apart from the fields
 // so the arithmetic is one readable expression and every term is attributable.
 func (e *OpenEstimate) imageHeapBytes() int64 {
@@ -434,22 +460,23 @@ func (e *OpenEstimate) imageHeapBytes() int64 {
 		return 0
 	}
 
-	// Slots, not records. Both arrays are indexed by identifier, so what they
-	// cost is set by the highest identifier and not by how many are live — which
-	// is the cost no estimate derived from file size predicts. Below v5 there is
-	// no high-water mark to read and the record count is the only figure
+	// Slots, not records — but paged slots, not one per identifier ever issued.
+	// A record's page is materialised whole, so the arrays cost a page of slots
+	// for every page the identifiers fall in; the record count bounds those
+	// pages above (a page needs a record to exist), and so does the identifier
+	// space itself. That gap — between the identifiers issued and the pages they
+	// occupy — is the cost no estimate derived from file size predicts. Below v5
+	// there is no high-water mark to read and the record count is the only figure
 	// available; it is a floor, and ImageSeqHWKnown is how a caller is told.
 	nodeSlots, edgeSlots := e.ImageNodeCount, e.ImageEdgeCount
+	var dirBytes int64
 	if e.ImageSeqHWKnown {
-		if hw := int64(e.ImageNodeSeqHW) + 1; hw > nodeSlots {
-			nodeSlots = hw
-		}
-		if hw := int64(e.ImageEdgeSeqHW) + 1; hw > edgeSlots {
-			edgeSlots = hw
-		}
+		nodeSlots = pagedSlots(e.ImageNodeCount, e.ImageNodeSeqHW)
+		edgeSlots = pagedSlots(e.ImageEdgeCount, e.ImageEdgeSeqHW)
+		dirBytes = directoryBytes(e.ImageNodeSeqHW) + directoryBytes(e.ImageEdgeSeqHW)
 	}
 
-	total := nodeSlots*estNodeSlotBytes + edgeSlots*estEdgeSlotBytes
+	total := nodeSlots*estNodeSlotBytes + edgeSlots*estEdgeSlotBytes + dirBytes
 	total += e.ImageEdgeCount * estLiveEdgeBytes
 	total += e.ImagePropertyEntriesMax * estPropertyEntryBytes
 

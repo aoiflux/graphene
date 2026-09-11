@@ -541,54 +541,57 @@ func (r reader) edgesByTypeN(t store.EdgeType, n int) []store.EdgeID {
 //
 // The delta pass counts every ID the delta has an opinion about and resolves
 // to a live record — which covers both delta-only nodes and image nodes the
-// delta has updated. The image pass then adds the records the delta has nothing
-// to say about at this epoch. "Nothing to say" is the load-bearing part: a node
-// created after this reader's epoch is in the map but invisible here, and the
-// image copy (if any) is what the graph held then.
+// delta has updated. The image's own live count then adds the records the delta
+// has nothing to say about at this epoch, minus the ones it does: "nothing to
+// say" is the load-bearing part, because a node created after this reader's
+// epoch is in the map but invisible here, and the image copy (if any) is what
+// the graph held then.
+//
+// Counting by subtraction rather than by walking the image keeps this
+// proportional to the delta. Autocompact asks for it on every tick, and the
+// image is the large half.
 func (r reader) nodeCount() uint64 {
-	var total uint64
-	for _, ver := range r.v.delta.nodes {
-		if n, ok := ver.at(r.epoch); ok && n != nil {
-			total++
+	var live, shadowed uint64
+	for id, ver := range r.v.delta.nodes {
+		n, ok := ver.at(r.epoch)
+		if !ok {
+			continue
+		}
+		if n != nil {
+			live++
+		}
+		if r.v.csr != nil {
+			if _, inImage := r.v.csr.GetNode(id); inImage {
+				shadowed++
+			}
 		}
 	}
 	if r.v.csr == nil {
-		return total
+		return live
 	}
-	for i := 1; i < len(r.v.csr.nodes); i++ {
-		id := r.v.csr.nodes[i].ID
-		if id == store.InvalidNodeID {
-			continue
-		}
-		if r.deltaNodeKnown(id) {
-			continue
-		}
-		total++
-	}
-	return total
+	return live + uint64(r.v.csr.NodeCount()) - shadowed
 }
 
 func (r reader) edgeCount() uint64 {
-	var total uint64
-	for _, ver := range r.v.delta.edges {
-		if e, ok := ver.at(r.epoch); ok && e != nil {
-			total++
+	var live, shadowed uint64
+	for id, ver := range r.v.delta.edges {
+		e, ok := ver.at(r.epoch)
+		if !ok {
+			continue
+		}
+		if e != nil {
+			live++
+		}
+		if r.v.csr != nil {
+			if _, inImage := r.v.csr.GetEdge(id); inImage {
+				shadowed++
+			}
 		}
 	}
 	if r.v.csr == nil {
-		return total
+		return live
 	}
-	for i := 1; i < len(r.v.csr.edges); i++ {
-		id := r.v.csr.edges[i].ID
-		if id == store.InvalidEdgeID {
-			continue
-		}
-		if r.deltaEdgeKnown(id) {
-			continue
-		}
-		total++
-	}
-	return total
+	return live + uint64(r.v.csr.EdgeCount()) - shadowed
 }
 
 // deltaLiveNodeIDs returns the node IDs the delta resolves to a live record at
@@ -617,30 +620,17 @@ func (r reader) deltaLiveEdgeIDs() []store.EdgeID {
 	return out
 }
 
-// imageNodeLen is one past the last image record index, or zero with no image.
-func (r reader) imageNodeLen() int {
-	if r.v.csr == nil {
-		return 0
-	}
-	return len(r.v.csr.nodes)
-}
-
-func (r reader) imageEdgeLen() int {
-	if r.v.csr == nil {
-		return 0
-	}
-	return len(r.v.csr.edges)
-}
-
 // allNodeIDs returns every live node ID. The planner's last-resort driver.
 //
 // The image half skips anything the delta has an opinion about, which is what
 // makes the two halves disjoint and is why this needs no dedupe of its own.
 func (r reader) allNodeIDs() []store.NodeID {
 	out := r.deltaLiveNodeIDs()
-	for i := 1; i < r.imageNodeLen(); i++ {
-		id := r.v.csr.nodes[i].ID
-		if id == store.InvalidNodeID || r.deltaNodeKnown(id) {
+	if r.v.csr == nil {
+		return out
+	}
+	for id := range r.v.csr.NodeIDs() {
+		if r.deltaNodeKnown(id) {
 			continue
 		}
 		out = append(out, id)
@@ -650,9 +640,11 @@ func (r reader) allNodeIDs() []store.NodeID {
 
 func (r reader) allEdgeIDs() []store.EdgeID {
 	out := r.deltaLiveEdgeIDs()
-	for i := 1; i < r.imageEdgeLen(); i++ {
-		id := r.v.csr.edges[i].ID
-		if id == store.InvalidEdgeID || r.deltaEdgeKnown(id) {
+	if r.v.csr == nil {
+		return out
+	}
+	for id := range r.v.csr.EdgeIDs() {
+		if r.deltaEdgeKnown(id) {
 			continue
 		}
 		out = append(out, id)

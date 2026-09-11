@@ -95,10 +95,13 @@ func scanChunked[T store.EntityID](sn *snapshot, fill scanFill[T]) iter.Seq2[T, 
 // deduplicates anyway, for the reason the label merge does: a merge that met a
 // duplicate would drop a record rather than repeat one.
 type nodeScanCursor struct {
-	delta   []store.NodeID
-	di      int
-	ii      int // next image record index
-	n       int // one past the last image record index
+	delta []store.NodeID
+	di    int
+	// cur walks the image's records. It holds the record arena rather than
+	// an index into a per-identifier array, because the arena is paged: an
+	// index would still resume at the right place, but only the arena knows
+	// which identifier a slot stands for.
+	cur     nodeIDCursor
 	pending store.NodeID
 	held    bool
 	started bool
@@ -107,21 +110,22 @@ type nodeScanCursor struct {
 func (c *nodeScanCursor) start(r reader) {
 	c.delta = r.deltaLiveNodeIDs()
 	slices.Sort(c.delta)
-	c.ii, c.n = 1, r.imageNodeLen()
+	c.cur = r.v.csr.nodeIDCursor()
 	c.started = true
 }
 
 // nextImage returns the next live image node ID the delta says nothing about.
 func (c *nodeScanCursor) nextImage(r reader) (store.NodeID, bool) {
-	for c.ii < c.n {
-		id := r.v.csr.nodes[c.ii].ID
-		c.ii++
-		if id == store.InvalidNodeID || r.deltaNodeKnown(id) {
+	for {
+		id, ok := c.cur.next()
+		if !ok {
+			return store.InvalidNodeID, false
+		}
+		if r.deltaNodeKnown(id) {
 			continue
 		}
 		return id, true
 	}
-	return store.InvalidNodeID, false
 }
 
 func (c *nodeScanCursor) fill(r reader, dst []store.NodeID, limit int) ([]store.NodeID, bool) {
@@ -154,8 +158,7 @@ func (c *nodeScanCursor) fill(r reader, dst []store.NodeID, limit int) ([]store.
 type edgeScanCursor struct {
 	delta   []store.EdgeID
 	di      int
-	ii      int
-	n       int
+	cur     edgeIDCursor
 	pending store.EdgeID
 	held    bool
 	started bool
@@ -164,20 +167,21 @@ type edgeScanCursor struct {
 func (c *edgeScanCursor) start(r reader) {
 	c.delta = r.deltaLiveEdgeIDs()
 	slices.Sort(c.delta)
-	c.ii, c.n = 1, r.imageEdgeLen()
+	c.cur = r.v.csr.edgeIDCursor()
 	c.started = true
 }
 
 func (c *edgeScanCursor) nextImage(r reader) (store.EdgeID, bool) {
-	for c.ii < c.n {
-		id := r.v.csr.edges[c.ii].ID
-		c.ii++
-		if id == store.InvalidEdgeID || r.deltaEdgeKnown(id) {
+	for {
+		id, ok := c.cur.next()
+		if !ok {
+			return store.InvalidEdgeID, false
+		}
+		if r.deltaEdgeKnown(id) {
 			continue
 		}
 		return id, true
 	}
-	return store.InvalidEdgeID, false
 }
 
 func (c *edgeScanCursor) fill(r reader, dst []store.EdgeID, limit int) ([]store.EdgeID, bool) {

@@ -118,6 +118,19 @@ type Store struct {
 	nodeSeq atomic.Uint64
 	edgeSeq atomic.Uint64
 
+	// idHeadroomWarn is Options.IDHeadroomWarn as given: zero means the default,
+	// negative disables. Resolved at the point of use so the zero Store stays
+	// the documented default.
+	idHeadroomWarn float64
+
+	// nodeHeadroomWarned and edgeHeadroomWarned record that the
+	// identifier-headroom warning has already fired for that kind in this
+	// process, so a store compacting on a timer near the threshold reports it
+	// once rather than every few minutes. Atomic because the check runs after
+	// compactCommit has released the store lock.
+	nodeHeadroomWarned atomic.Bool
+	edgeHeadroomWarned atomic.Bool
+
 	// commitSeq numbers batch commits. Like nodeSeq and edgeSeq it has a
 	// high-water mark in the CSR header (v8, commitSeqHW), so compaction
 	// truncating the log no longer resets it: on open it resumes from the larger
@@ -329,7 +342,37 @@ func (s *Store) StorageStats() store.StorageStats {
 		st.CSREdges = csr.EdgeCount()
 	}
 	st.PropertyNodeEntries, st.PropertyEdgeEntries = s.index().EntryCounts()
+
+	// Identifiers issued, not identifiers present. The counters are what the
+	// next write takes from, and they are what the ceiling binds; the image's
+	// own highest identifier is lower whenever the top of the space has been
+	// deleted, which would report headroom the store does not have.
+	st.HighestNodeID = s.nodeSeq.Load()
+	st.HighestEdgeID = s.edgeSeq.Load()
+	st.IDCeiling = maxCSREntityID
+	st.NodeIDHeadroom = idHeadroom(st.HighestNodeID)
+	st.EdgeIDHeadroom = idHeadroom(st.HighestEdgeID)
 	return st
+}
+
+// defaultIDHeadroomWarn is the fraction of the identifier space at which a
+// compaction starts reporting. One tenth of 2^32 identifiers is still some
+// four hundred million, which at a million burned per rebuild is hundreds of
+// rebuilds of warning — the point of the figure is that the remedy involves
+// planning, so it has to arrive long before it is urgent.
+const defaultIDHeadroomWarn = 0.10
+
+// idHeadroom is the fraction of the identifier space still unissued.
+//
+// Clamped at zero rather than allowed to go negative: a store that somehow
+// issued past the ceiling is in a state the next open refuses, and a negative
+// fraction would render as a number an operator has to interpret instead of a
+// zero they cannot misread.
+func idHeadroom(issued uint64) float64 {
+	if issued >= maxCSREntityID {
+		return 0
+	}
+	return float64(maxCSREntityID-issued) / float64(maxCSREntityID)
 }
 
 // index returns the property index the store is currently serving from.
@@ -394,26 +437,31 @@ const (
 	minEdgeRecordBytes = 33
 	minPropEntryBytes  = 14
 
-	// Build indexes its arrays by entity ID, so opening a file costs memory
-	// proportional to its highest ID, not to how many records it holds. Two
-	// bounds keep that from being a file's to choose.
+	// Build stores records in pages of 4096 identifiers, so opening a file costs
+	// memory proportional to the pages its identifiers fall in, not to its
+	// highest ID. Two bounds keep even that from being a file's to choose.
 	//
-	// maxCSREntityID is the absolute ceiling: ~67M IDs, so the node array tops
-	// out near 4 GB. IDs are never reused, and Compact preserves them, so a
-	// long-lived store's highest ID only ever grows — this is the ceiling on the
-	// engine's addressable lifetime, and the right value follows from the maximum
-	// graph size it intends to support, still open as plan §8 Q2.
+	// maxCSREntityID is the absolute ceiling, and what it bounds is the page
+	// directory: one int32 per page of the identifier space up to the highest ID
+	// named, so 4 MiB per kind at the ceiling for a file that names an identifier
+	// just below it. IDs are never reused, and Compact preserves them, so a
+	// long-lived store's highest ID only ever grows — 2^32 is the ceiling on the
+	// engine's addressable lifetime, which at a million identifiers burned per
+	// rebuild is some four thousand rebuilds. The headroom figures in
+	// StorageStats are how an operator sees it coming.
 	//
-	// csrIDSparsityFactor bounds the highest ID against the record count actually
-	// present, because the absolute ceiling alone is no protection: one 13-byte
-	// record naming ID 2^26 is enough to demand the whole 4 GB. Allowing 256 IDs
-	// burned per surviving record is far past what rollbacks and deletions
-	// produce in practice, and it makes a small file's worst case small.
+	// csrIDSparsityFactor bounds the pages the records touch against the record
+	// count actually present, because the absolute ceiling alone is no protection:
+	// a file of scattered 13-byte records, one per page, would charge 4096 record
+	// slots each. Allowing 256 identifiers per surviving record is far past what
+	// rollbacks and deletions produce in practice, and it makes a small file's
+	// worst case small.
 	//
 	// csrIDSparsityFloor keeps the relative bound from over-constraining a nearly
 	// empty file, whose record count is too small to derive a useful ceiling
-	// from. It is what caps a hostile minimal file, at ~4 MB.
-	maxCSREntityID      = 1 << 26
+	// from. Sixteen pages is what it allows, and with the directory it is what
+	// caps a hostile minimal file: 4 MiB per kind plus the pages it touches.
+	maxCSREntityID      = 1 << 32
 	csrIDSparsityFactor = 256
 	csrIDSparsityFloor  = 1 << 16
 )
@@ -660,6 +708,25 @@ type Options struct {
 	// way to ask the question.
 	MaxReplayRecords int64
 	MaxReplayBytes   int64
+
+	// IDHeadroomWarn is the fraction of the identifier space remaining below
+	// which a completed compaction emits MetricIDHeadroomLow and writes an
+	// AuditIDHeadroomLow entry. Zero takes the default of 0.10; a negative value
+	// disables the warning entirely.
+	//
+	// It is checked at compaction rather than per write because it is a property
+	// of the store's lifetime, not of any one batch: the fraction moves by
+	// millionths per write and an operator needs it once, early, with somewhere
+	// durable to read it later. The warning is sticky per kind within a process
+	// — once it has fired for nodes it does not fire again for nodes — so a
+	// store compacting on a timer near the threshold does not fill its audit
+	// chain with the same observation.
+	//
+	// There is no refusal here, deliberately. A store at 5% headroom works
+	// exactly as it did at 95%, and the remedy — export and import into a fresh
+	// store — is a decision with downtime in it. Refusing writes early would
+	// take that decision on the operator's behalf.
+	IDHeadroomWarn float64
 }
 
 // ErrReplayBudget reports an Open refused because the log exceeds
@@ -917,6 +984,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		uniqueEdgeTypes: make(store.UniqueEdgeTypeSet),
 
 		maxSnapshotAge: opts.MaxSnapshotAge,
+		idHeadroomWarn: opts.IDHeadroomWarn,
 		syncOnCommit:   true,
 		metrics:        opts.Metrics,
 		signer:         opts.Signer,

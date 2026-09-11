@@ -502,8 +502,8 @@ loaded graph _occupies_. These build the graph, GC twice, then read `HeapAlloc`.
 - **The CSR is ~33% more compact in RAM** than the in-memory backend, and its
   on-disk form smaller again.
 
-Deletions the CSR has not reclaimed — its arrays are sized by the highest ID
-ever issued, not the live count:
+Deletions the CSR has not reclaimed — a record slot stays allocated until a
+compaction rebuilds the page it sits in:
 
 | State                     | Bytes per live node |    Total |
 | ------------------------- | ------------------: | -------: |
@@ -1638,6 +1638,10 @@ reports the whole series. **79.0 B of resident memory per burned identifier.**
 At 1.5M nodes per rebuild that is ~119 MiB added permanently per rebuild, on top
 of a live set that has not grown.
 
+> Superseded by [The page-table CSR](#the-page-table-csr-2026-09-11): the same
+> series now measures 17.65 B per burned identifier. The figures here are what
+> the change was made against and are kept for that comparison.
+
 ### Compaction recovers this only if you delete the high half
 
 Same 50,000 live nodes, same live bytes, compacted in both arms. Only the
@@ -1659,6 +1663,10 @@ half and writes above it, so the maximum only rises and compaction recovers none
 of it. The two measurements do not contradict each other; they measure different
 deletion shapes, and only one of them is the workload.
 
+> Superseded by [The page-table CSR](#the-page-table-csr-2026-09-11): the two
+> shapes now cost the same to within 0.13%, which is what removing the
+> per-identifier slot did.
+
 ### Reproducing
 
 ```sh
@@ -1672,6 +1680,87 @@ make cpuprofile FILTER=BenchmarkRSS_Open    # where the time goes
 One fixture size per process, always: a process that builds several large
 fixtures reports the high-water mark of the largest, and the peak figures then
 say nothing about the smaller ones.
+
+## The page-table CSR (2026-09-11)
+
+Method as §1 of `CONTRIBUTING.md`: three interleaved rounds, alternating the
+working tree against a pristine `HEAD` tree, one fixture per process, medians
+reported with the full spread. Same machine block as the program baselines
+above. `HEAD` is `30cf153`.
+
+The change: records are stored in pages of 4096 identifiers with an `int32`
+directory per page, instead of one record slot per identifier ever issued. The
+two sections above are what it was built against.
+
+### The identifier high-water mark, after
+
+12 cycles of 20,000 nodes, the same series the table above reports.
+
+| metric | before | after | change |
+| --- | ---: | ---: | ---: |
+| B per burned identifier | 84.45 (78.68–91.85) | **17.65** (15.56–17.65) | **−79.1%** |
+| MiB per cycle, tail half | 1.611 (1.501–1.752) | **0.337** (0.297–0.337) | **−79.1%** |
+| resident after 12 cycles | 130.9 MiB (130.4–132.0) | **112.9 MiB** (111.3–114.3) | −13.8% |
+| Go heap after 12 cycles | 71.15 MiB | **55.01 MiB** | −22.7% |
+| peak RSS | 296.8 MiB | **251.3 MiB** | −15.3% |
+| resident after cycle 0 | 108.8 MiB | 108.5 MiB | −0.3% |
+
+The first row is the one the change was made for and the last row is the control:
+a store that has burned nothing costs what it always did, and the slope is what
+moved.
+
+**What the remaining 17.65 B is.** Not the record arrays — a page whose records
+have all been deleted and compacted away is four bytes. It is the rest of the
+store's per-identifier state (the property index's own bookkeeping, the delta,
+the log), which this change does not touch and which the next items in the
+program do. The figure to compare it against is 84.45, not zero.
+
+### Deleting the low half now costs the same as deleting the high half
+
+Same 50,000 live nodes, same live bytes, compacted in both arms — the two
+deletion shapes from the section above.
+
+| deletion shape | before | after | change |
+| --- | ---: | ---: | ---: |
+| low half — a derived-layer rebuild | 531.2 B/node, 25.33 MiB | **314.6 B/node, 15.00 MiB** | **−40.8%** |
+| high half — where the maximum falls with the deletion | 378.8 B/node, 18.06 MiB | **314.2 B/node, 14.98 MiB** | −17.1% |
+
+The two arms now agree to within 0.13%, which is the whole claim: where the
+surviving identifiers sit no longer changes what a store costs. The 152 B per
+burned identifier that separated them is gone, and both shapes come out below
+what the *cheaper* of them cost before.
+
+### What it cost
+
+| control | before | after | change |
+| --- | ---: | ---: | ---: |
+| `Footprint_DiskFileSize` | 175.0 B/node, 87.5 B/edge, 16.69 MiB | 175.0 B/node, 87.5 B/edge, 16.69 MiB | **±0.0%** |
+| `RSS_Open` resident (50k) | 176.9 MiB (176.8–177.0) | 176.6 MiB (176.5–177.0) | −0.2% |
+| `RSS_Open` Go heap | 118.2 MiB | 118.4 MiB | +0.2% |
+| `PointLookupNode_Disk` | 40.35 ns (38.96–43.00) | 39.70 ns (37.00–44.62) | −1.6% |
+| `PointLookupNode_Disk` allocations | 64 B/op, 1 alloc/op | 64 B/op, 1 alloc/op | ±0 |
+| `PointLookupNode_Memory` *(untouched control)* | 28.96 ns (24.77–31.41) | 26.06 ns (20.30–26.47) | −10.0% |
+
+The on-disk form is **byte-identical** — the same figure to four significant
+digits on every round, which is what the layout being a load-time construct
+means in a measurement rather than in an argument.
+
+The lookup reading is the one to be careful with. `GetNode` gained a dependent
+load, so a small regression was expected and none is visible; but the memory
+backend, which this change does not touch at all, moved by **−10.0%** in the same
+rounds. That is the noise floor on this host, and it is larger than the disk
+arm's movement in either direction. The honest statement is that no lookup
+regression is measurable above it, not that the lookup got faster.
+
+### The guard, and that it would have failed
+
+`TestRebuildCycle_ResidentIsProportionalToLive` (untagged, in `make check`) runs
+12 delete-all/rewrite cycles over 2,000 live nodes and divides the retained heap
+by the identifiers burned. On the tree before this change it reports **72.0 B per
+burned identifier** and fails; on this one it reports **12.7–13.1 B** across
+repeated runs and passes, against a ceiling of 24. The 72.0 is the predicted
+per-slot cost of a `nodeRecord` plus its two offsets, to the decimal, on a
+fixture with no edges.
 
 ## Pre-open cost query and the replay budget (2026-09-10)
 

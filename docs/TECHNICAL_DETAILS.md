@@ -170,34 +170,55 @@ empties the WAL.
 
 ### 3.3 Why CSR
 
-Compressed Sparse Row, addressed **by ID directly**:
+Compressed Sparse Row, addressed through a **two-level page table**. The
+identifier space is cut into pages of 4096; a directory maps a page number to an
+arena page, or to −1 when nothing falls in it:
 
 ```
-                    ┌────────────────────────────────────────┐
- nodes[]            │ n₀ │ n₁ │ n₂ │ n₃ │ ...  len = maxID+1 │
-                    └────────────────────────────────────────┘
-                             ▲
-                    GetNode(1) = nodes[1]   ← bounds check + pointer, ~6 ns
+ id = 4099                    id >> 12 = 1        id & 4095 = 3
 
- outOffset[]        │ 0 │ 2 │ 5 │ 5 │ 7 │      len = maxID+2
+                    ┌───────────────────────────────────────────┐
+ nodeDir[]          │ 0 │ 1 │ -1 │ -1 │ 2 │  int32 per 4096 IDs  │
+                    └───────────────────────────────────────────┘
+                           └──┐  a page nothing occupies costs 4 bytes
+                    ┌─────────▼─────────────────────────────────┐
+ nodeRecs[]         │ page 0: 4096 slots │ page 1: 4096 slots │…│
+                    └───────────────────────────────────────────┘
+                    GetNode(4099) = nodeRecs[1<<12 | 3], then rec.ID == 4099
+                                              ← two dependent loads, ~6-8 ns
+
+ outOffset[]        │ 0 │ 2 │ 5 │ 5 │ 7 │      len = slots + 1, indexed by slot
                        └───┬───┘
  outEdges[]         │ e₃ │ e₇ │ e₁ │ e₄ │ e₉ │ e₂ │ e₅ │
 
- neighbours(1) = outEdges[outOffset[1] : outOffset[2]] = [e₁, e₄, e₉]
+ neighbours(1) = outEdges[outOffset[slot(1)] : outOffset[slot(1)+1]] = [e₁, e₄, e₉]
 ```
+
+Arena pages are handed out in ascending page number, so **arena order is
+identifier order**: a linear walk of the arena that skips the zero-valued dead
+slots visits exactly the live records, ascending — which is the order the file
+is written in and the order the Merkle leaves are hashed in. Nothing about the
+pages reaches disk; they are a load-time construct, like the adjacency arrays
+themselves.
 
 Three properties follow, and they are the reason for the layout:
 
-1. **A point lookup is an array index**, not a hash — no hashing, no probe chain.
+1. **A point lookup is two array indexes**, not a hash — no hashing, no probe
+   chain. The directory for a live band of 1.5M identifiers is 367 entries,
+   which stays in L1.
 2. **Adjacency is contiguous**, so a traversal walks memory linearly rather than
-   chasing pointers.
-3. **Degree is `outOffset[n+1] - outOffset[n]`** — O(1), zero allocation, no
+   chasing pointers. One CSR spans the whole slot space with a single sentinel,
+   so the range of a page's last slot is closed by the next page's first.
+3. **Degree is `outOffset[s+1] - outOffset[s]`** — O(1), zero allocation, no
    record materialised.
 
-**The cost:** arrays follow the highest ID ever issued, not the live count, so
-deletions leave holes until `Compact()`. Measured at 715 B per live node
-half-deleted-uncompacted against 158 B compacted — **4.5×**. §14 explains why
-this is accepted rather than fixed.
+**The cost:** the arenas follow the pages the live identifiers fall in, not the
+live count, so deletions leave holes until `Compact()` and a page keeps its 4096
+slots until nothing in it survives. Measured at 715 B per live node
+half-deleted-uncompacted against 158 B compacted — **4.5×**. What it is no
+longer proportional to is the *highest identifier ever issued*: a page whose
+records have all been deleted and compacted away costs one int32, which is what
+makes a repeated rebuild bounded (§14.15).
 
 ---
 
@@ -819,9 +840,9 @@ bulk read 2.05 ms → 0.48 ms. Figures in [benchmarks.md](benchmarks.md).
 | # | Index | Structure | Complexity | Persisted |
 |---|---|---|---|---|
 | 1 | Primary (memory) | hash map | O(1) | no |
-| 2 | Primary (CSR) | direct array offset | O(1) | yes |
+| 2 | Primary (CSR) | page directory + arena slot | O(1) | yes |
 | 3 | Primary (delta) | hash-map overlay | O(1) | via WAL |
-| 4 | Adjacency (CSR) | prefix-sum arrays | O(degree) | yes |
+| 4 | Adjacency (CSR) | prefix-sum arrays over slots | O(degree) | no (rebuilt at load) |
 | 5 | Adjacency (delta/memory) | `map[NodeID]{out,in}` | O(degree) | via WAL |
 | 6 | Label postings | sorted `[]ID` per label | O(log n) lookup | rebuilt at load |
 | 7 | Label postings (CSR) | sorted `[]ID` | O(1) lookup | derived at load |
@@ -3477,20 +3498,23 @@ by roughly a third; the all-distinct end is unchanged, by design.
 
 ### 14.2 Rejected: ID-remapping compaction
 
-Would recover the 4.5× memory overhead of max-ID-sized CSR arrays. **Rejected
-because it breaks "IDs are never reused"** (§15), which is documented, relied on
-by callers holding IDs outside the store, and the reason an ID is a stable
-external handle at all. A stored ID that silently means a different node after a
-compaction is a far worse defect than the memory it saves.
+Would recover the memory a CSR sized by the highest identifier wasted.
+**Rejected because it breaks "IDs are never reused"** (§15), which is
+documented, relied on by callers holding IDs outside the store, and the reason
+an ID is a stable external handle at all. A stored ID that silently means a
+different node after a compaction is a far worse defect than the memory it
+saves.
 
-Mitigation: `Compact()` recovers the 4.5× outright, and compaction is now ~10×
-cheaper than it was.
+Mitigation: the page table (§14.15). `Compact()` recovers the 4.5× overhead of
+*uncompacted deletions* outright, and compaction is now ~10× cheaper than it
+was; what it never recovered was the identifier space itself, and that is what
+paging made cheap rather than what compaction fixed.
 
 ### 14.3 Rejected: offset table + decode-on-access
 
 The only design that makes `Open` O(1). **Rejected because it inverts the
-bargain**: today you pay once at open and every `GetNode` is a direct array index
-at ~6 ns; this would spend a decode on every read, forever, to save a one-off
+bargain**: today you pay once at open and every `GetNode` is a directory
+read and an arena index at ~6-8 ns; this would spend a decode on every read, forever, to save a one-off
 startup cost. For a long-lived process that is the wrong way round — opens are
 counted per process, lookups per query.
 
@@ -3874,8 +3898,8 @@ important one.** `nodeRecord` and `rawEdge` **still hold `[]NodeType` and
 into shared backing arrays and hands each record a three-index sub-slice
 (`arena[lo:hi:hi]`, which preserves the `csrBytes` aliasing contract by making an
 append copy rather than scribble into a neighbour). That changes **where the
-pointers point**, not **whether they exist** — `CSRGraph.nodes` and `.edges`
-remain pointer-bearing arrays the collector walks. So the mechanism the spike
+pointers point**, not **whether they exist** — `CSRGraph.nodeRecs` and
+`.edgeRecs` remain pointer-bearing arenas the collector walks. So the mechanism the spike
 predicted the win from was never built: what shipped is the allocation-count half
 (~600k small objects become a handful of large ones) without the layout half.
 
@@ -4010,6 +4034,70 @@ none of this was ever a format change — the neighbour arrays are recomputed by
 `Build` on every load. If a workload ever appears whose hop cost is dominated by
 record resolution rather than by materialising results, the change costs a
 rebuild and no migration.
+
+### 14.15 Taken: the page-table CSR
+
+The change that made a repeated rebuild bounded, and the first one in this file
+whose acceptance test fails on the tree that preceded it.
+
+**The defect, measured before it was fixed.** Identifiers are never reused
+(§15.1) and `Compact()` preserves them (§14.2), so a store that rebuilds a
+derived layer — delete every record of a type, write the same number again —
+leaves each generation's identifiers behind at the *low* end of the space. The
+CSR indexed one record slot per identifier, so those dead identifiers kept 56 B
+of `nodeRecord` and 16 B of offsets each, for the life of the store, and
+compaction recovered none of it: it recovers the *high* end, which a rebuild
+never touches. The Phase 0 instrument put it at **79 B of RSS per burned node
+identifier** across a twelve-cycle series, decomposing in the heap instrument as
+exactly 72 B of node slot plus 80 B of edge slot — a figure the plan predicted
+from the struct layout before anything was measured, which is the rare case of a
+model and an instrument agreeing to the byte. At the consumer's shape (1.5M
+identifiers per rebuild) that is ~119 MiB added permanently per rebuild, and an
+addressable lifetime of about 44 rebuilds before the 2²⁶ ceiling.
+
+**What shipped.** Records live in pages of 4096 identifiers. A per-kind
+directory of `int32` maps a page number to an arena page or to −1; the arenas
+hold `live pages × 4096` slots; adjacency is one CSR over that slot space with a
+single sentinel. A page nothing occupies costs four bytes. `GetNode` became two
+dependent loads instead of one.
+
+**Why it is format-neutral, and how that is enforced.** Arena pages are assigned
+in ascending page number, so arena order is identifier order, so the linear walk
+that skips dead slots is byte-for-byte the walk the old layout did. Nothing about
+pages is written. That claim is not left to argument: `disk/testdata/csr_v8_before_pages.bin`
+was written by the build *before* this change and
+`TestCSRPages_WalkOrderMatchesSerialisedBytes` asserts this build reproduces it
+byte for byte, while `TestCSRPages_GoldenImageStillVerifies` reparses it,
+recomputes its Merkle roots from the paged layout and checks an inclusion proof
+against the root the file carries. The determinism tests already in the package
+cannot do this: both compare a build against *itself*, so a change that reordered
+every record consistently satisfies them and makes every image in the field
+unreadable.
+
+**What changed observably.** Four things, all deliberate:
+
+- `Build` refuses a duplicate identifier instead of silently keeping the last
+  one, so a file whose records collide fails to open rather than opening with a
+  header count that disagrees with its contents.
+- `maxCSREntityID` rose from 2²⁶ to 2³². The ceiling now bounds the *directory*
+  (4 MiB per kind at the top of the space), not the record arrays, so the old
+  value was costing addressable lifetime for a bound that no longer binds. A
+  file whose identifiers exceed 2²⁶ is refused by a v0.7.0 reader; nothing else
+  about the format moved.
+- The sparsity rule counts **touched pages**, not the highest identifier:
+  `touchedPages × 4096 ≤ max(65536, records × 256)`, with the pages of an edge's
+  endpoints counted as touched. It is identically tight against a hostile file
+  and strictly more permissive for a real one — a single record naming an
+  identifier just under the ceiling now loads, because it now costs one page.
+- An edge naming an endpoint no record occupies materialises that endpoint's
+  page rather than panicking. No file that loaded before stops loading.
+
+**What it cost.** A directory read per lookup, and the quantisation: a page keeps
+its 4096 slots while one record in it survives, so a store whose live records are
+spread thinly over many pages pays more than one whose records are dense.
+`graphene store info` flags that: when an image's record slots run far ahead of
+its records — by a ratio *and* by an absolute margin, so a small store is not
+flagged for holding one page — it names the pages and the multiple.
 
 ---
 
@@ -4236,6 +4324,23 @@ Any change must preserve these. Each is enforced by tests.
     index omits records it should name (§10.5). What a cancelled rebuild
     guarantees is that the store is no worse than it was, not that it is
     repaired.
+22. **The identifier space is capped at 2³² per kind, and a store cannot be
+    renumbered.** Identifiers are never reused (§15.1) and compaction preserves
+    them (§14.2), so a long-lived store's highest identifier only rises. Above
+    `maxCSREntityID` an image is refused at open — the directory that addresses
+    its pages is bounded at 4 MiB per kind, and that bound is the ceiling. At a
+    million identifiers burned per rebuild that is some four thousand rebuilds;
+    `StorageStats` reports the headroom so it is visible long before it binds.
+    The sanctioned remedy is an export and import into a fresh store, which is
+    a new store with new identifiers rather than a renumbering of this one.
+23. **Records are paged, so slots are not records.** A page of 4096
+    identifiers is materialised whole as soon as one record falls in it, and
+    keeps its 4096 record slots until nothing in it survives a compaction. A
+    store whose live identifiers are spread thinly therefore costs more than
+    its record count suggests — the worst case being one record per page, which
+    the open path bounds at `touchedPages × 4096 ≤ max(65536, records × 256)`
+    and refuses beyond it. `graphene store info` flags the gap when it is worth
+    an operator's attention, naming the pages.
 
 ---
 

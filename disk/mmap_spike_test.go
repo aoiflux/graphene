@@ -75,16 +75,20 @@ func measureCSR(c *CSRGraph) csrFootprint {
 		uint64(len(c.outEdges))*uint64(unsafe.Sizeof(store.EdgeID(0))) +
 		uint64(len(c.inEdges))*uint64(unsafe.Sizeof(store.EdgeID(0)))
 
-	f.recordHdrs = uint64(len(c.nodes))*uint64(unsafe.Sizeof(nodeRecord{})) +
-		uint64(len(c.edges))*uint64(unsafe.Sizeof(rawEdge{}))
+	// recordHdrs counts the slots the record arenas materialise, which since the
+	// page table is the live pages times their size rather than one per
+	// identifier ever issued. The spike's arithmetic is unchanged; what it
+	// measures got smaller.
+	f.recordHdrs = uint64(len(c.nodeRecs))*uint64(unsafe.Sizeof(nodeRecord{})) +
+		uint64(len(c.edgeRecs))*uint64(unsafe.Sizeof(rawEdge{}))
 
-	for i := range c.nodes {
-		f.recordPay += uint64(len(c.nodes[i].Labels)) * uint64(unsafe.Sizeof(store.NodeType(0)))
-		f.recordPay += uint64(len(c.nodes[i].Properties))
+	for i := range c.nodeRecs {
+		f.recordPay += uint64(len(c.nodeRecs[i].Labels)) * uint64(unsafe.Sizeof(store.NodeType(0)))
+		f.recordPay += uint64(len(c.nodeRecs[i].Properties))
 	}
-	for i := range c.edges {
-		f.recordPay += uint64(len(c.edges[i].Labels)) * uint64(unsafe.Sizeof(store.EdgeType(0)))
-		f.recordPay += uint64(len(c.edges[i].Properties))
+	for i := range c.edgeRecs {
+		f.recordPay += uint64(len(c.edgeRecs[i].Labels)) * uint64(unsafe.Sizeof(store.EdgeType(0)))
+		f.recordPay += uint64(len(c.edgeRecs[i].Properties))
 	}
 
 	for _, ids := range c.nodesByLabel {
@@ -135,7 +139,7 @@ func TestMmapSpike(t *testing.T) {
 			if c == nil {
 				t.Fatal("fixture has no image — the compaction did not happen")
 			}
-			if got := len(c.nodes) - 1; got != size.nodes {
+			if got := c.NodeCount(); got != size.nodes {
 				t.Fatalf("fixture holds %d nodes, wanted %d", got, size.nodes)
 			}
 

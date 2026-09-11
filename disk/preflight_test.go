@@ -381,12 +381,21 @@ func TestPreflightOpen_ModelFollowsTheIdentifierSpaceNotTheRecordCount(t *testin
 			"it is sized by the record count, which is the cost model this program "+
 			"exists to replace", base, after.ImageHeapBytes)
 	}
-	// And by roughly the documented per-identifier constant, not by an arbitrary
-	// amount — the constant is what makes the number mean something.
+	// And by the page model's own arithmetic, not by an arbitrary amount. The
+	// charge is per page rather than per identifier: thirty records occupy at
+	// most thirty pages however far apart their identifiers are, so a million
+	// burned identifiers cost thirty pages of slots — about 8.8 B each — where
+	// one slot per identifier would have cost 72 B each. That difference is
+	// R10(b) stated as a budget.
 	perID := float64(after.ImageHeapBytes-base) / float64(burned)
-	if perID < estNodeSlotBytes*0.9 || perID > estNodeSlotBytes*1.1 {
-		t.Errorf("model charges %.1f B per burned identifier, expected about %d",
-			perID, estNodeSlotBytes)
+	wantPerID := float64(est.ImageNodeCount*csrPageSlots*estNodeSlotBytes) / float64(burned)
+	if perID < wantPerID*0.9 || perID > wantPerID*1.1 {
+		t.Errorf("model charges %.1f B per burned identifier, expected about %.1f",
+			perID, wantPerID)
+	}
+	if dense := float64(burned * estNodeSlotBytes); float64(after.ImageHeapBytes) > dense/4 {
+		t.Errorf("model charges %d B, which is not far enough below the %.0f B a slot "+
+			"per identifier would have cost", after.ImageHeapBytes, dense)
 	}
 }
 

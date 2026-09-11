@@ -15,6 +15,10 @@ compacted image
   nodes                                   5
   edges                                   5
                                           
+identifiers issued                        
+  nodes                                   5 of 4294967296 (100.00% headroom)
+  edges                                   5 of 4294967296 (100.00% headroom)
+                                          
 delta, written since the last compaction  
   nodes                                   0
   edges                                   0

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"iter"
 	"math"
 	"slices"
 	"sort"
@@ -17,13 +18,56 @@ import (
 // read-heavy, bulk-ingest workloads. For each node, all outbound (and
 // separately all inbound) edge indices are stored contiguously in a flat array.
 //
-// Layout (in-memory; serialised to disk separately):
+// # Records live in pages, not in one array slot per identifier
 //
-//   outOffset[nodeID]  → start index in outEdges
-//   outOffset[nodeID+1] → exclusive end index in outEdges
-//   outEdges[i]         → EdgeID at position i
+// Identifiers are never reused (§15.1), so a store that has deleted heavily
+// carries a highest ID far above its live count. Indexing one array slot per
+// identifier made the image cost memory for every identifier ever issued — 72 B
+// per burned node ID and 80 B per burned edge ID — recoverable only by deleting
+// the *high* end of the space (docs/benchmarks.md, "The identifier high-water
+// mark"). A rebuild workload burns the low end, and paid that forever.
 //
-// Same structure exists for inbound adjacency (inOffset / inEdges).
+// The layout is therefore a two-level page table. The identifier space is cut
+// into pages of csrPageSlots identifiers; a directory maps each page number to
+// an arena page, or to csrDeadPage when no record falls in it. Records sit in
+// one arena, at
+//
+//	slot(id) = dir[id >> csrPageBits] << csrPageBits | id & csrPageMask
+//
+// so a lookup is one directory read and one dependent record read, and a page
+// with nothing in it costs one int32. Arena pages are assigned in ascending page
+// number, which makes arena order identifier order: every walk over the arena
+// that skips the zero-valued dead slots visits live records in ascending ID
+// order, which is the order the file is written in and the order the Merkle
+// leaves are hashed in. Nothing about the pages reaches the file — they are a
+// load-time construct, like the adjacency arrays.
+//
+// Adjacency is a plain CSR over the same slot space:
+//
+//	outOffset[slot]   → start index in outEdges
+//	outOffset[slot+1] → exclusive end index in outEdges
+//	outEdges[i]       → EdgeID at position i
+//
+// with a single sentinel at outOffset[len(nodeRecs)]. The arena is contiguous,
+// so the offset after a page's last slot is the offset of the next arena page's
+// first slot, and no per-page sentinel is needed. Same structure for inbound
+// adjacency (inOffset / inEdges).
+
+// The page table's geometry.
+//
+// 4096 identifiers per page puts a 1.5M-identifier band in a directory of 367
+// entries, and makes a page holding a single live record cost
+// 4096 × (56 + 16) B ≈ 288 KB — small enough that a hostile file is bounded by
+// how many pages it touches (checkIDCeiling) and large enough that a directory
+// over the whole addressable space is 4 MiB per kind (maxCSREntityID).
+const (
+	csrPageBits  = 12
+	csrPageSlots = 1 << csrPageBits
+	csrPageMask  = csrPageSlots - 1
+
+	// csrDeadPage marks a directory entry with no arena page behind it.
+	csrDeadPage = int32(-1)
+)
 
 // rawEdge is the compact on-disk/in-memory edge representation used during
 // CSR construction.
@@ -38,14 +82,33 @@ type rawEdge struct {
 
 // CSRGraph holds the built adjacency arrays plus the node/edge metadata slices.
 type CSRGraph struct {
-	// Node metadata indexed by NodeID (1-based; index 0 is unused).
-	nodes []nodeRecord // len = maxNodeID + 1
+	// Node records. nodeDir is indexed by page number (id >> csrPageBits) and
+	// holds the arena page index, or csrDeadPage. nodeRecs is the arena: one
+	// zero-initialised slot per identifier of every materialised page, so a
+	// dead slot inside a live page reads as a record whose ID is InvalidNodeID.
+	// nodePages is the inverse of nodeDir over live pages — arena page index →
+	// page number — which is what turns a slot back into an identifier.
+	// nodeLiveBefore[p] is the number of live records in the arena pages before
+	// p, so the position of a record among the live ones (the index an
+	// inclusion proof is built at) costs one page scan rather than a walk from
+	// the start of the arena.
+	nodeDir        []int32
+	nodeRecs       []nodeRecord // len = live node pages × csrPageSlots
+	nodePages      []uint32
+	nodeLiveBefore []int
+	liveNodes      int
+	highestNodeID  store.NodeID // highest ID carrying a record; 0 when none
 
-	// Edge metadata indexed by EdgeID (1-based; index 0 is unused).
-	edges []rawEdge // len = maxEdgeID + 1
+	// Edge records, the same shape.
+	edgeDir        []int32
+	edgeRecs       []rawEdge // len = live edge pages × csrPageSlots
+	edgePages      []uint32
+	edgeLiveBefore []int
+	liveEdges      int
+	highestEdgeID  store.EdgeID
 
-	// Outbound adjacency.
-	outOffset []uint64 // len = maxNodeID + 2
+	// Outbound adjacency, indexed by node slot.
+	outOffset []uint64 // len = len(nodeRecs) + 1
 	outEdges  []store.EdgeID
 
 	// Inbound adjacency.
@@ -57,7 +120,7 @@ type CSRGraph struct {
 	// same answer in time proportional to the number of matches.
 	//
 	// Both are keyed by label and hold ascending ID lists (construction walks the
-	// record arrays in ID order). They are derived state: Build recomputes them,
+	// record arena in ID order). They are derived state: Build recomputes them,
 	// so they are not part of the on-disk format and cost one pass at load time.
 	nodesByLabel map[store.NodeType][]store.NodeID
 	edgesByLabel map[store.EdgeType][]store.EdgeID
@@ -66,7 +129,7 @@ type CSRGraph struct {
 	// time this CSR was built. Persisted so that IDs are never reused after a
 	// delete-then-compact-then-reopen cycle drops the record that held the max
 	// ID. Zero means "unknown" (older CSR formats) — callers fall back to the
-	// max ID physically present.
+	// max ID physically present, HighestNodeID and HighestEdgeID.
 	nodeSeqHW uint64
 	edgeSeqHW uint64
 
@@ -108,87 +171,289 @@ type nodeRecord struct {
 	Properties []byte
 }
 
-// Build constructs a CSRGraph from a slice of nodes and edges.
-// nodes and edges must be complete at build time (this is the bulk-ingest path).
-func Build(nodes []nodeRecord, edges []rawEdge) *CSRGraph {
+// Build constructs a CSRGraph from a slice of nodes and edges. nodes and edges
+// must be complete at build time (this is the bulk-ingest path); their order
+// does not matter, because every record is placed by its own identifier.
+//
+// It fails on a duplicate identifier. Two records claiming one ID is a file
+// lying about its own record count, or a compaction plan that broke its
+// disjointness rule; silently keeping the last one — what the one-slot-per-ID
+// layout did — hid either. A record whose ID is the invalid zero is skipped
+// rather than refused: the old layout dropped it into the unused slot 0, where
+// nothing ever read it, and a file that carries one loads today.
+//
+// An edge names two endpoints, and the page of each is materialised whether or
+// not a node record falls in it. Every live edge has both endpoints present —
+// deletion cascades to incident edges — so for a well-formed input this
+// materialises nothing extra. For a hostile one the cost is bounded by
+// checkCSREntityIDs, which counts endpoint pages as touched.
+//
+// With no nodes the result is an empty graph and any edges are dropped, as
+// before.
+//
+// Memory is proportional to the pages touched, not to the highest identifier:
+// one int32 per page of the identifier space up to the highest ID named, plus
+// csrPageSlots records and two csrPageSlots offsets per materialised page. The
+// only transient beyond the result is the directory's own touched-page marks.
+func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
+	g := &CSRGraph{}
 	if len(nodes) == 0 {
-		return &CSRGraph{
-			nodesByLabel: make(map[store.NodeType][]store.NodeID),
-			edgesByLabel: make(map[store.EdgeType][]store.EdgeID),
+		g.nodesByLabel = make(map[store.NodeType][]store.NodeID)
+		g.edgesByLabel = make(map[store.EdgeType][]store.EdgeID)
+		// One sentinel each, over zero slots. The offset arrays are one longer
+		// than the arena at every other size, and verifyAdjacency checks exactly
+		// that; leaving them nil here would make the empty image the one shape
+		// the invariant did not hold for.
+		g.outOffset = make([]uint64, 1)
+		g.inOffset = make([]uint64, 1)
+		return g, nil
+	}
+
+	// The extent of each directory. The node directory covers the highest node
+	// ID and every endpoint of a live edge; the edge directory the highest edge
+	// ID. An edge with the invalid zero ID is skipped everywhere, so its
+	// endpoints extend nothing.
+	var highestNode, nodeExtent, highestEdge uint64
+	for i := range nodes {
+		if id := uint64(nodes[i].ID); id > highestNode {
+			highestNode = id
+		}
+	}
+	nodeExtent = highestNode
+	for i := range edges {
+		e := &edges[i]
+		if e.ID == store.InvalidEdgeID {
+			continue
+		}
+		if id := uint64(e.ID); id > highestEdge {
+			highestEdge = id
+		}
+		if src := uint64(e.Src); src > nodeExtent {
+			nodeExtent = src
+		}
+		if dst := uint64(e.Dst); dst > nodeExtent {
+			nodeExtent = dst
 		}
 	}
 
-	// Determine max node ID.
-	var maxNID uint64
-	for _, n := range nodes {
-		if uint64(n.ID) > maxNID {
-			maxNID = uint64(n.ID)
+	// Mark the pages that need an arena page, then hand them out in ascending
+	// page number so that arena order is identifier order.
+	g.nodeDir = newPageDir(nodeExtent)
+	g.edgeDir = newPageDir(highestEdge)
+	for i := range nodes {
+		if nodes[i].ID != store.InvalidNodeID {
+			touchPage(g.nodeDir, uint64(nodes[i].ID))
 		}
 	}
-
-	// Determine max edge ID.
-	var maxEID uint64
-	for _, e := range edges {
-		if uint64(e.ID) > maxEID {
-			maxEID = uint64(e.ID)
+	for i := range edges {
+		e := &edges[i]
+		if e.ID == store.InvalidEdgeID {
+			continue
 		}
+		touchPage(g.edgeDir, uint64(e.ID))
+		touchPage(g.nodeDir, uint64(e.Src))
+		touchPage(g.nodeDir, uint64(e.Dst))
+	}
+	g.nodePages = assignPages(g.nodeDir)
+	g.edgePages = assignPages(g.edgeDir)
+	g.nodeRecs = make([]nodeRecord, len(g.nodePages)<<csrPageBits)
+	g.edgeRecs = make([]rawEdge, len(g.edgePages)<<csrPageBits)
+
+	// Place the records. A slot that is already taken is the duplicate this
+	// refuses.
+	for i := range nodes {
+		n := nodes[i]
+		if n.ID == store.InvalidNodeID {
+			continue
+		}
+		s := g.nodeSlotRaw(n.ID)
+		if g.nodeRecs[s].ID != store.InvalidNodeID {
+			return nil, fmt.Errorf("csr: duplicate node ID %d", n.ID)
+		}
+		g.nodeRecs[s] = n
+		g.liveNodes++
+	}
+	for i := range edges {
+		e := edges[i]
+		if e.ID == store.InvalidEdgeID {
+			continue
+		}
+		s := g.edgeSlotRaw(e.ID)
+		if g.edgeRecs[s].ID != store.InvalidEdgeID {
+			return nil, fmt.Errorf("csr: duplicate edge ID %d", e.ID)
+		}
+		g.edgeRecs[s] = e
+		g.liveEdges++
+	}
+	g.highestNodeID = store.NodeID(highestNode)
+	g.highestEdgeID = store.EdgeID(highestEdge)
+	g.nodeLiveBefore = make([]int, len(g.nodePages))
+	for p := 1; p < len(g.nodePages); p++ {
+		g.nodeLiveBefore[p] = g.nodeLiveBefore[p-1] + g.livePageNodes(p-1)
+	}
+	g.edgeLiveBefore = make([]int, len(g.edgePages))
+	for p := 1; p < len(g.edgePages); p++ {
+		g.edgeLiveBefore[p] = g.edgeLiveBefore[p-1] + g.livePageEdges(p-1)
 	}
 
-	g := &CSRGraph{
-		nodes:     make([]nodeRecord, maxNID+1),
-		edges:     make([]rawEdge, maxEID+1),
-		outOffset: make([]uint64, maxNID+2),
-		inOffset:  make([]uint64, maxNID+2),
+	// Adjacency: count degrees into offset[slot+1], prefix-sum, then fill. The
+	// fill uses the offset arrays themselves as the running cursors and shifts
+	// them back afterwards, which is what spares the two full-size counter
+	// copies the old layout made. Entries within a slot's range keep the input
+	// order of the edges slice.
+	slots := len(g.nodeRecs)
+	g.outOffset = make([]uint64, slots+1)
+	g.inOffset = make([]uint64, slots+1)
+	for i := range edges {
+		e := &edges[i]
+		if e.ID == store.InvalidEdgeID {
+			continue
+		}
+		g.outOffset[g.nodeSlotRaw(e.Src)+1]++
+		g.inOffset[g.nodeSlotRaw(e.Dst)+1]++
 	}
-
-	// Fill node records.
-	for _, n := range nodes {
-		g.nodes[n.ID] = n
-	}
-
-	// Fill edge records.
-	for _, e := range edges {
-		g.edges[e.ID] = e
-	}
-
-	// Count outbound and inbound degrees.
-	for _, e := range edges {
-		g.outOffset[e.Src+1]++
-		g.inOffset[e.Dst+1]++
-	}
-
-	// Prefix-sum to compute start offsets.
-	for i := 1; i < len(g.outOffset); i++ {
+	for i := 1; i <= slots; i++ {
 		g.outOffset[i] += g.outOffset[i-1]
-	}
-	for i := 1; i < len(g.inOffset); i++ {
 		g.inOffset[i] += g.inOffset[i-1]
 	}
-
-	// Allocate adjacency arrays.
-	total := uint64(len(edges))
-	g.outEdges = make([]store.EdgeID, total)
-	g.inEdges = make([]store.EdgeID, total)
-
-	// Fill adjacency arrays using a temp counter.
-	outCur := make([]uint64, len(g.outOffset))
-	inCur := make([]uint64, len(g.inOffset))
-	copy(outCur, g.outOffset)
-	copy(inCur, g.inOffset)
-
-	for _, e := range edges {
-		g.outEdges[outCur[e.Src]] = e.ID
-		outCur[e.Src]++
-		g.inEdges[inCur[e.Dst]] = e.ID
-		inCur[e.Dst]++
+	g.outEdges = make([]store.EdgeID, g.liveEdges)
+	g.inEdges = make([]store.EdgeID, g.liveEdges)
+	for i := range edges {
+		e := &edges[i]
+		if e.ID == store.InvalidEdgeID {
+			continue
+		}
+		so := g.nodeSlotRaw(e.Src)
+		g.outEdges[g.outOffset[so]] = e.ID
+		g.outOffset[so]++
+		si := g.nodeSlotRaw(e.Dst)
+		g.inEdges[g.inOffset[si]] = e.ID
+		g.inOffset[si]++
 	}
+	// After the fill offset[s] is the end of slot s, which is the start of
+	// slot s+1; one shift right restores the starts and reinstates offset[0].
+	copy(g.outOffset[1:], g.outOffset[:slots])
+	g.outOffset[0] = 0
+	copy(g.inOffset[1:], g.inOffset[:slots])
+	g.inOffset[0] = 0
 
 	g.buildLabelIndex()
 
-	return g
+	return g, nil
 }
 
-// buildLabelIndex populates the label postings by walking the record arrays in
+// newPageDir returns a directory covering identifiers 0..extent with every
+// page dead.
+func newPageDir(extent uint64) []int32 {
+	dir := make([]int32, extent>>csrPageBits+1)
+	for i := range dir {
+		dir[i] = csrDeadPage
+	}
+	return dir
+}
+
+// touchPage marks the page holding id as needing an arena page. The directory
+// was sized to cover id, so there is no bounds check.
+func touchPage(dir []int32, id uint64) {
+	dir[id>>csrPageBits] = 0
+}
+
+// assignPages gives every touched page an arena index in ascending page-number
+// order and returns the page number of each arena page.
+func assignPages(dir []int32) []uint32 {
+	n := 0
+	for _, e := range dir {
+		if e != csrDeadPage {
+			n++
+		}
+	}
+	pages := make([]uint32, 0, n)
+	for p := range dir {
+		if dir[p] == csrDeadPage {
+			continue
+		}
+		dir[p] = int32(len(pages))
+		pages = append(pages, uint32(p))
+	}
+	return pages
+}
+
+// livePageNodes counts the live records in arena page p.
+func (g *CSRGraph) livePageNodes(p int) int {
+	n := 0
+	for _, rec := range g.nodeRecs[p<<csrPageBits : (p+1)<<csrPageBits] {
+		if rec.ID != store.InvalidNodeID {
+			n++
+		}
+	}
+	return n
+}
+
+func (g *CSRGraph) livePageEdges(p int) int {
+	n := 0
+	for _, rec := range g.edgeRecs[p<<csrPageBits : (p+1)<<csrPageBits] {
+		if rec.ID != store.InvalidEdgeID {
+			n++
+		}
+	}
+	return n
+}
+
+// nodeSlot returns the arena slot for id, or -1 when id is the invalid zero,
+// lies beyond the directory, or falls in a page with no records. A slot says
+// nothing about whether a record is there: the caller compares the record's ID.
+//
+// The zero identifier is rejected here rather than by the ID comparison
+// because page 0's slot 0 holds a zero-valued record that satisfies `n.ID == 0`,
+// which would make InvalidNodeID read as an entity that exists.
+func (g *CSRGraph) nodeSlot(id store.NodeID) int {
+	if id == store.InvalidNodeID {
+		return -1
+	}
+	p := uint64(id) >> csrPageBits
+	if p >= uint64(len(g.nodeDir)) {
+		return -1
+	}
+	pi := g.nodeDir[p]
+	if pi == csrDeadPage {
+		return -1
+	}
+	return int(pi)<<csrPageBits | int(id&csrPageMask)
+}
+
+func (g *CSRGraph) edgeSlot(id store.EdgeID) int {
+	if id == store.InvalidEdgeID {
+		return -1
+	}
+	p := uint64(id) >> csrPageBits
+	if p >= uint64(len(g.edgeDir)) {
+		return -1
+	}
+	pi := g.edgeDir[p]
+	if pi == csrDeadPage {
+		return -1
+	}
+	return int(pi)<<csrPageBits | int(id&csrPageMask)
+}
+
+// nodeSlotRaw is nodeSlot for Build, where the directory is known to cover id
+// and its page to be live, and where the zero identifier must map to its slot
+// so that an edge naming it — tolerated, never valid — still has somewhere to
+// count its adjacency.
+func (g *CSRGraph) nodeSlotRaw(id store.NodeID) int {
+	return int(g.nodeDir[uint64(id)>>csrPageBits])<<csrPageBits | int(id&csrPageMask)
+}
+
+func (g *CSRGraph) edgeSlotRaw(id store.EdgeID) int {
+	return int(g.edgeDir[uint64(id)>>csrPageBits])<<csrPageBits | int(id&csrPageMask)
+}
+
+// nodeSlotID is the identifier a node slot stands for, live or not.
+func (g *CSRGraph) nodeSlotID(slot int) store.NodeID {
+	return store.NodeID(uint64(g.nodePages[slot>>csrPageBits])<<csrPageBits | uint64(slot&csrPageMask))
+}
+
+// buildLabelIndex populates the label postings by walking the record arenas in
 // ID order, which yields ascending postings lists for free.
 //
 // A record's labels are deduplicated as we go: a repeated label would otherwise
@@ -199,11 +464,7 @@ func (g *CSRGraph) buildLabelIndex() {
 	g.nodesByLabel = make(map[store.NodeType][]store.NodeID)
 	g.edgesByLabel = make(map[store.EdgeType][]store.EdgeID)
 
-	for i := 1; i < len(g.nodes); i++ {
-		n := g.nodes[i]
-		if n.ID == store.InvalidNodeID {
-			continue
-		}
+	for n := range g.Nodes() {
 		for j, lbl := range n.Labels {
 			if nodeRecordHasLabel(n.Labels[:j], lbl) {
 				continue
@@ -211,11 +472,7 @@ func (g *CSRGraph) buildLabelIndex() {
 			g.nodesByLabel[lbl] = append(g.nodesByLabel[lbl], n.ID)
 		}
 	}
-	for i := 1; i < len(g.edges); i++ {
-		e := g.edges[i]
-		if e.ID == store.InvalidEdgeID {
-			continue
-		}
+	for e := range g.Edges() {
 		for j, lbl := range e.Labels {
 			if rawEdgeHasLabel(e.Labels[:j], lbl) {
 				continue
@@ -223,6 +480,116 @@ func (g *CSRGraph) buildLabelIndex() {
 			g.edgesByLabel[lbl] = append(g.edgesByLabel[lbl], e.ID)
 		}
 	}
+}
+
+// Nodes yields every live node record in ascending ID order. That order is the
+// file's record order and the Merkle leaf order, and it holds because arena
+// pages are assigned in page-number order and a dead slot is the zero record.
+func (g *CSRGraph) Nodes() iter.Seq[nodeRecord] {
+	return func(yield func(nodeRecord) bool) {
+		for i := range g.nodeRecs {
+			if g.nodeRecs[i].ID == store.InvalidNodeID {
+				continue
+			}
+			if !yield(g.nodeRecs[i]) {
+				return
+			}
+		}
+	}
+}
+
+// Edges yields every live edge record in ascending ID order.
+func (g *CSRGraph) Edges() iter.Seq[rawEdge] {
+	return func(yield func(rawEdge) bool) {
+		for i := range g.edgeRecs {
+			if g.edgeRecs[i].ID == store.InvalidEdgeID {
+				continue
+			}
+			if !yield(g.edgeRecs[i]) {
+				return
+			}
+		}
+	}
+}
+
+// NodeIDs yields every live node ID in ascending order, without copying the
+// records.
+func (g *CSRGraph) NodeIDs() iter.Seq[store.NodeID] {
+	return func(yield func(store.NodeID) bool) {
+		for i := range g.nodeRecs {
+			if id := g.nodeRecs[i].ID; id != store.InvalidNodeID && !yield(id) {
+				return
+			}
+		}
+	}
+}
+
+// EdgeIDs yields every live edge ID in ascending order.
+func (g *CSRGraph) EdgeIDs() iter.Seq[store.EdgeID] {
+	return func(yield func(store.EdgeID) bool) {
+		for i := range g.edgeRecs {
+			if id := g.edgeRecs[i].ID; id != store.InvalidEdgeID && !yield(id) {
+				return
+			}
+		}
+	}
+}
+
+// nodeIDCursor walks the live node IDs in ascending order one call at a time,
+// so a scan can put the walk down across a lock release and pick it up again.
+//
+// It holds the arena rather than the graph, and the arena is immutable once
+// published (§9.2), so a cursor stays valid for as long as the image it was
+// taken from — which is what lets a Scanner resume into an image after the
+// store has moved on to a newer one. The zero cursor is exhausted.
+type nodeIDCursor struct {
+	recs []nodeRecord
+	slot int
+}
+
+// nodeIDCursor returns a cursor at the start of the image; a nil graph yields
+// an exhausted one.
+func (g *CSRGraph) nodeIDCursor() nodeIDCursor {
+	if g == nil {
+		return nodeIDCursor{}
+	}
+	return nodeIDCursor{recs: g.nodeRecs}
+}
+
+// next returns the next live ID, or false once the arena is walked.
+func (c *nodeIDCursor) next() (store.NodeID, bool) {
+	for c.slot < len(c.recs) {
+		id := c.recs[c.slot].ID
+		c.slot++
+		if id != store.InvalidNodeID {
+			return id, true
+		}
+	}
+	return store.InvalidNodeID, false
+}
+
+// edgeIDCursor is nodeIDCursor for edges.
+type edgeIDCursor struct {
+	recs []rawEdge
+	slot int
+}
+
+func (g *CSRGraph) edgeIDCursor() edgeIDCursor {
+	if g == nil {
+		return edgeIDCursor{}
+	}
+	return edgeIDCursor{recs: g.edgeRecs}
+}
+
+func (c *edgeIDCursor) next() (store.EdgeID, bool) {
+	for c.slot < len(c.recs) {
+		id := c.recs[c.slot].ID
+		c.slot++
+		if id != store.InvalidEdgeID {
+			return id, true
+		}
+	}
+	return store.InvalidEdgeID, false
 }
 
 // OutboundEdges returns the raw edges for nodeID in outbound direction.
@@ -235,17 +602,23 @@ func (g *CSRGraph) InboundEdges(id store.NodeID) ([]rawEdge, error) {
 	return g.adjacentEdges(id, g.inOffset, g.inEdges)
 }
 
+// adjacentEdges errors for an identifier beyond the directory and answers an
+// empty list for one the directory covers but no record or endpoint ever
+// named — the same split the one-slot-per-ID layout made between "beyond the
+// array" and "a dead slot inside it".
 func (g *CSRGraph) adjacentEdges(id store.NodeID, offsets []uint64, edgeList []store.EdgeID) ([]rawEdge, error) {
-	if int(id) >= len(offsets)-1 {
+	if uint64(id)>>csrPageBits >= uint64(len(g.nodeDir)) {
 		return nil, fmt.Errorf("node %d out of range", id)
 	}
-	start := offsets[id]
-	end := offsets[id+1]
+	s := g.nodeSlot(id)
+	if s < 0 {
+		return nil, nil
+	}
+	start, end := offsets[s], offsets[s+1]
 	result := make([]rawEdge, 0, end-start)
-	for i := start; i < end; i++ {
-		eid := edgeList[i]
-		if int(eid) < len(g.edges) {
-			result = append(result, g.edges[eid])
+	for _, eid := range edgeList[start:end] {
+		if e, ok := g.GetEdge(eid); ok {
+			result = append(result, e)
 		}
 	}
 	return result, nil
@@ -268,11 +641,7 @@ func (g *CSRGraph) verifyLabelIndex() error {
 			}
 		}
 	}
-	for i := 1; i < len(g.nodes); i++ {
-		n := g.nodes[i]
-		if n.ID == store.InvalidNodeID {
-			continue
-		}
+	for n := range g.Nodes() {
 		for _, lbl := range n.Labels {
 			// Postings are ascending, so membership is a binary search. A linear
 			// scan here would make verification quadratic in the size of the
@@ -297,11 +666,7 @@ func (g *CSRGraph) verifyLabelIndex() error {
 			}
 		}
 	}
-	for i := 1; i < len(g.edges); i++ {
-		e := g.edges[i]
-		if e.ID == store.InvalidEdgeID {
-			continue
-		}
+	for e := range g.Edges() {
 		for _, lbl := range e.Labels {
 			if !sortedContainsEdgeID(g.edgesByLabel[lbl], e.ID) {
 				return fmt.Errorf("csr edge label index: edge %d carries %v but is missing from the postings", e.ID, lbl)
@@ -323,13 +688,20 @@ func sortedContainsEdgeID(ids []store.EdgeID, target store.EdgeID) bool {
 	return i < len(ids) && ids[i] == target
 }
 
-// verifyAdjacency checks that the offset arrays are monotonic and that every
-// adjacency entry points at an edge whose endpoint matches.
+// verifyAdjacency checks that the offset arrays span the arena, are monotonic,
+// and that every adjacency entry points at an edge whose endpoint matches.
+//
+// It walks every slot of every materialised page rather than only the live
+// records: an endpoint page materialised for an edge whose node record is
+// absent carries adjacency at a slot no record occupies, and that adjacency is
+// exactly what a dangling edge would show up as.
 func (g *CSRGraph) verifyAdjacency() error {
-	if len(g.outOffset) != len(g.inOffset) {
-		return fmt.Errorf("csr adjacency: offset arrays differ in length (%d vs %d)", len(g.outOffset), len(g.inOffset))
+	slots := len(g.nodeRecs)
+	if len(g.outOffset) != slots+1 || len(g.inOffset) != slots+1 {
+		return fmt.Errorf("csr adjacency: offset arrays are %d and %d long for %d slots",
+			len(g.outOffset), len(g.inOffset), slots)
 	}
-	for i := 1; i < len(g.outOffset); i++ {
+	for i := 1; i <= slots; i++ {
 		if g.outOffset[i] < g.outOffset[i-1] {
 			return fmt.Errorf("csr adjacency: outOffset not monotonic at %d", i)
 		}
@@ -337,16 +709,16 @@ func (g *CSRGraph) verifyAdjacency() error {
 			return fmt.Errorf("csr adjacency: inOffset not monotonic at %d", i)
 		}
 	}
-	if n := len(g.outOffset); n > 0 && int(g.outOffset[n-1]) != len(g.outEdges) {
-		return fmt.Errorf("csr adjacency: outOffset tail %d != len(outEdges) %d", g.outOffset[n-1], len(g.outEdges))
+	if int(g.outOffset[slots]) != len(g.outEdges) {
+		return fmt.Errorf("csr adjacency: outOffset tail %d != len(outEdges) %d", g.outOffset[slots], len(g.outEdges))
 	}
-	if n := len(g.inOffset); n > 0 && int(g.inOffset[n-1]) != len(g.inEdges) {
-		return fmt.Errorf("csr adjacency: inOffset tail %d != len(inEdges) %d", g.inOffset[n-1], len(g.inEdges))
+	if int(g.inOffset[slots]) != len(g.inEdges) {
+		return fmt.Errorf("csr adjacency: inOffset tail %d != len(inEdges) %d", g.inOffset[slots], len(g.inEdges))
 	}
 
-	for id := 1; id < len(g.outOffset)-1; id++ {
-		nodeID := store.NodeID(id)
-		for _, eid := range g.OutboundEdgeIDs(nodeID) {
+	for s := 0; s < slots; s++ {
+		nodeID := g.nodeSlotID(s)
+		for _, eid := range g.outEdges[g.outOffset[s]:g.outOffset[s+1]] {
 			e, ok := g.GetEdge(eid)
 			if !ok {
 				return fmt.Errorf("csr adjacency: node %d lists outbound edge %d, which is not in the CSR", nodeID, eid)
@@ -355,7 +727,7 @@ func (g *CSRGraph) verifyAdjacency() error {
 				return fmt.Errorf("csr adjacency: node %d lists outbound edge %d, whose Src is %d", nodeID, eid, e.Src)
 			}
 		}
-		for _, eid := range g.InboundEdgeIDs(nodeID) {
+		for _, eid := range g.inEdges[g.inOffset[s]:g.inOffset[s+1]] {
 			e, ok := g.GetEdge(eid)
 			if !ok {
 				return fmt.Errorf("csr adjacency: node %d lists inbound edge %d, which is not in the CSR", nodeID, eid)
@@ -373,72 +745,111 @@ func (g *CSRGraph) verifyAdjacency() error {
 // result aliases CSR-owned memory: callers must hold the store lock and must not
 // retain or mutate it.
 func (g *CSRGraph) OutboundEdgeIDs(id store.NodeID) []store.EdgeID {
-	return adjacencySlice(id, g.outOffset, g.outEdges)
+	return g.adjacencySlice(id, g.outOffset, g.outEdges)
 }
 
 // InboundEdgeIDs returns the inbound edge IDs for nodeID. Same aliasing contract
 // as OutboundEdgeIDs.
 func (g *CSRGraph) InboundEdgeIDs(id store.NodeID) []store.EdgeID {
-	return adjacencySlice(id, g.inOffset, g.inEdges)
+	return g.adjacencySlice(id, g.inOffset, g.inEdges)
 }
 
 // OutDegree returns the outbound degree of nodeID in constant time, straight
 // from the offset array. It counts edges present in the CSR, so callers must
 // still account for any delete masks held by the store.
 func (g *CSRGraph) OutDegree(id store.NodeID) int {
-	return len(adjacencySlice(id, g.outOffset, g.outEdges))
+	return len(g.adjacencySlice(id, g.outOffset, g.outEdges))
 }
 
 // InDegree returns the inbound degree of nodeID in constant time.
 func (g *CSRGraph) InDegree(id store.NodeID) int {
-	return len(adjacencySlice(id, g.inOffset, g.inEdges))
+	return len(g.adjacencySlice(id, g.inOffset, g.inEdges))
 }
 
-func adjacencySlice(id store.NodeID, offsets []uint64, edgeList []store.EdgeID) []store.EdgeID {
-	if int(id) >= len(offsets)-1 {
+// adjacencySlice is nil for an identifier with no slot — beyond the directory,
+// in a dead page, or the invalid zero — and the slot's range otherwise.
+func (g *CSRGraph) adjacencySlice(id store.NodeID, offsets []uint64, edgeList []store.EdgeID) []store.EdgeID {
+	s := g.nodeSlot(id)
+	if s < 0 {
 		return nil
 	}
-	return edgeList[offsets[id]:offsets[id+1]]
+	return edgeList[offsets[s]:offsets[s+1]]
 }
 
 // GetNode returns the nodeRecord for the given ID.
 func (g *CSRGraph) GetNode(id store.NodeID) (nodeRecord, bool) {
-	// Slot 0 is the unused placeholder — the arrays are indexed by ID and IDs
-	// start at 1. Without this the zero-valued record in that slot satisfies
-	// `n.ID == id` for id 0 and is returned as a real one, so InvalidNodeID
-	// reads as an entity that exists. Every other walk here already starts at
-	// index 1; this is the one that did not.
-	if id == store.InvalidNodeID || int(id) >= len(g.nodes) {
+	s := g.nodeSlot(id)
+	if s < 0 {
 		return nodeRecord{}, false
 	}
-	n := g.nodes[id]
+	n := g.nodeRecs[s]
 	return n, n.ID == id
 }
 
 // GetEdge returns the rawEdge for the given ID.
 func (g *CSRGraph) GetEdge(id store.EdgeID) (rawEdge, bool) {
-	// Same placeholder slot as GetNode; same reason.
-	if id == store.InvalidEdgeID || int(id) >= len(g.edges) {
+	s := g.edgeSlot(id)
+	if s < 0 {
 		return rawEdge{}, false
 	}
-	e := g.edges[id]
+	e := g.edgeRecs[s]
 	return e, e.ID == id
 }
 
 // NodeCount returns the number of stored nodes.
-func (g *CSRGraph) NodeCount() int {
-	count := 0
-	for i := 1; i < len(g.nodes); i++ {
-		if g.nodes[i].ID != store.InvalidNodeID {
-			count++
-		}
-	}
-	return count
-}
+func (g *CSRGraph) NodeCount() int { return g.liveNodes }
 
 // EdgeCount returns the number of stored edges.
-func (g *CSRGraph) EdgeCount() int {
-	return len(g.outEdges)
+func (g *CSRGraph) EdgeCount() int { return g.liveEdges }
+
+// HighestNodeID is the highest node identifier carrying a record, or zero for
+// an image with no nodes. It is what the image physically holds, not what the
+// store has issued: the sequence high-water marks in the header are the latter,
+// and are what the next identifier is taken from.
+func (g *CSRGraph) HighestNodeID() store.NodeID { return g.highestNodeID }
+
+// HighestEdgeID is HighestNodeID for edges.
+func (g *CSRGraph) HighestEdgeID() store.EdgeID { return g.highestEdgeID }
+
+// nodePageCount is the number of node pages materialised — the unit the image's
+// resident cost is proportional to.
+func (g *CSRGraph) nodePageCount() int { return len(g.nodePages) }
+
+func (g *CSRGraph) edgePageCount() int { return len(g.edgePages) }
+
+// nodeLeafIndex returns the position of id among the live nodes, which is the
+// index an inclusion proof is built at: the number of live records with a
+// smaller ID, since Nodes walks ascending. One page scan at most, thanks to the
+// per-page prefix nodeLiveBefore.
+func (g *CSRGraph) nodeLeafIndex(id store.NodeID) (int, bool) {
+	s := g.nodeSlot(id)
+	if s < 0 || g.nodeRecs[s].ID != id {
+		return 0, false
+	}
+	p := s >> csrPageBits
+	pos := g.nodeLiveBefore[p]
+	for _, rec := range g.nodeRecs[p<<csrPageBits : s] {
+		if rec.ID != store.InvalidNodeID {
+			pos++
+		}
+	}
+	return pos, true
+}
+
+// edgeLeafIndex is nodeLeafIndex for edges.
+func (g *CSRGraph) edgeLeafIndex(id store.EdgeID) (int, bool) {
+	s := g.edgeSlot(id)
+	if s < 0 || g.edgeRecs[s].ID != id {
+		return 0, false
+	}
+	p := s >> csrPageBits
+	pos := g.edgeLiveBefore[p]
+	for _, rec := range g.edgeRecs[p<<csrPageBits : s] {
+		if rec.ID != store.InvalidEdgeID {
+			pos++
+		}
+	}
+	return pos, true
 }
 
 // Serialise writes the CSR to the current binary format, csrVersionCurrent —
@@ -547,19 +958,11 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 	nodeProps, edgeProps := payload.NodeProps, payload.EdgeProps
 	var buf bytes.Buffer
 
-	// Count valid nodes and edges.
-	nodeCount := 0
-	for i := 1; i < len(g.nodes); i++ {
-		if g.nodes[i].ID != store.InvalidNodeID {
-			nodeCount++
-		}
-	}
-	edgeCount := 0
-	for i := 1; i < len(g.edges); i++ {
-		if g.edges[i].ID != store.InvalidEdgeID {
-			edgeCount++
-		}
-	}
+	// Count valid nodes and edges. Build maintains both counters, so the header
+	// counts cost nothing to produce and cannot disagree with the record stream
+	// written below: the same liveness test decides both.
+	nodeCount := g.NodeCount()
+	edgeCount := g.EdgeCount()
 
 	// Header. The first 46 bytes keep their v6 meaning and position; v8 appends
 	// to them rather than rearranging, so a reader can identify a file and read
@@ -582,12 +985,10 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 	digestPos := buf.Len()
 	buf.Write(make([]byte, csrDigestSize)) // patched last, over a zeroed field
 
-	// Nodes (variable-length labels)
-	for i := 1; i < len(g.nodes); i++ {
-		n := g.nodes[i]
-		if n.ID == store.InvalidNodeID {
-			continue
-		}
+	// Nodes (variable-length labels), ascending by ID - the order Nodes yields,
+	// the order the Merkle leaves are hashed in, and the order every reader
+	// since v2 has assumed.
+	for n := range g.Nodes() {
 		writeUint64(&buf, uint64(n.ID))
 		buf.WriteByte(byte(len(n.Labels)))
 		for _, lbl := range n.Labels {
@@ -597,12 +998,8 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 		buf.Write(n.Properties)
 	}
 
-	// Edges (variable-length labels)
-	for i := 1; i < len(g.edges); i++ {
-		e := g.edges[i]
-		if e.ID == store.InvalidEdgeID {
-			continue
-		}
+	// Edges (variable-length labels), ascending by ID for the same reasons.
+	for e := range g.Edges() {
 		writeUint64(&buf, uint64(e.ID))
 		writeUint64(&buf, uint64(e.Src))
 		writeUint64(&buf, uint64(e.Dst))
@@ -619,9 +1016,9 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 
 	// No adjacency arrays. They were written here through v6 and never read
 	// back: deserialiseCSR rebuilds them with Build() from the records it has
-	// just parsed, then jumps straight to indexOffset. Proven by
-	// TestAdjacencyArraysAreDeadBytes, which corrupts the region and observes no
-	// difference.
+	// just parsed, then jumps straight to indexOffset. The test that proved it by
+	// corrupting the region is gone; what holds the line now is that no v7+ reader
+	// ever seeks into those bytes.
 	//
 	// On a 100k-node fixture that was ~4.8 MB of a ~22 MB file, written on every
 	// Compact and read by nobody.

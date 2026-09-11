@@ -69,6 +69,18 @@ func TestStrict_OptionsEnablesEverything(t *testing.T) {
 	}
 }
 
+// tamperedLabelOffset points at the label of the last node record, counted
+// from the end of the header. The fifteen records the fixture writes are 15
+// bytes each — an identifier, a label count, one label, a property length -
+// so this is a byte the reader parses and nothing else derives from.
+//
+// It is deliberately not an identifier. Since the CSR became paged, Build
+// refuses a file whose records collide on one, and a bit flipped into the low
+// byte of an identifier is exactly such a collision: the Open would then fail
+// for a reason that has nothing to do with verification, and these tests would
+// pass while testing nothing.
+const tamperedLabelOffset = 14*15 + 9
+
 // A tampered image fails the Open rather than loading and reporting later.
 func TestStrict_TamperedImageFailsTheOpen(t *testing.T) {
 	dir, key, ring := strictFixture(t)
@@ -78,7 +90,7 @@ func TestStrict_TamperedImageFailsTheOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data[csrV8HeaderSize+30] ^= 0x01
+	data[csrV8HeaderSize+tamperedLabelOffset] ^= 0x01
 	if err := os.WriteFile(p, data, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +216,7 @@ func TestStrict_DefaultIsUnchanged(t *testing.T) {
 	dir, _, _ := strictFixture(t)
 	p := filepath.Join(dir, csrFileName)
 	data, _ := os.ReadFile(p)
-	data[csrV8HeaderSize+30] ^= 0x01
+	data[csrV8HeaderSize+tamperedLabelOffset] ^= 0x01
 	if err := os.WriteFile(p, data, 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -87,22 +87,15 @@ func (s *Store) loadCSR(path string) error {
 			s.propIdx.IndexEdge(e.ID, e.Key, e.Value)
 		}
 	}
-	// Advance sequence counters past existing CSR IDs.
-	for i := len(csr.nodes) - 1; i >= 1; i-- {
-		if csr.nodes[i].ID != store.InvalidNodeID {
-			if uint64(csr.nodes[i].ID) > s.nodeSeq.Load() {
-				s.nodeSeq.Store(uint64(csr.nodes[i].ID))
-			}
-			break
-		}
+	// Advance sequence counters past existing CSR IDs. This is the pre-v5
+	// fallback: files that carry high-water marks raise the counters again
+	// below, and those marks win because a deleted record's ID must not be
+	// handed out twice.
+	if hw := uint64(csr.HighestNodeID()); hw > s.nodeSeq.Load() {
+		s.nodeSeq.Store(hw)
 	}
-	for i := len(csr.edges) - 1; i >= 1; i-- {
-		if csr.edges[i].ID != store.InvalidEdgeID {
-			if uint64(csr.edges[i].ID) > s.edgeSeq.Load() {
-				s.edgeSeq.Store(uint64(csr.edges[i].ID))
-			}
-			break
-		}
+	if hw := uint64(csr.HighestEdgeID()); hw > s.edgeSeq.Load() {
+		s.edgeSeq.Store(hw)
 	}
 	// Restore the marks that used to be lost at every compaction (v8+). Zero
 	// means the file predates them, in which case the commit counter resumes
@@ -352,17 +345,20 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		edges[i].Properties = arenaBytes(edgePropArena, edgePropSpan[i])
 	}
 
-	// Build indexes its arrays by entity ID, not by record count, so it allocates
-	// maxID+1 slots regardless of how few records there are. Bounding the counts
-	// above is therefore not enough: two records carrying IDs of 0x3030303030303030
-	// make a 105-byte file demand an exabyte-scale slice, which panics in
-	// makeslice rather than returning an error. Validate the IDs before Build
-	// sees them.
+	// Build allocates one int32 per page of the identifier space up to the
+	// highest ID named, and a full page of records for every page a record or
+	// an endpoint falls in. Bounding the record counts above is therefore not
+	// enough: two records carrying IDs of 0x3030303030303030 would make a
+	// 105-byte file demand an exabyte-scale directory, which panics in makeslice
+	// rather than returning an error. Validate the IDs before Build sees them.
 	if err := checkCSREntityIDs(nodes, edges, version, nodeSeqHW, edgeSeqHW); err != nil {
 		return nil, nil, err
 	}
 
-	csr := Build(nodes, edges)
+	csr, err := Build(nodes, edges)
+	if err != nil {
+		return nil, nil, err
+	}
 	csr.nodeSeqHW = nodeSeqHW
 	csr.edgeSeqHW = edgeSeqHW
 	csr.commitSeqHW = trailer.CommitSeqHW
@@ -474,33 +470,78 @@ type csrIndexSection struct {
 	CompositeEdgeKeys [][]string
 }
 
-// checkIDCeiling bounds the highest ID of one entity kind both absolutely and
-// against how many records of that kind the file actually carries.
+// checkIDSpace is the absolute half of checkIDCeiling, applied on its own
+// before anything is sized from a file's identifiers.
 //
-// The relative bound is the one that matters for a small file: without it a
-// single 13-byte record naming the maximum permitted ID is enough to demand the
-// entire absolute ceiling's worth of memory. With it, a file's worst case scales
-// with what the file contains.
-func checkIDCeiling(kind string, maxID uint64, records int) error {
+// The order matters: the touched-page bitmap the relative rule needs is itself
+// sized from the highest ID, so a file naming ID 2^62 would allocate a 512 GiB
+// bitmap to find out that it is not allowed to name ID 2^62.
+func checkIDSpace(kind string, maxID uint64) error {
 	if maxID > maxCSREntityID {
 		return fmt.Errorf("deserialiseCSR: %s ID %d exceeds the maximum addressable ID %d",
 			kind, maxID, uint64(maxCSREntityID))
 	}
+	return nil
+}
+
+// checkIDCeiling bounds one entity kind both absolutely and against how many
+// records of that kind the file actually carries.
+//
+// The relative bound is the one that matters for a small file. Records live in
+// pages of csrPageSlots identifiers and a page costs a full page of slots
+// whether one record falls in it or four thousand do, so the quantity to bound
+// is the number of pages the file touches — not its highest ID, which after
+// paging says nothing about what the file costs. Without the bound, a handful
+// of records scattered one per page would each charge a whole page.
+func checkIDCeiling(kind string, maxID uint64, records, touchedPages int) error {
+	if err := checkIDSpace(kind, maxID); err != nil {
+		return err
+	}
+	slots := uint64(touchedPages) * csrPageSlots
 	allowed := uint64(records) * csrIDSparsityFactor
 	if allowed < csrIDSparsityFloor {
 		allowed = csrIDSparsityFloor
 	}
-	if maxID > allowed {
-		return fmt.Errorf("deserialiseCSR: %s ID %d is too sparse for %d records (ceiling %d)",
-			kind, maxID, records, allowed)
+	if slots > allowed {
+		return fmt.Errorf("deserialiseCSR: %d %s records touch %d pages (%d slots), too sparse for the ceiling of %d",
+			records, kind, touchedPages, slots, allowed)
 	}
 	return nil
 }
 
-// checkCSREntityIDs rejects records whose IDs would make Build allocate an
-// array the file gives no reason to believe in.
+// touchedPageSet counts the distinct identifier pages a file names, which is
+// what Build's arenas are sized from.
 //
-// Two rules, in order of strength:
+// It is a bitmap rather than a map because it is built from untrusted input on
+// the open path: at the maximum addressable ID it is 128 KiB and allocated
+// once, where a map would be a per-page header and a hash insert for a file
+// that may have nothing but scattered pages.
+type touchedPageSet struct {
+	bits  []uint64
+	pages int
+}
+
+// newTouchedPageSet covers identifiers 0..maxID. maxID must already have passed
+// checkIDSpace.
+func newTouchedPageSet(maxID uint64) touchedPageSet {
+	return touchedPageSet{bits: make([]uint64, (maxID>>csrPageBits)/64+1)}
+}
+
+// mark records the page holding id, counting it once.
+func (t *touchedPageSet) mark(id uint64) {
+	p := id >> csrPageBits
+	w, bit := p/64, uint64(1)<<(p%64)
+	if t.bits[w]&bit != 0 {
+		return
+	}
+	t.bits[w] |= bit
+	t.pages++
+}
+
+// checkCSREntityIDs rejects records whose IDs would make Build allocate memory
+// the file gives no reason to believe in.
+//
+// Three rules, in order of strength:
 //
 //   - For v5+ files the header carries the sequence high-water marks. IDs are
 //     handed out from those monotonic counters and Compact stamps the current
@@ -511,18 +552,26 @@ func checkIDCeiling(kind string, maxID uint64, records int) error {
 //   - maxCSREntityID is a backstop, applied to every version. It exists because
 //     the high-water marks live in the same header an attacker controls, so the
 //     first rule alone still permits "seqHW = 2^62, one record with that ID".
+//     It bounds the page directory: 4 MiB per kind at the ceiling, for a file
+//     that names one identifier just below it.
 //
-//   - csrIDSparsityFactor bounds the highest ID against the record count that is
-//     actually present, with csrIDSparsityFloor as the minimum allowance. This
-//     is what stops one 13-byte record naming ID 2^26 from demanding the whole
-//     array; the absolute ceiling alone is no protection against that.
+//   - csrIDSparsityFactor bounds the *pages* the records touch against the
+//     record count that is actually present, with csrIDSparsityFloor as the
+//     minimum allowance — sixteen pages, which is more than any small file
+//     needs. This is what stops a file of seventeen records placed one per page
+//     from demanding seventeen pages of arena; the absolute ceiling alone is no
+//     protection against that.
 //
 // The third rule is a *loose* bound on purpose, not an assertion that IDs track
 // the record count. They do not: IDs are monotonic and never reused, so a
 // long-lived store that has deleted heavily carries a maxID far above its live
-// count and that file is perfectly valid. 256 burned IDs per surviving record
-// is far past what deletions and rollbacks produce in practice, which is what
-// lets the bound reject a hostile file without rejecting a real one.
+// count and that file is perfectly valid. Under paging such a store is cheap
+// anyway — a burned page costs one int32 — so the rule now rejects only the
+// shape that is genuinely expensive, records spread thinly across many pages.
+//
+// The endpoint rule runs before the pages are counted, so that an edge naming a
+// node the file does not contain cannot extend the identifier space the bitmap
+// covers.
 func checkCSREntityIDs(nodes []nodeRecord, edges []rawEdge, version uint16, nodeSeqHW, edgeSeqHW uint64) error {
 	var maxNID, maxEID uint64
 	for i := range nodes {
@@ -536,19 +585,21 @@ func checkCSREntityIDs(nodes []nodeRecord, edges []rawEdge, version uint16, node
 		}
 	}
 
-	if err := checkIDCeiling("node", maxNID, len(nodes)); err != nil {
+	if err := checkIDSpace("node", maxNID); err != nil {
 		return err
 	}
-	if err := checkIDCeiling("edge", maxEID, len(edges)); err != nil {
+	if err := checkIDSpace("edge", maxEID); err != nil {
 		return err
 	}
 
-	// Endpoints are a separate bound from IDs, and the one that actually crashes.
-	// Build sizes the adjacency offset arrays from the highest *node* ID, then
-	// indexes them by each edge's Src and Dst without checking, so an edge naming
-	// a node the file does not contain reads past the end of the array rather
-	// than producing a parse error. Every live edge has both endpoints present —
-	// deletion cascades to incident edges — so this rejects nothing valid.
+	// Endpoints are a separate bound from IDs, and the one that used to crash.
+	// Build materialises the page of every endpoint whether or not a node record
+	// falls in it, so an edge naming a node the file does not contain costs a
+	// page rather than reading past the end of an array. That is bounded — the
+	// page rule below counts endpoint pages — but keeping the check confines
+	// materialisation to pages inside the identifier space the records already
+	// describe. Every live edge has both endpoints present — deletion cascades to
+	// incident edges — so this rejects nothing valid.
 	for i := range edges {
 		if uint64(edges[i].Src) > maxNID {
 			return fmt.Errorf("deserialiseCSR: edge %d has source %d, beyond the highest node ID %d",
@@ -558,6 +609,33 @@ func checkCSREntityIDs(nodes []nodeRecord, edges []rawEdge, version uint16, node
 			return fmt.Errorf("deserialiseCSR: edge %d has target %d, beyond the highest node ID %d",
 				edges[i].ID, edges[i].Dst, maxNID)
 		}
+	}
+
+	// Count exactly what Build will materialise: the page of every record with a
+	// usable identifier, plus the pages of both endpoints of every such edge.
+	// Records carrying the invalid zero identifier are skipped there, so they are
+	// skipped here.
+	nodePages := newTouchedPageSet(maxNID)
+	edgePages := newTouchedPageSet(maxEID)
+	for i := range nodes {
+		if nodes[i].ID != store.InvalidNodeID {
+			nodePages.mark(uint64(nodes[i].ID))
+		}
+	}
+	for i := range edges {
+		if edges[i].ID == store.InvalidEdgeID {
+			continue
+		}
+		edgePages.mark(uint64(edges[i].ID))
+		nodePages.mark(uint64(edges[i].Src))
+		nodePages.mark(uint64(edges[i].Dst))
+	}
+
+	if err := checkIDCeiling("node", maxNID, len(nodes), nodePages.pages); err != nil {
+		return err
+	}
+	if err := checkIDCeiling("edge", maxEID, len(edges), edgePages.pages); err != nil {
+		return err
 	}
 
 	// A zero mark means "not stamped" rather than "the highest ID is zero".

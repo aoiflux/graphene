@@ -91,6 +91,8 @@ func (s *Store) ProveNode(id store.NodeID) (NodeInclusionProof, error) {
 	if !present {
 		return NodeInclusionProof{}, fmt.Errorf("%w: node %d", ErrNotInSnapshot, id)
 	}
+	// Present, so this hit: the same record the leaf above was hashed from.
+	rec, _ := csr.GetNode(id)
 
 	// The image's own body version, not this build's preference: a proof built
 	// with a different leaf encoding than the root was computed from resolves to
@@ -103,7 +105,7 @@ func (s *Store) ProveNode(id store.NodeID) (NodeInclusionProof, error) {
 
 	return NodeInclusionProof{
 		NodeID:   id,
-		LeafData: nodeLeafFor(roots.bodyVersion(), csr.nodes[id]),
+		LeafData: nodeLeafFor(roots.bodyVersion(), rec),
 		Proof:    proof,
 		NodeRoot: roots.NodeRoot,
 		Roots:    roots,

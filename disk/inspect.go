@@ -37,6 +37,11 @@ import (
 // already made.
 const CSRVersionCurrent = csrVersionCurrent
 
+// CSRPageSlots is how many identifiers one record page covers. It is exported
+// for the sake of reporting: NodePages times this is the number of record
+// slots an image holds, which is what its resident cost follows.
+const CSRPageSlots = csrPageSlots
+
 // CSRInfo describes a graphene.csr file without loading the graph it holds.
 type CSRInfo struct {
 	Path      string
@@ -54,10 +59,19 @@ type CSRInfo struct {
 	PropertyEdgeEntries int
 
 	// IDSpan is the highest node and edge ID present. Compared against the
-	// counts it shows how sparse the ID space has become, which is what governs
-	// the memory an open costs — the CSR indexes its arrays by ID, not by count.
+	// counts it shows how sparse the ID space has become; what the memory an
+	// open costs actually follows is NodePages/EdgePages below, because the CSR
+	// stores records in pages of 4096 identifiers and a page nothing falls in
+	// costs four bytes.
 	MaxNodeID uint64
 	MaxEdgeID uint64
+
+	// NodePages and EdgePages are the pages of identifier space the image
+	// materialises — the unit its resident cost is proportional to, at
+	// CSRPageSlots record slots each. A store whose identifiers are spread
+	// thinly has many pages for few records.
+	NodePages int
+	EdgePages int
 
 	// v8 additions. CommitSeqHW and LastCompactUnixNano are zero in older files.
 	CommitSeqHW         uint64
@@ -150,12 +164,10 @@ func InspectCSR(path string) (CSRInfo, error) {
 	info.EdgeCount = csr.EdgeCount()
 	info.NodeSeqHW = csr.nodeSeqHW
 	info.EdgeSeqHW = csr.edgeSeqHW
-	if len(csr.nodes) > 0 {
-		info.MaxNodeID = uint64(len(csr.nodes) - 1)
-	}
-	if len(csr.edges) > 0 {
-		info.MaxEdgeID = uint64(len(csr.edges) - 1)
-	}
+	info.MaxNodeID = uint64(csr.HighestNodeID())
+	info.MaxEdgeID = uint64(csr.HighestEdgeID())
+	info.NodePages = csr.nodePageCount()
+	info.EdgePages = csr.edgePageCount()
 	if section != nil {
 		info.PropertyNodeEntries = len(section.NodeProps)
 		info.PropertyEdgeEntries = len(section.EdgeProps)

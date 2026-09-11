@@ -34,7 +34,11 @@ func TestArenaRecordsDoNotAliasAcrossRecords(t *testing.T) {
 		{ID: 2, Src: 2, Dst: 3, Labels: []store.EdgeType{store.EdgeTypeContains}, Properties: []byte("edge-two")},
 	}
 
-	blob := Build(nodes, edges).Serialise()
+	g, err := Build(nodes, edges)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	blob := g.Serialise()
 	csr, _, err := deserialiseCSR(blob)
 	if err != nil {
 		t.Fatalf("deserialise: %v", err)
@@ -106,7 +110,11 @@ func TestArenaRoundTripPreservesRecords(t *testing.T) {
 		{ID: 2, Src: 2, Dst: 3, Labels: []store.EdgeType{store.EdgeTypeContains, store.EdgeTypeSimilarTo}, Properties: []byte("e2")},
 	}
 
-	blob := Build(nodes, edges).Serialise()
+	g, err := Build(nodes, edges)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	blob := g.Serialise()
 	csr, _, err := deserialiseCSR(blob)
 	if err != nil {
 		t.Fatalf("deserialise: %v", err)

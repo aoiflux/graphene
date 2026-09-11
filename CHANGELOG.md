@@ -5,6 +5,96 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### The CSR stores records in pages, so a burned identifier costs four bytes
+
+The two measurements above — 79 B of resident memory per identifier issued and
+never reusable, and a low-half deletion costing 152 B per identifier more than a
+high-half one — describe the same defect. The CSR indexed one record slot per
+identifier, so a store that rebuilds a derived layer paid 56 B of `nodeRecord`
+and 16 B of offsets for every identifier it had ever issued, forever, and
+compaction recovered none of it: compaction recovers the *top* of the identifier
+space, and a rebuild burns the bottom.
+
+Records now live in pages of 4096 identifiers. A per-kind directory of `int32`
+maps a page number to an arena page or to −1, the arenas hold one slot per
+identifier of the pages that are actually occupied, and adjacency is one CSR over
+that slot space with a single sentinel. A page nothing occupies costs four bytes;
+a page whose records have all been deleted and compacted away goes back to
+costing four bytes.
+
+Measured against the tree before it, three interleaved rounds:
+
+- **17.65 B per burned identifier**, from 84.45 — **−79.1%**, with the tail slope
+  falling from 1.611 to 0.337 MiB per cycle.
+- **The two deletion shapes now cost the same**: 314.6 B/node for the low half
+  against 314.2 for the high half, where they were 531.2 and 378.8. Where the
+  surviving identifiers sit no longer changes what a store costs.
+- Resident after twelve rebuild cycles **130.9 → 112.9 MiB**, Go heap
+  **71.15 → 55.01 MiB**, peak **296.8 → 251.3 MiB**. A store that has burned
+  nothing is unchanged, which is the control.
+
+**The on-disk format did not move, and that is tested rather than asserted.**
+Arena pages are assigned in ascending page number, so arena order is identifier
+order, so the walk that writes the record stream and hashes the Merkle leaves is
+the walk it always was. `disk/testdata/csr_v8_before_pages.bin` was written by
+the build *preceding* this change; the test suite reproduces it byte for byte,
+reparses it, recomputes its roots from the paged layout and checks an inclusion
+proof against the root the file carries. The determinism tests already here could
+not have caught a consistent reordering — both compare a build against itself.
+
+Four behaviours changed deliberately:
+
+- `Build` refuses a duplicate identifier instead of keeping the last silently, so
+  a file whose records collide fails to open rather than opening with a header
+  count that disagrees with its own contents.
+- The addressable identifier space rose from **2²⁶ to 2³²**. The ceiling now
+  bounds the page directory — 4 MiB per kind at the top of the space — rather
+  than the record arrays, so the old value was costing addressable lifetime for a
+  bound that no longer binds. An image naming identifiers above 2²⁶ cannot be
+  read by a v0.7.0 build.
+- The sparsity rule counts pages rather than the highest identifier:
+  `touchedPages × 4096 ≤ max(65536, records × 256)`, with an edge's endpoint
+  pages counted. It is identically tight against a hostile file and strictly more
+  permissive for a real one — one record naming an identifier just under the
+  ceiling now loads, because it now costs one page.
+- An edge naming an endpoint no record occupies materialises that endpoint's page
+  instead of panicking. No file that loaded before stops loading.
+
+The cost is a dependent load on every lookup and the quantisation: a page keeps
+its 4096 slots while one record in it survives. The lookup cost is not measurable
+above this host's noise — the memory backend, untouched by this change, moved
+10% in the same rounds while the disk arm moved 1.6% — and `store info` reports
+the quantisation when it is worth an operator's attention.
+
+`TestRebuildCycle_ResidentIsProportionalToLive` runs in `make check` and fails on
+the tree before this change, at 72.0 B per burned identifier against a ceiling of
+24.
+
+### A store can now see the end of its own identifier space
+
+Identifiers are never reused, compaction preserves them, and the ceiling above is
+on the store's lifetime rather than on its size. Nothing reported that.
+
+`StorageStats` gains `HighestNodeID`, `HighestEdgeID`, `IDCeiling`,
+`NodeIDHeadroom` and `EdgeIDHeadroom`. The headroom is computed from identifiers
+**issued**, not from the ones the image still holds: deleting the record that
+held the highest identifier does not give headroom back, because the next write
+will not reuse it, and a figure that said otherwise would be worse than none.
+
+A completed compaction reports it unprompted when the space remaining falls below
+`Options.IDHeadroomWarn` (default 0.10; negative disables): a
+`MetricIDHeadroomLow` metric and an `AuditIDHeadroomLow` entry naming the kind and
+the figures, once per kind per process so that a store compacting on a timer does
+not fill its own chain with one observation. `graphene store stats` and
+`graphene debug stats` print the identifiers issued against the ceiling, and
+`graphene store health` raises `store.id_headroom_low` as a warning.
+
+There is no refusal, deliberately. A store at 5% headroom works exactly as it did
+at 95%, and the remedy — an export and import into a fresh store, which is a new
+store with new identifiers rather than a renumbering of this one — is a decision
+with downtime in it. The engine's job here is to make sure the decision is not
+taken by surprise.
+
 ### Measuring the thing the budget is written against
 
 A consumer sized for a 2 GB machine measured 9,290 MiB of peak RSS rebuilding a

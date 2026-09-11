@@ -21,10 +21,100 @@ package disk
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/aoiflux/graphene/store"
 )
+
+// TestDenseSlots_FastPathRace runs the lock-free read path against a store
+// that is compacting, on a graph whose identifiers span several record pages.
+//
+// The page table turned one array into three that have to agree — a directory,
+// an arena and the offset arrays — and a lookup reads all three without the
+// store lock. That is only sound because a CSRGraph is built complete and then
+// published as one pointer, never amended in place: no page is materialised
+// lazily on a graph a reader can already see. Under -race, a build that
+// published early or filled a page after publication is a reported race here
+// rather than a wrong answer somewhere else much later.
+func TestDenseSlots_FastPathRace(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	// Enough nodes to cross a page boundary, plus edges so the adjacency
+	// arrays are read on the same path.
+	const n = csrPageSlots + 500
+	ids := make([]store.NodeID, 0, n)
+	for i := 0; i < n; i++ {
+		id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+		if err != nil {
+			t.Fatalf("AddNode: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	for i := 1; i < len(ids); i += 64 {
+		if _, err := s.AddEdge(&store.Edge{Src: ids[i-1], Dst: ids[i],
+			Labels: []store.EdgeType{store.EdgeTypeContains}}); err != nil {
+			t.Fatalf("AddEdge: %v", err)
+		}
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	// Delete from the low end so the next image has dead pages behind it and
+	// the surviving identifiers are the high ones — the rebuild shape.
+	for i := 0; i < 400; i++ {
+		if err := s.DeleteNode(ids[i]); err != nil {
+			t.Fatalf("DeleteNode: %v", err)
+		}
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			i := seed
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				id := ids[i%len(ids)]
+				i += 7
+				// Every answer is either the record or a clean miss; a torn read
+				// would be neither.
+				if n, err := s.GetNode(id); err == nil && n.ID != id {
+					t.Errorf("GetNode(%d) returned node %d", id, n.ID)
+					return
+				}
+				if _, err := s.DegreeOf(id, store.DirectionOutbound, nil); err != nil {
+					if _, notFound := err.(*store.ErrNotFound); !notFound {
+						t.Errorf("Degree(%d): %v", id, err)
+						return
+					}
+				}
+			}
+		}(r)
+	}
+
+	for c := 0; c < 3; c++ {
+		if err := s.Compact(); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("Compact: %v", err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
 
 // compactWithWrites compacts s while fn runs inside the build window.
 func compactWithWrites(t *testing.T, s *Store, fn func()) {

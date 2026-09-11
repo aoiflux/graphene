@@ -54,7 +54,10 @@ import (
   existing nodes. Multiple/parallel edges between the same pair are allowed.
 - **ID** — `NodeID` / `EdgeID` are `uint64`, assigned monotonically by the store
   and **never reused**. `0` is the invalid sentinel (`InvalidNodeID` /
-  `InvalidEdgeID`).
+  `InvalidEdgeID`). The usable space is capped at **2³² per kind**: an image
+  naming a higher identifier is refused at open, and because identifiers are
+  never reused that cap is on the store's lifetime rather than on its size.
+  `StorageStats` reports the headroom remaining.
 - **Label / type** — `NodeType` / `EdgeType` are `uint16`. Built-ins occupy the
   low range; `[32768, 65535]` is reserved for user-defined custom types.
 - **Property blob** — `[]byte`, opaque to the engine (typically msgpack/JSON).
@@ -1648,6 +1651,13 @@ and puts the meaning of every number in documentation nothing checks. Adding a
 | `snapshot-close` | nanoseconds held | — | — |
 | `backup` | files copied | — | bytes copied |
 | `refresh` | epochs advanced | — | log bytes applied |
+| `id-headroom-low` | highest ID issued | the ID ceiling | — |
+
+**id-headroom-low** is emitted by a completed compaction, at most once per kind
+per process, when the identifiers still unissued fall below
+`Options.IDHeadroomWarn` (default 0.10, negative disables). An audit entry of
+the same name is written beside it, naming the kind and the figures, because
+the question an operator asks later is when this first became true.
 
 `Count` on a **sync** is the number group commit exists to move: one fsync per
 commit means it is not working. `Examined` against `Count` on a **query** is the
@@ -1963,6 +1973,11 @@ Four things to know before setting either.
   in it, so it is *not* a whole-store figure, and on a never-compacted store it is
   zero while the true cost is at its highest. Resident memory ran 1.19–1.54× live
   heap on the one fixture measured, so read it as a floor.
+  It is also an upper bound in the other direction: records are stored in pages
+  of 4096 identifiers and the header cannot say how many pages an image touches,
+  so the model charges one page per record until the identifier space runs out
+  of pages to charge. A dense image costs far less than the figure; a maximally
+  sparse one costs exactly it.
 
 A refused `Open` is not a no-op on disk: the directory is created if missing, a
 stranded rebuilt log is adopted, and an empty log is given its container header.
@@ -2550,13 +2565,13 @@ call that is not.
 
 #### Point lookups are already optimal — don't build around them
 
-`GetNode` on the disk backend resolves through a direct array offset, so the
-*lookup* is free. What it is not is allocation-free: measured at the store level
+`GetNode` on the disk backend resolves through a page directory and an arena
+slot — two dependent loads, no hashing — so the *lookup* is free. What it is not is allocation-free: measured at the store level
 it is **~47 ns and one 64-byte allocation per call**, because the API hands back
 a `*store.Node` and building that pointer is the cost.
 
 > An earlier edition of this section quoted **~6 ns** here. That figure is the
-> array offset — `CSRGraph.GetNode`, which returns a record by value — and not
+> layout lookup — `CSRGraph.GetNode`, which returns a record by value — and not
 > what `Store.GetNode` costs. It was attributed to the wrong call, and the number
 > a caller actually gets is the one above. Re-measured on a Ryzen 9 5980HS;
 > ratios, not promises.
@@ -2597,7 +2612,8 @@ g.Degree(id, nil)                             // ~15 ns — reads CSR offsets
 g.Degree(id, []store.EdgeType{someType})      // ~7.4 µs — walks every incident edge
 ```
 
-**~488× apart**, because an unfiltered degree is `outOffset[n+1] - outOffset[n]`
+**~488× apart**, because an unfiltered degree is `outOffset[s+1] - outOffset[s]`
+for the node's arena slot
 — one subtraction, no records — while a type filter has to inspect each incident
 edge's labels. Both are far better than they were, but the gap is structural and
 will not close: filtering requires looking.

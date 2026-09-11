@@ -18,7 +18,7 @@ package disk
 // edge:
 //
 //	r.deltaEdge(eid)     a map probe, paid even when the delta is empty
-//	g.edges[eid]         a random access into an 80-byte-stride array
+//	g.edgeRecs[slot]     a random access into an 80-byte-stride arena
 //	rec.Labels           a pointer chase into a separately allocated slice
 //
 // The adjacency arrays hold EdgeID, so the far endpoint — the one field a hop
@@ -104,10 +104,14 @@ type denormCSR struct {
 // denormalise derives option B's arrays from a built CSR. sorted additionally
 // orders each span by the neighbour's ID, which is what makes an intersection a
 // merge instead of a hash build.
+// Since R10(b) the record arenas are paged and the offset arrays are indexed
+// by slot rather than by identifier. This spike's fixture numbers its records
+// densely from 1, so every page is materialised and slot equals identifier -
+// which is what lets the arrays below still be read the way they were written.
 func denormalise(g *CSRGraph, sorted bool) *denormCSR {
 	d := &denormCSR{
-		nodes:     g.nodes,
-		edges:     g.edges,
+		nodes:     g.nodeRecs,
+		edges:     g.edgeRecs,
 		outOffset: g.outOffset,
 		inOffset:  g.inOffset,
 		outEdges:  g.outEdges,
@@ -116,10 +120,12 @@ func denormalise(g *CSRGraph, sorted bool) *denormCSR {
 		inNbr:     make([]store.NodeID, len(g.inEdges)),
 	}
 	for i, eid := range d.outEdges {
-		d.outNbr[i] = g.edges[eid].Dst
+		e, _ := g.GetEdge(eid)
+		d.outNbr[i] = e.Dst
 	}
 	for i, eid := range d.inEdges {
-		d.inNbr[i] = g.edges[eid].Src
+		e, _ := g.GetEdge(eid)
+		d.inNbr[i] = e.Src
 	}
 	if sorted {
 		sortSpans(d.outOffset, d.outEdges, d.outNbr)
@@ -203,11 +209,11 @@ func buildSpikeFixture(n, m, blob int) ([]nodeRecord, []rawEdge) {
 // today: resolve the edge record, then read the far endpoint off it.
 func hopCurrent(g *CSRGraph, filter bool) uint64 {
 	var sum uint64
-	for id := 1; id+1 < len(g.outOffset); id++ {
-		lo, hi := g.outOffset[id], g.outOffset[id+1]
+	for slot := 1; slot+1 < len(g.outOffset); slot++ {
+		lo, hi := g.outOffset[slot], g.outOffset[slot+1]
 		for i := lo; i < hi; i++ {
 			eid := g.outEdges[i]
-			rec := g.edges[eid]
+			rec, _ := g.GetEdge(eid)
 			if filter && !rawEdgeMatchesFilter(spikeFilter, rec.Labels) {
 				continue
 			}
@@ -400,7 +406,10 @@ func TestV9SpikeFootprint(t *testing.T) {
 
 			func() {
 				nodes, edges := buildSpikeFixture(spikeNodes, spikeEdges, blob)
-				g := Build(nodes, edges)
+				g, err := Build(nodes, edges)
+				if err != nil {
+					t.Fatalf("build: %v", err)
+				}
 				nodes, edges = nil, nil
 
 				// Every arm retains the same *set* of structures: records,
@@ -420,17 +429,17 @@ func TestV9SpikeFootprint(t *testing.T) {
 
 				switch arm {
 				case "current":
-					img.nodes, img.edges = g.nodes, g.edges
+					img.nodes, img.edges = g.nodeRecs, g.edgeRecs
 				case "arena":
-					img.arena = packArena(g.nodes, g.edges)
+					img.arena = packArena(g.nodeRecs, g.edgeRecs)
 				case "denorm":
-					img.nodes, img.edges = g.nodes, g.edges
+					img.nodes, img.edges = g.nodeRecs, g.edgeRecs
 					d := denormalise(g, true)
 					img.outNbr, img.inNbr = d.outNbr, d.inNbr
 				case "arena+denorm":
 					d := denormalise(g, true)
 					img.outNbr, img.inNbr = d.outNbr, d.inNbr
-					img.arena = packArena(g.nodes, g.edges)
+					img.arena = packArena(g.nodeRecs, g.edgeRecs)
 				}
 
 				g = nil
@@ -460,7 +469,10 @@ func TestV9SpikeFootprint(t *testing.T) {
 // neighbour in the graph, with and without a label filter.
 func TestV9SpikeHops(t *testing.T) {
 	nodes, edges := buildSpikeFixture(spikeNodes, spikeEdges, 64)
-	g := Build(nodes, edges)
+	g, err := Build(nodes, edges)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
 	d := denormalise(g, false)
 
 	// Interleaved, alternating arms, minima reported — the same discipline the
@@ -492,8 +504,11 @@ func TestV9SpikeHops(t *testing.T) {
 func TestV9SpikeIntersection(t *testing.T) {
 	nodes, edges := buildSpikeFixture(spikeNodes, spikeEdges, 64)
 
-	buildPlain := timeIt(func() { sinkP = Build(nodes, edges) })
-	g := Build(nodes, edges)
+	buildPlain := timeIt(func() { sinkP, _ = Build(nodes, edges) })
+	g, err := Build(nodes, edges)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
 
 	unsorted := denormalise(g, false)
 	sortOnly := timeIt(func() {
@@ -508,7 +523,7 @@ func TestV9SpikeIntersection(t *testing.T) {
 		return func() {
 			n := 0
 			for i := 1; i <= pairs; i++ {
-				e := g.edges[store.EdgeID(i)]
+				e, _ := g.GetEdge(store.EdgeID(i))
 				n += fn(sorted, e.Src, e.Dst)
 			}
 			sinkI += n
