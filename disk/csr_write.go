@@ -138,6 +138,35 @@ func (iw *imageWriter) u64(v uint64) {
 	iw.bytes(iw.num[:8])
 }
 
+// from copies exactly n bytes out of r.
+//
+// It exists for the one region of the image that is not encoded in place: the
+// value tables of the mapped property index, which are generated while the runs
+// they address are being written and therefore arrive from a spill rather than
+// from a caller's slice. See csr_gpix.go.
+//
+// The copy reuses the writer's own buffer, so a region of any size costs no
+// allocation. A short read is an error rather than a shorter section: the spill
+// is a file this process wrote moments ago, and a section whose directory entry
+// promises more bytes than it holds is an image no reader can bound.
+func (iw *imageWriter) from(r io.Reader, n uint64) {
+	if iw.err != nil || n == 0 {
+		return
+	}
+	if !iw.drain() {
+		return
+	}
+	copied, err := io.CopyBuffer(iw.w, io.LimitReader(r, int64(n)), iw.buf[:cap(iw.buf)])
+	iw.buf = iw.buf[:0]
+	iw.n += uint64(copied)
+	switch {
+	case err != nil:
+		iw.err = err
+	case uint64(copied) != n:
+		iw.err = fmt.Errorf("serialise: copied %d of %d bytes", copied, n)
+	}
+}
+
 // drain empties the buffer, reporting whether the writer is still usable.
 func (iw *imageWriter) drain() bool {
 	if len(iw.buf) == 0 {
@@ -217,8 +246,20 @@ type csrPayload struct {
 	//
 	// Nil means the image carries no property index. It is written as a section
 	// holding two zero counts, which is exactly what an empty slice produced.
+	//
+	// Ignored when MappedIndex is set: the two are two encodings of the same
+	// entries, and writing both would put a second ~528 MiB copy in the image
+	// that no reader of either kind would read.
 	NodeProps iter.Seq[index.NodePropEntry]
 	EdgeProps iter.Seq[index.EdgePropEntry]
+
+	// MappedIndex asks for the property index as GPIX and GPIR -- searchable in
+	// place out of the image -- instead of GIDX, and stamps the image v9.
+	//
+	// Nil is the v8 arrangement and the default. Which one a store asks for is
+	// the store's decision and is resolved before it gets here: this struct is the
+	// payload, and choosing an index encoding is not a payload's business.
+	MappedIndex *gpixSource
 
 	// Keys declared ordered. Only the declarations travel — the entries are
 	// already in the property index section, and the ordered structure is
@@ -271,6 +312,22 @@ func (p csrPayload) withPropStreams() csrPayload {
 		p.EdgeProps = slices.Values([]index.EdgePropEntry(nil))
 	}
 	return p
+}
+
+// imageVersion is the container version this payload's sections require.
+//
+// What actually stops a v8 build from opening a v9 image is that GPIX and GPIR
+// are critical sections it does not understand -- and that is the correct outcome,
+// since it could not answer a property query from an index it cannot read. The
+// version is what makes the refusal legible: "written by a newer version" rather
+// than "unknown section". Everything else about the container is unchanged, so a
+// payload with no mapped index is written as v8 and opens in every build since
+// v8.
+func (p csrPayload) imageVersion() uint16 {
+	if p.MappedIndex != nil {
+		return csrVersionMappedIndex
+	}
+	return csrVersionSectioned
 }
 
 // SerialiseWithIndex writes the CSR plus the given property-index entries.
@@ -351,7 +408,7 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	// to them rather than rearranging, so a reader can identify a file and read
 	// its counts before it understands anything else. See csr_v8.go.
 	iw.str("GCSR")
-	iw.u16(csrVersionCurrent)
+	iw.u16(payload.imageVersion())
 	iw.u64(uint64(nodeCount))
 	iw.u64(uint64(edgeCount))
 	// Sequence high-water marks (version 5+).
@@ -416,45 +473,61 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	// grew a directory instead of another offset field.
 	var sections []csrSection
 
-	indexOffset := iw.at()
-	iw.str(csrIndexSectionMagic)
-	// Each half of the section is counted in a u64 that precedes it, and a
-	// streamed payload has no length to write there. So the counts go down as
-	// zeros and are patched after the flush -- which is what the header's
-	// sectionTableOffset has always done, for the same reason, and the digest
-	// pass reads the file back after both. The bytes that end up in the file are
-	// the bytes the counted form wrote.
+	// The property index, in whichever of its two encodings the payload asks
+	// for. Both go here, where GIDX has always gone: the sections that follow --
+	// the snapshot roots above all -- commit to the entries, so they must be
+	// written after them.
 	//
-	// The values are also owned by whoever yielded them: writePropEntry copies
-	// into the output buffer and addPropEntry hashes immediately, so nothing
-	// here outlives the iteration step. That is what lets the property index
-	// hand out its own bytes instead of a copy per entry.
-	nodePropsCountPos := int64(iw.at())
-	iw.u64(0)
+	// Positions of the two GIDX counts, patched after the flush. Negative means
+	// no GIDX was written, which is what a mapped index means.
+	nodePropsCountPos, edgePropsCountPos := int64(-1), int64(-1)
 	var nodePropCount, edgePropCount uint64
-	for e := range payload.NodeProps {
-		writePropEntry(iw, uint64(e.ID), e.Key, e.Value)
-		if roots != nil {
-			roots.addPropEntry(uint64(e.ID), e.Key, e.Value)
+
+	if src := payload.MappedIndex; src != nil {
+		var err error
+		if sections, err = writeMappedIndexSections(iw, sections, *src, roots); err != nil {
+			return err
 		}
-		nodePropCount++
-	}
-	edgePropsCountPos := int64(iw.at())
-	iw.u64(0)
-	for e := range payload.EdgeProps {
-		writePropEntry(iw, uint64(e.ID), e.Key, e.Value)
-		if roots != nil {
-			roots.addPropEntry(uint64(e.ID), e.Key, e.Value)
+	} else {
+		indexOffset := iw.at()
+		iw.str(csrIndexSectionMagic)
+		// Each half of the section is counted in a u64 that precedes it, and a
+		// streamed payload has no length to write there. So the counts go down as
+		// zeros and are patched after the flush -- which is what the header's
+		// sectionTableOffset has always done, for the same reason, and the digest
+		// pass reads the file back after both. The bytes that end up in the file
+		// are the bytes the counted form wrote.
+		//
+		// The values are also owned by whoever yielded them: writePropEntry
+		// copies into the output buffer and addPropEntry hashes immediately, so
+		// nothing here outlives the iteration step. That is what lets the
+		// property index hand out its own bytes instead of a copy per entry.
+		nodePropsCountPos = int64(iw.at())
+		iw.u64(0)
+		for e := range payload.NodeProps {
+			writePropEntry(iw, uint64(e.ID), e.Key, e.Value)
+			if roots != nil {
+				roots.addPropEntry(uint64(e.ID), e.Key, e.Value)
+			}
+			nodePropCount++
 		}
-		edgePropCount++
+		edgePropsCountPos = int64(iw.at())
+		iw.u64(0)
+		for e := range payload.EdgeProps {
+			writePropEntry(iw, uint64(e.ID), e.Key, e.Value)
+			if roots != nil {
+				roots.addPropEntry(uint64(e.ID), e.Key, e.Value)
+			}
+			edgePropCount++
+		}
+		sections = append(sections, csrSection{
+			// Optional: a reader that skips it answers every query correctly and
+			// only pays for re-registering entries from the WAL.
+			Magic:  csrSectionPropIndex,
+			Offset: indexOffset,
+			Length: iw.at() - indexOffset,
+		})
 	}
-	sections = append(sections, csrSection{
-		// Optional: a reader that skips it answers every query correctly and
-		// only pays for re-registering entries from the WAL.
-		Magic:  csrSectionPropIndex,
-		Offset: indexOffset,
-		Length: iw.at() - indexOffset,
-	})
 
 	if len(payload.OrderedNodeKeys) > 0 || len(payload.OrderedEdgeKeys) > 0 {
 		ordOffset := iw.at()
@@ -543,11 +616,13 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	patchU64 := func(off int64, v uint64) error {
 		return patchAt(dst, off, binary.LittleEndian.AppendUint64(nil, v))
 	}
-	if err := patchU64(nodePropsCountPos, nodePropCount); err != nil {
-		return err
-	}
-	if err := patchU64(edgePropsCountPos, edgePropCount); err != nil {
-		return err
+	if nodePropsCountPos >= 0 {
+		if err := patchU64(nodePropsCountPos, nodePropCount); err != nil {
+			return err
+		}
+		if err := patchU64(edgePropsCountPos, edgePropCount); err != nil {
+			return err
+		}
 	}
 	if err := patchU64(sectionTableOffsetPos, sectionTableOffset); err != nil {
 		return err

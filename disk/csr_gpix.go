@@ -32,12 +32,13 @@ package disk
 //	GPIX body
 //	  header      magic "GPIX" | bodyVersion u16 | flags u16 | nodeKeys u32 | edgeKeys u32
 //	  per key     node keys ascending, then edge keys ascending:
-//	    vtab      (distinct+1) × { prefix [8]byte | runOff u64 }
-//	              runOff is relative to this key's runsOff; entry [distinct] is a
-//	              sentinel whose runOff is runsLen, so every run's end is the
-//	              next entry's start with no special case for the last one.
 //	    runs      per distinct value ascending:
 //	              valLen u32 | value | idCount u32 | ids (idCount × u64)
+//	  vtabs       per key, in that same order:
+//	              (distinct+1) × { prefix [8]byte | runOff u64 }
+//	              runOff is relative to that key's runsOff; entry [distinct] is a
+//	              sentinel whose runOff is runsLen, so every run's end is the
+//	              next entry's start with no special case for the last one.
 //	  kdir        keyCount × gpixKeyDirSize, sorted by (kind, key)
 //	  key bytes   addressed by the kdir
 //	  footer      kdirOff u64
@@ -49,26 +50,38 @@ package disk
 // the section is already in the section directory and the last eight bytes of a
 // known-length section need no forward reference at all.
 //
-// # Why a key is walked twice rather than buffered once
+// # Why the value tables come after the runs, and travel through a file
 //
-// A key's vtab precedes its runs and is sized by the key's distinct count, and
-// each vtab entry holds the offset of a run that has not been written yet. Three
-// ways to resolve that: buffer the vtab (16 B × distinct — 448 MiB for one
-// 28M-entry all-distinct key, which is the problem restated), seek back and
-// patch it (the writer cannot), or compute the offsets without the bytes.
+// A vtab entry holds the offset of its run and imageWriter cannot seek, so
+// either every offset is known before the runs are written or the vtab is
+// written after them.
 //
-// The third is free. A run's length is 4 + len(value) + 4 + 8×len(ids), which is
-// known from the value and its posting list without writing anything. So pass
-// one walks the key summing run lengths and writes the vtab as it goes; pass two
-// walks it again and writes the runs. Two walks of one key, no buffer larger
-// than one value.
+// Knowing them in advance means walking each key twice: once summing run
+// lengths, once writing them. The source is the live property index, and a walk
+// of one key is atomic under that key's shard lock while two walks are not — a
+// writer registering an entry between them changes the key's value count, and
+// the second pass then writes a run the first pass did not size. A design that
+// cannot express that is a design that refuses the compaction whenever it
+// happens, which under the writer this program was measured against — one
+// rebuilding a derived layer of 1.5M entities — is most of them.
 //
-// This is why the source below is a per-key walker rather than the whole-index
-// iterator the payload uses. ForEachNodeValue already yields a key's distinct
+// So the runs go first and each key's vtab is built as they are written. It
+// cannot go into the image between one key's runs and the next, because it is not
+// finished until they are, and it cannot be held in memory: 16 bytes per distinct
+// value is 448 MiB for one 28M-entry all-distinct key, which is the allocation
+// this section exists to remove, reappearing in the code that writes it. It goes
+// into a spillBuffer instead — memory while it is small, a file when it is not —
+// and is copied into the image in one pass once every key's runs are down. See
+// spill.go.
+//
+// Nothing in the reader depends on the order. kdir carries vtabOff and runsOff
+// independently and bounds each against the body on its own, which is what makes
+// this the writer's arrangement rather than part of the format.
+//
+// The source is still a per-key walker rather than the whole-index iterator the
+// GIDX payload uses, because ForEachNodeValue already yields a key's distinct
 // values ascending with each value's ascending ids, holding the index's own
-// memory — so both passes are free of copies as well as of buffers, and the
-// repeatability the second pass needs is the repeatability a frozen index has by
-// construction.
+// memory: one walk, no copy per value and no buffer larger than one run.
 //
 // # The 8-byte prefix, and what it is for
 //
@@ -168,14 +181,62 @@ type gpixKeyDir struct {
 	RunsLen  uint64
 }
 
-// gpixValueWalker yields every distinct value of one key in ascending order
-// together with that value's ascending ids. It must be repeatable: the encoder
-// drives it twice per key and requires the same values in the same order both
-// times. A frozen index satisfies that by construction, which is why freeze
-// happens at the pin and not here.
+// gpixValueWalker yields every distinct value of one key together with that
+// value's ids. It is called once per key.
+//
+// Both orders are load-bearing and neither is checked here: values must ascend
+// by bytes.Compare, which is the order the vtab is binary-searched in and the
+// order §15.8 fixes for the index as a whole, and a value's ids must ascend,
+// which is what lets a merged read walk a run and a delta's postings together.
+// A source that breaks either produces a file whose reads are bounded and wrong,
+// and naming that is the O(entries) pass VerifyIndexes pays.
 //
 // The ids are the walker's own memory and are neither retained nor mutated.
 type gpixValueWalker func(key string, fn func(value []byte, ids []uint64) bool) error
+
+// gpixVtabMemCap is how much of the value-table intermediate is held in memory
+// before it spills to a file: one megabyte, 65,536 values. A store below that
+// writes its index with no temporary file at all.
+//
+// Deliberately small. It could be far larger without spilling on any realistic
+// store, and that would be the wrong trade for this program: memory is the
+// constrained resource and sequential disk is not, so the cap is set where it
+// bounds the transient rather than where it avoids the file. Raising it buys back
+// some IO and costs exactly what this whole section of the program is spending
+// down. See spill.go.
+const gpixVtabMemCap = 1 << 20
+
+// gpixSource is everything the two mapped-index sections are written from.
+type gpixSource struct {
+	// NodeKeys and EdgeKeys must each be ascending and free of duplicates: the
+	// kdir is binary-searched by (kind, key) at read time and the encoder does
+	// not sort what it is given. The caller has them in that order already — the
+	// index yields its key list sorted, for the determinism reason
+	// ForEachNodeProperty documents.
+	NodeKeys, EdgeKeys []string
+
+	// NodeValues and EdgeValues walk one key's values. Nil means no key of that
+	// kind yields anything, which is not the same as no section: an image with no
+	// node properties still carries GPIX and GPIR holding zero keys, because
+	// "this image indexes no node under any key" is a fact a reader must be able
+	// to read rather than infer from an absence.
+	NodeValues, EdgeValues gpixValueWalker
+
+	// ScratchDir is where the intermediates spill. Empty means the operating
+	// system's temporary directory; compaction names the store's own directory,
+	// so a spill lands on the filesystem whose free space an operator sized for
+	// the image beside it.
+	ScratchDir string
+
+	// vtabMemCap and revChunk override the two thresholds that decide whether an
+	// intermediate is held in memory or spilled. Zero takes the defaults.
+	//
+	// They exist because the spilled and merged paths are the ones the store
+	// this program is aimed at takes, and a threshold only a multi-gigabyte
+	// fixture crosses is a threshold nothing tests.
+	vtabMemCap int
+	revChunk   int
+}
 
 // writeGPIX writes the GPIX body and returns the kdir it wrote, which the caller
 // needs in order to build GPIR against the same key ids.
@@ -184,22 +245,44 @@ type gpixValueWalker func(key string, fn func(value []byte, ids []uint64) bool) 
 // is binary-searched by (kind, key) at read time and the encoder does not sort
 // what it is given. The caller has them in that order already — the index yields
 // its key list sorted, for the determinism reason ForEachNodeProperty documents.
-func writeGPIX(iw *imageWriter, base uint64, nodeKeys, edgeKeys []string,
-	nodeWalk, edgeWalk gpixValueWalker) ([]gpixKeyDir, error) {
+func writeGPIX(iw *imageWriter, base uint64, src gpixSource,
+	nodeRev, edgeRev *gpirSorter, roots *snapshotRootStream) ([]gpixKeyDir, error) {
 
 	iw.str(csrSectionMappedIndex)
 	iw.u16(gpixBodyVersion)
 	iw.u16(0)
-	iw.u32(uint32(len(nodeKeys)))
-	iw.u32(uint32(len(edgeKeys)))
+	iw.u32(uint32(len(src.NodeKeys)))
+	iw.u32(uint32(len(src.EdgeKeys)))
 
-	dirs := make([]gpixKeyDir, 0, len(nodeKeys)+len(edgeKeys))
+	memCap := src.vtabMemCap
+	if memCap <= 0 {
+		memCap = gpixVtabMemCap
+	}
+	vtab := newSpill(src.ScratchDir, memCap)
+	defer vtab.close()
+
+	dirs := make([]gpixKeyDir, 0, len(src.NodeKeys)+len(src.EdgeKeys))
 	var err error
-	if dirs, err = writeGPIXKind(iw, base, dirs, gpixKindNode, nodeKeys, nodeWalk); err != nil {
+	if dirs, err = writeGPIXKind(iw, base, dirs, vtab, gpixKindNode,
+		src.NodeKeys, src.NodeValues, nodeRev, roots); err != nil {
 		return nil, err
 	}
-	if dirs, err = writeGPIXKind(iw, base, dirs, gpixKindEdge, edgeKeys, edgeWalk); err != nil {
+	if dirs, err = writeGPIXKind(iw, base, dirs, vtab, gpixKindEdge,
+		src.EdgeKeys, src.EdgeValues, edgeRev, roots); err != nil {
 		return nil, err
+	}
+
+	// The value tables, in key order, copied out of the spill in one pass. Each
+	// key's VtabOff has held its offset within the spill up to this point; it
+	// becomes an offset within the section now that the region's start is known.
+	vtabRegion := iw.at() - base
+	r, err := vtab.reader()
+	if err != nil {
+		return nil, err
+	}
+	iw.from(r, vtab.len())
+	for i := range dirs {
+		dirs[i].VtabOff += vtabRegion
 	}
 
 	// The kdir, then the key bytes it addresses. Key bytes trail the directory so
@@ -238,29 +321,54 @@ func writeGPIX(iw *imageWriter, base uint64, nodeKeys, edgeKeys []string,
 // Both kinds go through one function because an id is eight bytes on the wire
 // whichever it is; the kind is in the directory entry rather than in the code
 // path.
-func writeGPIXKind(iw *imageWriter, base uint64, dirs []gpixKeyDir, kind uint8,
-	keys []string, walk gpixValueWalker) ([]gpixKeyDir, error) {
+func writeGPIXKind(iw *imageWriter, base uint64, dirs []gpixKeyDir, vtab *spillBuffer,
+	kind uint8, keys []string, walk gpixValueWalker, rev *gpirSorter,
+	roots *snapshotRootStream) ([]gpixKeyDir, error) {
 
+	if walk == nil {
+		walk = emptyValueWalk
+	}
+	// One scratch entry for every key of this kind rather than one per value. It
+	// escapes — spillBuffer.write can hand a slice straight to an os.File, so
+	// anything passed to it does — and an escaping array declared inside the walk
+	// is a heap allocation per distinct value, which is precisely the
+	// cost-proportional-to-the-index this section exists to remove.
+	// TestGPIX_WriteAllocationIsFlatInEntries caught it; iw.num is the same trick
+	// for the same reason.
+	var ent [gpixVtabEntry]byte
 	for _, key := range keys {
 		d := gpixKeyDir{Key: key, Kind: kind, KeyID: uint16(len(dirs))}
-
-		// Pass one: the value table. Each entry's offset is the running sum of
-		// the run lengths before it, so the runs need not exist yet — see the
-		// two-walk discussion above.
-		d.VtabOff = iw.at() - base
+		d.VtabOff = vtab.len() // spill-relative until writeGPIX places the region
+		d.RunsOff = iw.at() - base
 		var runAt, distinct, entries uint64
-		// One scratch entry for the whole key rather than one per value. It
-		// escapes — imageWriter.bytes can hand a large slice straight to the
-		// io.Writer, so anything passed to it does — and an escaping array
-		// declared inside the walk is a heap allocation per distinct value, which
-		// is precisely the cost-proportional-to-the-index this section exists to
-		// remove. TestGPIX_WriteAllocationIsFlatInEntries caught it; iw.num is
-		// the same trick for the same reason.
-		var ent [gpixVtabEntry]byte
 		if err := walk(key, func(value []byte, ids []uint64) bool {
+			// A value no entity holds is not in the index and is not written. The
+			// merged walk a compaction reads from skips a value whose every id has
+			// been retracted, so writing one would put in the image something the
+			// index cannot produce — and the next compaction of the same content
+			// would not write it, which is a difference in bytes the digest
+			// covers.
+			if len(ids) == 0 {
+				return true
+			}
 			binary.BigEndian.PutUint64(ent[0:8], gpixPrefixOf(value))
 			binary.LittleEndian.PutUint64(ent[8:16], runAt)
-			iw.bytes(ent[:])
+			vtab.write(ent[:])
+
+			iw.u32(uint32(len(value)))
+			iw.bytes(value)
+			iw.u32(uint32(len(ids)))
+			// A reverse entry addresses the value bytes inside this key's runs
+			// region, which start four bytes past the run's own start.
+			valueOff := runAt + 4
+			for _, id := range ids {
+				iw.u64(id)
+				rev.add(gpirEntry{ID: id, KeyID: d.KeyID,
+					ValLen: uint32(len(value)), ValueOff: valueOff})
+				if roots != nil {
+					roots.addPropEntry(id, key, value)
+				}
+			}
 			runAt += 8 + uint64(len(value)) + 8*uint64(len(ids))
 			distinct++
 			entries += uint64(len(ids))
@@ -273,42 +381,85 @@ func writeGPIXKind(iw *imageWriter, base uint64, dirs []gpixKeyDir, kind uint8,
 		// makes every run's extent the difference of two adjacent entries.
 		binary.BigEndian.PutUint64(ent[0:8], ^uint64(0))
 		binary.LittleEndian.PutUint64(ent[8:16], runAt)
-		iw.bytes(ent[:])
+		vtab.write(ent[:])
 
-		// Pass two: the runs themselves.
-		d.RunsOff = iw.at() - base
-		var wrote uint64
-		if err := walk(key, func(value []byte, ids []uint64) bool {
-			iw.u32(uint32(len(value)))
-			iw.bytes(value)
-			iw.u32(uint32(len(ids)))
-			for _, id := range ids {
-				iw.u64(uint64(id))
-			}
-			wrote++
-			return true
-		}); err != nil {
-			return nil, fmt.Errorf("gpix: write %q runs: %w", key, err)
-		}
 		d.RunsLen = iw.at() - base - d.RunsOff
 		d.Distinct = distinct
 		d.Entries = entries
 
-		// The two passes disagreeing is a bug in the walker, not a corrupt file,
-		// and it would otherwise surface as a reader following an offset into the
-		// middle of a different run. Catching it here costs one comparison per
-		// key and turns a silent wrong answer into a refused compaction.
-		if wrote != distinct {
-			return nil, fmt.Errorf("gpix: key %q yielded %d values then %d: the source is not repeatable",
-				key, distinct, wrote)
-		}
+		// runAt is what the value table's offsets add up to and RunsLen is what
+		// was written. They can only disagree if the two arithmetics have
+		// drifted, which would leave a reader following an offset into the middle
+		// of a different run, so it is worth one comparison per key to turn that
+		// into a refused compaction rather than a wrong answer.
 		if d.RunsLen != runAt {
-			return nil, fmt.Errorf("gpix: key %q runs are %d bytes, value table sized them at %d",
+			return nil, fmt.Errorf("gpix: key %q runs are %d bytes, the value table sized them at %d",
 				key, d.RunsLen, runAt)
 		}
 		dirs = append(dirs, d)
 	}
 	return dirs, nil
+}
+
+// emptyValueWalk stands in for an absent walker.
+func emptyValueWalk(string, func([]byte, []uint64) bool) error { return nil }
+
+// writeMappedIndexSections writes GPIX and GPIR, appending a directory entry for
+// each.
+//
+// The two are written together and in this order because GPIR's entries address
+// value bytes inside GPIX's runs: the offsets only exist once the runs have been
+// written, which is why the reverse entries are generated by the forward pass and
+// ordered afterwards. See gpir_sort.go.
+//
+// Both sorters are released on every path. They hold a spill file once the index
+// is larger than a chunk, and a compaction that fails is exactly the case where
+// leaving one behind matters -- the most likely reason a compaction fails is a
+// full disk.
+func writeMappedIndexSections(iw *imageWriter, sections []csrSection, src gpixSource,
+	roots *snapshotRootStream) ([]csrSection, error) {
+
+	nodeRev := newGPIRSorter(src.ScratchDir, src.revChunk)
+	defer nodeRev.close()
+	edgeRev := newGPIRSorter(src.ScratchDir, src.revChunk)
+	defer edgeRev.close()
+
+	gpixOff := iw.at()
+	if _, err := writeGPIX(iw, gpixOff, src, nodeRev, edgeRev, roots); err != nil {
+		return nil, err
+	}
+	sections = append(sections, csrSection{
+		// CRITICAL, unlike GIDX. A v9 image carries no GIDX to fall back to, so a
+		// reader that skipped this would answer every property query with no
+		// matches -- a wrong answer rather than a slow one.
+		Magic:  csrSectionMappedIndex,
+		Flags:  csrSectionCritial,
+		Offset: gpixOff,
+		Length: iw.at() - gpixOff,
+	})
+
+	gpirOff := iw.at()
+	writeGPIRHeader(iw, nodeRev.count(), edgeRev.count())
+	if err := nodeRev.emit(func(e gpirEntry) { writeGPIREntry(iw, e) }); err != nil {
+		return nil, err
+	}
+	if err := edgeRev.emit(func(e gpirEntry) { writeGPIREntry(iw, e) }); err != nil {
+		return nil, err
+	}
+	sections = append(sections, csrSection{
+		// CRITICAL for GPIX's reason and for one of its own: nothing else can say
+		// what an entity is indexed under, so a reader without it could not purge
+		// an entity's entries and would leave the forward direction naming
+		// something that is gone.
+		Magic:  csrSectionMappedReverse,
+		Flags:  csrSectionCritial,
+		Offset: gpirOff,
+		Length: iw.at() - gpirOff,
+	})
+	if iw.err != nil {
+		return nil, iw.err
+	}
+	return sections, nil
 }
 
 // --- reading ---

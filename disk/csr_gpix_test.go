@@ -53,7 +53,7 @@ func (f *gpixFixture) keys(kind uint8) []string {
 }
 
 // walker yields one key's distinct values ascending with ascending ids, which is
-// the contract writeGPIX requires of a frozen index.
+// the order writeGPIX requires of its source.
 func (f *gpixFixture) walker(kind uint8) gpixValueWalker {
 	m := f.nodes
 	if kind == gpixKindEdge {
@@ -77,19 +77,69 @@ func (f *gpixFixture) walker(kind uint8) gpixValueWalker {
 	}
 }
 
+// source returns the fixture as a gpixSource.
+//
+// The two thresholds are arguments because whether the value table and the
+// reverse index are held in memory or spilled is the difference between the path
+// a test-sized store takes and the path the store this program is aimed at takes.
+// Zero means the production defaults, which nothing here is large enough to
+// cross; the tests that care pass small ones.
+func (f *gpixFixture) source(dir string, vtabCap, revChunk int) gpixSource {
+	return gpixSource{
+		NodeKeys:   f.keys(gpixKindNode),
+		EdgeKeys:   f.keys(gpixKindEdge),
+		NodeValues: f.walker(gpixKindNode),
+		EdgeValues: f.walker(gpixKindEdge),
+		ScratchDir: dir,
+		vtabMemCap: vtabCap,
+		revChunk:   revChunk,
+	}
+}
+
+// encodeGPIXFrom writes one source's GPIX body and discards its reverse entries.
+func encodeGPIXFrom(src gpixSource) ([]byte, error) {
+	body, _, _, err := encodeMappedIndexFrom(src)
+	return body, err
+}
+
+// encodeMappedIndexFrom writes both bodies, which is what a v9 image carries and
+// what the reverse direction has to be judged against: a GPIR entry is only
+// meaningful beside the GPIX runs its offsets address.
+func encodeMappedIndexFrom(src gpixSource) (gpix, gpir []byte, dirs []gpixKeyDir, err error) {
+	var fwd, rev bytes.Buffer
+	iw := newImageWriter(&fwd, make([]byte, 0, 4096))
+	nodeRev := newGPIRSorter(src.ScratchDir, src.revChunk)
+	defer nodeRev.close()
+	edgeRev := newGPIRSorter(src.ScratchDir, src.revChunk)
+	defer edgeRev.close()
+	if dirs, err = writeGPIX(iw, 0, src, nodeRev, edgeRev, nil); err != nil {
+		return nil, nil, nil, err
+	}
+	if err = iw.flush(); err != nil {
+		return nil, nil, nil, err
+	}
+	rw := newImageWriter(&rev, make([]byte, 0, 4096))
+	writeGPIRHeader(rw, nodeRev.count(), edgeRev.count())
+	if err = nodeRev.emit(func(e gpirEntry) { writeGPIREntry(rw, e) }); err != nil {
+		return nil, nil, nil, err
+	}
+	if err = edgeRev.emit(func(e gpirEntry) { writeGPIREntry(rw, e) }); err != nil {
+		return nil, nil, nil, err
+	}
+	if err = rw.flush(); err != nil {
+		return nil, nil, nil, err
+	}
+	return fwd.Bytes(), rev.Bytes(), dirs, nil
+}
+
 // encode writes the fixture as a GPIX body.
 func (f *gpixFixture) encode(t *testing.T) []byte {
 	t.Helper()
-	var buf bytes.Buffer
-	iw := newImageWriter(&buf, make([]byte, 0, 4096))
-	if _, err := writeGPIX(iw, 0, f.keys(gpixKindNode), f.keys(gpixKindEdge),
-		f.walker(gpixKindNode), f.walker(gpixKindEdge)); err != nil {
+	body, err := encodeGPIXFrom(f.source(t.TempDir(), 0, 0))
+	if err != nil {
 		t.Fatalf("writeGPIX: %v", err)
 	}
-	if err := iw.flush(); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-	return buf.Bytes()
+	return body
 }
 
 // --- round trip ---
@@ -370,71 +420,153 @@ func TestGPIX_ByteDeterministic(t *testing.T) {
 	}
 }
 
-// TestGPIX_RefusesNonRepeatableSource guards the two-walk design directly. A
-// source that yields different values on the second walk would otherwise write a
-// value table addressing runs that are not there, which a reader would follow
-// into the middle of a different run — a wrong answer, not a detected fault. The
-// encoder must refuse instead.
-func TestGPIX_RefusesNonRepeatableSource(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		walk gpixValueWalker
-	}{
-		{"fewer values on the second pass", nonRepeatable(2, 1)},
-		{"more values on the second pass", nonRepeatable(1, 2)},
-		{"same count, longer values", func() gpixValueWalker {
-			pass := 0
-			return func(_ string, fn func([]byte, []uint64) bool) error {
-				pass++
-				if pass == 1 {
-					fn([]byte("a"), []uint64{1})
-					return nil
-				}
-				fn([]byte("aaaaaaaa"), []uint64{1})
-				return nil
-			}
-		}()},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			iw := newImageWriter(&buf, make([]byte, 0, 4096))
-			_, err := writeGPIX(iw, 0, []string{"k"}, nil, tc.walk, emptyWalker)
-			if err == nil {
-				t.Fatal("writeGPIX accepted a source that changed between passes")
-			}
-		})
+// A source is walked once per key now, so there is no second pass to disagree
+// with the first. What is left to check is that a source or a destination which
+// fails mid-section fails the section, and that where the intermediates are held
+// makes no difference to the bytes.
+
+// TestGPIX_RefusesAWriterThatRunsOut checks that a destination failing part way
+// through a section is reported rather than producing a short one.
+//
+// The likeliest reason a compaction fails is a full disk, and the value table now
+// travels through a second file, so there are two places for that to happen
+// instead of one. A section that ends early is worse than a compaction that
+// fails: the directory entry still claims the bytes, so a reader bounds a region
+// that is not there.
+func TestGPIX_RefusesAWriterThatRunsOut(t *testing.T) {
+	f := newGPIXFixture()
+	for i := 0; i < 64; i++ {
+		f.add(gpixKindNode, "digest", fmt.Sprintf("v%04d", i), uint64(i))
+	}
+	src := f.source(t.TempDir(), 0, 0)
+	rev := newGPIRSorter(src.ScratchDir, 0)
+	defer rev.close()
+	iw := newImageWriter(&shortWriter{limit: 24}, make([]byte, 0, 8))
+	_, err := writeGPIX(iw, 0, src, rev, rev, nil)
+	if err == nil {
+		err = iw.flush()
+	}
+	if err == nil {
+		t.Fatal("writeGPIX reported success over a writer that refused the bytes")
 	}
 }
 
-func nonRepeatable(first, second int) gpixValueWalker {
-	pass := 0
-	return func(_ string, fn func([]byte, []uint64) bool) error {
-		pass++
-		n := first
-		if pass > 1 {
-			n = second
-		}
-		for i := 0; i < n; i++ {
-			if !fn([]byte(fmt.Sprintf("v%d", i)), []uint64{uint64(i)}) {
-				return nil
-			}
-		}
-		return nil
-	}
+// shortWriter accepts limit bytes and then fails, which is the shape of a full
+// disk.
+type shortWriter struct {
+	limit int
+	n     int
 }
 
-func emptyWalker(string, func([]byte, []uint64) bool) error { return nil }
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if w.n+len(p) > w.limit {
+		w.n = w.limit
+		return 0, fmt.Errorf("no space left on device")
+	}
+	w.n += len(p)
+	return len(p), nil
+}
 
 // TestGPIX_PropagatesWalkerError checks that a source failing mid-walk fails the
 // section rather than writing a short one.
 func TestGPIX_PropagatesWalkerError(t *testing.T) {
 	boom := fmt.Errorf("index unavailable")
-	var buf bytes.Buffer
-	iw := newImageWriter(&buf, make([]byte, 0, 4096))
-	_, err := writeGPIX(iw, 0, []string{"k"}, nil,
-		func(string, func([]byte, []uint64) bool) error { return boom }, emptyWalker)
+	_, err := encodeGPIXFrom(gpixSource{
+		NodeKeys:   []string{"k"},
+		NodeValues: func(string, func([]byte, []uint64) bool) error { return boom },
+		ScratchDir: t.TempDir(),
+	})
 	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("index unavailable")) {
 		t.Fatalf("err = %v, want the walker's error", err)
+	}
+}
+
+// TestMappedIndex_SpillingChangesNothingButWhereBytesWereHeld encodes one fixture
+// with both intermediates in memory and again with both on disk, and asserts the
+// two images are identical.
+//
+// This is the test that makes the spill safe to default to. The disk path is the
+// one the store this program is aimed at takes and the memory path is the one
+// every other test in this package takes, so without this the two halves of the
+// encoder are each covered by a suite the other never runs. And "it also works"
+// is not the claim: the claim is that it produces the same bytes, because the
+// image's digest covers them and two compactions of one content must agree.
+func TestMappedIndex_SpillingChangesNothingButWhereBytesWereHeld(t *testing.T) {
+	f := newGPIXFixture()
+	for i := 0; i < 200; i++ {
+		f.add(gpixKindNode, "digest", fmt.Sprintf("v%06d", i), uint64(i+1))
+		f.add(gpixKindNode, "bucket", fmt.Sprintf("b%02d", i%7), uint64(i+1))
+		f.add(gpixKindEdge, "rel", fmt.Sprintf("r%03d", i%40), uint64(i+1))
+	}
+	held, revHeld, _, err := encodeMappedIndexFrom(f.source(t.TempDir(), 1<<20, 1<<20))
+	if err != nil {
+		t.Fatalf("in memory: %v", err)
+	}
+	// Sixteen bytes is one value-table entry and three entries is a fraction of
+	// one key, so both intermediates spill many times over.
+	spilled, revSpilled, _, err := encodeMappedIndexFrom(f.source(t.TempDir(), 16, 3))
+	if err != nil {
+		t.Fatalf("spilled: %v", err)
+	}
+	if !bytes.Equal(held, spilled) {
+		t.Fatalf("GPIX differs: %d bytes held, %d spilled", len(held), len(spilled))
+	}
+	if !bytes.Equal(revHeld, revSpilled) {
+		t.Fatalf("GPIR differs: %d bytes held, %d spilled", len(revHeld), len(revSpilled))
+	}
+}
+
+// TestMappedIndex_ReverseMatchesTheObviousDerivation asserts that the external
+// sort produces exactly the reverse section a reader would get by deriving it in
+// memory from the forward one.
+//
+// The forward section is the authority: every valueOff in the derivation is read
+// out of the value table the encoder wrote, so this compares the streaming sort
+// against an independent statement of the same answer rather than against itself.
+// Swept over both thresholds, because in-memory and merged are two different
+// algorithms and only one of them is a sort of the whole set at once.
+func TestMappedIndex_ReverseMatchesTheObviousDerivation(t *testing.T) {
+	f := newGPIXFixture()
+	for i := 1; i <= 300; i++ {
+		id := uint64(i)
+		f.add(gpixKindNode, "digest", fmt.Sprintf("d%08d", i), id)
+		f.add(gpixKindNode, "bucket", fmt.Sprintf("b%d", i%5), id)
+		if i%3 == 0 {
+			f.add(gpixKindNode, "url", fmt.Sprintf("https://example.test/%d", i%11), id)
+		}
+		f.add(gpixKindEdge, "rel", fmt.Sprintf("r%d", i%7), id)
+	}
+	for _, tc := range []struct {
+		name            string
+		vtabCap, revLen int
+	}{
+		{"sorted in memory", 1 << 20, 1 << 20},
+		{"merged from many runs", 16, 7},
+		{"merged from two runs", 1 << 20, 900},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fwdBody, revBody, _, err := encodeMappedIndexFrom(f.source(t.TempDir(), tc.vtabCap, tc.revLen))
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			sec, err := parseGPIX(fwdBody)
+			if err != nil {
+				t.Fatalf("parseGPIX: %v", err)
+			}
+			if want := buildGPIRFor(t, sec); !bytes.Equal(revBody, want) {
+				t.Fatalf("GPIR is %d bytes, the derivation is %d; the sort disagrees with the section",
+					len(revBody), len(want))
+			}
+			// Parsed as well as compared: equal bytes that neither reader accepts
+			// would pass the comparison above and fail every query.
+			rev, err := parseGPIR(revBody)
+			if err != nil {
+				t.Fatalf("parseGPIR: %v", err)
+			}
+			if _, err := newGPIXBase(sec, rev); err != nil {
+				t.Fatalf("newGPIXBase: %v", err)
+			}
+		})
 	}
 }
 
@@ -904,12 +1036,8 @@ func drainGPIXFuzz(sec *gpixSection) {
 }
 
 func seedGPIX(f *gpixFixture) []byte {
-	var buf bytes.Buffer
-	iw := newImageWriter(&buf, make([]byte, 0, 4096))
-	_, _ = writeGPIX(iw, 0, f.keys(gpixKindNode), f.keys(gpixKindEdge),
-		f.walker(gpixKindNode), f.walker(gpixKindEdge))
-	_ = iw.flush()
-	return buf.Bytes()
+	body, _ := encodeGPIXFrom(f.source("", 0, 0))
+	return body
 }
 
 func newGPIXSeedEmpty() []byte { return seedGPIX(newGPIXFixture()) }
@@ -1008,37 +1136,72 @@ func (s *flatGPIXSource) walk(_ string, fn func([]byte, []uint64) bool) error {
 // A slope and not a ceiling, which is the lesson TestAllocGuards_Paths records —
 // a ceiling passes until the fixture grows and then says nothing about why. Ten
 // times the entries through the same encoder must not cost ten times the memory:
-// if it does, someone has reintroduced the buffer the two-walk design removed,
-// and the compaction transient docs/MEMORY_MODEL.md §4 decomposes grows with the
-// index again.
+// if it does, someone has reintroduced the intermediate the spill removed, and
+// the compaction transient docs/MEMORY_MODEL.md §4 decomposes grows with the index
+// again.
+//
+// Both thresholds are swept, because the encoder has two arrangements and the
+// claim is about both: below the caps the intermediates are in memory and their
+// allocation is the caps rather than the index, and above them they are files and
+// the allocation is the caps plus the merge's read budget. Neither is a function
+// of the entries, and neither grows when the entries do.
+//
+// It is also what caught the caps being grown into rather than allocated. Sixteen
+// and twenty-four byte appends into a one-megabyte buffer cost about five
+// megabytes on the way up, which made the encoder's allocation proportional to the
+// index right up to the cap — bounded, and not what the cap is for.
 func TestGPIX_WriteAllocationIsFlatInEntries(t *testing.T) {
-	measure := func(distinct int) uint64 {
-		src := newFlatGPIXSource(distinct, 4)
-		var before, after runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-		iw := newImageWriter(io.Discard, make([]byte, 0, 4096))
-		if _, err := writeGPIX(iw, 0, []string{"k"}, nil, src.walk, emptyWalker); err != nil {
-			t.Fatalf("writeGPIX: %v", err)
-		}
-		if err := iw.flush(); err != nil {
-			t.Fatalf("flush: %v", err)
-		}
-		runtime.ReadMemStats(&after)
-		return after.TotalAlloc - before.TotalAlloc
-	}
+	for _, tc := range []struct {
+		name            string
+		vtabCap, revLen int
+	}{
+		{"intermediates in memory", 0, 0},
+		{"intermediates spilled", 512, 64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			measure := func(distinct int) uint64 {
+				src := newFlatGPIXSource(distinct, 4)
+				var before, after runtime.MemStats
+				runtime.GC()
+				runtime.ReadMemStats(&before)
+				iw := newImageWriter(io.Discard, make([]byte, 0, 4096))
+				rev := newGPIRSorter(dir, tc.revLen)
+				defer rev.close()
+				gsrc := gpixSource{NodeKeys: []string{"k"}, NodeValues: src.walk,
+					ScratchDir: dir, vtabMemCap: tc.vtabCap, revChunk: tc.revLen}
+				if _, err := writeGPIX(iw, 0, gsrc, rev, rev, nil); err != nil {
+					t.Fatalf("writeGPIX: %v", err)
+				}
+				if err := iw.flush(); err != nil {
+					t.Fatalf("flush: %v", err)
+				}
+				if err := rev.emit(func(gpirEntry) {}); err != nil {
+					t.Fatalf("emit: %v", err)
+				}
+				runtime.ReadMemStats(&after)
+				return after.TotalAlloc - before.TotalAlloc
+			}
 
-	small := measure(2_000)
-	large := measure(20_000)
-	if large > 2*small+4096 {
-		t.Fatalf("writing 10x the entries allocated %d bytes against %d for the base size: "+
-			"the encoder is holding the index, not streaming it", large, small)
+			small := measure(2_000)
+			large := measure(20_000)
+			if large > 2*small+64<<10 {
+				t.Fatalf("writing 10x the entries allocated %d bytes against %d for the base "+
+					"size: the encoder is holding the index, not streaming it", large, small)
+			}
+			t.Logf("gpix write allocation: 2k values %d B, 20k values %d B", small, large)
+		})
 	}
-	t.Logf("gpix write allocation: 2k values %d B, 20k values %d B", small, large)
 }
 
-// BenchmarkGPIXWrite reports the per-entry cost of writing the section, which is
+// BenchmarkGPIXWrite reports the per-entry cost of writing both sections, which is
 // the figure the compaction arm of R3 is judged against.
+//
+// Both sections, and including the reverse index's sort and emit: the forward half
+// alone is not what a compaction pays, and the sort is the part whose cost is not
+// obvious. The thresholds are left at their defaults, so what this measures is the
+// arrangement a real store gets — the intermediates held in memory until they
+// exceed a cap and spilled after.
 func BenchmarkGPIXWrite(b *testing.B) {
 	for _, shape := range []struct {
 		name             string
@@ -1049,19 +1212,101 @@ func BenchmarkGPIXWrite(b *testing.B) {
 	} {
 		b.Run(shape.name, func(b *testing.B) {
 			src := newFlatGPIXSource(shape.distinct, shape.idsPer)
+			dir := b.TempDir()
 			entries := shape.distinct * shape.idsPer
+			gsrc := gpixSource{NodeKeys: []string{"k"}, NodeValues: src.walk, ScratchDir: dir}
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				iw := newImageWriter(io.Discard, make([]byte, 0, 64<<10))
-				if _, err := writeGPIX(iw, 0, []string{"k"}, nil, src.walk, emptyWalker); err != nil {
+				rev := newGPIRSorter(dir, 0)
+				if _, err := writeGPIX(iw, 0, gsrc, rev, nil, nil); err != nil {
+					b.Fatal(err)
+				}
+				writeGPIRHeader(iw, rev.count(), 0)
+				if err := rev.emit(func(e gpirEntry) { writeGPIREntry(iw, e) }); err != nil {
 					b.Fatal(err)
 				}
 				if err := iw.flush(); err != nil {
 					b.Fatal(err)
 				}
+				rev.close()
 			}
 			b.ReportMetric(float64(entries), "entries/op")
 		})
+	}
+}
+
+// TestGPIX_SkipsAValueNothingHolds asserts that a value with an empty id list is
+// left out of the section entirely.
+//
+// A merged walk under a base never yields one — a value whose every id has been
+// retracted is dropped there — but the writer must not lean on that. The section's
+// distinct count and its runs would otherwise describe a value the index does not
+// have, so a search could land on it and answer with no ids; and whether it is
+// present would depend on which side of a compaction the retraction fell, which
+// the image's digest covers.
+func TestGPIX_SkipsAValueNothingHolds(t *testing.T) {
+	src := gpixSource{
+		NodeKeys: []string{"k"},
+		NodeValues: func(_ string, fn func([]byte, []uint64) bool) error {
+			for _, v := range []struct {
+				value string
+				ids   []uint64
+			}{
+				{"aaa", []uint64{1}},
+				{"bbb", nil},
+				{"ccc", []uint64{2, 3}},
+			} {
+				if !fn([]byte(v.value), v.ids) {
+					return nil
+				}
+			}
+			return nil
+		},
+		ScratchDir: t.TempDir(),
+	}
+	fwdBody, revBody, _, err := encodeMappedIndexFrom(src)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	sec, err := parseGPIX(fwdBody)
+	if err != nil {
+		t.Fatalf("parseGPIX: %v", err)
+	}
+	k := sec.key(gpixKindNode, "k")
+	if k == nil {
+		t.Fatal("the key is missing")
+	}
+	if k.Distinct != 2 || k.Entries != 3 {
+		t.Fatalf("distinct = %d, entries = %d, want 2 and 3", k.Distinct, k.Entries)
+	}
+	ids, err := k.idsOf([]byte("bbb"))
+	if err != nil {
+		t.Fatalf("idsOf(bbb): %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("the value nothing holds is in the section, holding %v", decodeIDs(ids))
+	}
+	// The values that are held still are, and the value table's search still lands
+	// on them: skipping one must not shift the offsets of the others.
+	for _, tc := range []struct {
+		value string
+		want  []uint64
+	}{{"aaa", []uint64{1}}, {"ccc", []uint64{2, 3}}} {
+		got, err := k.idsOf([]byte(tc.value))
+		if err != nil {
+			t.Fatalf("idsOf(%s): %v", tc.value, err)
+		}
+		if !equalIDs(decodeIDs(got), tc.want) {
+			t.Fatalf("idsOf(%s) = %v, want %v", tc.value, decodeIDs(got), tc.want)
+		}
+	}
+	rev, err := parseGPIR(revBody)
+	if err != nil {
+		t.Fatalf("parseGPIR: %v", err)
+	}
+	if n := gpirCount(rev.entriesAt(gpixKindNode)); n != 3 {
+		t.Fatalf("the reverse section holds %d entries, want 3", n)
 	}
 }

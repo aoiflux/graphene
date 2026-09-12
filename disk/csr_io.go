@@ -165,9 +165,9 @@ func deserialiseCSRFrom(data []byte, mapped bool) (*CSRGraph, *csrIndexSection, 
 		return nil, nil, fmt.Errorf("deserialiseCSR: invalid magic")
 	}
 	version := binary.LittleEndian.Uint16(data[4:6])
-	if version < csrVersionV2 || version > csrVersionCurrent {
+	if version < csrVersionV2 || version > csrVersionMax {
 		return nil, nil, fmt.Errorf("deserialiseCSR: unsupported version %d (supported: %d-%d)",
-			version, csrVersionV2, csrVersionCurrent)
+			version, csrVersionV2, csrVersionMax)
 	}
 	nodeCount := int(binary.LittleEndian.Uint64(data[6:14]))
 	edgeCount := int(binary.LittleEndian.Uint64(data[14:22]))

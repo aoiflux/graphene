@@ -5,6 +5,138 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### A compaction can write the mapped index: format v9
+
+The two sections the entries below describe now have a writer. Give
+`csrPayload` a `MappedIndex` source and the image carries GPIX and GPIR instead
+of GIDX and declares itself v9; leave it nil and the image is v8, byte for byte
+what it was. Nothing in the engine sets it yet — no store writes v9, the golden
+v8 fixture still matches to the byte, and every file that loads today loads
+identically. What is new is the encoder, and the two problems it turned out to
+have.
+
+**The two-walk design did not survive contact with a live index.** The previous
+entry describes an encoder that walks each key twice: once summing run lengths
+to size the value table, once writing the runs. That works against a frozen
+source and the plan for this item specified one — the shards swapped for empty
+ones at the pin. It does not work against the live index, and the live index is
+what a compaction has: a walk of one key is atomic under that key's shard lock,
+two walks are not, and a writer registering an entry between them changes the
+key's value count so the second pass writes a run the first did not size. The
+encoder catches that and refuses the compaction, which under the writer this
+program was measured against — one rebuilding a derived layer of 1.5M entities —
+would be most of them.
+
+So the runs are written first, in one walk, and each key's value table is built
+as they go. It cannot be held in memory: sixteen bytes per distinct value is 448
+MiB for one 28M-entry key, which is the allocation this section of the program
+exists to remove, reappearing in the code that writes it. It goes into a
+`spillBuffer` — memory up to a cap, a file past it, copied into the image in one
+pass once every key's runs are down. Nothing in the reader changed: the key
+directory carries the value table's offset and the runs' offset independently and
+bounds each on its own, so where they sit relative to each other was never part
+of the format.
+
+**GPIR is sorted outside memory.** The forward pass generates reverse entries in
+key order and the section is searched by entity, and 24 bytes an entry is 672
+MiB at this program's shape. So chunks of 32Ki entries are sorted in memory and
+spilled, and the section is written by merging them with a heap — one sequential
+write and one sequential read of the entries, memory bounded by one chunk plus a
+read budget the merge divides between however many runs it has. A store below a
+chunk is sorted in place and opens no file at all.
+
+`(id, keyID, valueOff)` is a total order over the entries a valid index produces,
+because an entity is indexed under one value of one key at most once. That is
+what lets the sort have no tie-break and the merge no stable-run bookkeeping, and
+it is what makes the section's bytes a function of its contents.
+
+**The snapshot root does not move.** An image's identity is stated in terms of it
+— custody chains, attestations, every expected value an operator has retained —
+and changing how the property index is encoded must not change it. It does not,
+because GPIX's walk yields the entries in the order GIDX wrote them: key
+ascending, value ascending, id ascending. That is a coincidence of two orders
+being the same order, which is exactly the kind of thing that quietly stops being
+true, so `TestSerialiseTo_MappedIndexKeepsTheSnapshotRoots` serialises one graph
+both ways and compares all four roots.
+
+**Two version numbers where there was one.** `csrVersionCurrent` is what a store
+writes and `csrVersionMax` is the highest it reads, and until v9 they were the
+same number because every version before it was written by every build that could
+read it. v9 is chosen by the payload, not by the build: it means "this image
+carries the index as GPIX and GPIR". So this build reads v9 and writes v8, and
+`graphene version` and `graphene migrate` go on reporting 8, which is the truth
+about what an operator's next compaction will produce.
+
+The version bump is not what makes an older reader refuse a v9 image — the two
+sections are critical, and that alone stops a v8 build from opening a store whose
+index it would then ignore. What the bump buys is the diagnosis: "written by a
+newer version" rather than "unknown section". This build refuses a v9 image for
+exactly that reason too, and will until the change that teaches the loader to
+read the sections.
+
+**Cost, measured.** Interleaved against a control tree at the previous commit,
+four order-alternated passes, over 50,000 entries:
+
+| | control (forward only) | this change (both sections) |
+|---|---|---|
+| all-distinct, ns/op | 1,837,000–1,952,000 | 6,099,000–7,385,000 |
+| low-cardinality, ns/op | 285,900–330,700 | 4,659,000–6,537,000 |
+| B/op, either shape | 65,800 | 2,955,000 |
+| allocs/op | 9 | 36 |
+
+The control writes only the forward section, so this is not like for like: the
+low-cardinality gap is almost entirely the reverse index, which has 50,000
+entries to sort where the forward section has 50 values to write. Per entry the
+whole job is ~122 ns against ~38 ns for half of it. `BenchmarkGPIXBaseLookup` —
+the read path, untouched — is flat across the same passes at 100.5 against 99.3
+ns, which is what says the numbers above are the change and not the trees.
+
+The allocation figure went the wrong way and is still the right trade. It was
+65.8 kB because the old encoder streamed and held nothing; it is 2.96 MB because
+the new one holds two intermediates, and those are bounded by three constants —
+a 1 MiB value table, a 768 KiB sort chunk, a 2 MiB merge budget — rather than by
+the index. All three are deliberately small: raising them buys back sequential IO
+and spends the resource this program is spending down. The figure is now the same
+for both shapes and does not move when the entries grow tenfold, which is the
+property R1's acceptance criterion actually asks for.
+
+That property had to be fixed rather than observed.
+`TestGPIX_WriteAllocationIsFlatInEntries` caught the caps being *grown into*
+rather than allocated: sixteen and twenty-four byte appends up to a one-megabyte
+buffer cost about five megabytes on the way, which made the encoder's allocation
+proportional to the index right up to the cap. Bounded, and not what a cap is
+for.
+
+**Method.** Twelve mutants, twelve killed, each a guard or an offset removed: a
+value table entry pointing past its run, a missing sentinel, a reverse entry
+addressing the run rather than the value, a value nothing holds written anyway,
+value table offsets left spill-relative, an unsorted reverse section, a merge
+ordering by id alone, a spilled id encoded big-endian, a spill swallowing a failed
+write, a short copy into the image accepted, a mapped index stamped v8, and GPIX
+written as optional. One further mutant survives and is equivalent: the reverse
+entry's two pad bytes are never decoded and the buffer they are written into
+already holds zeros, so nothing can observe them. No new fuzz target — the
+encoder reads no untrusted bytes, and the parse surface `FuzzParseGPIX` and
+`FuzzParseGPIR` cover is unchanged.
+
+**A finding that changes what the next two items can deliver.** The plan has a
+compaction install the new base at commit and keep only what was registered since
+the pin as the delta, which is what would make the index resident cost fall
+inside a running process. It cannot: a compaction publishes a graph it *built*,
+not one parsed from a file, so nothing maps the image it has just written — the
+mapping protocol says so in as many words, and deliberately, because a mapping
+per compaction would pin the first one for the life of the store. There is
+therefore no new base to attach at commit, and freezing the shards at the pin
+would buy nothing, which is why this change has no freeze in it.
+
+The residency win is an *open-time* win. A process that opens a v9 store holds
+the fences and the key directory and nothing else; a process that then rebuilds
+and compacts holds what it registered until it reopens. That is the shape the
+consumer's read-only aggregate is in — the 4,871 MiB arm — and the writer arm
+gets it at its next start. Closing the gap inside one process needs the index
+sections mapped on a lifetime of their own, separately from the record stream,
+which is its own item and not this one.
+
 ### The property index can be a base plus a delta: `base ∪ delta − retracted`
 
 `PropertyIndex` can now answer from two halves. Attach an `index.Base` — the

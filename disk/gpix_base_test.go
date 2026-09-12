@@ -831,16 +831,11 @@ func BenchmarkGPIXBaseLookup(b *testing.B) {
 					f.add(gpixKindNode, "k", value, uint64(v*shape.idsPerValue+i))
 				}
 			}
-			var buf bytes.Buffer
-			iw := newImageWriter(&buf, make([]byte, 0, 1<<16))
-			if _, err := writeGPIX(iw, 0, []string{"k"}, nil,
-				f.walker(gpixKindNode), emptyWalker); err != nil {
+			body, err := encodeGPIXFrom(f.source(b.TempDir(), 0, 0))
+			if err != nil {
 				b.Fatalf("writeGPIX: %v", err)
 			}
-			if err := iw.flush(); err != nil {
-				b.Fatalf("flush: %v", err)
-			}
-			sec, err := parseGPIX(buf.Bytes())
+			sec, err := parseGPIX(body)
 			if err != nil {
 				b.Fatalf("parseGPIX: %v", err)
 			}

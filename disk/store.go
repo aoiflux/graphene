@@ -429,13 +429,27 @@ const (
 	edgePayloadPropLenBytes  = 4
 	edgePayloadTailFixedSize = edgePayloadWeightBytes + edgePayloadPropLenBytes
 
-	csrVersionV2             = 2
-	csrVersionV3             = 3
-	csrVersionWithU16Labels  = 4
-	csrVersionWithSeqHW      = 5
-	csrVersionWithPropIndex  = 6
-	csrVersionNoAdjacency    = 7 // stopped writing the never-read adjacency arrays
+	csrVersionV2            = 2
+	csrVersionV3            = 3
+	csrVersionWithU16Labels = 4
+	csrVersionWithSeqHW     = 5
+	csrVersionWithPropIndex = 6
+	csrVersionNoAdjacency   = 7 // stopped writing the never-read adjacency arrays
+	csrVersionMappedIndex   = 9 // carries the property index as GPIX/GPIR, not GIDX
+
+	// csrVersionCurrent is what a store writes by default and csrVersionMax is
+	// the highest it reads. They were one number until v9, because every version
+	// before it was written by every build that could read it.
+	//
+	// v9 is chosen by the payload rather than by the build: it means "this image
+	// carries the property index as GPIX and GPIR", which is a decision about how
+	// the index is held, not about how new the writer is. So a build reads v9 from
+	// the change that teaches it to, and writes v9 from the change that makes that
+	// the default. Anything asking which version an operator's next compaction
+	// will produce wants csrVersionCurrent; anything bounding a file it is about
+	// to parse wants csrVersionMax.
 	csrVersionCurrent        = csrVersionSectioned
+	csrVersionMax            = csrVersionMappedIndex
 	csrV6HeaderSize          = 46 // magic4 + version2 + counts16 + seqHW16 + indexOffset8
 	csrV5HeaderSize          = 38
 	csrIndexSectionMagic     = "GIDX"
