@@ -94,6 +94,17 @@ const (
 	csrSectionAttestation = "GATT" // signatures and attestations — CRITICAL when written
 	csrSectionComposite   = "GCMP" // composite index declarations — optional
 	csrSectionTombstones  = "GRDT" // records of deliberate removal — CRITICAL when written
+
+	// The disk-resident property index and its reverse direction, written only
+	// by a v9 writer. CRITICAL, unlike GIDX: a v9 image carries no GIDX to fall
+	// back to, so a build that skipped these would answer every property query
+	// with no matches rather than slowly. See csr_gpix.go.
+	//
+	// Registered here ahead of the loader that reads them, which is what this
+	// block is for — two capabilities must not pick the same four bytes. They are
+	// deliberately not yet in checkCriticalSections; see the note there.
+	csrSectionMappedIndex   = "GPIX"
+	csrSectionMappedReverse = "GPIR"
 )
 
 // csrSection is one entry in the directory.
@@ -369,6 +380,13 @@ func checkCriticalSections(sections []csrSection) error {
 		case csrSectionPropIndex, csrSectionOrderedKeys, csrSectionEntityHash, csrSectionAttestation,
 			csrSectionTombstones, csrSectionComposite:
 			// Understood.
+			//
+			// GPIX and GPIR are deliberately absent until the loader reads them.
+			// The magics are registered in this file, but registering a magic is
+			// not understanding a section: a build that listed them here would
+			// accept an image whose index it then ignored, which is the wrong
+			// answer their critical flag exists to refuse. They join this list in
+			// the change that teaches the loader to read them.
 		default:
 			return fmt.Errorf("deserialiseCSR: file carries critical section %q, which this build does not understand — "+
 				"it was written by a newer version and must not be read as though the section were absent", s.Magic)

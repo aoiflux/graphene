@@ -5,6 +5,105 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### GPIX and GPIR are readable: `index.Base`
+
+The two sections the entry below describes now have a reader, and it answers
+through an interface rather than a concrete type: `index.Base` is what a
+disk-resident property index looks like from the side that queries it, and
+`disk` implements it over one image's two sections. Nothing in the engine reads
+a base yet — the resident index is still the only index there is — so no image's
+bytes change, the image version is still 8, and no file that loads today loads
+differently.
+
+**The interface is in `index` because `disk` imports `index`, not the other way
+around.** The plan for this item put the reader in `index/mapped.go` and the format
+in `disk`, which cannot be written: the two would have to import each other. The
+format stays whole in `disk`, where its encoder already lives, because a format
+whose encoder and decoder sit in different packages drifts. What `index` gains is
+the contract — `Base`, `EntityKind`, `IDRun` — stated only in `store` types and
+callbacks, so `disk` names nothing of `index`'s except those.
+
+The boundary is drawn where the calls are coarse. Every `Base` method is entered
+once per query, or once per distinct value of a range walk, never once per id: an
+interface dispatch is amortised over a whole postings list rather than paid per
+element. `IDRun` is the exception and therefore a concrete struct — it is the one
+type on this boundary touched per id, and it is a *view* over the image's bytes, so
+reading a value's postings copies nothing. **Reads through the interface allocate
+nothing at all**: `TestGPIXBase_ReadsDoNotAllocatePerEntry` measures 0.0
+allocations per lookup at eight ids per value and 0.0 at eighty, the closure
+`ForEachValue` takes included, and asserts it as a slope so a reader that began
+copying postings would show as growth rather than as a number under a ceiling. A
+warm lookup costs ~250 ns against a 50,000-value all-distinct key and ~160–210 ns
+against a 50-value one, 0 B/op in both.
+
+`Base` promises immutability, which is not a convenience: a base is the index as of
+the compaction that wrote the image and never changes again, so it needs no lock,
+and nothing can be resurrected out of it — the hazard `TECHNICAL_DETAILS.md` §14.7
+records against lazy index construction is answered by the shape of the type rather
+than by a rule someone has to follow. Only the methods that decode a run can fail,
+because a corrupt image can make one unreadable and the alternative — reporting an
+unreadable run as an absent value — turns a damaged file into a wrong answer.
+
+Correctness is established differentially: the same triples are loaded into a real
+`index.PropertyIndex` and into an encoded GPIX/GPIR pair, and every method is
+checked to answer exactly what the resident index answers — lookups present and
+absent, key and value counts, ascending value walks, lower bounds probed one byte
+either side of every present value against `sort.SearchStrings`, the entries of an
+entity, and a dense band of ids so that misses are probed as densely as hits. A
+base whose answers merely resembled the resident index's could not be unioned with
+a delta to replace it.
+
+Two things this found. A reverse entry naming a key of the *other* kind would have
+resolved a value cleanly out of the wrong key's runs, because the two kinds share
+one key-id space — checked now, and named as a corruption. And `parseGPIX` bounded
+a key's distinct-value count against its own runs region but not its entry count;
+the planner reads that count as an `int` to weigh selectivity, so a file-supplied
+2^64−1 arriving there as a negative number would have made the planner choose by a
+figure that means nothing. Both are refused at parse or at read, not at the first
+query that trips over them.
+
+### The property index has an on-disk form: GPIX and GPIR
+
+The property index is 94.5% of the anonymous memory a 1.2 GiB store holds and
+94.1% of the transient it pays to open one — 528 MiB of encoded entries become
+2,748 MiB of Go maps, 5.20x their own size on disk, where the record image costs
+0.229x once it is mapped. `docs/MEMORY_MODEL.md` measures it and ranks it: it is
+the one term that decides whether a store fits a 2 GiB machine, and nothing else
+in the engine is within an order of magnitude of it.
+
+This is the format that lets the index be read in place instead of rebuilt into
+the heap. Two sections, neither yet written by any writer nor read by any loader:
+
+- **GPIX**, the forward direction. Per declared key, a table of its distinct
+  values and, per value, a run of the ids carrying it. Values are searched by an
+  eight-byte prefix held in the table, falling through to the value itself
+  wherever two prefixes agree — so a key whose values share a long prefix is
+  searched exactly rather than scanned.
+- **GPIR**, the reverse direction: per entity, the keys it is indexed under, each
+  naming its value by an offset into GPIX rather than carrying a copy of it.
+
+Both are written forward-only, because `imageWriter` cannot seek and a writer that
+could would invite holding the section in order to patch it. A key's value table
+precedes its runs and is sized by a count that is not known until the key has been
+walked, so the encoder walks each key twice: once summing run lengths to write the
+table, once writing the runs. A run's length is a function of its value and its
+posting list, so pass one needs nothing that pass two produces.
+
+What that buys: **9 allocations and 65.8 kB to write 50,000 entries, flat in both
+the number of entries and their shape** — and 64 kB of that figure is the caller's
+own output buffer. Ten times the entries allocate sixteen bytes more.
+`TestGPIX_WriteAllocationIsFlatInEntries` asserts it as a slope rather than a
+ceiling, and it has already earned its place: the first draft allocated one scratch
+array per distinct value, which the guard caught as a 9x growth. Wall clock is
+~38 ns per entry for an all-distinct key and ~6 ns for a low-cardinality one.
+
+No image's bytes change and no file that loads today loads differently. The image
+version is still 8, nothing writes either section, and the two magics are
+registered *without* being added to the set of critical sections this build claims
+to understand — a build that listed them before its loader read them would accept
+an image whose index it then ignored, which is the wrong answer their critical flag
+exists to refuse.
+
 ### A compaction no longer materialises the property index
 
 `compactPin` used to call `PropertyIndex.NodeEntries()` and `EdgeEntries()`,

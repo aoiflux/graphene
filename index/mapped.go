@@ -1,0 +1,182 @@
+package index
+
+import "encoding/binary"
+
+// This file declares what a *disk-resident* property index looks like from the
+// index package's side: the Base interface, the entity kind it is addressed by,
+// and the view type its postings come back as.
+//
+// # Why an interface, and why here
+//
+// The plan for R3 named one file, index/mapped.go, holding the reader over the
+// image's GPIX and GPIR sections. That cannot be written: disk imports index, so
+// index cannot name a disk type, and the sections are read where they are
+// written — disk/csr_gpix.go — because a format whose encoder and decoder live
+// in different packages drifts. So the reader is in disk and what is here is the
+// contract it satisfies.
+//
+// The boundary is drawn where the calls are coarse. Every method below is
+// entered once per *query* (or once per distinct value of a walk), never once
+// per id, so an interface dispatch is amortised over a whole postings list
+// rather than paid per element. That is the reason IDRun is a concrete struct
+// and not an interface: it is the one type on this boundary that is touched per
+// id, and a virtual call there would cost more than reading the id.
+//
+// # What a Base promises
+//
+// A Base is immutable and safe for concurrent readers. It is the state of the
+// index as of the compaction that wrote the image, and it never changes again:
+// everything since is the in-memory delta, and everything removed since is the
+// retracted set. That immutability is not a convenience, it is the whole design
+// — it is why nothing can be resurrected out of it (docs/TECHNICAL_DETAILS.md
+// §14.7's hazard) and why it needs no lock.
+//
+// Values and ids handed to callbacks belong to the base, which under the mapped
+// image means they are file-backed memory. Read them, do not retain them. That
+// is the same contract ForEachNodeEntry already states for the resident index's
+// interned strings, which is what lets one caller serve both.
+
+// EntityKind names which of the two entity kinds an operation addresses.
+//
+// The values match the on-disk kind byte, so the disk-side implementation is a
+// conversion rather than a lookup table; disk asserts that agreement in a test
+// rather than leaving it to two constants that merely happen to line up today.
+type EntityKind uint8
+
+const (
+	// NodeKind addresses the node half of a base.
+	NodeKind EntityKind = 0
+	// EdgeKind addresses the edge half of a base.
+	EdgeKind EntityKind = 1
+)
+
+func (k EntityKind) String() string {
+	if k == EdgeKind {
+		return "edge"
+	}
+	return "node"
+}
+
+// IDRun is a read-only view of one value's postings list, ascending.
+//
+// It is a view and not a slice of IDs because the bytes it addresses are the
+// image: turning a run into []store.NodeID is exactly the allocation this whole
+// item exists to stop paying. A caller that needs to keep the ids copies them
+// out — and every *public* caller does, at the boundary where PropertyIndex
+// returns a result, so no mapped memory ever reaches a caller of the store. The
+// view is for the code in between, which merges a base run against the delta and
+// keeps neither.
+//
+// # The encoding
+//
+// raw is a packed array of little-endian uint64s and nothing else — no header,
+// no padding, length implied by len(raw). That is this interface's contract, not
+// GPIX's: any implementation presents its postings this way, and GPIX stores
+// them this way because it is the shape that needs no conversion. Eight-byte
+// alignment is *not* assumed, because a run begins wherever its value's length
+// leaves it; binary.LittleEndian handles that, and the load is the cheap half of
+// touching a page that may not be resident.
+//
+// The zero IDRun is an empty run and every method below is valid on it.
+type IDRun struct {
+	raw []byte
+}
+
+// NewIDRun wraps packed little-endian uint64s as a run.
+//
+// A length that is not a multiple of eight yields the ids that are whole and
+// ignores the remainder, because Len floors — the trailing bytes are never
+// addressed by any method here. It is not refused: the caller has already
+// bounded the region this came out of, and a ragged length is a corruption for
+// the verifier to name, not something a lookup can act on.
+func NewIDRun(raw []byte) IDRun {
+	return IDRun{raw: raw}
+}
+
+// Len reports how many whole ids the run holds.
+func (r IDRun) Len() int { return len(r.raw) / 8 }
+
+// At returns the i'th id. It panics for i outside [0, Len).
+func (r IDRun) At(i int) uint64 {
+	return binary.LittleEndian.Uint64(r.raw[i*8:])
+}
+
+// Contains reports whether id is in the run, by binary search.
+//
+// The run is ascending — that is the base's promise, and a base that broke it
+// would make this answer "absent" for a present id. Verification checks the
+// ordering over the whole section; this path does not re-check it per probe,
+// for the same reason the resident index's containsSorted does not.
+func (r IDRun) Contains(id uint64) bool {
+	lo, hi := 0, r.Len()
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if r.At(mid) < id {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo < r.Len() && r.At(lo) == id
+}
+
+// First returns the lowest id in the run, and whether there is one.
+func (r IDRun) First() (uint64, bool) {
+	if r.Len() == 0 {
+		return 0, false
+	}
+	return r.At(0), true
+}
+
+// Base is a disk-resident property index: the forward direction (key and value
+// to ids) and the reverse (entity to the keys it is indexed under), read in
+// place.
+//
+// Methods that decode a run return an error, because a corrupt image can make
+// one unreadable and the alternative — treating an unreadable run as an absent
+// value — turns a damaged file into a wrong answer. Methods that read only what
+// parsing already bounded do not.
+type Base interface {
+	// Keys returns the keys this base carries for kind, ascending. A key the
+	// caller declared but that carried no entry at the last compaction is
+	// absent, exactly as an empty bucket is absent from the resident maps.
+	Keys(kind EntityKind) []string
+
+	// KeyStats returns the number of distinct values under key and the number
+	// of (id, value) entries across them. Both are zero for an absent key.
+	// This is the planner's selectivity input and the ordered index's totalIDs.
+	KeyStats(kind EntityKind, key string) (distinct, entries int)
+
+	// Lookup returns the ids indexed under key=value, ascending. An absent key
+	// or value yields an empty run and no error.
+	Lookup(kind EntityKind, key string, value []byte) (IDRun, error)
+
+	// ForEachValue walks key's distinct values in ascending byte order,
+	// beginning at the first value not less than from. A nil from starts at the
+	// first value. Returning false from fn stops the walk without an error.
+	//
+	// This is the whole of the range path: a caller resolves its filter to a
+	// lower bound, walks from there, and stops itself at the upper bound — one
+	// search rather than two, and no index arithmetic on this side of the
+	// boundary.
+	ForEachValue(kind EntityKind, key string, from []byte, fn func(value []byte, ids IDRun) bool) error
+
+	// ForEachEntryOf walks the entries registered for one entity, ascending by
+	// key and then by value.
+	ForEachEntryOf(kind EntityKind, id uint64, fn func(key string, value []byte) bool) error
+
+	// HasEntries reports whether id carries any entry at all.
+	HasEntries(kind EntityKind, id uint64) bool
+
+	// ForEachID walks every distinct indexed id of kind, ascending. Returning
+	// false from fn stops the walk.
+	ForEachID(kind EntityKind, fn func(id uint64) bool)
+
+	// MaxID returns the highest indexed id of kind, or zero if there are none.
+	// This sizes the retracted bitset: an id above it was never in the base, so
+	// it can never need retracting.
+	MaxID(kind EntityKind) uint64
+
+	// TotalEntries returns the entry count across every key of kind.
+	TotalEntries(kind EntityKind) int
+}
