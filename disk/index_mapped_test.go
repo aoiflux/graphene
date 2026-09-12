@@ -476,7 +476,7 @@ func TestIndexMapped_RefusesADamagedRun(t *testing.T) {
 	// run holds its length and then its bytes, and that pair occurs once.
 	needle := []byte{2, 0, 0, 0, 'b', '3'}
 	at := bytes.Index(data, needle)
-	if at < 0 || bytes.Index(data[at+1:], needle) >= 0 {
+	if at < 0 || bytes.Contains(data[at+1:], needle) {
 		t.Fatalf("the value's run prefix occurs %d times, so the corruption is not aimed",
 			bytes.Count(data, needle))
 	}
