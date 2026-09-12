@@ -966,6 +966,19 @@ type StorageStats struct {
 	// zero when it is not mapped. These bytes are page cache the kernel may
 	// evict, so they are not part of what the process must keep.
 	ImageMappedBytes int64
+
+	// IndexMode names where the property index is: "mapped" when it is read out
+	// of the image, "resident" when it is held in the heap, and "" from a backend
+	// that has no image to read one from.
+	//
+	// It is the answer rather than the request, which matters because the two can
+	// differ: a store configured for a mapped index reports "resident" when the
+	// image it opened carries no such index, or when the image itself is in the
+	// heap. The difference is most of what a store holds — a resident index costs
+	// about a hundred bytes per indexed entry and a mapped one costs a fence per
+	// key — so it is here rather than only in a metric a caller has to subscribe
+	// to.
+	IndexMode string
 }
 
 // DeltaRecords is the total number of records held in memory since the last

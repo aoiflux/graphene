@@ -16,8 +16,8 @@ import (
 //
 // Everything here works one level above csr_gpix_test.go: those tests judge the
 // two sections on their own, and these judge the image that carries them — the
-// version it declares, the sections it lists, the roots it commits to, and the
-// fact that this build refuses to open it.
+// version it declares, the sections it lists, and the roots it commits to. What a
+// *store* does with such an image is index_mapped_test.go.
 
 // v9Fixture returns a graph, a v8 payload carrying its entries as GIDX, and a v9
 // payload carrying the same entries as GPIX and GPIR.
@@ -97,8 +97,8 @@ func canonicalEntries(f *gpixFixture) ([]index.NodePropEntry, []index.EdgePropEn
 	return nodes, edges
 }
 
-// sectionsOf reads an image's directory without parsing the graph, which is what
-// a test of a version this build refuses to open needs.
+// sectionsOf reads an image's directory without parsing the graph, so a test can
+// judge what the writer put in the file without depending on the loader agreeing.
 func sectionsOf(t *testing.T, data []byte) []csrSection {
 	t.Helper()
 	sections, err := readCSRSectionDirectory(data, csrSectionTableOffsetOf(data))
@@ -329,29 +329,6 @@ func (s *writeOnlySeeker) Read([]byte) (int, error) {
 	return 0, fmt.Errorf("not readable")
 }
 func (s *writeOnlySeeker) Seek(int64, int) (int64, error) { return 0, nil }
-
-// TestDeserialise_RefusesV9UntilTheLoaderReadsIt pins what this build does with
-// an image it can write and cannot read.
-//
-// The two sections are critical and this build's checkCriticalSections does not
-// list them, so the file is refused — which is the correct answer for a build
-// that would otherwise open the store and answer every property query with no
-// matches. The refusal goes away in the change that teaches the loader to read
-// them, and so does this test.
-func TestDeserialise_RefusesV9UntilTheLoaderReadsIt(t *testing.T) {
-	g, _, v9 := v9Fixture(t, 20)
-	data, err := g.SerialiseWithPayload(v9)
-	if err != nil {
-		t.Fatalf("serialise: %v", err)
-	}
-	_, _, err = deserialiseCSR(data)
-	if err == nil {
-		t.Fatal("this build opened a v9 image whose index it cannot read")
-	}
-	if !bytes.Contains([]byte(err.Error()), []byte(csrSectionMappedIndex)) {
-		t.Fatalf("err = %v, want it to name %s", err, csrSectionMappedIndex)
-	}
-}
 
 // TestImageWriter_FromRefusesAShortSource guards the one check that stands between
 // a spill that lost bytes and an image whose section directory lies.

@@ -42,65 +42,27 @@ func (s *Store) loadImage(src *imageSource) error {
 		src.discard()
 		return err
 	}
+
+	// The index before the graph, and that order is load-bearing rather than
+	// tidy. Loading the index can fail — a v9 image whose runs will not decode is
+	// a damaged file, and a store that came up on one would answer from a
+	// half-built index — and src is this function's to release only until
+	// noteImage hands the mapping's lifetime to the collector. A failure after
+	// that point would leave the image mapped for the life of the process.
+	//
+	// Nothing in here needs the published view: the index is a structure beside
+	// the graph, not a reader of it.
+	if err := s.loadIndex(section, src.mapped()); err != nil {
+		src.discard()
+		return err
+	}
+
 	s.publishCSR(csr)
 
 	// After the graph is published, because noteImage attaches the cleanup that
 	// decides when the mapping may be released and the graph has to exist first.
 	s.noteImage(src, csr)
 
-	// Load the persisted property index (v6+). This happens before WAL replay so
-	// that post-compaction WAL records — including purges — apply on top of it.
-	// A pre-v6 file carries no section; its entries come from the WAL as before,
-	// and the next Compact writes them into the CSR.
-	if section != nil {
-		// Re-declare before the entries land, so the ordered structures are built
-		// by the same incremental path a live declaration uses rather than by a
-		// backfill afterwards. Either order is correct — DeclareOrderedNodeKey
-		// backfills from what is already indexed — but doing it first means there
-		// is one path to reason about.
-		//
-		// This is what stops a reopen silently turning every declared range query
-		// back into a scan.
-		for _, k := range section.OrderedNodeKeys {
-			s.propIdx.DeclareOrderedNodeKey(k)
-		}
-		for _, k := range section.OrderedEdgeKeys {
-			s.propIdx.DeclareOrderedEdgeKey(k)
-		}
-		// Composites are re-declared here for the same reason and with the same
-		// effect: the entries below then maintain them as they land, rather than
-		// a backfill re-deriving what the incremental path would have built.
-		//
-		// A tuple this build will not accept is skipped, not fatal. GCMP is an
-		// optional section, which is a commitment that a reader ignoring it
-		// entirely still answers every query correctly — so refusing the whole
-		// store over one declaration would break exactly the compatibility the
-		// flag exists to provide, and would do it to a later version that
-		// declares tuples this one does not allow. What is skipped is visible:
-		// CompositeNodeProperties reports what is actually declared, so a tuple
-		// that did not survive the open is absent there rather than assumed.
-		//
-		// A malformed section *body* is still fatal — see readCompositeSection.
-		// That is damage to the file, not a disagreement about its contents.
-		for _, keys := range section.CompositeNodeKeys {
-			_ = s.propIdx.DeclareCompositeNodeKeys(keys)
-		}
-		for _, keys := range section.CompositeEdgeKeys {
-			_ = s.propIdx.DeclareCompositeEdgeKeys(keys)
-		}
-
-		// Deliberately per-entry. Bulk loading was built and measured here — one
-		// lock per shard, parallel fill, presized reverse map, batch-local value
-		// interning — and it cut allocations 9-19% but cost 35-75% more resident
-		// memory, because partitioning copies every entry into per-shard slices
-		// and the presize is keyed on entry count rather than entity count
-		for _, e := range section.NodeProps {
-			s.propIdx.IndexNode(e.ID, e.Key, e.Value)
-		}
-		for _, e := range section.EdgeProps {
-			s.propIdx.IndexEdge(e.ID, e.Key, e.Value)
-		}
-	}
 	// Advance sequence counters past existing CSR IDs. This is the pre-v5
 	// fallback: files that carry high-water marks raise the counters again
 	// below, and those marks win because a deleted record's ID must not be
@@ -128,6 +90,150 @@ func (s *Store) loadImage(src *imageSource) error {
 	}
 	if csr.edgeSeqHW > s.edgeSeq.Load() {
 		s.edgeSeq.Store(csr.edgeSeqHW)
+	}
+	return nil
+}
+
+// loadIndex installs the property index the image carries (v6+).
+//
+// It runs before WAL replay, so records written after the last compaction —
+// including purges — apply on top of it. A pre-v6 file carries no section at
+// all: its entries come from the WAL as before, and the next Compact writes them
+// into the image.
+//
+// mapped says whether the image itself is mapped, which is what decides whether
+// an index read out of it is sound. See IndexMode.
+func (s *Store) loadIndex(section *csrIndexSection, mapped bool) error {
+	if section == nil {
+		return nil
+	}
+
+	// The base is attached first. Either order would do — AttachBase fills the
+	// composites already declared and a later declaration fills itself, because a
+	// store restores its declarations from its catalogue before it ever reaches
+	// this function and the fill has to work both ways round — but attaching first
+	// is the order that reads as what is happening: the index acquires its
+	// disk-resident half, and then the declarations are re-stated over it.
+	attached := false
+	if section.Base != nil {
+		if why := s.indexBaseAllowed(mapped); why == nil {
+			if err := s.propIdx.AttachBase(section.Base); err != nil {
+				return err
+			}
+			attached = true
+		} else if s.indexMode == IndexMapped {
+			// Reported, not refused. The resident index answers every query the
+			// mapped one answers, at the cost this program exists to remove, so a
+			// mode that cannot be honoured is a memory decision that did not go the
+			// caller's way and not a reason the store cannot open. The metric is
+			// skipped when the mode is what ruled it out, because a caller who asked
+			// for the resident index is not being told it got one.
+			s.recordIndexFallback(why)
+		}
+	}
+
+	// Re-declared before anything is loaded, so the ordered structures are built
+	// by the same incremental path a live declaration uses rather than by a
+	// backfill afterwards. Either order is correct — DeclareOrderedNodeKey
+	// backfills from what is already indexed — but doing it first means there
+	// is one path to reason about. Under a base this is also the only order that
+	// works, because what is loaded below is nothing: the declarations are what
+	// the entries are read for.
+	//
+	// This is what stops a reopen silently turning every declared range query
+	// back into a scan.
+	for _, k := range section.OrderedNodeKeys {
+		s.propIdx.DeclareOrderedNodeKey(k)
+	}
+	for _, k := range section.OrderedEdgeKeys {
+		s.propIdx.DeclareOrderedEdgeKey(k)
+	}
+	// Composites are re-declared here for the same reason and with the same
+	// effect: whatever is loaded below then maintains them as it lands, rather
+	// than a backfill re-deriving what the incremental path would have built.
+	// Over a base nothing lands, so the declaration is what fills them — from
+	// the base's own runs, which is the one resident structure a mapped index
+	// still pays for.
+	//
+	// A tuple this build will not accept is skipped, not fatal. GCMP is an
+	// optional section, which is a commitment that a reader ignoring it
+	// entirely still answers every query correctly — so refusing the whole
+	// store over one declaration would break exactly the compatibility the
+	// flag exists to provide, and would do it to a later version that
+	// declares tuples this one does not allow. What is skipped is visible:
+	// CompositeNodeProperties reports what is actually declared, so a tuple
+	// that did not survive the open is absent there rather than assumed.
+	//
+	// A malformed section *body* is still fatal — see readCompositeSection.
+	// That is damage to the file, not a disagreement about its contents.
+	for _, keys := range section.CompositeNodeKeys {
+		_ = s.propIdx.DeclareCompositeNodeKeys(keys)
+	}
+	for _, keys := range section.CompositeEdgeKeys {
+		_ = s.propIdx.DeclareCompositeEdgeKeys(keys)
+	}
+
+	if attached {
+		// Every entry is already where it is read from, so there is nothing to
+		// load. What the declarations above did do is the only reading of the base
+		// this open performs — the composites' backfill — and a fault recorded
+		// there is a run that would not decode, which is damage to the file. The
+		// alternative to refusing is a store that comes up serving a composite
+		// index missing whatever the damaged run held.
+		return s.propIdx.BaseFault()
+	}
+	if section.Base != nil {
+		return s.rebuildIndexFrom(section.Base)
+	}
+
+	// Deliberately per-entry. Bulk loading was built and measured here — one
+	// lock per shard, parallel fill, presized reverse map, batch-local value
+	// interning — and it cut allocations 9-19% but cost 35-75% more resident
+	// memory, because partitioning copies every entry into per-shard slices
+	// and the presize is keyed on entry count rather than entity count
+	for _, e := range section.NodeProps {
+		s.propIdx.IndexNode(e.ID, e.Key, e.Value)
+	}
+	for _, e := range section.EdgeProps {
+		s.propIdx.IndexEdge(e.ID, e.Key, e.Value)
+	}
+	return nil
+}
+
+// rebuildIndexFrom walks a mapped index into the resident one.
+//
+// This is what a v9 image does under IndexResident, and what one does under
+// IndexMapped when the store is holding the image in the heap. It is deliberately
+// the same per-entry path GIDX's entries take: two arms of one option must
+// produce the same index out of the same file, and the bulk loader §14.4 measured
+// and reverted stays reverted.
+//
+// The values handed to IndexNode are the image's own bytes, and IndexNode interns
+// a string out of every one of them, so nothing here retains mapped memory. That
+// is also what makes this the expensive arm — it is the ~107 bytes an entry the
+// mapped index does not pay.
+func (s *Store) rebuildIndexFrom(b index.Base) error {
+	for _, key := range b.Keys(index.NodeKind) {
+		err := b.ForEachValue(index.NodeKind, key, nil, func(value []byte, ids index.IDRun) bool {
+			for i, n := 0, ids.Len(); i < n; i++ {
+				s.propIdx.IndexNode(store.NodeID(ids.At(i)), key, value)
+			}
+			return true
+		})
+		if err != nil {
+			return fmt.Errorf("deserialiseCSR: rebuilding node key %q from the image: %w", key, err)
+		}
+	}
+	for _, key := range b.Keys(index.EdgeKind) {
+		err := b.ForEachValue(index.EdgeKind, key, nil, func(value []byte, ids index.IDRun) bool {
+			for i, n := 0, ids.Len(); i < n; i++ {
+				s.propIdx.IndexEdge(store.EdgeID(ids.At(i)), key, value)
+			}
+			return true
+		})
+		if err != nil {
+			return fmt.Errorf("deserialiseCSR: rebuilding edge key %q from the image: %w", key, err)
+		}
 	}
 	return nil
 }
@@ -442,8 +548,20 @@ func deserialiseCSRFrom(data []byte, mapped bool) (*CSRGraph, *csrIndexSection, 
 	if version < csrVersionWithPropIndex {
 		return csr, nil, nil
 	}
-	section, err := readCSRIndexSection(data, int(indexOffset))
+	// The index travels one of two ways, never both. A v9 image carries it as its
+	// own two sections, read where they lie; anything earlier carries the GIDX
+	// stream, which the loader replays entry by entry. Which one the file holds
+	// decides this, not the version it declares — the sections are what make it a
+	// v9 image, and the version number is there so an older build says "written by
+	// a newer version" rather than "unknown section".
+	base, mappedIndex, err := readMappedIndexSections(data, trailer.Sections)
 	if err != nil {
+		return nil, nil, err
+	}
+	var section *csrIndexSection
+	if mappedIndex {
+		section = &csrIndexSection{Base: base}
+	} else if section, err = readCSRIndexSection(data, int(indexOffset)); err != nil {
 		return nil, nil, err
 	}
 
@@ -534,6 +652,13 @@ func deserialiseCSRFrom(data []byte, mapped bool) (*CSRGraph, *csrIndexSection, 
 type csrIndexSection struct {
 	NodeProps []index.NodePropEntry
 	EdgeProps []index.EdgePropEntry
+
+	// Base is the index read in place out of GPIX and GPIR (v9+), present
+	// *instead of* NodeProps and EdgeProps rather than beside them. A caller
+	// either attaches it or walks it into the resident index; either way it
+	// addresses the bytes this section was parsed from, so it is only as valid as
+	// they are.
+	Base index.Base
 
 	// Keys declared ordered when the image was written (GORD, v8+).
 	OrderedNodeKeys []string
@@ -726,6 +851,44 @@ func checkCSREntityIDs(nodes []nodeRecord, edges []rawEdge, version uint16, node
 		}
 	}
 	return nil
+}
+
+// readMappedIndexSections parses a v9 image's index into a base, reporting
+// whether the file carries one at all.
+//
+// Half of one is a hard failure rather than a degraded read, for the reason
+// newGPIXBase gives: the two directions answer different questions and a reader
+// holding one would answer some queries and silently miss others. The ok result
+// is therefore "this file is one of those images", not "this file gave us
+// something usable" — a file carrying GPIR alone is still a v9 image, and it is
+// refused as a damaged one instead of being read as a v8 image whose index went
+// missing.
+func readMappedIndexSections(data []byte, sections []csrSection) (index.Base, bool, error) {
+	fwd, hasFwd := findSection(sections, csrSectionMappedIndex)
+	rev, hasRev := findSection(sections, csrSectionMappedReverse)
+	if !hasFwd && !hasRev {
+		return nil, false, nil
+	}
+	var (
+		fwdSec *gpixSection
+		revSec *gpirSection
+		err    error
+	)
+	if hasFwd {
+		if fwdSec, err = parseGPIX(data[fwd.Offset : fwd.Offset+fwd.Length]); err != nil {
+			return nil, true, fmt.Errorf("deserialiseCSR: %w", err)
+		}
+	}
+	if hasRev {
+		if revSec, err = parseGPIR(data[rev.Offset : rev.Offset+rev.Length]); err != nil {
+			return nil, true, fmt.Errorf("deserialiseCSR: %w", err)
+		}
+	}
+	b, err := newGPIXBase(fwdSec, revSec)
+	if err != nil {
+		return nil, true, fmt.Errorf("deserialiseCSR: %w", err)
+	}
+	return b, true, nil
 }
 
 // readCSRIndexSection parses the property-index section at the given offset.

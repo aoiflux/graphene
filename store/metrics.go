@@ -110,6 +110,17 @@ const (
 	// once, at the moment the decision is taken. StorageStats.ImageMode is the
 	// same fact for a caller that did not attach a sink.
 	MetricImageFallback
+
+	// MetricIndexFallback is one open that asked for a property index read out of
+	// the image and rebuilt it in the heap instead. Err names why: the mode is
+	// IndexResident, or the image is in the heap, where an index read in place
+	// would pin the whole file to save part of it.
+	//
+	// A file that simply carries no such index — anything written before the
+	// format could hold one — is not a fallback and emits nothing. There is
+	// nothing in that file to read in place, and the next compaction is what
+	// produces one.
+	MetricIndexFallback
 )
 
 // String names the kind, for a sink that labels its output.
@@ -137,6 +148,8 @@ func (k MetricKind) String() string {
 		return "id-headroom-low"
 	case MetricImageFallback:
 		return "image-fallback"
+	case MetricIndexFallback:
+		return "index-fallback"
 	default:
 		return "unknown"
 	}

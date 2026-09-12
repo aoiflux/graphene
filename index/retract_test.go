@@ -40,6 +40,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aoiflux/graphene/store"
@@ -57,7 +58,18 @@ type fakeBase struct {
 	// how the damaged-base paths are reached without a damaged file.
 	failKey string
 	failErr error
+
+	// walks counts calls to ForEachValue, so a test can assert what a path read
+	// out of the base rather than only what it concluded. Atomic because one base
+	// is read by sixty-four goroutines in the uniqueness test.
+	walks atomic.Int64
 }
+
+// valueWalks is how many times ForEachValue has been entered.
+func (b *fakeBase) valueWalks() int { return int(b.walks.Load()) }
+
+// resetCounts zeroes the counters, for a test that reuses one base across arms.
+func (b *fakeBase) resetCounts() { b.walks.Store(0) }
 
 type fakeSide struct {
 	keys      []string                     // ascending
@@ -179,6 +191,7 @@ func (b *fakeBase) Lookup(kind EntityKind, key string, value []byte) (IDRun, err
 }
 
 func (b *fakeBase) ForEachValue(kind EntityKind, key string, from []byte, fn func([]byte, IDRun) bool) error {
+	b.walks.Add(1)
 	if err := b.fail(key); err != nil {
 		return err
 	}

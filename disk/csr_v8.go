@@ -378,15 +378,14 @@ func checkCriticalSections(sections []csrSection) error {
 		}
 		switch s.Magic {
 		case csrSectionPropIndex, csrSectionOrderedKeys, csrSectionEntityHash, csrSectionAttestation,
-			csrSectionTombstones, csrSectionComposite:
+			csrSectionTombstones, csrSectionComposite, csrSectionMappedIndex, csrSectionMappedReverse:
 			// Understood.
 			//
-			// GPIX and GPIR are deliberately absent until the loader reads them.
-			// The magics are registered in this file, but registering a magic is
-			// not understanding a section: a build that listed them here would
-			// accept an image whose index it then ignored, which is the wrong
-			// answer their critical flag exists to refuse. They join this list in
-			// the change that teaches the loader to read them.
+			// GPIX and GPIR joined this list when the loader learned to read them,
+			// and not when the writer learned to write them: registering a magic is
+			// not understanding a section, and a build that had listed them early
+			// would have accepted an image whose index it then ignored — which is
+			// the wrong answer their critical flag exists to refuse.
 		default:
 			return fmt.Errorf("deserialiseCSR: file carries critical section %q, which this build does not understand — "+
 				"it was written by a newer version and must not be read as though the section were absent", s.Magic)

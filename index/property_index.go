@@ -231,6 +231,14 @@ func (p *PropertyIndex) DeclareCompositeNodeKeys(keys []string) error {
 	// store, and therefore before the snapshot below.
 	p.compDeclared.Store(true)
 
+	// The base first, for a composite declared over a store that already has one.
+	// AttachBase does the same for the other order — a composite declared before
+	// the base arrived, which is every composite a store restores from its
+	// catalogue at Open. See fillCompositeFromBase.
+	if s, hasBase := p.nodeBase(); hasBase {
+		fillCompositeFromBase(s, idx)
+	}
+
 	// One member key at a time: snapshot that key's entries under its own read
 	// lock, release, then file them. Filing under the shard lock would mean
 	// holding a shard lock and a composite lock at once, which is the single
@@ -266,6 +274,10 @@ func (p *PropertyIndex) DeclareCompositeEdgeKeys(keys []string) error {
 		return nil
 	}
 	p.compDeclared.Store(true)
+	// See DeclareCompositeNodeKeys for why the base is walked first.
+	if s, hasBase := p.edgeBase(); hasBase {
+		fillCompositeFromBase(s, idx)
+	}
 	for pos, key := range idx.keys {
 		type entry struct {
 			id    store.EdgeID

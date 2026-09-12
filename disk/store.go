@@ -101,6 +101,10 @@ type Store struct {
 	// the zero value stays the documented default. See mapping.go.
 	imageMode ImageMode
 
+	// indexMode is Options.IndexMode as given, on the same terms. See
+	// index_mode.go.
+	indexMode IndexMode
+
 	// images holds every mapping of graphene.csr this store has created, and is
 	// what keeps them alive: a CSRGraph deliberately does not reference its
 	// mapping, because runtime.AddCleanup never fires on an object its argument
@@ -356,6 +360,7 @@ func (s *Store) StorageStats() store.StorageStats {
 		st.CSREdges = csr.EdgeCount()
 	}
 	st.ImageMode, st.ImageMappedBytes = s.imageHolding()
+	st.IndexMode = s.indexHolding()
 	st.PropertyNodeEntries, st.PropertyEdgeEntries = s.index().EntryCounts()
 
 	// Identifiers issued, not identifiers present. The counters are what the
@@ -775,6 +780,18 @@ type Options struct {
 	//
 	// See mapping.go for the lifetime argument and §14.18 for the measurement.
 	ImageMode ImageMode
+
+	// IndexMode decides whether a property index the image carries is read in
+	// place or rebuilt in the heap at Open. The zero value, IndexResident,
+	// rebuilds it, which is what every version before the format could carry a
+	// readable one did.
+	//
+	// IndexMapped is the memory this section of the program is about: the index
+	// stops being a function of the number of entries and becomes a fence per key.
+	// It requires a mapped image and falls back with a metric otherwise.
+	//
+	// See index_mode.go for what the choice actually costs on each side.
+	IndexMode IndexMode
 }
 
 // ErrReplayBudget reports an Open refused because the log exceeds
@@ -1037,6 +1054,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		maxSnapshotAge: opts.MaxSnapshotAge,
 		idHeadroomWarn: opts.IDHeadroomWarn,
 		imageMode:      opts.ImageMode,
+		indexMode:      opts.IndexMode,
 		syncOnCommit:   true,
 		metrics:        opts.Metrics,
 		signer:         opts.Signer,

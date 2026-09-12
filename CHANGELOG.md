@@ -5,6 +5,99 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### A store can open the mapped index: `Options.IndexMode`
+
+The two sections now have a reader on the other side of the loader. A v9 image
+parses to an `index.Base`, `Options.IndexMode: IndexMapped` attaches it, and the
+in-memory index becomes the delta over it — the arrangement `base ∪ delta −
+retracted` was built for, reached from a file for the first time.
+
+The default is still `IndexResident`, and that is deliberate. Reading the index
+in place changes what a lookup costs as well as what a store holds, and the
+change that moves the default is the one that measures both against each other.
+Everything here is reachable today by asking for it.
+
+**What it is worth, measured.** A store of 50,000 nodes carrying 150,000 indexed
+entries, opened both ways from one image:
+
+| | resident | mapped |
+|---|---|---|
+| heap after Open | 25.0 MiB | 10.3 MiB (−58.9%) |
+| Open | 121–126 ms | 29–35 ms (−72 to −77%) |
+| warm point lookup | 272–294 ns | 276–310 ns (+1.5 to +5.4%) |
+
+Three runs, identical to the tenth of a percent on the heap figure. The saving is
+103 bytes per indexed entry, which is the ~107 bytes the cost model predicts, and
+it grows with the entries: 7.0 MiB at 60,000 and 14.8 MiB at 150,000. Open is
+faster because the resident arm rebuilds 150,000 entries and the mapped arm reads
+a directory. The latency this trade was expected to spend is not visible warm —
+a lookup that was 0.2 µs is 0.28 µs, and the 13 random reads a cold one costs are
+what `NodesByPropertyBatch` is for.
+
+`disk/index_mode_spike_test.go` is that measurement, under `-tags=stress`. It
+exists because §14.13 recorded "±0.0%" for a change that plainly moved bytes, and
+the reason it recorded that is that nothing reopened a store from disk.
+
+**Composites are the one thing a base cannot answer in place.** A composite is an
+index over a tuple of keys the forward direction holds separately, so answering
+one from the image would mean intersecting the member keys' runs on every query —
+the work a composite exists to have done once. So `AttachBase` does it once, and
+the fill is proportional to the member keys' entries rather than to the index: a
+store that declares no composite reads nothing from the base at all.
+
+Which is where the ordering bit. A store restores its declarations from its
+catalogue *before* it loads its image, so at Open the composite exists and the
+base does not — and a fill that ran only when a composite was declared left every
+reopened store answering every composite query with no matches. Silently: an
+empty result, not a slow one, which is worse than the scan the GORD section
+exists to prevent. It is filled from both ends now, and a test asserts both
+orders produce the same answers.
+
+**A v9 image under `IndexResident` is not refused.** Its runs are walked into the
+resident index through the same per-entry path GIDX's entries take, so the two
+arms of the option produce the same index out of the same file — which is what
+lets the resident arm be the oracle for every test of the mapped one. It is also
+what keeps the bulk loader §14.4 measured and reverted reverted.
+
+`IndexMapped` needs a mapped image. Under `ImageHeap` the file is a buffer the
+parse copies what it needs out of, so an index read out of it would pin the whole
+image in anonymous memory to save part of it — the opposite of the trade. The
+store rebuilds it, `StorageStats.IndexMode` says "resident", and
+`store.MetricIndexFallback` names why. A file that simply carries no mapped index
+is not a fallback and reports nothing: there is nothing in it to read in place.
+
+**A damaged run fails the open.** Most of this index's read paths have no error to
+return, so a base records its first fault rather than reporting an unreadable run
+as an absent value; a store checks that fault once its declarations are in and
+refuses to come up on a file whose index it could only partly read. Both arms
+refuse, for the same reason at different scales — the mapped arm reads the runs a
+composite needs, and the resident arm reads all of them because rebuilding is
+reading all of them.
+
+**The loader.** GPIX and GPIR joined the understood-section list, which is what
+lifts this build's refusal of an image it could already write — and they joined it
+now rather than when the writer landed, because registering a magic is not
+understanding a section. A file carrying one of the two is refused as damaged
+rather than read as one carrying no index: the forward direction cannot say what
+an entity is indexed under, which is what removing it needs, and the reverse names
+values it cannot resolve. `InspectCSR` reports both as known, so an operator
+diagnosing a file is not told it was written by a newer version than the build
+reading it.
+
+The index is also now loaded *before* the graph is published and the mapping
+attached to it, which is not tidying: loading it can now fail, and the image
+source is the loader's to release only until the mapping's lifetime passes to the
+collector. A failure after that point would leave the file mapped for the life of
+the process.
+
+**Cost to everything that does not ask for this.** Nothing measurable. The
+default is unchanged, a v8 image takes the same path it did, and the added work on
+it is two lookups in a section directory of at most seven entries. Interleaved
+against a control tree over seven passes: allocation identical (2.045–2.059 MB and
+396–397 allocs per open on both sides), heap after Open identical to two decimals
+(92.12–92.15 MiB on both sides), and a wall-clock difference smaller than the
+spread within either arm. Twelve mutants, twelve killed.
+
 ### A compaction can write the mapped index: format v9
 
 The two sections the entries below describe now have a writer. Give

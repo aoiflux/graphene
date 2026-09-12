@@ -106,6 +106,15 @@ before §6's aliasing note surprises you:
 falls back to a heap copy wherever it is unavailable rather than refusing the
 open.
 
+`disk.Options.IndexMode` is the same shape of choice for the property index. The
+default, `IndexResident`, rebuilds it in the heap at open. `IndexMapped` reads it
+out of the image instead, which costs about a hundred bytes per indexed entry less
+memory and a few nanoseconds per warm lookup more — and needs both a mapped image
+and an image new enough to carry the index in a readable form. It does not change
+what a read hands back: property values are copied out of the index at every
+public boundary either way. `StorageStats.IndexMode` reports what is in force and
+`store.MetricIndexFallback` names any request that could not be honoured.
+
 ```go
 g := graphene.NewInMemory()
 defer g.Close()

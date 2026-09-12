@@ -183,9 +183,17 @@ func (s *retractSet) bytes() int {
 // AttachBase makes b the disk-resident half of this index, the shards becoming
 // the delta over it.
 //
-// It is not a load. Nothing is read from b here beyond its two highest ids,
-// which fix the length of the retraction sets; every entry b holds is read in
-// place, on the query that needs it.
+// Almost nothing is read from b here. Its two highest ids fix the length of the
+// retraction sets, and every entry it holds is read in place, on the query that
+// needs it — that is the whole point of it being a base.
+//
+// The exception is the declared composites, which are filled from it. A composite
+// cannot be answered in place: it is an index over a tuple of keys that the
+// forward direction holds separately, and answering one from the base would mean
+// intersecting the member keys' runs per query, which is the work a composite
+// exists to have done once. So it is done once, here. See fillCompositeFromBase
+// for what that costs and why it is the one resident structure a mapped index
+// still pays for.
 //
 // A base may be attached to an index that has none, which is what a store does
 // once, at open. Replacing one belongs to compaction: it is the only thing that
@@ -193,6 +201,11 @@ func (s *retractSet) bytes() int {
 // survive into it — an id retracted from the old base is simply absent from the
 // new one, so the new set starts empty and receives only what is retracted after
 // the pin.
+//
+// A run that will not decode during the composite fill is recorded rather than
+// returned: the error here is for misuse, and damage to the image is what
+// BaseFault reports. A caller that will not serve a half-built composite index
+// checks it afterwards, which is what a store does at open.
 func (p *PropertyIndex) AttachBase(b Base) error {
 	if b == nil {
 		return errIndexf("index: AttachBase needs a base")
@@ -203,7 +216,47 @@ func (p *PropertyIndex) AttachBase(b Base) error {
 	if !p.baseRef.CompareAndSwap(nil, st) {
 		return errIndexf("index: a base is already attached")
 	}
+	// After the swap, not before: the fill reads through nodeBase and edgeBase,
+	// which is also what records a fault, and both of those are reached from
+	// baseRef.
+	if s, ok := p.nodeBase(); ok {
+		for _, idx := range p.nodeComposites.all() {
+			fillCompositeFromBase(s, idx)
+		}
+	}
+	if s, ok := p.edgeBase(); ok {
+		for _, idx := range p.edgeComposites.all() {
+			fillCompositeFromBase(s, idx)
+		}
+	}
 	return nil
+}
+
+// fillCompositeFromBase files every entry the base holds under one composite's
+// member keys into that composite.
+//
+// This is the resident cost a mapped index does not remove, and it is
+// proportional to the entries under the composite's member keys rather than to
+// the index as a whole — a store that declares no composite pays nothing, and one
+// that declares a tuple over two keys pays for those two.
+//
+// No lock is taken over the base: it is immutable. The shard locks are not taken
+// either, deliberately, because filing under one would mean holding a shard lock
+// and a composite lock at once — the single thing the composite design avoids.
+// The delta's own entries are filed separately, by whoever has them.
+//
+// Filing the same (id, pos, value) twice is a no-op, so an entry the base and the
+// delta both hold costs one redundant register and nothing else.
+func fillCompositeFromBase[T entityID](s baseSide[T], idx *compositeIndex[T]) {
+	var vals []string
+	var buf []T
+	for pos, key := range idx.keys {
+		vals, buf = s.mergeForEachEntry(key, nil, vals, buf,
+			func(id T, value []byte) bool {
+				idx.register(id, pos, string(value))
+				return true
+			})
+	}
 }
 
 // AttachedBase returns the attached base, or nil.
