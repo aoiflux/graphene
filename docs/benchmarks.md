@@ -2597,3 +2597,184 @@ benchmark builds its whole fixture inside the measurement, and building it
 includes a compaction — so 300,000 of its allocations were the payload. The
 bytes-per-node and bytes-per-edge figures it exists to report are unchanged to
 four significant figures.
+
+## The memory architecture review (2026-09-12)
+
+The Phase 2 measurement campaign. Interpretation, the models fitted to these numbers
+and what they rank is in [MEMORY_MODEL.md](MEMORY_MODEL.md); this section is the raw
+record so a later run can be compared against it.
+
+No engine change. The tree is `d5ac514` throughout — the campaign measures the shipped
+program (R1, R10(b), R2), it does not evaluate a candidate. What changed is the
+instrument: `tests/rss_bench_test.go` gained a persistent reusable master
+(`GRAPHENE_RSS_DIR`) and the three fixture knobs Phase 0 specified and never built
+(`GRAPHENE_RSS_EDGE_STRIDE`, `GRAPHENE_RSS_BLOB_DIST`, `GRAPHENE_RSS_NOINDEX`).
+
+Conditions: Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, 31.4 GiB RAM,
+go 1.26, NVMe, 4 KiB pages. `-tags=stress`, `-benchtime=1x`, never under `-race`. Every
+arm runs in a fresh process against a master built by an earlier one.
+
+### Why the master is persistent
+
+Building the 1.4M-node fixture and then measuring in the same process reports
+`peakMiB` **9,584** against 4,326 settled — the build's high-water mark under the
+measurement's name — and its settled anonymous figure is 3,111 against 2,909 measured
+freshly, so `debug.FreeOSMemory` does not fully undo a build either. The first no-index
+arm was run this way and reported 205.1 MiB anon / 2,907 peak; re-run in a fresh
+process it reports 161.1 / 980.2. **Both figures in that pair were wrong, in the same
+direction, for the same reason.** Every number below is from a fresh process.
+
+Incidentally, the 9,584 MiB build peak lands within 3% of the 9,290 MiB rebuild peak an
+embedding consumer reported from outside the engine.
+
+### Arm A — the indexed master, 1,400,000 nodes, 512-byte blobs
+
+Store on disk 1,292,200,487 B = 1.2035 GiB. Three fresh processes per row.
+
+| benchmark | anonMiB | fileMiB | rssMiB | heapMiB | peakMiB |
+|---|---|---|---|---|---|
+| `RSS_Open` | 2909 / 2909 / 2911 | 1220 / 1221 / 1221 | 4129 / 4130 / 4131 | 2756 ×3 | 6161 – 6227 |
+| `RSS_Scan` | 2903 / 2908 / 2909 | 1219 – 1221 | 4124 / 4128 / 4128 | 2756 ×3 | 5880 – 6239 |
+| `RSS_BlobTouch` | 2911 – 2914 | 1220 – 1221 | 4132 – 4135 | 2756 ×3 | 6203 – 6242 |
+| `RSS_CompactIncremental` | 2918 | 1220 | 4138 | 2771 | 6145 |
+
+`residentPerDisk` 3.351. Spread across processes 0.07% on anon, 0.05% on total. A
+fourth independent process (the profile run of the follow-ups) reports anon 2910 /
+file 1222 / heap 2756 / peak 6139 / `residentPerDisk` 3.354 — arm A reproduced to 0.03%.
+
+`RSS_BlobTouch` walks every blob: 683.6 MiB of blob bytes (= 512 B × 1,400,000 exactly),
+92–153 ns/record, a 128–214 ms walk, and neither residency class moves.
+
+`RSS_CompactIncremental` at 1,414,000 live records: `compactAllocB` 193,767,064
+(184.8 MiB) in `compactAllocs` 53,306 = 137.0 B/record; `compactDeltaMiB` 185.5;
+`compactPeakMiB` 4,323; `compactMs` 19,969.
+
+### Arm B — the same store with no index, 1,400,000 nodes
+
+`GRAPHENE_RSS_NOINDEX=1` skips every declaration and every index call. Three fresh
+processes:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| anonMiB | 160.7 | 161.6 | 161.9 |
+| fileMiB | 700.4 | 699.7 | 699.5 |
+| rssMiB | 861.1 | 861.3 | 861.5 |
+| heapMiB | 110.5 | 110.5 | 110.5 |
+| peakMiB | 980.1 | 980.2 | 980.2 |
+| diskMiB | 703.6 | 703.6 | 703.6 |
+| residentPerDisk | 1.224 | 1.224 | 1.224 |
+
+Subtracting arm A: the property index is **528.4 MiB on disk, 2,748 MiB of anonymous
+memory (94.5%), 2,645 MiB of live heap (96.0%)**, and 94.1% of the open transient
+(2,006 MiB indexed against 118.9 MiB without).
+
+`RSS_Scan` has no no-index arm: it resolves rows through `NodesByProperty` and asserts
+it found them, which cannot succeed against a fixture with no index.
+
+### Arm C — edges, 400,000 nodes
+
+`GRAPHENE_RSS_EDGE_STRIDE` writes one edge per N nodes. Every previously recorded
+baseline in this file was measured on an edgeless store, so no adjacency or edge-record
+term had ever been measured.
+
+| stride | edges | heapMiB | B/edge over the previous row |
+|---|---|---|---|
+| none | 0 | 722.1 | — |
+| 4 | 100,000 | 732.5 | 109.1 |
+| 1 | 400,000 | 763.0 | 107.2 |
+
+Linear to 1.7% over a 4× range, and within 3% of the 104 B/edge the structures predict
+(`rawEdge` 80 + `outEdges`/`inEdges` 16 + `edgesByLabel` 8).
+
+### Arm D — rebuild cycles, 200,000 live nodes
+
+Each cycle deletes every node and writes 200,000 new ones, then compacts. Identifiers
+are never reused, so every cycle burns 200,000 of them permanently. This is the M8
+instrument.
+
+| cycle | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| resident, MiB | 571.1 | 590.2 | 603.8 | 611.1 | 614.6 | 619.0 | 623.1 | 624.8 | 629.4 | 632.9 | 629.4 |
+| Δ | — | +19.1 | +13.6 | +7.3 | +3.5 | +4.5 | +4.1 | +1.7 | +4.6 | +3.5 | −3.5 |
+
+`MiBPerCycle` 5.647 over all ten; `MiBPerCycleTail` **2.065** over the second half;
+`BPerBurnedID` **10.83**. Final anon 627.5 / heap 507.0 / peak 1171.
+
+A one-cycle arm reports `MiBPerCycle` 13.15 (anon 583.3, heap 476.2, peak 1113) — the
+series is decelerating, so measuring one cycle and multiplying overstates forty cycles
+by 6.4×. Against the 72 B per burned identifier the pre-R10(b) layout costs by
+structure, 10.83 B is a 6.6× reduction.
+
+`RSS_Open_UncompactedWAL` at 200,000 nodes, no image on disk at all: anon 533.4,
+file 0, rss 533.4, heap 475.4, peak 902.7, disk 200.1, `residentPerDisk` 2.666.
+
+### Arm E — a first compaction, 200,000 nodes, resident sampled on a ticker
+
+| run | anonMiB | heapMiB | compactDeltaMiB | compactPeakMiB | peakMiB | samples |
+|---|---|---|---|---|---|---|
+| 1 | 520.2 | 467.9 | 143.3 | 672.1 | 724.2 | 6648 |
+| 2 | 524.3 | 467.9 | 142.3 | 676.2 | 742.1 | 6310 |
+| 3 | 519.6 | 468.0 | 142.1 | 670.7 | 766.8 | 4338 |
+
+Spread 0.8% on the transient.
+
+### Arm F — the consumer's blob distribution, 20,000 nodes
+
+`GRAPHENE_RSS_BLOB_DIST=1` writes 90% at 512 B, 9% at 64 KiB, 1% at 4 MiB — a mean of
+48,302 B per node.
+
+| | fixed 512 B | long-tailed |
+|---|---|---|
+| diskMiB | 17.61 | 929.1 |
+| anonMiB | 96.56 / 96.86 / 97.02 | 109.4 / 107.1 / 107.9 |
+| fileMiB | 16.18 / 16.16 / 16.23 | 20.85 / 20.38 / 20.33 |
+| rssMiB | 112.7 / 113.0 / 113.3 | 130.3 / 127.4 / 128.2 |
+| heapMiB | 44.36 / 44.41 / 44.38 | 44.38 / 44.42 / 44.42 |
+| peakMiB | 167.1 / 178.8 / 178.8 | 3905 / 3905 / 4171 |
+| residentPerDisk | 6.404 – 6.433 | 0.1372 – 0.1402 |
+
+52.8× the store for 1.12× the anonymous memory and 1.000× the live heap. `peakMiB` here
+is build contamination — arm F has no persistent master — but it is informative anyway:
+writing a store whose tail is 4 MiB blobs peaks near 4 GiB, because the write path
+buffers whole blobs before they reach the WAL.
+
+### The compaction transient, decomposed
+
+`-memprofilerate=1` over `BenchmarkRSS_CompactIncremental` at 200,000 nodes. Absolute
+residency in this run is inflated by the profiler (anon 678.8 against arm E's 520) and
+is not comparable; the attribution is. Reported figures: `compactAllocB` 28,546,832,
+`compactAllocBPerRecord` 141.3, `compactAllocs` 7,487, `compactDeltaMiB` 27.54,
+`compactPeakMiB` 841.4, `compactMs` 2,653, `liveRecords` 202,000.
+
+`alloc_space`, focused on the `Compact` call — total 27,611 kB = 26.96 MiB:
+
+| site | kB | per unit |
+|---|---|---|
+| `disk.buildSeq` (cum) | 23,241.80 | 117.8 B/live record — the new `CSRGraph` |
+| ` └ CSRGraph.buildLabelIndex` | 8,822.75 | 44.7 B/node, append-grown, not presized |
+| `CSRGraph.SerialiseTo` (cum) | 3,234.80 | 16.4 B/live record for a 176 MiB image |
+| ` └ compactPlan.nodePropSeq → ForEachNodeProperty` | 3,162.89 | **1.19 B/index entry** over 2.6M entries |
+| `index.sortedBucketValues` | 3,160 | |
+| `Store.compactPin` (cum) | 1,129.43 | the plan |
+| ` └ disk.cloneBytes` | 1,000 | **512 B × 2,000 delta records, exactly** |
+
+The same profile focused on the fixture build, whose compaction is a *first* compaction
+with every record in the delta, shows `cloneBytes` at 0.10 GB flat = 512 B × 200,000 —
+which is why arm E's transient is 142.6 MiB and this one's is 27.5 MiB on the same store
+size.
+
+Also visible in the build path, and outside Phase 2's questions but worth recording:
+`appendMarshalledNode` 0.50 GB = 2.68 KB allocated per node for a 512-byte blob;
+`postings.add` + `addRef` 0.70 GB; `WAL.beginFrame` 0.12 GB.
+
+### A method that does not work, recorded so it is not retried
+
+The plan specified `-memprofile` with `-memprofilerate=1` and `inuse_space` to decompose
+heap ownership at Open. It cannot: `go test -memprofile` writes the profile at binary
+exit, after the benchmark's `defer g.Close()`, so the store is gone before the heap is
+sampled. An `inuse_space` profile of a 1.4M-node indexed Open reports **6.1 MB total,
+91.7% of it `runtime.mallocgc` under `runtime.newm`** — the scheduler's own allocations
+after teardown. Profiling a live store needs `pprof.WriteHeapProfile` inside the
+benchmark while the handle is open, which no current instrument does. The index figures
+above are differencing results for that reason, and for an index spread over a hundred
+maps differencing is the better method regardless.

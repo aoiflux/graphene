@@ -7,6 +7,7 @@ were tried and rejected, so they are not re-attempted.
 
 For *using* the engine, read [API_REFERENCE.md](API_REFERENCE.md) and
 [USER_GUIDE.md](USER_GUIDE.md). For numbers, read [benchmarks.md](benchmarks.md);
+for what holds resident memory and why, [MEMORY_MODEL.md](MEMORY_MODEL.md);
 figures here are illustrative and that document is authoritative.
 
 **Status.** Pre-production. This describes the current implementation, not a
