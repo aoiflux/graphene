@@ -115,12 +115,18 @@ func TestZeroExternalDependencies(t *testing.T) {
 //     and locking flags the syscall package does not expose as typed calls.
 //   - index/property_index.go — unsafeBytes, a no-copy string→[]byte view
 //     handed to a callback that is documented not to retain or mutate it.
+//   - disk/mmap_windows.go — sliceOfMapping, which turns the address
+//     MapViewOfFile returns into the []byte the image is read from. It assigns
+//     the slice header's fields rather than converting a uintptr to a pointer,
+//     which is the form that leaves go vet's unsafeptr check something to do
+//     everywhere else; the function says why at length.
 //
 // An addition here is not forbidden; it is required to be deliberate. The
-// list is what makes a fourth file a review decision instead of an accident.
+// list is what makes a fifth file a review decision instead of an accident.
 var unsafeFiles = map[string]bool{
 	"disk/fileshare_windows.go": true,
 	"disk/lock_windows.go":      true,
+	"disk/mmap_windows.go":      true,
 	"index/property_index.go":   true,
 }
 

@@ -1954,8 +1954,10 @@ writer. That second half is not a limitation of file locking — it follows from
 how the store loads.
 
 `Open` materialises everything once: the delta maps and property index from a WAL
-replay (`store.go`), the CSR from a single `os.ReadFile` (`csr_io.go`). Nothing
-re-reads afterwards. A reader admitted alongside a writer would therefore serve
+replay (`store.go`), the CSR from a single read or a single mapping of
+`graphene.csr` (`csr_io.go`, §14.18). Nothing re-reads afterwards, and a mapping
+does not change that — the image is never rewritten in place (§15.13), so the
+bytes behind it are the ones that were there at `Open`. A reader admitted alongside a writer would therefore serve
 the graph as it stood at its own open, for its whole lifetime, with no indication
 that it had gone stale — a wrong answer delivered confidently, which is worse
 than a refusal.
@@ -4189,6 +4191,333 @@ both back.
 
 ---
 
+### 14.17 Taken: the compaction plan holds the image instead of copying it
+
+The third item of the memory program, and the one that finished bounding what a
+compaction costs by what was written since the last one.
+
+**The defect.** `compactPin` built the new image's record set as two slices,
+under `s.mu`, by walking the live image and appending every record the delta had
+no opinion about. That is one `nodeRecord` per live node and one `rawEdge` per
+live edge — 56 B and 80 B — for the whole live set, allocated while a writer is
+blocked, and held for the length of the build *beside the image it had just been
+copied out of*. Neither slice was presized, so reaching that size had allocated
+about five times as much again.
+
+**What the copy was for, and why it was not needed.** The plan must share nothing
+mutable with the store, because the build runs with no lock. The delta's maps
+satisfy nothing of the sort and must be copied. But a `CSRGraph` is immutable
+once published — that is already an invariant, §15 — so the image does not need
+copying at all. It needs *reaching*, which is one pointer.
+
+**What shipped.** `compactPlan` holds `csr *CSRGraph`, the pinned image, plus the
+delta's own records in `deltaNodes`/`deltaEdges`, presized from the live counts
+the delta already maintains. `build` merges the two, so the record set is never
+materialised anywhere:
+
+- `Build` becomes a thin wrapper over `buildSeq(iter.Seq[nodeRecord],
+  iter.Seq[rawEdge])`. `deserialiseCSR` holds a slice and keeps calling `Build`,
+  as do the tests; nothing outside compaction changed shape.
+- `compactPlan.nodeSeq`/`edgeSeq` walk the image's arena and the sorted delta
+  with two cursors, yielding ascending identifiers and materialising nothing.
+
+**The problem the known-identifier sets solve.** The merge has to drop the image
+records the delta displaces, and the old loop answered that with
+`reader.deltaNodeKnown(id)` — a map probe plus a version-chain resolve, once per
+image record, under the lock. Probing a map from inside the build would mean the
+plan holding the delta's maps, which is precisely what it may not do.
+
+So the pin records every identifier the delta had an opinion about at the pinned
+epoch — `deltaKnownNodes`, `deltaKnownEdges` — in the same single pass over the
+delta maps that produces the record copies. A tombstone contributes an identifier
+and no record, which is the only reason a tombstone survives the pin. Outside the
+lock the four slices are sorted, and the merge consumes the known set with a
+monotonic cursor: the test that ran once per image record now runs once per delta
+entry, and the structure it needs is two sorted slices of identifiers rather than
+a map.
+
+**Why the sequences are walked more than once, and what that costs.** `buildSeq`
+makes three passes over nodes and five over edges, and that is inherent rather
+than lazy: the page directory is sized from the highest identifier, the arena
+from the touched pages, and adjacency is a degree count followed by a fill. A
+sequence given to it must therefore be repeatable and must yield the same records
+every time — a contract no slice caller can break and every generator caller can.
+
+It is checked to the extent it cheaply can be. Each later pass counts what it saw
+and disagreement with the first pass returns `errUnstableBuild`, at the pass where
+it appears rather than as an out-of-range write two passes downstream. The
+adjacency fill carries the check *inside* its loop as well, because that is the
+one pass where an extra record writes past the end of an array sized by an
+earlier count rather than merely disagreeing with it. A sequence yielding the same
+number of *different* records is a caller bug this does not try to survive, and
+the doc comment says so: both sequences in the package are stable by construction,
+so these are a diagnostic for whatever is written next, not a defence against a
+file.
+
+**The side-effect worth having.** The merge yields globally ascending identifiers,
+so the adjacency arrays a compaction produces are now identical to the ones the
+same image produces when it is read back from disk, where records arrive in file
+order. Before this the delta's edges were appended in Go map order, so a freshly
+compacted store and a reopened one could disagree about the order of a node's
+incident edges — and disagree differently on every run.
+`TestCompact_AdjacencyMatchesAReopenOfTheSameImage` holds that.
+
+**The metric that had been wrong against its own contract.** `store/metrics.go`
+documents a compaction's `Examined` as "records scanned", and it was
+`len(plan.nodes) + len(plan.edges)` — the records in the new image, which is what
+`Count` reports. The pin can state the true figure for nothing now, because both
+counts it needs are maintained: the image's live records plus every delta entry.
+`Examined − Count` is therefore the work that produced nothing, which is the
+number that says whether compacting was worth the write.
+
+**What it bought.** On a store with a 100,000-record image and a 1,000-record
+delta, three interleaved rounds: a compaction allocates **95,859,304 B against
+128,050,664 B**, which is 949.1 B per live record against 1,268 B, and its
+transient peak over steady state falls from 122.0 MiB to **91.27 MiB**. At twice
+the image the per-record figures are unchanged in both arms — 949.1 B and 1,267 B
+— so the cost removed was proportional to the image, and the saving doubles with
+it, 30.70 MiB to 61.24 MiB. The pin measured on its own allocates **2,416 B over
+a 1,000-record image and 2,416 B over an 8,000-record one**. The image is
+byte-identical. See
+[benchmarks.md](benchmarks.md#the-compaction-plan-stops-copying-the-image-2026-09-12).
+
+**What it cost, and where.** A compaction is slower: +10.7%, +8.3% and +2.5% on
+the three `Forensic_Compact` arms at n=10,000, spreads overlapping. A three-arm
+measurement attributes all of it to sorting the delta — about 330 ns a record,
+dominated by moving 56-byte structs — and shows the rest of the change to be
+*quicker* than what it replaced, by around 10% with non-overlapping spreads: the
+sequence indirection costs less than building and growing the slice it removed.
+The sort was kept, because it is what makes the merge two cursors instead of a
+lookup structure and what makes the ascending-order property above statable
+without an exception. Under decision 1 of the program that is the trade to make.
+
+Open pays the indirection too, `Build`'s other caller being `deserialiseCSR`, and
+the figures say what for: **twenty-three allocations per open, no measurable bytes
+and no measurable time.**
+
+**What the mutation pass found.** That one of eleven mutations was provably
+equivalent rather than surviving: flushing delta records ahead of an image record
+with `<=` instead of `<` cannot change the output, because a delta record sharing
+an image record's identifier is necessarily in the known set, so the image record
+is dropped either way and the delta record is emitted at the same position. It
+was replaced by a mutation that is a realistic bug — `edgeSeq` consulting
+`deltaKnownNodes` — which two tests catch. The pass also found that the
+adjacency-fill bounds check was not covered: the existing extra-edge case used
+endpoints in the middle of the arena, so the stray write landed in another node's
+range and the trailing count check caught it instead. A subtest whose extra edge
+is incident on the highest node makes the write land past the end of the array,
+which is the case that check exists for.
+
+---
+
+### 14.18 Taken: the image is mapped, not copied
+
+The second item of the memory program's Phase 3, and the first one that moves
+bytes out of the class a RAM ceiling constrains rather than merely allocating
+fewer of them.
+
+**The defect.** `loadCSR` read `graphene.csr` with one `os.ReadFile` and then
+copied every property blob out of that buffer into an arena the `CSRGraph` keeps
+for its life. So opening a 1.2 GiB store cost a 1.2 GiB transient, a second
+allocation of the blob bytes that never went away, and a peak of both at once.
+The bytes on disk are contiguous, pointer-free, and already in exactly the form a
+reader wants: the copy bought nothing but the copy. M1 in the brief named this
+and got half of it wrong — the file buffer does *not* stay for the life of the
+handle, it is garbage as soon as `loadCSR` returns — and the half it got right is
+the arena.
+
+**What shipped.** `Options.ImageMode`, defaulting to `ImageMapped`. The loader
+maps the file and `deserialiseCSRFrom(data, mapped)` resolves each record's
+property blob as a three-index sub-slice of the mapping rather than appending it
+to an arena. Under a mapping there is no arena *and* no span array: spans exist
+only so that a slice taken mid-parse survives the arena's own growth
+reallocating, and a mapping never grows.
+
+Labels stay on the heap in both modes. A label is a `uint16` written at offset +9
+of a record, so the on-disk stream is unaligned and reading it in place would need
+an `unsafe` cast; three megabytes at a million and a half nodes is not worth one.
+
+`mapping` in `disk/mapping.go` owns the region; `mmap_unix.go` is `syscall.Mmap`
+with `PROT_READ`/`MAP_SHARED`, `mmap_windows.go` is
+`CreateFileMapping`/`MapViewOfFile`, and `mmap_unsupported.go` is an honest
+refusal on the platforms with neither. `MAP_SHARED` rather than `MAP_PRIVATE` is a
+measurement decision: read-only the two behave identically, but the kernel
+accounts a shared file mapping's pages as file-backed, which is the separation
+Phase 0's instrument reports and the separation the whole item is judged by.
+
+The Windows half turns the mapping address into a slice by assigning the slice
+header's fields rather than converting a `uintptr` to a pointer, which is the form
+Phase 0 arrived at in `tests/rss_mapfile_windows_test.go` after trying the
+alternatives: `go vet`'s `unsafeptr` check flags the direct spelling inline,
+behind a helper and fed straight from the syscall result alike, and the only way
+to silence it otherwise is to disable the check for the whole repository — where it
+is doing real work in `index/narrow.go` and `index/encoding/encoding.go`.
+`reflect.SliceHeader`'s deprecation is aimed at describing heap memory, which is
+the one thing this is deliberately not.
+
+**Where it falls back, and why that is reported.** Mapping is unavailable on a
+platform with no primitive, on an empty or unaddressably large file, and when the
+mapping call fails. It is also *declined* for a store that holds no process lock —
+a live reader, or a platform where locking is not enforced — because a mapping is
+only as stable as the file under it and a lock is what makes "nothing else is
+rewriting this" true. Every one of those falls back to the copy, so the store
+always opens; each is reported through `store.MetricImageFallback` and
+`StorageStats.ImageMode`, because a store paying for a copy it was configured not
+to pay for is a memory regression with no symptom other than the memory.
+`ImageMappedUnlocked` is the opt-in for the lock-less case, with its own contract.
+
+**The lifetime problem, and why the planned answer was wrong.** The plan for this
+item specified `runtime.AddCleanup` marking a mapping retirable, a `retired` list,
+and a sweep at the commit of the compaction producing image N+2 — so a mapped
+slice would be valid across one compaction and released at the next. Building it
+that way is a use-after-unmap, and the reason is one line of `buildSeq`: it copies
+*record values*, and a record value is two slice headers. The graph a compaction
+publishes therefore addresses the previous image's bytes for every record the
+delta did not touch, and the graph after that addresses them too, having been
+built from records that already do. Unmapping at N+2 would pull the file out from
+under the live graph. Pinning each mapping until its dependents were gone gives
+the opposite failure: the *first* mapping is pinned for the life of the store and
+one more is added per compaction.
+
+So the design is the simpler one that follows from that observation. **A mapping
+created at Open lives until Close. A compaction creates none and retires none** —
+it writes a file and goes on reading blobs from the mapping it already had. A
+store holds exactly one image mapping however often it compacts, there is no
+window in which a compaction invalidates a caller's slice, and the contract on a
+returned `Properties` or `Labels` is the one it always had with one sentence
+added: not after `Close`.
+
+The retirement machinery still exists and is still needed, for exactly one path.
+A live reader rebuilds from the files on a `Refresh` that crosses a compaction, so
+under `ImageMappedUnlocked` it really does map a second image. There
+`runtime.AddCleanup` on the `CSRGraph` marks the old mapping retirable once
+nothing can reach that graph — not `viewPtr`, not a snapshot, not an in-flight
+lock-free reader's local — and `sweepImages` releases it at the next reload.
+Measured over five reloads the reader holds two mappings in the steady state and
+has released four, which is the grace period stated on `ImageMappedUnlocked`: a
+slice from image N is valid until the second reload after it.
+
+Two details of that are worth writing down because they are easy to get backwards.
+The `CSRGraph` deliberately does **not** hold its mapping — it holds only the
+mapped size — because `runtime.AddCleanup` never runs a cleanup whose argument is
+reachable from the object it watches; `Store.images` is what keeps the mapping
+alive. And the test is reachability rather than a reference count because a point
+read from the image costs about six nanoseconds and an atomic pair around it would
+cost more than the read. Reachability is a *floor* on the truth, not the truth:
+the collector does not trace slices into mapped memory, because mapped memory is
+not in the heap. That is why the documented window is the conservative reading of
+the sweep points and why `store.CloneNode`/`CloneEdge` exist.
+
+**The Windows install sequence the plan called for, and the measurement that
+deleted it.** §15.13 predicted that installing an image under a mapping could not
+be a single rename on Windows, and that the old name would have to be renamed
+aside first. Measuring it before building on it — which is what this document asks
+of every claim in it — showed the prediction was wrong. A section object created
+from a `FILE_SHARE_DELETE` handle keeps the bytes reachable by itself and inherits
+that share mode, so once the file handle is closed the name is free: renaming
+another file over the mapped one succeeds, and the mapping goes on reading its own
+bytes. Three generations of image, each mapped and each replaced by a rename over
+the live mapping, each read back whole and correct. The table is in §15.13.
+
+So `mapFile` closes the file handle before it returns — load-bearing, not tidy,
+because keeping it open is what makes the rename fail — and `compactCommit`
+installs an image with the plain `os.Rename` it always used, on both platforms.
+`imageinstall_unix.go`, `imageinstall_windows.go`, the `.retired.<seq>` aside
+files, and the recovery path for a crash between two renames were all designed and
+none of them exist. `TestImageMapped_CompactRenamesOverALiveMapping` is what keeps
+that true, and it runs everywhere.
+
+The same measurement made the fault contract in §15.14 more precise rather than
+less. Windows refuses to shorten a file with a live mapping at all
+(`ERROR_USER_MAPPED_FILE`), so the truncation that produces `SIGBUS` on Unix has
+no Windows counterpart. What is reachable on both is an in-place overwrite, which
+is visible through the mapping immediately — not a fault, but a read returning
+bytes the image's own digest does not vouch for.
+
+**Verification on open stopped reading the image twice.** `verifyImageOnOpen` took
+a path and read the file for itself; the load then read it again. It now takes the
+`imageSource` the open already has, so the image is read or mapped once and the
+two legs share it. The parse still happens twice — verification builds a throwaway
+graph to recompute the roots against — and under a mapping neither parse allocates
+a blob arena, which is why the verified arm gains the same two thirds the plain one
+does.
+
+**What it bought.** Three interleaved rounds against the tree before it, reopening
+from disk, `BenchmarkRSS_Open`:
+
+| | 100 000 nodes | 200 000 nodes |
+|---|---:|---:|
+| Go heap after it settles | 234.6 → **182.1 MiB** (−22.4%) | 467.0 → **362.0 MiB** (−22.5%) |
+| anonymous resident | 297.7 → **257.4 MiB** (−13.5%) | 545.0 → **444.6 MiB** (−18.4%) |
+| file-backed resident | 0 → 84.83 MiB | 0 → 172.0 MiB |
+| total resident | 297.7 → 342.7 MiB | 545.0 → 616.2 MiB |
+| the image on disk | 88.02 MiB | 176.0 MiB |
+
+The heap falls by **52.5 MiB at one size and 105.0 MiB at twice it** — exactly
+double, so what was removed is proportional to the image and the saving doubles
+with it. Per live record the heap goes from 2.46 KiB to 1.91 KiB. What remains is
+the record arenas, the label arena, the adjacency, and the property index, which
+is the larger term and is R3's target.
+
+Total resident goes *up*, and that is the item working rather than failing. The
+file-backed pages are counted in the working set and are evictable without swap;
+the anonymous pages are what a 2 GB ceiling actually constrains. A report that
+looked only at total RSS would read this change as a 15% regression, which is
+precisely why Phase 0 built `TestRSSInstrument_SeparatesFileBackedResidency`
+before anything depended on the separation.
+
+The transient is visible in allocation, which is exact rather than polled.
+`BenchmarkForensic_Open`: **6,295,947 → 2,038,619 B/op (−67.6%)** on the plain
+arm and **12,456,753 → 3,999,403 (−67.9%)** verified, with allocations down 11 and
+25. Wall clock fell on both — 8.19 → 6.80 ms plain, with non-overlapping spreads —
+which is the read and the copy not happening.
+
+A compaction over an existing image inherits the steady-state saving: heap
+235.7 → 183.1 MiB. What it allocates is unchanged to four significant figures,
+because R1(iii) had already stopped it copying the image.
+
+**What it cost, and where.** The polled process residency *during* a compaction
+rises 11.9% (386.0 → 432.0 MiB) — the mapped pages are in the working set, same
+accounting effect as above.
+
+`BenchmarkForensic_Compact` moves by up to 18% and in both directions, and the
+figure to take from that is that it is noise: those arms compact a store that was
+never compacted, so no image is mapped and the change cannot reach them, which
+their identical `B/op` to four significant figures confirms. It is a useful
+calibration of this host — an n=1,000 compaction varies by nearly a fifth between
+runs — and the same caution applies to `PointLookupNode_Memory`, which cannot be
+reached by this change either and moved 6.2%.
+
+The real cost is the one no existing benchmark could see, because every read
+benchmark in the suite gets a record *back* without dereferencing its blob — which
+is the engine's read contract, and exactly the wrong shape for measuring a
+mapping, since a blob nobody reads is a page nobody faults in.
+`BenchmarkRSS_BlobTouch` is that instrument: it walks every record and touches
+every page of every blob, which is the most a mapping can be made to cost.
+
+**The controls.** The image on disk is byte-identical — 175.0 B/node, 87.50
+B/edge, 16.69 MiB on every round of both arms — and no exported behaviour changed
+except the documented lifetime of a returned slice. Both point lookups overlap.
+
+**What the mutation pass found.** Nine mutations, nine caught, and two of them
+only after the pass pointed at something.
+
+A counter that was not counting. `mapping` carried `pins atomic.Int64` so that
+several graphs could share a mapping, and removing the check against zero changed
+nothing any test could observe. That is the definition of a dead counter: a
+mapping is attached exactly once, in `noteImage`, and a compaction attaches
+nothing because the graph it publishes is not parsed from a file. The field is
+gone, with a comment saying what would bring it back.
+
+And an invisible leak. Dropping `src.discard()` from `loadImage`'s failure path
+leaks a mapping that was never added to `Store.images`, so no test that counts
+entries in that list can see it — the only place it is visible is from a caller
+holding the source.
+`TestLoadImage_ReleasesTheMappingWhenTheParseFails` does that, and it exists
+because the pass found nothing else did.
+
+---
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.
@@ -4227,50 +4556,89 @@ Any change must preserve these. Each is enforced by tests.
     file, fsynced, and renamed over the old name; the log is only ever appended
     to or replaced whole by that same sequence. Two things already rest on this:
     `VerifyCSRDigest` hashes an image as it reads it rather than reading it
-    whole, and a live reader parses one while a writer may be compacting. A
-    memory-mapped image would rest on it absolutely — see §15.14.
+    whole, a live reader parses one while a writer may be compacting, and since
+    §14.18 a mapped image rests on it absolutely — see §15.14.
 
-    The two platforms honour it by opposite routes, and the difference is
-    load-bearing rather than incidental. On unix the rename leaves the old inode
-    alone: a handle opened before a compaction goes on reading the image it
+    The two platforms honour it by different routes, and which route depends on
+    whether the reader is holding a *file handle* or a *mapping*. On unix the
+    distinction does not arise: the rename leaves the old inode alone, so a
+    handle or a mapping taken before a compaction goes on reading the image it
     opened while the directory entry names a newer one, and the old file is
-    reclaimed when the last handle closes. On windows renaming a file *over*
-    another is refused outright while any handle to the target is open — with
-    `FILE_SHARE_DELETE` and without it alike, since that share flag permits
-    renaming a file *aside*, which is a different operation. The reader is
-    protected just as completely, by the compaction failing rather than by the
-    two files coexisting.
+    reclaimed when the last reference closes.
 
-    So on windows a process holding the image open — `graphene store csr
-    -verify` against a live store, or anything mapping it — stalls a writer's
-    compaction for as long as it holds on, and the writer sees `Access is
-    denied` on the rename. The compaction leaves the store untouched and
-    succeeds on the next attempt once the reader lets go. Installing an image
-    underneath a mapping therefore cannot be a single rename on windows: the old
-    name has to be renamed aside first and the new file put in its place second.
-    `TestImage_AHeldHandleNeverSeesTheBytesChange` pins both routes.
+    On windows renaming a file *over* another is refused while any handle to the
+    target is open — with `FILE_SHARE_DELETE` and without it alike, since that
+    share flag permits renaming a file *aside*, which is a different operation.
+    So a process holding the image **open** — `graphene store csr -verify`
+    against a live store — stalls a writer's compaction for as long as it holds
+    on, and the writer sees `Access is denied` on the rename. The compaction
+    leaves the store untouched and succeeds on the next attempt once the reader
+    lets go. The reader is protected just as completely, by the compaction
+    failing rather than by the two files coexisting.
+
+    A **mapping** is not a handle, and that is what makes §14.18 possible. This
+    section previously concluded that installing an image underneath a mapping
+    could not be a single rename on windows and that the old name would have to
+    be renamed aside first. That was a prediction, and measuring it before
+    building on it — which is what this document asks of every claim in it —
+    showed it to be wrong. A section object created from a handle opened with
+    `FILE_SHARE_DELETE` keeps the bytes reachable by itself and inherits that
+    share mode, so once the handle is closed the *name* is free. Measured on
+    Windows 11 Pro 26200:
+
+    | operation on a mapped `graphene.csr` | handle closed | handle kept open |
+    |---|---|---|
+    | rename the mapped file away | OK | OK |
+    | rename another file over it | **OK** | Access denied |
+    | delete it | OK | OK |
+    | read through the mapping after any of those | OK | OK |
+    | truncate it | `ERROR_USER_MAPPED_FILE` | `ERROR_USER_MAPPED_FILE` |
+
+    Three generations of image, each mapped and each replaced by a rename over
+    the live mapping, each read back its own bytes whole and correct. So
+    `mapFile` closes the file handle before it returns — load-bearing, not tidy —
+    and `compactCommit` installs an image with the plain `os.Rename` it always
+    used, on both platforms, with no aside, no `.retired.<seq>` files and no
+    recovery path for a crash between two renames.
+    `TestImage_AHeldHandleNeverSeesTheBytesChange` pins the handle route and
+    `TestImageMapped_CompactRenamesOverALiveMapping` the mapping route, the
+    latter on every platform.
 14. **The store directory is the engine's to write, and no one else's, for as
     long as a handle is open.** This is an obligation on the caller, not a
     property the engine can enforce: the write lock keeps other *graphene*
     processes out (§9.1a), and nothing keeps out `truncate`, an editor, a restore
     into a live directory, or a backup tool that rewrites files in place.
 
-    What breaking it costs depends on how the image is held, and the difference
-    is worth stating before it becomes load-bearing. Read into the heap — the
-    only mode this version has — the damage is bounded and reported: the bytes
-    are already decoded, so a live handle keeps working, and the next refresh or
-    reopen fails with a parse error naming what it found. Under a memory-mapped
-    image the same act is not an error at all but a machine fault on the next
-    access to a page that no longer exists: `SIGBUS` on unix, an
-    `EXCEPTION_IN_PAGE_ERROR` on windows. Neither is recoverable in Go — there is
-    no way to turn a fault on a mapped page into an error return — so the process
-    dies, and it dies at whatever unrelated line of caller code happened to touch
-    the property slice.
+    What breaking it costs depends on how the image is held, and since §14.18
+    there are two answers rather than one.
 
-    That is a *defined* outcome rather than a safe one, and it is the reason the
-    invariant is written down here before any mapping exists to enforce it. It
-    binds hardest on `OpenLive` readers, which take no lock at all (§9.1c) and so
-    have no way of knowing a writer's directory is being edited beneath them.
+    Under `ImageHeap` the damage is bounded and reported: the bytes are already
+    decoded, so a live handle keeps working, and the next refresh or reopen fails
+    with a parse error naming what it found.
+
+    Under a mapping there are two distinct hazards and they are not the same
+    size. **Shortening** the file removes pages a slice still addresses, and the
+    next access to one is a machine fault rather than an error — `SIGBUS` on
+    unix. It is not recoverable in Go, so the process dies, and it dies at
+    whatever unrelated line of caller code happened to touch the property slice.
+    On windows this hazard **does not exist**: the operating system refuses to
+    shorten a file with a live mapping at all (`ERROR_USER_MAPPED_FILE`, measured
+    in the table above and asserted by
+    `TestImageMapped_TruncationIsRefusedOnWindows`), so the act that produces the
+    fault cannot happen. **Overwriting bytes in place** without changing the
+    length is permitted on both platforms and is visible through the mapping
+    immediately. That is not a fault but something arguably worse to diagnose: a
+    read returning bytes the image's own digest does not vouch for, with no error
+    anywhere. `VerifyOnOpen` catches it at the next open and nothing catches it
+    during one.
+
+    Both are *defined* outcomes rather than safe ones, which is why the invariant
+    was written down here before any mapping existed to enforce it. They bind
+    hardest on `OpenLive` readers, which take no lock at all (§9.1c) and so have
+    no way of knowing a writer's directory is being edited beneath them — and
+    that is precisely why a live reader is **not** mapped by default and
+    `ImageMappedUnlocked` is a separate, documented opt-in rather than a
+    platform detail of `ImageMapped`.
 
 ---
 

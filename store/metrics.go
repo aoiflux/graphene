@@ -98,6 +98,18 @@ const (
 	// Appended at the end: a kind's number is what a sink's own storage records,
 	// and inserting one anywhere else renumbers every kind after it.
 	MetricIDHeadroomLow
+
+	// MetricImageFallback is one open that asked for a mapped image and did not
+	// get one. Err names why: the platform has no mapping primitive, the store
+	// holds no process lock and the mode requires one, the file is empty or too
+	// large to address, or the mapping call itself failed.
+	//
+	// It exists because the fallback is correct, silent, and expensive. A store
+	// reading its whole image into the heap when it was configured not to is a
+	// memory regression with no symptom other than the memory, so it is reported
+	// once, at the moment the decision is taken. StorageStats.ImageMode is the
+	// same fact for a caller that did not attach a sink.
+	MetricImageFallback
 )
 
 // String names the kind, for a sink that labels its output.
@@ -123,6 +135,8 @@ func (k MetricKind) String() string {
 		return "refresh"
 	case MetricIDHeadroomLow:
 		return "id-headroom-low"
+	case MetricImageFallback:
+		return "image-fallback"
 	default:
 		return "unknown"
 	}

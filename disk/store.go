@@ -97,6 +97,20 @@ type Store struct {
 	// restart replayed the whole index.
 	propIdx *index.PropertyIndex
 
+	// imageMode is Options.ImageMode as given, resolved at the point of use so
+	// the zero value stays the documented default. See mapping.go.
+	imageMode ImageMode
+
+	// images holds every mapping of graphene.csr this store has created, and is
+	// what keeps them alive: a CSRGraph deliberately does not reference its
+	// mapping, because runtime.AddCleanup never fires on an object its argument
+	// is reachable from. Guarded by mu.
+	//
+	// A writer has at most one entry here for the life of the store. Only a live
+	// reader, which rebuilds from the files on a Refresh across a compaction,
+	// ever accumulates more — see sweepImages.
+	images []*mapping
+
 	// live, and the three numbers a live reader advances over. Guarded by mu;
 	// zero and unused on every other kind of store. See live.go.
 	live      bool
@@ -341,6 +355,7 @@ func (s *Store) StorageStats() store.StorageStats {
 		st.CSRNodes = csr.NodeCount()
 		st.CSREdges = csr.EdgeCount()
 	}
+	st.ImageMode, st.ImageMappedBytes = s.imageHolding()
 	st.PropertyNodeEntries, st.PropertyEdgeEntries = s.index().EntryCounts()
 
 	// Identifiers issued, not identifiers present. The counters are what the
@@ -564,11 +579,16 @@ type Options struct {
 	//
 	// This is the part to understand before relying on it. Open materialises the
 	// whole store into memory once — the delta layer and property index from a
-	// WAL replay, the CSR from one os.ReadFile — and nothing re-reads afterwards.
-	// (VerifyOnOpen reads the image once more, before the load and to decide
-	// whether to do it at all; that read is discarded and changes nothing here.)
-	// A read-only store therefore shows the graph as it stood when it opened, for
-	// as long as it lives. Reopen to advance.
+	// WAL replay, the CSR from one read or one mapping of graphene.csr — and
+	// nothing re-reads afterwards. (VerifyOnOpen shares that one read rather than
+	// taking its own, so enabling it does not change this either.) A read-only
+	// store therefore shows the graph as it stood when it opened, for as long as
+	// it lives. Reopen to advance.
+	//
+	// Under the default ImageMode a read-only store maps the image, which is
+	// consistent with a fixed view rather than in tension with it: the engine
+	// never rewrites graphene.csr in place, so the mapped bytes are the ones that
+	// were there at Open. See ImageMode and §15.13.
 	//
 	// That is why a reader is refused alongside a writer rather than permitted:
 	// the alternative is a permanently stale view with nothing to indicate it is
@@ -727,6 +747,20 @@ type Options struct {
 	// store — is a decision with downtime in it. Refusing writes early would
 	// take that decision on the operator's behalf.
 	IDHeadroomWarn float64
+
+	// ImageMode decides whether the compacted image is mapped or copied into the
+	// heap. The zero value, ImageMapped, maps it — which is the default because
+	// the blob half of an image is the largest single thing a store holds and
+	// copying it buys nothing but the copy.
+	//
+	// What it changes for a caller is one sentence, and it is on ImageMapped:
+	// the Properties and Labels slices a read hands back address the file, so
+	// they are valid for the life of the handle and not past Close. ImageHeap is
+	// the way back to bytes that are ordinary heap. store.CloneNode and
+	// store.CloneEdge are the way to keep one record either way.
+	//
+	// See mapping.go for the lifetime argument and §14.18 for the measurement.
+	ImageMode ImageMode
 }
 
 // ErrReplayBudget reports an Open refused because the log exceeds
@@ -807,9 +841,9 @@ func StrictOptions(signer store.Signer, verifier store.Verifier, actorID uint64)
 	}
 }
 
-// verifyImageOnOpen runs the checks VerifyOnOpen asks for, in increasing order
-// of what they prove: the bytes are unchanged, the roots describe those bytes,
-// and a named key vouched for the result.
+// verifyImage runs the checks VerifyOnOpen asks for, in increasing order of
+// what they prove: the bytes are unchanged, the roots describe those bytes, and
+// a named key vouched for the result.
 //
 // The three legs stay separate and stay in this order — the digest matching is
 // no evidence the roots do, which is what catches an edit that repaired the
@@ -818,11 +852,14 @@ func StrictOptions(signer store.Signer, verifier store.Verifier, actorID uint64)
 // store whose image is most of the machine's memory, an opt-in integrity check
 // that costs four reads and three parses is one nobody can afford to leave on,
 // and a check that is turned off protects nothing.
-func verifyImageOnOpen(csrPath string, opts Options) error {
-	data, err := os.ReadFile(csrPath)
-	if err != nil {
-		return fmt.Errorf("verify image: verify csr digest: %w", err)
-	}
+//
+// It now takes the image the open is about to load rather than a path, so the
+// count is one: the same bytes are hashed, parsed for the roots, and then
+// installed. Under a mapping that is one mapping, and the parse here allocates
+// no property arena either — the graph it builds to check the roots is
+// discarded, and while it exists its blobs address the file.
+func verifyImage(src *imageSource, opts Options) error {
+	data := src.data
 
 	switch status, _ := csrDigestStatus(data); status {
 	case DigestMismatch:
@@ -836,7 +873,7 @@ func verifyImageOnOpen(csrPath string, opts Options) error {
 		return nil
 	}
 
-	csr, section, err := deserialiseCSR(data)
+	csr, section, err := deserialiseCSRFrom(data, src.mapped())
 	if err != nil {
 		return fmt.Errorf("verify image: verify roots: %w", err)
 	}
@@ -985,6 +1022,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 
 		maxSnapshotAge: opts.MaxSnapshotAge,
 		idHeadroomWarn: opts.IDHeadroomWarn,
+		imageMode:      opts.ImageMode,
 		syncOnCommit:   true,
 		metrics:        opts.Metrics,
 		signer:         opts.Signer,
@@ -1102,14 +1140,23 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	// Try to load existing CSR.
 	csrPath := filepath.Join(dir, csrFileName)
 	if _, err := os.Stat(csrPath); err == nil {
+		// Mapped or read once here, and used twice below. See verifyImage for
+		// what that replaced.
+		src, serr := s.openImage(csrPath)
+		if serr != nil {
+			return fail("disk.Open: load CSR: %w", serr)
+		}
 		// Integrity checks run before the image is loaded, so a store that fails
 		// them never comes up holding records it could not vouch for.
 		if opts.VerifyOnOpen {
-			if err := verifyImageOnOpen(csrPath, opts); err != nil {
+			if err := verifyImage(src, opts); err != nil {
+				src.discard()
 				return fail("disk.Open: %w", err)
 			}
 		}
-		if err := s.loadCSR(csrPath); err != nil {
+		// loadImage owns src from here, including releasing it if the parse
+		// fails.
+		if err := s.loadImage(src); err != nil {
 			return fail("disk.Open: load CSR: %w", err)
 		}
 	}
@@ -2095,6 +2142,15 @@ func (s *Store) Close() error {
 		walErr = err
 	}
 	if err := s.grants.Close(); err != nil && walErr == nil {
+		walErr = err
+	}
+
+	// Every image mapping goes here, reachable or not. This is where a mapped
+	// Properties slice stops being valid, which is the one sentence Close adds to
+	// the aliasing contract — store.CloneNode is for a caller who needs the bytes
+	// afterwards. Before the lock is released, so no other process takes the
+	// directory while this one still has a section open on a file in it.
+	if err := s.closeImages(); err != nil && walErr == nil {
 		walErr = err
 	}
 

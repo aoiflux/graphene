@@ -5,6 +5,151 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### The compacted image is memory-mapped instead of copied into the heap
+
+Opening a store read `graphene.csr` with one `os.ReadFile` and then copied every
+property blob out of that buffer into an arena the graph keeps for its life. The
+bytes on disk are contiguous, pointer-free and already in the form a reader wants,
+so the copy bought nothing but the copy — and it bought it twice over at the peak,
+once as the file buffer and once as the arena.
+
+The image is now mapped, and a record's `Properties` addresses the file directly.
+`Options.ImageMode` selects it: `ImageMapped` (the default), `ImageHeap` for the
+previous behaviour, and `ImageMappedUnlocked` for a live reader. Labels are still
+decoded into a heap arena in both modes, because a label is a `uint16` at an odd
+offset in the record stream.
+
+**What a caller has to know.** A `Properties` or `Labels` slice from a mapped
+image is valid for the life of the handle and **not past `Close()`** — after
+`Close` the process no longer has the memory, so reading it is a fault rather than
+stale data. Compaction does not shorten that window: a compaction writes a new
+file and goes on reading blobs from the mapping it already had, so a slice taken
+before one is still valid after it, and a store holds exactly one image mapping
+however often it compacts. `store.CloneNode`, `store.CloneEdge`, `store.CloneNodes`
+and `store.CloneEdges` are new, and are the correct way to keep a record — they
+copy `Labels` too, which is the half that is easy to forget.
+
+A live reader is the one store that maps more than one image, because `Refresh`
+rebuilds from the files across a compaction. It is therefore **not** mapped by
+default: it holds no process lock, and a mapping is only as stable as the file
+under it. `ImageMappedUnlocked` opts in, and documents both consequences — the
+exposure to the directory being edited underneath it, and that a slice from image
+N is valid until the second reload after it.
+
+Mapping falls back to the copy rather than refusing an open: on a platform with no
+mapping primitive, on an empty or unaddressably large file, when the syscall
+fails, and for a store holding no lock under the default mode. Every fallback is
+reported through the new `store.MetricImageFallback` and through
+`StorageStats.ImageMode` and `StorageStats.ImageMappedBytes`, because a store
+paying for a copy it was configured not to pay for is a memory regression with no
+other symptom.
+
+Measured against the tree before it, three interleaved rounds, reopened from
+disk:
+
+- **The Go heap falls 22.4%** on a 100 000-node store — 234.6 MiB to 182.1 MiB —
+  and 22.5% at twice the size, 467.0 to 362.0 MiB. The saving is 52.5 MiB and
+  105.0 MiB: exactly double, so what was removed is proportional to the image.
+- **Anonymous resident memory falls 13.5% and 18.4%**, and 84.83 MiB of an
+  88.02 MiB image becomes file-backed. *Total* resident goes up about 15%, and
+  that is the change working rather than failing: file-backed pages are evictable
+  without swap, and anonymous pages are what a memory ceiling constrains.
+- **An open allocates 67.6% fewer bytes** — 6,295,947 to 2,038,619 B/op — and
+  67.9% fewer with `VerifyOnOpen`, which also stopped reading the image a second
+  time for itself. Wall clock fell on both.
+- **The image on disk is byte-identical**: 175.0 B/node, 87.50 B/edge, 16.69 MiB
+  on every round of both arms. Both point lookups are within noise.
+- A compaction over an existing image inherits the same 22% heap saving and
+  allocates the same bytes to four significant figures.
+
+The cost is that the bytes are read when they are touched rather than at open, so
+a caller that walks every blob pays it as page faults instead of as one sequential
+read. `BenchmarkRSS_BlobTouch` is the new instrument for that case, and it is the
+mapped path's worst case: after touching every page of every blob, total resident
+memory is within a few per cent of the copying path's, with the same 22% off the
+heap.
+
+Also: `disk/mmap_windows.go` is the fifth file in the tree permitted to import
+`unsafe`, and `TestUnsafeIsConfinedToKnownFiles` records the reason. It turns the
+mapping address into a slice by assigning the slice header's fields, which is what
+keeps `go vet`'s `unsafeptr` check enabled for the rest of the tree.
+
+The on-disk format did not move.
+
+### A compaction no longer copies the image it is replacing
+
+Pinning a compaction built the new image's record set as two slices while
+writers were blocked: one entry per live node and one per live edge, 56 and 80
+bytes each, walked out of the image that was about to be replaced and held for
+the whole build beside it. Neither slice was presized, so reaching that size had
+allocated about five times as much again. On the store this program is aimed at
+that is 84 MB held and several hundred allocated, to say something the engine
+already had a pointer to.
+
+A `CSRGraph` is immutable once published. So the plan now holds the image, and
+copies only the delta — whose maps really are mutable — presized from the live
+counts the delta already maintains. `build` merges the two: `Build` became a
+wrapper over `buildSeq`, which takes `iter.Seq` instead of slices, and the plan's
+`nodeSeq`/`edgeSeq` walk the image's arena and the sorted delta with two cursors,
+materialising nothing. Every existing caller still passes slices and is unchanged.
+
+Deciding which image records the delta displaces used to be a map probe and a
+version-chain resolve per image record, under the lock. The pin now records every
+identifier the delta had an opinion about — tombstones included, which is the only
+reason a tombstone survives the pin — in the same pass that copies the records,
+and the merge consumes that with a cursor. The test that ran once per image record
+runs once per delta entry.
+
+Measured against the tree before it, interleaved rounds, on a store with a
+100,000-record image and a 1,000-record delta:
+
+- **A compaction allocates 25.1% fewer bytes** — 128,050,664 B becomes
+  95,859,304 B — and its transient peak over steady state falls from 122.0 MiB to
+  **91.27 MiB**. The allocation *count* is unchanged; this was two large slices,
+  not many small ones.
+- **The cost removed was proportional to the image.** Per live record, before:
+  1,268 B at 100,000 records and 1,267 B at 200,000. After: **949.1 B at both.**
+  So the saving doubles when the image does — 30.70 MiB to 61.24 MiB.
+- **The pin on its own is flat.** A pin over a 1,000-record image allocates
+  2,416 B; over an 8,000-record image, **2,416 B**. Before, the same pair differed
+  by 56 B a node.
+- **A first compaction, where there is no image to copy, still gains from the
+  presize**: transient peak 163.8 → **139.2 MiB**, and 41.9% fewer bytes at
+  n=10,000 in `Forensic_Compact`.
+- **The image is byte-identical**: 175.0 B/node, 87.50 B/edge, 16.69 MiB on every
+  round of both arms.
+- **A compaction is slower**, by +10.7%, +8.3% and +2.5% on the three
+  `Forensic_Compact` arms at n=10,000, with the spreads overlapping. A three-arm
+  measurement puts all of it on sorting the delta — about 330 ns a record — and
+  shows the rest of the change to be about 10% *quicker* than what it replaced,
+  with non-overlapping spreads. The sort is what makes the merge two cursors
+  instead of a lookup structure, and it is kept.
+- Opening a store pays the same indirection, `Build`'s other caller being the
+  loader: **twenty-three allocations, no measurable bytes and no measurable time.**
+
+Two things came out of it that were not the point.
+
+A freshly compacted store's adjacency arrays now match the ones the same image
+produces when it is read back from disk. The merge yields globally ascending
+identifiers; before it, the delta's edges were appended in Go map order, so the
+two could disagree about the order of a node's incident edges — and disagree
+differently on every run.
+
+And the compaction metric's `Examined` is now what `store/metrics.go` says it is.
+It documented "records scanned" and reported the records in the new image, which
+is what `Count` reports; it is now the image's live records plus every delta
+entry, so `Examined − Count` is the work the compaction did that produced
+nothing. Both figures were already maintained, so the pin states it for free.
+
+`buildSeq` walks its inputs three times for nodes and five times for edges —
+the page directory is sized from the highest identifier, the arena from the
+touched pages, and adjacency is a count then a fill — so a sequence given to it
+must yield the same records every time. Each later pass counts what it saw and
+refuses a disagreement with `errUnstableBuild` at the pass where it appears,
+rather than as an out-of-range write two passes downstream.
+
+The on-disk format did not move and no exported API changed.
+
 ### Compaction writes the image instead of building it
 
 Serialisation built the whole file in a `bytes.Buffer` and handed back a

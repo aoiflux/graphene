@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 	"iter"
 	"slices"
@@ -152,7 +153,25 @@ type CSRGraph struct {
 	// attestation is the signed assertion over roots.Snapshot, present when the
 	// file carried a GATT section. Its Signature is nil when absent.
 	attestation Attestation
+
+	// imgBytes is the size of the mapped image this graph's property blobs
+	// address, and zero when they are heap. It is the size rather than the
+	// mapping itself, and that is deliberate: runtime.AddCleanup never runs a
+	// cleanup whose argument is reachable from the object it watches, and the
+	// mapping is exactly that argument. Store.images holds the mapping; see
+	// mapping.go.
+	//
+	// A graph Build produced reports zero even when its records address a
+	// mapping, which every graph a compaction publishes does. That is not a
+	// discrepancy to fix: the figure answers "is this image being served from a
+	// file", and a rebuilt image is being served from record arrays the
+	// compaction allocated.
+	imgBytes int64
 }
+
+// MappedBytes is the size of the image file this graph reads its property blobs
+// from, or zero when they are on the heap. See StorageStats.ImageMappedBytes.
+func (g *CSRGraph) MappedBytes() int64 { return g.imgBytes }
 
 // Roots returns the Merkle identity of this image, and whether it has one.
 func (g *CSRGraph) Roots() (SnapshotRoots, bool) {
@@ -166,9 +185,48 @@ type nodeRecord struct {
 	Properties []byte
 }
 
-// Build constructs a CSRGraph from a slice of nodes and edges. nodes and edges
-// must be complete at build time (this is the bulk-ingest path); their order
-// does not matter, because every record is placed by its own identifier.
+// Build constructs a CSRGraph from a slice of nodes and edges. It is buildSeq
+// over the two slices; the contract, and the reason a sequence form exists at
+// all, are stated there.
+func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
+	return buildSeq(slices.Values(nodes), slices.Values(edges))
+}
+
+// errUnstableBuild reports a build sequence that yielded a different number of
+// records on a later pass than on its first. See buildSeq.
+var errUnstableBuild = errors.New("csr: a build sequence yielded a different number of records on a later pass")
+
+// buildSeq constructs a CSRGraph from sequences of nodes and edges. They must be
+// complete at build time (this is the bulk-ingest path); their order does not
+// matter, because every record is placed by its own identifier.
+//
+// # Why a sequence rather than a slice
+//
+// The one caller that does not already hold a slice is compaction. Building one
+// for it meant copying every live record out of the image it was about to
+// replace — 56 B per node and 80 B per edge, across the whole live set, held
+// under the store lock for the length of the pin and beside the image it was
+// copied from. A sequence lets the merge that produces those records run inside
+// the build, so the copy is never made. deserialiseCSR holds a slice already and
+// reaches this through Build.
+//
+// # The sequences are walked more than once
+//
+// Three times for nodes and five for edges, and that is inherent rather than
+// lazy: the page directory is sized from the highest identifier, so nothing can
+// be touched until every ID has been seen; the arena is sized from the touched
+// pages, so nothing can be placed until every page has been touched; and
+// adjacency is a degree count followed by a fill. A sequence passed here must
+// therefore be repeatable and must yield the same records every time.
+//
+// That is checked rather than assumed, to the extent it can be cheaply: each
+// later pass counts what it saw and disagreement with the first pass is refused
+// with errUnstableBuild, at the pass where it appears rather than as an
+// out-of-range write into the adjacency arrays two passes later. A sequence that
+// yields the same number of *different* records is a caller bug this does not
+// try to survive. Both sequences in this package are stable by construction — a
+// slice, and a merge over an immutable image and two sorted slices — so this is
+// a diagnostic for whatever is written next, not a defence against a file.
 //
 // It fails on a duplicate identifier. Two records claiming one ID is a file
 // lying about its own record count, or a compaction plan that broke its
@@ -184,15 +242,36 @@ type nodeRecord struct {
 // checkCSREntityIDs, which counts endpoint pages as touched.
 //
 // With no nodes the result is an empty graph and any edges are dropped, as
-// before.
+// before; the edge sequence is not walked at all in that case.
 //
 // Memory is proportional to the pages touched, not to the highest identifier:
 // one int32 per page of the identifier space up to the highest ID named, plus
 // csrPageSlots records and two csrPageSlots offsets per materialised page. The
 // only transient beyond the result is the directory's own touched-page marks.
-func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
+func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge]) (*CSRGraph, error) {
 	g := &CSRGraph{}
-	if len(nodes) == 0 {
+
+	// The extent of each directory. The node directory covers the highest node
+	// ID and every endpoint of a live edge; the edge directory the highest edge
+	// ID. An edge with the invalid zero ID is skipped everywhere, so its
+	// endpoints extend nothing.
+	//
+	// yielded counts every node offered, which is what len(nodes) used to answer
+	// for the empty case. wantNodes and wantEdges count the ones that will be
+	// placed, and are what every later pass is held to.
+	var highestNode, nodeExtent, highestEdge uint64
+	var yielded, wantNodes, wantEdges int
+	for n := range nodes {
+		yielded++
+		if n.ID == store.InvalidNodeID {
+			continue
+		}
+		wantNodes++
+		if id := uint64(n.ID); id > highestNode {
+			highestNode = id
+		}
+	}
+	if yielded == 0 {
 		g.nodesByLabel = make(map[store.NodeType][]store.NodeID)
 		g.edgesByLabel = make(map[store.EdgeType][]store.EdgeID)
 		// One sentinel each, over zero slots. The offset arrays are one longer
@@ -204,22 +283,12 @@ func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
 		return g, nil
 	}
 
-	// The extent of each directory. The node directory covers the highest node
-	// ID and every endpoint of a live edge; the edge directory the highest edge
-	// ID. An edge with the invalid zero ID is skipped everywhere, so its
-	// endpoints extend nothing.
-	var highestNode, nodeExtent, highestEdge uint64
-	for i := range nodes {
-		if id := uint64(nodes[i].ID); id > highestNode {
-			highestNode = id
-		}
-	}
 	nodeExtent = highestNode
-	for i := range edges {
-		e := &edges[i]
+	for e := range edges {
 		if e.ID == store.InvalidEdgeID {
 			continue
 		}
+		wantEdges++
 		if id := uint64(e.ID); id > highestEdge {
 			highestEdge = id
 		}
@@ -235,19 +304,29 @@ func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
 	// page number so that arena order is identifier order.
 	g.nodeDir = newPageDir(nodeExtent)
 	g.edgeDir = newPageDir(highestEdge)
-	for i := range nodes {
-		if nodes[i].ID != store.InvalidNodeID {
-			touchPage(g.nodeDir, uint64(nodes[i].ID))
+	seen := 0
+	for n := range nodes {
+		if n.ID == store.InvalidNodeID {
+			continue
 		}
+		seen++
+		touchPage(g.nodeDir, uint64(n.ID))
 	}
-	for i := range edges {
-		e := &edges[i]
+	if seen != wantNodes {
+		return nil, errUnstableBuild
+	}
+	seen = 0
+	for e := range edges {
 		if e.ID == store.InvalidEdgeID {
 			continue
 		}
+		seen++
 		touchPage(g.edgeDir, uint64(e.ID))
 		touchPage(g.nodeDir, uint64(e.Src))
 		touchPage(g.nodeDir, uint64(e.Dst))
+	}
+	if seen != wantEdges {
+		return nil, errUnstableBuild
 	}
 	g.nodePages = assignPages(g.nodeDir)
 	g.edgePages = assignPages(g.edgeDir)
@@ -256,8 +335,7 @@ func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
 
 	// Place the records. A slot that is already taken is the duplicate this
 	// refuses.
-	for i := range nodes {
-		n := nodes[i]
+	for n := range nodes {
 		if n.ID == store.InvalidNodeID {
 			continue
 		}
@@ -268,8 +346,10 @@ func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
 		g.nodeRecs[s] = n
 		g.liveNodes++
 	}
-	for i := range edges {
-		e := edges[i]
+	if g.liveNodes != wantNodes {
+		return nil, errUnstableBuild
+	}
+	for e := range edges {
 		if e.ID == store.InvalidEdgeID {
 			continue
 		}
@@ -279,6 +359,9 @@ func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
 		}
 		g.edgeRecs[s] = e
 		g.liveEdges++
+	}
+	if g.liveEdges != wantEdges {
+		return nil, errUnstableBuild
 	}
 	g.highestNodeID = store.NodeID(highestNode)
 	g.highestEdgeID = store.EdgeID(highestEdge)
@@ -294,18 +377,22 @@ func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
 	// Adjacency: count degrees into offset[slot+1], prefix-sum, then fill. The
 	// fill uses the offset arrays themselves as the running cursors and shifts
 	// them back afterwards, which is what spares the two full-size counter
-	// copies the old layout made. Entries within a slot's range keep the input
-	// order of the edges slice.
+	// copies the old layout made. Entries within a slot's range keep the order
+	// the edge sequence yielded them in.
 	slots := len(g.nodeRecs)
 	g.outOffset = make([]uint64, slots+1)
 	g.inOffset = make([]uint64, slots+1)
-	for i := range edges {
-		e := &edges[i]
+	seen = 0
+	for e := range edges {
 		if e.ID == store.InvalidEdgeID {
 			continue
 		}
+		seen++
 		g.outOffset[g.nodeSlotRaw(e.Src)+1]++
 		g.inOffset[g.nodeSlotRaw(e.Dst)+1]++
+	}
+	if seen != wantEdges {
+		return nil, errUnstableBuild
 	}
 	for i := 1; i <= slots; i++ {
 		g.outOffset[i] += g.outOffset[i-1]
@@ -313,10 +400,17 @@ func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
 	}
 	g.outEdges = make([]store.EdgeID, g.liveEdges)
 	g.inEdges = make([]store.EdgeID, g.liveEdges)
-	for i := range edges {
-		e := &edges[i]
+	seen = 0
+	for e := range edges {
 		if e.ID == store.InvalidEdgeID {
 			continue
+		}
+		seen++
+		if seen > wantEdges {
+			// The one pass where an extra record would write past the end of an
+			// array sized by the count above, rather than merely disagree with
+			// it.
+			return nil, errUnstableBuild
 		}
 		so := g.nodeSlotRaw(e.Src)
 		g.outEdges[g.outOffset[so]] = e.ID
@@ -324,6 +418,9 @@ func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
 		si := g.nodeSlotRaw(e.Dst)
 		g.inEdges[g.inOffset[si]] = e.ID
 		g.inOffset[si]++
+	}
+	if seen != wantEdges {
+		return nil, errUnstableBuild
 	}
 	// After the fill offset[s] is the end of slot s, which is the start of
 	// slot s+1; one shift right restores the starts and reinstates offset[0].

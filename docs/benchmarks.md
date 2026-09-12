@@ -1867,6 +1867,211 @@ noise floor made the reading useless anyway: `PointLookupNode_Memory`, which
 this change cannot touch, moved by more than 50% between arms in the same rounds
 that `PointLookupNode_Disk` moved 20%.
 
+## The compaction plan stops copying the image (2026-09-12)
+
+Method as §1 of `CONTRIBUTING.md`: interleaved rounds alternating the working
+tree against a pristine `HEAD` tree, one fixture per process, medians reported
+with the full spread. Same machine block as the program baselines above. `HEAD`
+is `0977ad2`.
+
+The change: the compaction plan holds the pinned `*CSRGraph` instead of a copy of
+its records, and `build` merges it with the copied delta through `buildSeq`,
+which takes `iter.Seq` rather than slices. The delta's own copy is presized from
+counts the delta maintains.
+
+**A new instrument, run identically in both arms.** Every existing compaction
+benchmark compacts a store that has never been compacted, so its plan is
+delta-only and the image half — the half this change removes — is empty.
+`BenchmarkRSS_CompactIncremental` compacts a store that already holds an image,
+which is what every compaction but a store's first one does. It was written for
+this measurement and copied unchanged into the control tree, so the only
+difference between the arms is the engine. It reports allocation beside
+residency because allocation is the less noisy of the two by a wide margin: a
+polled residency peak is a floor on the truth and carries the variance of the
+whole runtime, while `TotalAlloc` across the call is exact and attributable.
+
+### A compaction over an existing image
+
+Three interleaved rounds. The delta is one per cent of the live set, which is
+what isolates the image term.
+
+| metric | 100k image, before | 100k image, after | 200k image, before | 200k image, after |
+| --- | ---: | ---: | ---: | ---: |
+| allocated during `Compact` | 128,050,664 B | **95,859,304 B** | 255,942,312 B | **191,725,680 B** |
+| per live record | 1,268 B | **949.1 B** | 1,267 B | **949.1 B** |
+| bytes not allocated | — | **30.70 MiB** | — | **61.24 MiB** |
+| transient peak over steady state | 122.0 MiB | **91.27 MiB** | 243.9 MiB | **182.3 MiB** |
+| process peak during it | 416.0 MiB | 386.0 MiB | 783.5 MiB | **722.8 MiB** |
+| allocation count | 1,316,318 | 1,316,375 | 2,632,736 | 2,632,910 |
+| Go heap after it settles | 235.7 MiB | 235.6 MiB | 469.3 MiB | 469.4 MiB |
+
+**−25.1% of the bytes a compaction allocates, at both sizes.** The two rows that
+carry the argument are the second and the third: before the change the cost per
+live record is 1,268 B at one size and 1,267 B at twice it, and after it is
+949.1 B at both — so what was removed was proportional to the image, and the
+saving doubles when the image does, 30.70 MiB to 61.24 MiB. The transient peak
+falls by the same quarter, which is the same figure arrived at by an independent
+instrument.
+
+The allocation *count* is unchanged to four significant figures. This was never
+a change about how often a compaction allocates; the plan's two slices were a
+handful of large reallocations, and the last row is the control: what the store
+holds afterwards did not move.
+
+318 B per live record disappeared, against the 56 B a `nodeRecord` occupies. The
+factor of five and a half is the copy's growth history: the old plan reached its
+size by appending into a slice with no capacity, and a slice that grows by a
+quarter at a time has allocated about five times its final size by the time it
+gets there. Presizing removes the four; holding the image instead of copying it
+removes the fifth.
+
+### The first compaction of a store's life
+
+`BenchmarkRSS_Compact`, 100,000 nodes. There is no image here, so the plan is
+delta-only and the presize is the whole of what can matter.
+
+| metric | before | after | change |
+| --- | ---: | ---: | ---: |
+| transient peak over steady state | 163.8 MiB (161.6–165.3) | **139.2 MiB** (136.1–140.7) | **−15.0%** |
+| process peak during the compaction | 473.6 MiB (473.5–474.9) | **448.7 MiB** (448.4–450.5) | −5.3% |
+| Go heap after it settles | 235.1 MiB | 235.0 MiB | ±0.0% |
+
+### Allocation during a compaction
+
+`BenchmarkForensic_Compact`, which builds a store and compacts it — again a
+first compaction, so again the presize alone. Three interleaved rounds, medians.
+
+| arm | before | after | change |
+| --- | ---: | ---: | ---: |
+| n=10,000 plain | 4,792,402 B/op, 10,135 allocs | **2,785,453 B/op**, 10,146 allocs | **−41.9% bytes**, +11 allocations |
+| n=10,000 attested | 4,793,216 B/op, 10,144 allocs | 2,786,261 B/op, 10,155 allocs | −41.9%, +11 |
+| n=10,000 full | 6,766,754 B/op, 10,190 allocs | 4,762,336 B/op, 10,206 allocs | −29.6%, +16 |
+| n=1,000 plain | 613,592 B/op, 1,110 allocs | 557,344 B/op, 1,131 allocs | −9.2%, +21 |
+| n=1,000 full | 819,197 B/op, 1,164 allocs | 805,010 B/op, 1,187 allocs | −1.7%, +23 |
+
+Two million bytes per compaction at ten thousand records, for a live set whose
+records occupy 560 KB — which is the growth history again, and it is why the
+presize is worth a line of code.
+
+The allocation count rises by a constant of about twenty: the two sequence
+closures, the yield function each of the eight passes constructs, and the two
+sort comparators. It is a constant, which is why it reads as +21 against 1,110
+and +11 against 10,135 — the larger store also loses more of the old growth
+steps.
+
+### Where the wall clock went
+
+The change made a compaction slower and the report has to say by how much and
+why, so this arm has three trees rather than two:
+
+- **control** — `0977ad2`, the slice plan.
+- **no sort** — the working tree with `sortDelta` skipped when there is no image.
+  An attribution probe, **not a candidate**: it forfeits the ascending order
+  that makes a compaction's adjacency arrays match a reopen's.
+- **working tree**.
+
+`BenchmarkForensic_Compact` at n=10,000, three interleaved rounds at
+`-benchtime=5x`, medians with the full spread:
+
+| arm | plain | attested | full |
+| --- | ---: | ---: | ---: |
+| control | 17.12 ms (16.31–20.59) | 16.65 ms (15.91–20.16) | 28.46 ms (28.35–33.23) |
+| no sort | **15.32 ms** (15.00–16.09) | **14.99 ms** (14.99–15.26) | 28.10 ms (27.11–28.70) |
+| working tree | 18.95 ms (18.18–19.38) | 18.04 ms (17.59–18.56) | 29.17 ms (28.92–29.91) |
+
+**The sort is the whole of the regression, and everything else about the change
+is faster than what it replaced.** Sorting the delta costs 3.6 ms at ten
+thousand records — about 330 ns a record, dominated by moving 56-byte structs —
+and the no-sort arm is resolvably *quicker* than control, by 10.5% on `plain` and
+10.0% on `attested`, with non-overlapping spreads. So the sequence indirection,
+which is a closure call per record on each of eight passes, costs less than
+building and growing the slice it replaced.
+
+Against control the working tree is **+10.7% on `plain`, +8.3% on `attested` and
++2.5% on `full`**, and the spreads overlap on all three because control's third
+round was slow. The `full` arm moves least because it signs and retains, which
+the sort is small beside.
+
+The sort was kept. It is what makes the merge two cursors rather than a lookup
+structure, and it is what gives a freshly compacted store the same adjacency
+order as the same image read back from disk — a property the engine did not have
+before and cannot state conditionally. Under decision 1 of the program this
+trade is the one to make, and it is reported rather than absorbed.
+
+### The controls
+
+| control | before | after | change |
+| --- | ---: | ---: | ---: |
+| `Footprint_DiskFileSize` | 175.0 B/node, 87.50 B/edge, 16.69 MiB | 175.0 B/node, 87.50 B/edge, 16.69 MiB | **±0.0%** |
+| `Forensic_Open` plain, wall clock | 7.61 ms (5.38–8.52) | 6.95 ms (5.14–8.47) | spreads overlap |
+| `Forensic_Open` plain, bytes | 6,293,400 B/op | 6,294,530 B/op | +0.02% |
+| `Forensic_Open` plain, allocations | 383 | 406 | **+23** |
+| `Forensic_Open` verified, allocations | 482 | 524 | +42 |
+| `RSS_Open` settled resident (8 rounds) | 173.8 MiB (173.3–177.1) | 173.8 MiB (173.6–176.7) | ±0.0% |
+| `RSS_Open` Go heap (8 rounds) | 118.4 MiB | 118.4 MiB | **±0.0%** |
+| `RSS_Open` process peak (8 rounds) | 371.5 MiB (322.3–441.4) | 381.6 MiB (327.0–441.8) | spreads overlap |
+| `PointLookupNode_Memory` | 24.54 ns/op | 26.15 ns/op | spreads overlap |
+| `PointLookupNode_Disk` | 36.75 ns/op | 37.57 ns/op | spreads overlap |
+
+The image on disk is **byte-identical** — the same three figures on every round
+of both arms. The record order, the section order and the leaf order are
+unchanged; what changed is where the records were read from on the way in.
+
+`Forensic_Open` is here because `Build` has exactly two callers outside tests and
+the other one is `deserialiseCSR`. Open therefore pays the sequence indirection
+even though nothing about opening was the point of this change, and the figures
+say what that costs: **twenty-three allocations, no measurable bytes, and no
+measurable time.** The verified arm pays it twice because it builds twice, which
+is the arithmetic working.
+
+`RSS_Open`'s process peak read as a 4.2% regression with non-overlapping arms over
+the first three rounds. Five further interleaved rounds did not reproduce it and
+put the two arms inside each other on both sides; the eight-round figures are
+above. The metric is a process-lifetime high-water mark and the benchmark builds
+its fixture — which compacts — before it opens, so it is the noisiest thing this
+suite reports and the same instability showed up in the previous item's
+measurement. Its settled resident and its Go heap, which are the figures a
+control is for, are identical in all eight runs.
+
+The point lookups are controls in the strict sense — no code on the read path
+changed — and on this host they are useless as anything else: `PointLookupNode_Memory`,
+which this change cannot reach, moved 6.6% between arms.
+
+### The pin, measured directly
+
+`TestCompactPlan_PresizesTheDeltaCopy` and
+`TestCompactPlan_CostsNothingProportionalToTheImage` (untagged, in `make check`)
+allocate a plan and report what the pin cost:
+
+| image | delta | allocated by the pin |
+| ---: | ---: | ---: |
+| 1,000 records | 16 records | 2,416 B |
+| 8,000 records | 16 records | 2,416 B |
+
+**An eight-fold image costs nothing more.** Before the change the same pair
+differed by 56 B per node — about 392 KB at this shape, and 84 MB at the shape
+this program is aimed at. The test asserts a ceiling *and* a slope, for the same
+reason the serialiser's guard does.
+
+### Reproducing
+
+```
+# The item's instrument: a compaction over an image that already exists.
+GRAPHENE_RSS_NODES=100000 go test ./tests/ -tags=stress -run=^$ \
+  -bench=RSS_CompactIncremental -benchtime=1x -count=1
+
+# The first compaction of a store's life, where only the presize can matter.
+GRAPHENE_RSS_NODES=100000 go test ./tests/ -tags=stress -run=^$ \
+  -bench=RSS_Compact$ -benchtime=1x -count=1
+
+# Wall clock and allocation, and the open path Build's other caller pays for.
+go test ./tests/ -tags=stress -run=^$ -bench='Forensic_(Compact|Open)$' \
+  -benchmem -benchtime=5x -count=1
+
+# The pin on its own, no stress tag.
+go test ./disk/ -run 'TestCompactPlan_(Presizes|CostsNothing)' -v
+```
+
 ## Pre-open cost query and the replay budget (2026-09-10)
 
 Method as §1 of `CONTRIBUTING.md`: three interleaved rounds, alternating the
@@ -2057,3 +2262,210 @@ refuses to run on unless it is at least four times that. Reintroducing the
 whole read fails it and no other test; the thirteen-case differential table
 and `FuzzCSRDigestStream` (2.36 M executions, no divergence) are what hold the
 streamed and whole-buffer digests to the same bytes.
+
+## The image is mapped instead of copied (2026-09-12)
+
+Method as §1 of `CONTRIBUTING.md`: interleaved rounds alternating the working tree
+against a control tree, one fixture per process, medians reported with the full
+spread. Same machine block as the program baselines above. The control is the tree
+as it stood after the previous item, so the only difference between the arms is
+this change.
+
+The change: `Options.ImageMode` defaults to `ImageMapped`, and a record's property
+blob is a sub-slice of the mapped `graphene.csr` rather than a copy into an arena
+the graph owns. `ImageHeap` is the previous behaviour.
+
+**Read the anonymous and file-backed rows, not the total.** That is the whole
+reason Phase 0 built `TestRSSInstrument_SeparatesFileBackedResidency` before
+anything depended on it. This change moves bytes from anonymous memory, which a
+RAM ceiling constrains and which can only be given back by the collector, into
+file-backed memory, which the kernel evicts without swap. Total resident memory
+therefore goes *up*, and a report that looked only at that number would read this
+as a 15% regression.
+
+### Opening a store, reopened from disk
+
+`BenchmarkRSS_Open`, three interleaved rounds at two sizes.
+
+| metric | 100k, before | 100k, after | 200k, before | 200k, after |
+| --- | ---: | ---: | ---: | ---: |
+| **Go heap after it settles** | 234.6 MiB | **182.1 MiB** | 467.0 MiB | **362.0 MiB** |
+| **anonymous resident** | 297.7 MiB | **257.4 MiB** | 545.0 MiB | **444.6 MiB** |
+| file-backed resident | 0 | 84.83 MiB | 0 | 172.0 MiB |
+| total resident | 297.7 MiB | 342.7 MiB | 545.0 MiB | 616.2 MiB |
+| the image on disk | 88.02 MiB | 88.02 MiB | 176.0 MiB | 176.0 MiB |
+| heap per live record | 2.46 KiB | **1.91 KiB** | 2.45 KiB | **1.90 KiB** |
+
+**−22.4% of the Go heap at one size and −22.5% at twice it.** In absolute terms
+52.5 MiB and 105.0 MiB — exactly double, so what was removed is proportional to
+the image and the saving doubles with it. 84.83 MiB of the 88.02 MiB image is
+resident as file pages after the open, and it is evictable.
+
+What remains on the heap is the record arenas, the label arena, the adjacency
+arrays and the property index. The index is the larger term and this change does
+not touch it; it is R3's.
+
+`BenchmarkRSS_Scan` — the read-only aggregate shape, ten rows resolved through the
+index — reports the same steady state: heap 234.6 → 182.1 MiB, anonymous
+298.0 → 259.1 MiB. Nothing about resolving ten rows changed, which is the point:
+the saving is in what an open holds, not in what a read does.
+
+### The transient, measured by allocation rather than residency
+
+`peakMiB` is useless for this item and the reason is worth stating rather than
+working around: it is a process-lifetime high-water mark, and these benchmarks
+build their fixture — which compacts — before they open it, so the peak belongs to
+the build. `BenchmarkForensic_Open` measures the same thing exactly, because
+`TotalAlloc` across a call is not polled.
+
+| arm | before | after | change |
+| --- | ---: | ---: | ---: |
+| `Forensic_Open` plain, bytes | 6,295,947 B/op | **2,038,619 B/op** | **−67.6%** |
+| `Forensic_Open` plain, allocations | 406 | 395 | −11 |
+| `Forensic_Open` plain, wall clock | 8.19 ms (7.62–9.65) | **6.80 ms** (6.19–7.36) | **−17.1%**, spreads do not overlap |
+| `Forensic_Open` verified, bytes | 12,456,753 B/op | **3,999,403 B/op** | **−67.9%** |
+| `Forensic_Open` verified, allocations | 524 | 499 | −25 |
+| `Forensic_Open` verified, wall clock | 16.30 ms (13.72–19.38) | 14.64 ms (12.50–15.41) | spreads overlap |
+
+Two thirds of what an open allocates was the file buffer and the blob arena. The
+wall clock fell with it, which is the read and the copy not happening — an open is
+one of the few places in this program where the memory-first trade did not cost
+time.
+
+The verified arm gains the same proportion for a second reason as well:
+verification used to open the image for itself, so an open with `VerifyOnOpen` read
+the file twice. It now takes the image the open already has. The parse still
+happens twice — verification builds a throwaway graph to recompute the roots
+against — and under a mapping neither parse allocates a blob arena.
+
+### A compaction over an existing image
+
+`BenchmarkRSS_CompactIncremental`, the instrument written for the previous item.
+
+| metric | before | after | change |
+| --- | ---: | ---: | ---: |
+| Go heap after it settles | 235.7 MiB | **183.1 MiB** | **−22.3%** |
+| anonymous resident | 294.6 MiB | **255.7 MiB** | −13.2% |
+| file-backed resident | 0 | 85.06 MiB | — |
+| allocated during `Compact` | 95,854,328 B | 95,877,272 B | ±0.0% |
+| per live record | 949.1 B | 949.3 B | ±0.0% |
+| polled peak during it | 386.0 MiB | 432.0 MiB | +11.9% |
+
+The steady-state saving carries over unchanged. What a compaction *allocates* does
+not move at all, to four significant figures, because the previous item had already
+stopped it copying the image — it reads the pinned graph's records directly, and
+those records now address a file instead of an arena.
+
+The polled peak during the compaction rises by the same accounting effect as the
+total-resident row above: the mapped pages the merge reads are in the working set
+while it reads them.
+
+`BenchmarkRSS_Compact` — a store's *first* compaction — is identical across the
+arms in every figure, including the heap to four significant figures. There is no
+image to map at that point, so the change cannot reach it. That is the strongest
+kind of control: not "within noise" but "the same number".
+
+### What it costs: the bytes are read when they are touched
+
+Under a copy the whole image is read at open, in one sequential pass, whether or
+not anyone looks at it. Under a mapping the bytes arrive per page, for the pages
+someone touches. For the shape this program is aimed at — a read-only aggregate
+resolving ten rows out of a million and a half — that is most of the win. For a
+caller that walks everything it is close to a wash, with the same bytes arriving
+as page faults instead of as one read.
+
+No existing benchmark could see this, and the reason is the engine's read
+contract: reads alias out, so every read benchmark in the suite gets a record
+*back* without dereferencing its blob, and a blob nobody reads is a page nobody
+faults in. `BenchmarkRSS_BlobTouch` is the instrument for the other shape. It walks
+every record and touches one byte of every page of every blob, which is the most a
+mapping can be made to cost, and it was copied unchanged into the control tree.
+
+| metric, 100 000 records with 512-byte blobs | before | after | change |
+| --- | ---: | ---: | ---: |
+| the walk's wall clock | 4.518 ms (3.513–5.510) | 5.000 ms (5.000–5.988) | **+10.7%**, spreads overlap |
+| per record | 45.18 ns | 50.01 ns | +10.7% |
+| **Go heap after the walk** | 234.7 MiB | **182.1 MiB** | **−22.4%** |
+| **anonymous resident** | 298.1 MiB | **250.2 MiB** | **−16.1%** |
+| file-backed resident | 0 | 85.05 MiB | — |
+| total resident | 298.1 MiB | 335.3 MiB | +12.5% |
+| blob bytes read | 48.83 MiB | 48.83 MiB | ±0.0% |
+
+**Half a millisecond on a hundred-thousand-record walk, and the heap is still
+22.4% smaller afterwards.** The wall-clock spreads overlap and the host's variance
+on the control arms in this section reaches 18%, so the honest reading is "not
+resolvable, and bounded above by about a tenth". What the walk does resolve is the
+residency: touching every blob makes 85.05 MiB of the 88.02 MiB image resident —
+the record stream as well as the blobs, since reading a record touches its page —
+and *even then* total resident memory is 12.5% above the copying path while the
+heap is 22.4% below it. That is the mapped path's worst case against the copied
+path's only case.
+
+
+It is not a cold-cache measurement and does not claim to be: the fixture was
+written moments earlier, so what is measured is the minor fault and not a disk
+read. A genuinely cold cache would add the read the copying path performs at open,
+moved to where the bytes are used.
+
+`BenchmarkBlobBulkRead_GetNodes_Disk` is the other shape in the same round —
+ten thousand records resolved, no blob dereferenced:
+
+| sub-benchmark | before | after | change |
+| --- | ---: | ---: | ---: |
+| `blob=32` | 478,550 ns (470,241–541,480) | 534,370 ns (473,025–582,896) | spreads overlap |
+| `blob=128` | 447,643 ns (409,648–577,601) | 468,671 ns (396,396–544,973) | spreads overlap |
+| `blob=512` | 577,719 ns (405,132–577,986) | 436,690 ns (418,672–509,298) | spreads overlap |
+| bytes and allocations, all three | 803,840 B/op, 10,002 allocs | 803,840 B/op, 10,002 allocs | **±0.0%** |
+
+Identical to the byte, which is the contract holding: resolving a record does not
+read its blob, so the mapping is never touched and there is nothing for it to cost.
+The wall clock moves in both directions across the three blob sizes, by more
+between rounds of one arm than between arms, which is the same host variance the
+controls below show.
+
+
+### The controls
+
+| control | before | after | change |
+| --- | ---: | ---: | ---: |
+| `Footprint_DiskFileSize` | 175.0 B/node, 87.50 B/edge, 16.69 MiB | identical | **±0.0%** |
+| `RSS_Compact` (no image exists) | heap 235.1 MiB, anon 308.6 MiB | heap 235.1 MiB, anon 305.9 MiB | **±0.0% / −0.9%** |
+| `PointLookupNode_Disk` | 37.89 ns (34.84–53.38) | 39.91 ns (38.61–47.16) | spreads overlap |
+| `PointLookupNode_Memory` | 21.43 ns (20.86–82.73) | 22.76 ns (21.32–56.06) | spreads overlap |
+| `Forensic_Compact` n=10,000 plain, bytes | 2,786,241 B/op | 2,785,787 B/op | −0.0% |
+
+The image on disk is **byte-identical** — the same three figures on every round of
+both arms. Nothing about the format, the record order or the section order moved;
+what changed is where the bytes are read from.
+
+`BenchmarkForensic_Compact` is a control here and a useful one for a reason other
+than its own result. Those arms compact a store that was never compacted, so no
+image is mapped and the change cannot reach them — which their identical `B/op`
+confirms — and yet their wall clock moves by up to 18%, in both directions
+(n=1,000 plain +18.0%, n=10,000 attested −5.2%). That is this host's variance on a
+compaction, and it is the number to hold any other wall-clock reading in this
+section against. `PointLookupNode_Memory`, which this change also cannot reach,
+moved 6.2% the same way.
+
+### Reproducing
+
+```
+# The steady state, reopened from disk, at two sizes.
+GRAPHENE_RSS_NODES=100000 go test ./tests/ -tags=stress -run=^$ \
+  -bench='RSS_(Open|Scan)$' -benchtime=1x -count=1
+
+# The transient, which allocation measures and a polled peak cannot.
+go test ./tests/ -tags=stress -run=^$ -bench='Forensic_Open$' \
+  -benchmem -benchtime=5x -count=1
+
+# The cost side: every page of every blob faulted in.
+GRAPHENE_RSS_NODES=100000 go test ./tests/ -tags=stress -run=^$ \
+  -bench=RSS_BlobTouch -benchtime=1x -count=1
+
+# A compaction over an image that already exists, and a store's first one.
+GRAPHENE_RSS_NODES=100000 go test ./tests/ -tags=stress -run=^$ \
+  -bench='RSS_Compact(Incremental)?$' -benchtime=1x -count=1
+
+# The same store held both ways, for anything above.
+#   disk.OpenWithOptions(dir, disk.Options{ImageMode: disk.ImageHeap})
+```

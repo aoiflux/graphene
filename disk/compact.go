@@ -28,10 +28,12 @@ package disk
 //	               publish
 //
 // The middle stage is safe outside the lock because compactPlan shares nothing
-// mutable with the store. The record slices are freshly built; a *store.Node in
-// the delta is replaced rather than edited when it changes, so the Labels slice
-// a plan holds is not written again; a CSRGraph is immutable once published;
-// and the property entries and redaction ledger are copies taken under the lock.
+// mutable with the store. A CSRGraph is immutable once published, so the plan
+// holds the image itself rather than a copy of its records and reads it in the
+// build; the delta's records are copied under the lock, and a *store.Node in the
+// delta is replaced rather than edited when it changes, so the Labels slice a
+// plan holds is not written again; the property entries and redaction ledger are
+// copies taken under the lock.
 //
 // # What the released lock costs
 //
@@ -44,11 +46,14 @@ package disk
 // deltaLayer.since.
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -113,8 +118,34 @@ type compactPlan struct {
 	// is a commit that landed during the build.
 	epoch uint64
 
-	nodes []nodeRecord
-	edges []rawEdge
+	// The image is a merge of two things, and only one of them has to be
+	// copied.
+	//
+	// csr is the image the delta sits on. It is immutable once published, so
+	// the build reads it directly with no lock and the plan's only obligation
+	// is to keep it reachable for the length of the build. Copying its records
+	// into the plan — which is what this used to do — cost one entry per live
+	// record, 56 B a node and 80 B an edge, built under the store lock and held
+	// beside the very image it was copied out of. Nil when the store has none.
+	//
+	// deltaNodes and deltaEdges are the records the delta contributes, copied
+	// under the lock because the delta's maps are not immutable. deltaKnown*
+	// are every identifier the delta had an opinion about at the pinned epoch,
+	// tombstones included: that is what tells the merge which image records to
+	// drop, and it is the only reason a tombstone survives the pin at all.
+	//
+	// All four are in ascending identifier order by the time the build walks
+	// them — sortDelta, which runs outside the lock.
+	csr             *CSRGraph
+	deltaNodes      []nodeRecord
+	deltaEdges      []rawEdge
+	deltaKnownNodes []store.NodeID
+	deltaKnownEdges []store.EdgeID
+
+	// examined is how many records the merge walks: the image's live records
+	// plus every delta entry. The compaction metric reports it, and it is a
+	// figure the pin can take for free — both counts are maintained.
+	examined int64
 
 	payload csrPayload
 
@@ -201,7 +232,7 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 			Kind:     store.MetricCompaction,
 			Duration: time.Since(started),
 			Count:    int64(compactedRecords(newCSR)),
-			Examined: int64(len(plan.nodes) + len(plan.edges)),
+			Examined: plan.examined,
 			Bytes:    s.imageBytes(),
 			Err:      err,
 		})
@@ -298,45 +329,45 @@ func (s *Store) compactPin() (*compactPlan, error) {
 	r := s.writerLocked()
 	cur := r.v
 
-	// Collect all nodes and edges from both CSR and delta.
-	var nodes []nodeRecord
-	var edges []rawEdge
+	// Copy the delta, and only the delta. The image beneath it is immutable, so
+	// the build walks it where it lies; see compactPlan.
+	//
+	// Presized from counts the delta maintains rather than grown by doubling: a
+	// slice that doubles its way to n entries has touched 2n, and the point of
+	// this stage is that what a compaction holds is proportional to what was
+	// written since the last one.
+	deltaNodes := make([]nodeRecord, 0, cur.delta.liveNodes)
+	deltaEdges := make([]rawEdge, 0, cur.delta.liveEdges)
+	knownNodes := make([]store.NodeID, 0, len(cur.delta.nodes))
+	knownEdges := make([]store.EdgeID, 0, len(cur.delta.edges))
 
-	// From existing CSR — skip entries the delta has an opinion about, whether
-	// that is an update (the delta copy is emitted below) or a tombstone (the
-	// record is gone). Either way the rebuilt CSR reclaims the space and never
-	// double-counts.
-	if cur.csr != nil {
-		for n := range cur.csr.Nodes() {
-			if r.deltaNodeKnown(n.ID) {
-				continue
-			}
-			nodes = append(nodes, n)
-		}
-		for e := range cur.csr.Edges() {
-			if r.deltaEdgeKnown(e.ID) {
-				continue
-			}
-			edges = append(edges, e)
-		}
-	}
-
-	// From delta. A tombstoned entry resolves to nil and is simply not carried
-	// forward, which is what makes compaction the point at which a delete stops
-	// costing memory.
+	// An entry the delta has an opinion about at this epoch displaces the
+	// image's record, whether the opinion is an update (copied below) or a
+	// tombstone (the record is gone). Either way the rebuilt CSR reclaims the
+	// space and never double-counts, which is what makes compaction the point at
+	// which a delete stops costing memory. This is reader.deltaNodeKnown's test,
+	// run once over the map here instead of once per image record later.
 	for id, ver := range cur.delta.nodes {
 		n, ok := ver.at(r.epoch)
-		if !ok || n == nil {
+		if !ok {
 			continue
 		}
-		nodes = append(nodes, nodeRecord{ID: id, Labels: n.Labels, Properties: cloneBytes(n.Properties)})
+		knownNodes = append(knownNodes, id)
+		if n == nil {
+			continue
+		}
+		deltaNodes = append(deltaNodes, nodeRecord{ID: id, Labels: n.Labels, Properties: cloneBytes(n.Properties)})
 	}
 	for id, ver := range cur.delta.edges {
 		e, ok := ver.at(r.epoch)
-		if !ok || e == nil {
+		if !ok {
 			continue
 		}
-		edges = append(edges, rawEdge{
+		knownEdges = append(knownEdges, id)
+		if e == nil {
+			continue
+		}
+		deltaEdges = append(deltaEdges, rawEdge{
 			ID:         id,
 			Src:        e.Src,
 			Dst:        e.Dst,
@@ -344,6 +375,11 @@ func (s *Store) compactPin() (*compactPlan, error) {
 			Weight:     e.Weight,
 			Properties: cloneBytes(e.Properties),
 		})
+	}
+
+	examined := int64(len(cur.delta.nodes) + len(cur.delta.edges))
+	if cur.csr != nil {
+		examined += int64(cur.csr.NodeCount() + cur.csr.EdgeCount())
 	}
 
 	// Chain this image to the one it replaces, so the sequence of compactions is
@@ -393,9 +429,15 @@ func (s *Store) compactPin() (*compactPlan, error) {
 	_ = s.wal.FlushQueued()
 
 	plan := &compactPlan{
-		epoch:       r.epoch,
-		nodes:       nodes,
-		edges:       edges,
+		epoch: r.epoch,
+
+		csr:             cur.csr,
+		deltaNodes:      deltaNodes,
+		deltaEdges:      deltaEdges,
+		deltaKnownNodes: knownNodes,
+		deltaKnownEdges: knownEdges,
+		examined:        examined,
+
 		nodeSeqHW:   s.nodeSeq.Load(),
 		edgeSeqHW:   s.edgeSeq.Load(),
 		commitSeqHW: s.commitSeq.Load(),
@@ -439,6 +481,104 @@ func (s *Store) compactRelease() {
 	s.mu.Unlock()
 }
 
+// sortDelta puts the plan's delta records and its known-identifier sets in
+// ascending identifier order.
+//
+// That is what lets nodeSeq and edgeSeq merge against the image with two cursors
+// and no lookup structure. It runs here, outside the store lock, because it is
+// O(delta log delta) of pure CPU over memory the plan already owns and there is
+// no reason for a writer to wait on it.
+func (p *compactPlan) sortDelta() {
+	slices.SortFunc(p.deltaNodes, func(a, b nodeRecord) int { return cmp.Compare(a.ID, b.ID) })
+	slices.SortFunc(p.deltaEdges, func(a, b rawEdge) int { return cmp.Compare(a.ID, b.ID) })
+	slices.Sort(p.deltaKnownNodes)
+	slices.Sort(p.deltaKnownEdges)
+}
+
+// nodeSeq yields the node records the new image will hold: every record in the
+// pinned image the delta has no opinion about, merged with the delta's own, in
+// ascending identifier order.
+//
+// buildSeq walks this more than once — see there for why — so it keeps no state
+// between walks and starts from the beginning each time. Both inputs are already
+// ascending: the image's arena is in identifier order by construction, and
+// sortDelta does the rest. So a walk is two cursors over the delta and one pass
+// over the image, and nothing is materialised.
+//
+// A record the delta knows about is dropped here and re-emitted from deltaNodes
+// when the merge reaches it, which for an update is the same identifier one step
+// later and for a tombstone is never.
+//
+// Ascending order is not something buildSeq needs; it places every record by its
+// own identifier. It is what makes the adjacency arrays a compaction produces
+// identical to the ones the same image produces when it is read back from disk,
+// where records arrive in file order. Before this the delta's edges were
+// appended in Go map order, so a freshly compacted store and a reopened one
+// could disagree about the order of a node's incident edges.
+func (p *compactPlan) nodeSeq() iter.Seq[nodeRecord] {
+	return func(yield func(nodeRecord) bool) {
+		d, k := 0, 0
+		if p.csr != nil {
+			for n := range p.csr.Nodes() {
+				for d < len(p.deltaNodes) && p.deltaNodes[d].ID < n.ID {
+					if !yield(p.deltaNodes[d]) {
+						return
+					}
+					d++
+				}
+				for k < len(p.deltaKnownNodes) && p.deltaKnownNodes[k] < n.ID {
+					k++
+				}
+				if k < len(p.deltaKnownNodes) && p.deltaKnownNodes[k] == n.ID {
+					continue
+				}
+				if !yield(n) {
+					return
+				}
+			}
+		}
+		for ; d < len(p.deltaNodes); d++ {
+			if !yield(p.deltaNodes[d]) {
+				return
+			}
+		}
+	}
+}
+
+// edgeSeq is nodeSeq for edges. The two are written out rather than shared
+// behind a type parameter because the merge would then take an identifier
+// accessor as a function value, called once per record on a pass the build makes
+// five times.
+func (p *compactPlan) edgeSeq() iter.Seq[rawEdge] {
+	return func(yield func(rawEdge) bool) {
+		d, k := 0, 0
+		if p.csr != nil {
+			for e := range p.csr.Edges() {
+				for d < len(p.deltaEdges) && p.deltaEdges[d].ID < e.ID {
+					if !yield(p.deltaEdges[d]) {
+						return
+					}
+					d++
+				}
+				for k < len(p.deltaKnownEdges) && p.deltaKnownEdges[k] < e.ID {
+					k++
+				}
+				if k < len(p.deltaKnownEdges) && p.deltaKnownEdges[k] == e.ID {
+					continue
+				}
+				if !yield(e) {
+					return
+				}
+			}
+		}
+		for ; d < len(p.deltaEdges); d++ {
+			if !yield(p.deltaEdges[d]) {
+				return
+			}
+		}
+	}
+}
+
 // build turns the plan into a serialised image on disk, with no lock held.
 //
 // A failure here changes nothing: the log is intact, the image on disk is the
@@ -452,9 +592,27 @@ func (s *Store) compactRelease() {
 // retry on. Removal is best-effort for exactly that reason: if it fails, the
 // open path is still correct, so there is nothing further to report.
 func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string, error) {
-	// Build refuses a duplicate identifier. Nothing is on disk yet, so the
+	// Ascending order for the merge below. Pure CPU over memory the plan owns,
+	// and deliberately not done at the pin: this is the stage that holds no
+	// lock.
+	p.sortDelta()
+
+	// buildSeq refuses a duplicate identifier. Nothing is on disk yet, so the
 	// no-temp-file contract above holds for this path too.
-	newCSR, err := Build(p.nodes, p.edges)
+	//
+	// What comes out of it shares the pinned image's property bytes: buildSeq
+	// copies record values, and a record value is two slice headers. So when the
+	// image is mapped, the graph this compaction is about to publish addresses
+	// that mapping for every record the delta did not touch -- and so does the
+	// one after it, having been built from records that already do.
+	//
+	// That is the whole reason a compaction neither creates nor retires a
+	// mapping. Unmapping the image a compaction replaced would be a
+	// use-after-unmap on the graph it just published; keeping each mapping until
+	// its dependents were gone would pin the first one for the life of the store
+	// and add one per compaction. So the store maps once at Open and holds it
+	// until Close, and a compaction writes a file. See mapping.go.
+	newCSR, err := buildSeq(p.nodeSeq(), p.edgeSeq())
 	if err != nil {
 		return nil, "", fmt.Errorf("compact: %w", err)
 	}
@@ -632,7 +790,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 			return fmt.Errorf("compact: wal checkpoint: %w", err)
 		}
 		if s.retention.Keeps() {
-			return s.rotateLog(newCSR, len(p.nodes), len(p.edges))
+			return s.rotateLog(newCSR)
 		}
 		if err := s.wal.Truncate(); err != nil {
 			return fmt.Errorf("compact: wal truncate: %w", err)
@@ -644,7 +802,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 		s.keyTimeline = nil
 		if aerr := s.recordAudit(AuditCompact, s.attestActorID,
 			fmt.Sprintf("log discarded; %d nodes, %d edges; snapshot %x",
-				len(p.nodes), len(p.edges), newCSR.roots.Snapshot[:8])); aerr != nil {
+				newCSR.NodeCount(), newCSR.EdgeCount(), newCSR.roots.Snapshot[:8])); aerr != nil {
 			return fmt.Errorf("compact: %w", aerr)
 		}
 		return nil
@@ -674,7 +832,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 		s.keyTimeline = append([]KeyTransition(nil), s.keyTimeline[p.keyTimelineLen:]...)
 		if aerr := s.recordAudit(AuditCompact, s.attestActorID,
 			fmt.Sprintf("log rebuilt over %d bytes committed during the build; %d nodes, %d edges; snapshot %x",
-				tail, len(p.nodes), len(p.edges), newCSR.roots.Snapshot[:8])); aerr != nil {
+				tail, newCSR.NodeCount(), newCSR.EdgeCount(), newCSR.roots.Snapshot[:8])); aerr != nil {
 			return fmt.Errorf("compact: %w", aerr)
 		}
 		return nil
@@ -711,7 +869,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 		}
 		if aerr := s.recordAudit(AuditCompact, s.attestActorID,
 			fmt.Sprintf("log kept, %d bytes committed during the build could not be carried; %d nodes, %d edges; snapshot %x",
-				tail, len(p.nodes), len(p.edges), newCSR.roots.Snapshot[:8])); aerr != nil {
+				tail, newCSR.NodeCount(), newCSR.EdgeCount(), newCSR.roots.Snapshot[:8])); aerr != nil {
 			return fmt.Errorf("compact: %w", aerr)
 		}
 		return nil
@@ -723,7 +881,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 // With retention configured the log is kept rather than truncated. The
 // distinction is what a caller asked for, not what the engine thinks best — how
 // long evidence is held is not the engine's decision.
-func (s *Store) rotateLog(newCSR *CSRGraph, nodes, edges int) error {
+func (s *Store) rotateLog(newCSR *CSRGraph) error {
 	seg, err := s.wal.Rotate(s.dir, s.segmentSeq)
 	if err != nil {
 		return fmt.Errorf("compact: wal rotate: %w", err)
@@ -748,7 +906,7 @@ func (s *Store) rotateLog(newCSR *CSRGraph, nodes, edges int) error {
 
 	if aerr := s.recordAudit(AuditCompact, s.attestActorID,
 		fmt.Sprintf("retired segment %d; %d nodes, %d edges; snapshot %x",
-			seg.Sequence, nodes, edges, newCSR.roots.Snapshot[:8])); aerr != nil {
+			seg.Sequence, newCSR.NodeCount(), newCSR.EdgeCount(), newCSR.roots.Snapshot[:8])); aerr != nil {
 		return fmt.Errorf("compact: %w", aerr)
 	}
 	return nil

@@ -5,8 +5,9 @@ package disk
 // # What was missing, and what it costs
 //
 // OpenReadOnly fixes its view at the moment of the call. The store materialises
-// itself once -- the delta from a WAL replay, the image from one os.ReadFile --
-// and nothing re-reads afterwards, so a reader running beside a writer would
+// itself once -- the delta from a WAL replay, the image from one read or one
+// mapping of it -- and nothing re-reads afterwards, so a reader running beside a
+// writer would
 // serve a permanently stale graph with no sign that it was stale. The shared
 // process lock is what stopped that: a reader alongside a writer is refused, so
 // the staleness cannot arise.
@@ -248,6 +249,11 @@ func (s *Store) reloadLive(path string, header walFileHeader) (store.RefreshInfo
 	fail := func(err error) (store.RefreshInfo, error) {
 		wal.Close()
 		restore()
+		// The image this reload mapped and is now throwing away. Nothing can
+		// reach it once restore has put the previous view back, so the sweep
+		// releases it as soon as the collector notices -- which is not now, and
+		// is why this is a sweep rather than an unmap. See mapping.go.
+		s.sweepImages()
 		return store.RefreshInfo{}, fmt.Errorf("disk.Refresh: %w", err)
 	}
 
@@ -264,6 +270,14 @@ func (s *Store) reloadLive(path string, header walFileHeader) (store.RefreshInfo
 	}
 	s.replayOff = off
 	s.publishEpoch(s.mutEpoch.Load())
+
+	// A live reader is the only store that maps more than one image in its life,
+	// because it is the only one that rebuilds from the files. The one it was
+	// reading is unreachable now; it is released at the sweep after the
+	// collector has agreed, which is what makes a Properties slice from it valid
+	// for one further reload rather than until this instant. See
+	// ImageMappedUnlocked.
+	s.sweepImages()
 
 	prevWAL.Close()
 	return store.RefreshInfo{

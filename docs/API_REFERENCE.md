@@ -91,6 +91,21 @@ func OpenLive(dir string) (*Graph, error)
 - `OpenLive(dir)` — read-only, under **no lock**: runs alongside a writer and
   advances when you call `Refresh()`. See §16 for what it gives up.
 
+For anything beyond the defaults, open through the `disk` package:
+`disk.OpenWithOptions(dir, disk.Options{...})`. One option changes what a read
+hands back rather than only what the store does, so it is worth knowing about
+before §6's aliasing note surprises you:
+
+| `disk.Options.ImageMode` | Image held as | A returned `Properties` slice |
+|---|---|---|
+| `ImageMapped` (default) | the mapped file | valid for the life of the handle, not past `Close()` |
+| `ImageHeap` | a heap copy | ordinary heap; outlives the handle |
+| `ImageMappedUnlocked` | the mapped file, with no process lock | as `ImageMapped`, but a live reader's `Refresh` retires old mappings — see §6 |
+
+`StorageStats.ImageMode` reports which one is actually in force, because mapping
+falls back to a heap copy wherever it is unavailable rather than refusing the
+open.
+
 ```go
 g := graphene.NewInMemory()
 defer g.Close()
@@ -621,10 +636,33 @@ resolved reads without a per-item lock, so it gains nothing measurable there.
 > `UpdateNode`/`UpdateEdge` to change them.
 >
 > If you need to keep or modify a blob, copy it:
-> `p := append([]byte(nil), n.Properties...)`. This is the only case where a copy
-> is your responsibility — the reverse direction is handled for you: the store
-> always copies what you pass to `AddNode`/`AddEdge`/`UpdateNode`, so you may
-> reuse your own buffers freely after a write returns.
+> `p := append([]byte(nil), n.Properties...)`, or `store.CloneNode(n)` /
+> `store.CloneEdge(e)` for the whole record including its `Labels`. This is the
+> only case where a copy is your responsibility — the reverse direction is
+> handled for you: the store always copies what you pass to
+> `AddNode`/`AddEdge`/`UpdateNode`, so you may reuse your own buffers freely
+> after a write returns.
+
+> **How long a returned blob stays valid, on the disk backend.** By default the
+> compacted image is memory-mapped (`disk.Options.ImageMode` = `ImageMapped`), so
+> a `Properties` slice from a record in the image addresses the file rather than
+> the heap. That is valid **for the life of the handle and not past `Close()`** —
+> after `Close` the process no longer has the memory, and reading it is a fault
+> rather than stale data. Compaction does not shorten that window: a compaction
+> writes a new file and leaves the mapping it was reading in place, so a slice
+> taken before one is still valid after it.
+>
+> Two cases need more care.
+>
+> `graphene.OpenLive` with `disk.ImageMappedUnlocked`: a `Refresh()` that crosses
+> a compaction maps the new image and eventually releases the old one, so a slice
+> from image N is valid until the second such reload after it. Clone anything you
+> keep across a `Refresh`.
+>
+> And a caller that wants blobs independent of any file can ask for the previous
+> behaviour with `disk.ImageMode` = `ImageHeap`, which copies the whole blob half
+> of the image into the heap at open. The cost of that is the reason it is not the
+> default: see [benchmarks.md](benchmarks.md) and TECHNICAL_DETAILS §14.18.
 
 Removing the read-side copy made disk reads **flat in property-blob size** rather
 than proportional to it — a 512-byte-blob point lookup went from 151 ns to 45 ns,
@@ -1663,6 +1701,17 @@ the question an operator asks later is when this first became true.
 commit means it is not working. `Examined` against `Count` on a **query** is the
 planner's selectivity. **replay** is emitted once per open and is the best
 single indicator of how overdue a compaction is.
+
+`Examined` on a **compaction** is every record the merge considered: the live
+records of the image being replaced, plus every entry in the delta — a tombstone
+is an entry, and dropping the record it names is work. `Examined − Count` is
+therefore the part of that work which produced nothing, and it is the number
+that says whether compacting was worth the write. A delete contributes two to
+it — the image record discarded and the tombstone that discarded it — and an
+update one, because of the two records the merge read for it, the replacement is
+in the image it wrote. It is never below `Count`, and equal to it only for a
+compaction that dropped nothing at all: no deletes, no updates, a delta of
+records the image had never held.
 
 `Err` is non-nil when the operation failed, **and a failed operation is still
 recorded** — an error rate is a metric, and a sink that only ever hears about

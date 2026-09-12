@@ -34,8 +34,19 @@ func measureAlloc(f func()) uint64 {
 	return after.TotalAlloc - before.TotalAlloc
 }
 
-// verifyOnOpenAllocRatio reports what verifyImageOnOpen allocates as a multiple
-// of one read plus one parse of the same image.
+// verifyImageAt reads the image at path and verifies it, which is what Open
+// does in two statements instead of one now that the read is shared with the
+// load. Only tests need the pair as a unit.
+func verifyImageAt(path string, opts Options) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return verifyImage(&imageSource{data: data}, opts)
+}
+
+// verifyOnOpenAllocRatio reports what verifying an image on open allocates as a
+// multiple of one read plus one parse of the same image.
 //
 // Measured against that baseline rather than against the file size, because the
 // file size is not the unit the duplication was counted in: deserialiseCSR
@@ -76,8 +87,8 @@ func verifyOnOpenAllocRatio(t *testing.T, nodes int) (float64, int64) {
 
 	// Warm once: the first call through this path faults in whatever the
 	// runtime lazily builds, and that is not per-image cost.
-	if err := verifyImageOnOpen(csrPath, opts); err != nil {
-		t.Fatalf("verifyImageOnOpen: %v", err)
+	if err := verifyImageAt(csrPath, opts); err != nil {
+		t.Fatalf("verify image: %v", err)
 	}
 
 	baseline := measureAlloc(func() {
@@ -99,12 +110,12 @@ func verifyOnOpenAllocRatio(t *testing.T, nodes int) (float64, int64) {
 	}
 
 	got := measureAlloc(func() {
-		if err := verifyImageOnOpen(csrPath, opts); err != nil {
-			t.Errorf("verifyImageOnOpen: %v", err)
+		if err := verifyImageAt(csrPath, opts); err != nil {
+			t.Errorf("verify image: %v", err)
 		}
 	})
 
-	t.Logf("image %d bytes: one read+parse allocates %d, verifyImageOnOpen allocates %d",
+	t.Logf("image %d bytes: one read+parse allocates %d, one read+verify allocates %d",
 		fi.Size(), baseline, got)
 	return float64(got) / float64(baseline), fi.Size()
 }
@@ -121,9 +132,9 @@ func verifyOnOpenAllocRatio(t *testing.T, nodes int) (float64, int64) {
 // worth about a whole extra unit here and cannot hide under it.
 func TestVerifyOnOpen_ReadsAndParsesTheImageOnce(t *testing.T) {
 	ratio, size := verifyOnOpenAllocRatio(t, 4000)
-	t.Logf("verifyImageOnOpen costs %.2f read-and-parses of a %d-byte image", ratio, size)
+	t.Logf("verifying on open costs %.2f read-and-parses of a %d-byte image", ratio, size)
 	if ratio > 2.5 {
-		t.Errorf("verifyImageOnOpen allocates %.2f× one read and parse of the image: it is "+
+		t.Errorf("verifying on open allocates %.2f× one read and parse of the image: it is "+
 			"doing one of them more than once, which is what made the check too expensive "+
 			"to leave on", ratio)
 	}
@@ -158,7 +169,7 @@ func TestVerifyOnOpen_LegsStillFailSeparately(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read image: %v", err)
 	}
-	if err := verifyImageOnOpen(csrPath, Options{}); err != nil {
+	if err := verifyImageAt(csrPath, Options{}); err != nil {
 		t.Fatalf("the untouched image must verify: %v", err)
 	}
 
@@ -180,7 +191,7 @@ func TestVerifyOnOpen_LegsStillFailSeparately(t *testing.T) {
 		t.Fatalf("write edited image: %v", err)
 	}
 
-	if err := verifyImageOnOpen(csrPath, Options{}); err == nil {
+	if err := verifyImageAt(csrPath, Options{}); err == nil {
 		t.Error("an edit that repaired the digest was accepted: the roots leg is no longer " +
 			"asked its own question, only the digest's")
 	}

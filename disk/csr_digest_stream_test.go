@@ -261,10 +261,16 @@ func TestVerifyCSRDigest_DoesNotReadTheImageWhole(t *testing.T) {
 // *aside* is not the same operation as renaming another file *over* it. The
 // reader is protected just as completely, by the compaction failing rather than
 // by the two files coexisting. That is worth pinning down rather than leaving as
-// folklore: it is why an image that some other process is mapping or hashing can
-// stall a writer's compaction on windows, and why installing a new image under a
-// mapping will have to rename the old one aside first and put the new one in its
-// place second.
+// folklore: it is why an image that some other process is holding open — `graphene
+// store csr -verify` against a live store — can stall a writer's compaction on
+// windows.
+//
+// A *mapping* is a different thing from a handle and does not stall it. This
+// comment used to predict that installing an image under a mapping would have to
+// rename the old one aside first; measuring it showed otherwise, because a
+// section object created from a FILE_SHARE_DELETE handle keeps the bytes
+// reachable on its own and mapFile closes the handle before it returns. See
+// TestImageMapped_CompactRenamesOverALiveMapping and §15.13's table.
 func TestImage_AHeldHandleNeverSeesTheBytesChange(t *testing.T) {
 	dir, s := v8Fixture(t)
 	defer s.Close()

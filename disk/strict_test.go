@@ -173,7 +173,7 @@ func TestStrict_PreV8ImageIsNotRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := verifyImageOnOpen(p, Options{VerifyOnOpen: true}); err != nil {
+	if err := verifyImage(&imageSource{data: data}, Options{VerifyOnOpen: true}); err != nil {
 		t.Fatalf("verification rejected an image carrying no digest; absent is not a failure: %v", err)
 	}
 }

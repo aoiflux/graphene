@@ -441,6 +441,26 @@ genuinely misformatted ones. CI's `lint` job runs on Linux for exactly this
 reason. Fix real findings by hand rather than with `gofmt -w`, which would
 rewrite every line ending in the file and bury the change.
 
+### Turning a mapping address into a slice
+
+`go vet`'s `unsafeptr` check flags every `uintptr`-to-`unsafe.Pointer` conversion
+it cannot prove safe, and a mapping address is one it cannot: it has no way to
+tell a syscall-returned address outside the heap from a `uintptr` that once held a
+heap pointer. Inline, behind a helper, and fed straight from the syscall result
+were all tried and all flagged.
+
+So `disk/mmap_windows.go` assigns the slice header's fields instead, which
+performs no conversion for the check to fire on — `sliceOfMapping`, which carries
+the full argument including why `reflect.SliceHeader`'s deprecation does not apply
+to memory the collector is deliberately not being told about. Use that function
+rather than adding a second spelling, and do not reach for `-unsafeptr=false`: it
+would also stop the check looking at `index/narrow.go` and
+`index/encoding/encoding.go`, where it is doing real work.
+
+`TestUnsafeIsConfinedToKnownFiles` asserts the set of files importing `unsafe`
+exactly, in both directions, so a new one is a review decision rather than an
+accident.
+
 ### The priority order
 
 Ties are settled speed → memory → allocations, and correctness is not on that

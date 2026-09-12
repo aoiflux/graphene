@@ -950,6 +950,22 @@ type StorageStats struct {
 	// record count suggests, and nothing else in these statistics shows that.
 	NodeIDHeadroom float64
 	EdgeIDHeadroom float64
+
+	// ImageMode names how the backend is holding its compacted image: "mapped"
+	// when the image file is mapped and the property blobs a read returns
+	// address it, "heap" when the image was copied in, and "" from a backend
+	// that has no image at all.
+	//
+	// It is here because it is the difference between a store whose resident
+	// memory includes its blobs and one whose does not, and because it is how a
+	// caller confirms that asking for a mapping got one — a fallback is always
+	// available, always correct, and always more expensive.
+	ImageMode string
+
+	// ImageMappedBytes is how much of the image is mapped rather than resident,
+	// zero when it is not mapped. These bytes are page cache the kernel may
+	// evict, so they are not part of what the process must keep.
+	ImageMappedBytes int64
 }
 
 // DeltaRecords is the total number of records held in memory since the last

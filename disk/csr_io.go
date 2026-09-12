@@ -12,7 +12,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"os"
 	"time"
 
 	"github.com/aoiflux/graphene/index"
@@ -20,19 +19,34 @@ import (
 	"github.com/aoiflux/graphene/store"
 )
 
-// loadCSR reads and parses the CSR image at path into the store.
+// loadCSR maps or reads the CSR image at path and installs it. Caller holds
+// s.mu exclusively.
 func (s *Store) loadCSR(path string) error {
-	// For this first implementation, we load the CSR into memory from the
-	// serialised file. A future enhancement can mmap this file directly.
-	data, err := os.ReadFile(path)
+	src, err := s.openImage(path)
 	if err != nil {
 		return err
 	}
-	csr, section, err := deserialiseCSR(data)
+	return s.loadImage(src)
+}
+
+// loadImage parses an image the caller has already obtained and installs it.
+// Caller holds s.mu exclusively.
+//
+// It takes ownership of src: a mapping is released here if the parse fails, so
+// no caller has to reason about whether a failed load left one behind. Open
+// calls it with the same source VerifyOnOpen hashed, which is what keeps an
+// integrity check at one read of the image instead of three.
+func (s *Store) loadImage(src *imageSource) error {
+	csr, section, err := deserialiseCSRFrom(src.data, src.mapped())
 	if err != nil {
+		src.discard()
 		return err
 	}
 	s.publishCSR(csr)
+
+	// After the graph is published, because noteImage attaches the cleanup that
+	// decides when the mapping may be released and the graph has to exist first.
+	s.noteImage(src, csr)
 
 	// Load the persisted property index (v6+). This happens before WAL replay so
 	// that post-compaction WAL records — including purges — apply on top of it.
@@ -123,6 +137,27 @@ func (s *Store) loadCSR(path string) error {
 // 1-byte labels plus inline property blobs; format v4 stores uint16 labels
 // plus inline property blobs.
 func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
+	return deserialiseCSRFrom(data, false)
+}
+
+// deserialiseCSRFrom is deserialiseCSR over bytes that may be a mapping.
+//
+// mapped says that data will not move and will outlive the graph, which changes
+// one thing: a record's property blob is a sub-slice of data rather than a copy
+// into an arena the graph owns. That removes the arena -- the blob half of an
+// image, which on the store this program is aimed at is most of it -- and it
+// removes the span array the copy needed, because spans exist only to survive
+// the arena's own growth reallocating under a slice taken mid-parse. A mapping
+// never grows.
+//
+// Labels are copied in both modes. A label is a uint16 written at offset +9 of a
+// record, so the on-disk stream is unaligned and reading it in place would need
+// an unsafe cast; three megabytes at a million and a half nodes is not worth one.
+//
+// Everything else is identical, deliberately: the bounds, the order, the
+// sections, the errors. A file parses to the same graph either way, which is what
+// TestImageMode_SameGraphEitherWay asserts.
+func deserialiseCSRFrom(data []byte, mapped bool) (*CSRGraph, *csrIndexSection, error) {
 	if len(data) < 22 {
 		return nil, nil, fmt.Errorf("deserialiseCSR: data too short")
 	}
@@ -222,9 +257,17 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 	// because appending to the arena may move it and would leave any slice taken
 	// mid-parse pointing at a stale array.
 	nodeLabelArena := make([]store.NodeType, 0, nodeCount)
-	nodePropArena := make([]byte, 0, len(data)/8)
 	nodeLabelSpan := make([][2]uint32, nodeCount)
-	nodePropSpan := make([][2]uint32, nodeCount)
+
+	// Neither the property arena nor its span array is allocated under a
+	// mapping: the blob is addressed where it lies and the record's slice is
+	// taken in the loop below. See deserialiseCSRFrom.
+	var nodePropArena []byte
+	var nodePropSpan [][2]uint32
+	if !mapped {
+		nodePropArena = make([]byte, 0, len(data)/8)
+		nodePropSpan = make([][2]uint32, nodeCount)
+	}
 
 	for i := range nodes {
 		if pos+9 > len(data) {
@@ -265,19 +308,30 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		}
 		nodeLabelSpan[i] = [2]uint32{labelStart, uint32(labelCount)}
 
-		arena, propStart, propLen, nextPos, err := readCSRPropertiesInto(nodePropArena, data, pos, version, "node", i)
-		if err != nil {
-			return nil, nil, err
-		}
-		nodePropArena = arena
-		nodePropSpan[i] = [2]uint32{propStart, propLen}
-		pos = nextPos
 		nodes[i] = nodeRecord{ID: nid}
+		if mapped {
+			props, nextPos, err := aliasCSRProperties(data, pos, version, "node", i)
+			if err != nil {
+				return nil, nil, err
+			}
+			nodes[i].Properties = props
+			pos = nextPos
+		} else {
+			arena, propStart, propLen, nextPos, err := readCSRPropertiesInto(nodePropArena, data, pos, version, "node", i)
+			if err != nil {
+				return nil, nil, err
+			}
+			nodePropArena = arena
+			nodePropSpan[i] = [2]uint32{propStart, propLen}
+			pos = nextPos
+		}
 	}
 
 	for i := range nodes {
 		nodes[i].Labels = arenaLabels(nodeLabelArena, nodeLabelSpan[i])
-		nodes[i].Properties = arenaBytes(nodePropArena, nodePropSpan[i])
+		if !mapped {
+			nodes[i].Properties = arenaBytes(nodePropArena, nodePropSpan[i])
+		}
 	}
 
 	if edgeCount < 0 || edgeCount > (len(data)-pos)/minEdgeRecordBytes {
@@ -286,11 +340,17 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 	}
 	edges := make([]rawEdge, edgeCount)
 
-	// Same arena treatment as the node records above, and for the same reason.
+	// Same arena treatment as the node records above, and for the same reason --
+	// including the mapped case, where there is no property arena at all.
 	edgeLabelArena := make([]store.EdgeType, 0, edgeCount)
-	edgePropArena := make([]byte, 0, len(data)/8)
 	edgeLabelSpan := make([][2]uint32, edgeCount)
-	edgePropSpan := make([][2]uint32, edgeCount)
+
+	var edgePropArena []byte
+	var edgePropSpan [][2]uint32
+	if !mapped {
+		edgePropArena = make([]byte, 0, len(data)/8)
+		edgePropSpan = make([][2]uint32, edgeCount)
+	}
 
 	for i := range edges {
 		if pos+25 > len(data) {
@@ -330,19 +390,30 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 		edgeLabelSpan[i] = [2]uint32{labelStart, uint32(labelCount)}
 		weight := math.Float32frombits(binary.LittleEndian.Uint32(data[pos:]))
 		pos += 4
-		arena, propStart, propLen, nextPos, err := readCSRPropertiesInto(edgePropArena, data, pos, version, "edge", i)
-		if err != nil {
-			return nil, nil, err
-		}
-		edgePropArena = arena
-		edgePropSpan[i] = [2]uint32{propStart, propLen}
-		pos = nextPos
 		edges[i] = rawEdge{ID: eid, Src: src, Dst: dst, Weight: weight}
+		if mapped {
+			props, nextPos, err := aliasCSRProperties(data, pos, version, "edge", i)
+			if err != nil {
+				return nil, nil, err
+			}
+			edges[i].Properties = props
+			pos = nextPos
+		} else {
+			arena, propStart, propLen, nextPos, err := readCSRPropertiesInto(edgePropArena, data, pos, version, "edge", i)
+			if err != nil {
+				return nil, nil, err
+			}
+			edgePropArena = arena
+			edgePropSpan[i] = [2]uint32{propStart, propLen}
+			pos = nextPos
+		}
 	}
 
 	for i := range edges {
 		edges[i].Labels = arenaLabels(edgeLabelArena, edgeLabelSpan[i])
-		edges[i].Properties = arenaBytes(edgePropArena, edgePropSpan[i])
+		if !mapped {
+			edges[i].Properties = arenaBytes(edgePropArena, edgePropSpan[i])
+		}
 	}
 
 	// Build allocates one int32 per page of the identifier space up to the
@@ -358,6 +429,9 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 	csr, err := Build(nodes, edges)
 	if err != nil {
 		return nil, nil, err
+	}
+	if mapped {
+		csr.imgBytes = int64(len(data))
 	}
 	csr.nodeSeqHW = nodeSeqHW
 	csr.edgeSeqHW = edgeSeqHW
@@ -794,6 +868,41 @@ func readCSRPropertiesInto(arena []byte, data []byte, pos int, version uint16, k
 	off := uint32(len(arena))
 	arena = append(arena, data[pos:pos+propLen]...)
 	return arena, off, uint32(propLen), pos + propLen, nil
+}
+
+// aliasCSRProperties is readCSRProperties without the copy: the returned slice
+// addresses data.
+//
+// The three-index form is as load-bearing here as it is in arenaBytes, and for a
+// larger reason. cap == len makes a caller appending to a record's Properties
+// reallocate rather than write over the next record's bytes -- and under a
+// mapping those bytes are a read-only file, so the write would not corrupt the
+// next record, it would fault. Either way the append must not be allowed to
+// reach them, and this is what stops it.
+//
+// A zero-length blob resolves to nil rather than to an empty sub-slice, so that
+// a mapped read and a copied read are indistinguishable: both stores normalise
+// an empty blob to nil on the way in.
+func aliasCSRProperties(data []byte, pos int, version uint16, kind string, index int) ([]byte, int, error) {
+	if version == csrVersionV2 {
+		if pos+8 > len(data) {
+			return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
+		}
+		return nil, pos + 8, nil
+	}
+	if pos+4 > len(data) {
+		return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
+	}
+	propLen := int(binary.LittleEndian.Uint32(data[pos:]))
+	pos += 4
+	if pos+propLen > len(data) {
+		return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s property blob %d", kind, index)
+	}
+	if propLen == 0 {
+		return nil, pos, nil
+	}
+	end := pos + propLen
+	return data[pos:end:end], end, nil
 }
 
 func readCSRProperties(data []byte, pos int, version uint16, kind string, index int) ([]byte, int, error) {

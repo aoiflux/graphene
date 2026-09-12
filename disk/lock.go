@@ -22,7 +22,10 @@ package disk
 //
 // An OpenReadOnly reader's view is fixed at Open. The store materialises itself
 // into memory once — the delta maps and property index come from a WAL replay,
-// the CSR from one os.ReadFile — and nothing re-reads afterwards. So a reader
+// the CSR from one read or one mapping of graphene.csr — and nothing re-reads
+// afterwards. A mapping does not weaken that: the engine never rewrites the image
+// in place (§15.13), so the bytes behind it are the bytes that were there at
+// Open. So a reader
 // running alongside a writer would see a permanently stale graph with no
 // indication that it was stale, which is worse than being refused. The shared
 // lock exists for readers running alongside *other readers*; the exclusive lock
