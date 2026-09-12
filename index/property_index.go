@@ -68,6 +68,12 @@ type PropertyIndex struct {
 	// touched, so a store that declared no composite — the default — pays one
 	// atomic load per indexed property and no lock at all.
 	compDeclared atomic.Bool
+
+	// baseRef is the disk-resident half of the index, or nil. When it is set the
+	// shards above are the delta over it and every read is base ∪ delta −
+	// retracted; see retract.go for the design and union.go for the merges. A
+	// store with no base pays one atomic load and a branch per read path.
+	baseRef atomic.Pointer[baseState]
 }
 
 // propertyShards must be a power of two so the hash can be masked.
@@ -389,6 +395,9 @@ func (p *PropertyIndex) IndexEdge(id store.EdgeID, key string, value []byte) {
 // RemoveNode drops every indexed entry for the given node id across all keys
 // and values. Buckets left empty are removed so they do not accumulate.
 func (p *PropertyIndex) RemoveNode(id store.NodeID) {
+	// Before the shards, not after: retractNode says why the order matters to a
+	// concurrent uniqueness check. It is a no-op with no base attached.
+	p.retractNode(id)
 	// Each shard owns the entries for its own keys, so they are removed
 	// independently — one lock at a time, never two. That is what keeps this
 	// deadlock-free without any lock ordering rule.
@@ -414,6 +423,7 @@ func (p *PropertyIndex) RemoveNode(id store.NodeID) {
 // RemoveEdge drops every indexed entry for the given edge id across all keys
 // and values. Buckets left empty are removed so they do not accumulate.
 func (p *PropertyIndex) RemoveEdge(id store.EdgeID) {
+	p.retractEdge(id)
 	for i := range p.shards {
 		sh := &p.shards[i]
 		sh.mu.Lock()
@@ -452,6 +462,19 @@ func (p *PropertyIndex) NodesMatchingOrdered(dst []store.NodeID, f store.Propert
 	if !ok {
 		return dst, false
 	}
+	// A base's values are not in the delta's ordered index and cannot be: absorbing
+	// them is the residency this whole item removes. They are walked instead, from
+	// the filter's own lower bound, and merged value by value — which is why the
+	// declaration still has to be honoured here rather than by falling back to the
+	// scan path. The two compare differently, and a declared key that silently
+	// started comparing numerically because it acquired a base would answer a
+	// different question than the one it was declared for.
+	if s, hasBase := p.nodeBase(); hasBase {
+		if sc, scannable := orderedScanFor(f); scannable {
+			return s.appendOrderedRange(dst, f.Key, f, sc, idx, lo, hi), true
+		}
+		return dst, false
+	}
 	idx.forEachInRange(lo, hi, func(id store.NodeID) bool {
 		dst = append(dst, id)
 		return true
@@ -472,6 +495,13 @@ func (p *PropertyIndex) EdgesMatchingOrdered(dst []store.EdgeID, f store.Propert
 	if !ok {
 		return dst, false
 	}
+	// See NodesMatchingOrdered.
+	if s, hasBase := p.edgeBase(); hasBase {
+		if sc, scannable := orderedScanFor(f); scannable {
+			return s.appendOrderedRange(dst, f.Key, f, sc, idx, lo, hi), true
+		}
+		return dst, false
+	}
 	idx.forEachInRange(lo, hi, func(id store.EdgeID) bool {
 		dst = append(dst, id)
 		return true
@@ -481,11 +511,19 @@ func (p *PropertyIndex) EdgesMatchingOrdered(dst []store.EdgeID, f store.Propert
 
 // NodesByProperty returns all NodeIDs that have an indexed entry for key=value,
 // in ascending ID order. Returns nil if no match.
+//
+// Under a base the result is the base's run merged with the delta's postings and
+// the retracted ids dropped. The merge runs outside the shard lock, because
+// postings.lookup has already copied the delta's side — so the one thing that can
+// block here, a page fault against the image, blocks no writer.
 func (p *PropertyIndex) NodesByProperty(key string, value []byte) []store.NodeID {
 	sh := p.shardFor(key)
 	sh.mu.RLock()
 	out := sh.nodes.lookup(key, string(value))
 	sh.mu.RUnlock()
+	if s, hasBase := p.nodeBase(); hasBase {
+		return s.mergeLookup(key, value, out)
+	}
 	return out
 }
 
@@ -496,17 +534,26 @@ func (p *PropertyIndex) EdgesByProperty(key string, value []byte) []store.EdgeID
 	sh.mu.RLock()
 	out := sh.edges.lookup(key, string(value))
 	sh.mu.RUnlock()
+	if s, hasBase := p.edgeBase(); hasBase {
+		return s.mergeLookup(key, value, out)
+	}
 	return out
 }
 
 // NodeCardinality returns the number of node IDs registered under key=value
 // without copying the postings list. Used by the query planner to pick the most
 // selective driving index.
+//
+// Under a base it is an upper bound rather than a count: see mergeCardinality for
+// which cases are exact and why a bound is what the planner needs.
 func (p *PropertyIndex) NodeCardinality(key string, value []byte) int {
 	sh := p.shardFor(key)
 	sh.mu.RLock()
 	n := sh.nodes.cardinality(key, string(value))
 	sh.mu.RUnlock()
+	if s, hasBase := p.nodeBase(); hasBase {
+		return s.mergeCardinality(key, value, n)
+	}
 	return n
 }
 
@@ -516,6 +563,9 @@ func (p *PropertyIndex) EdgeCardinality(key string, value []byte) int {
 	sh.mu.RLock()
 	n := sh.edges.cardinality(key, string(value))
 	sh.mu.RUnlock()
+	if s, hasBase := p.edgeBase(); hasBase {
+		return s.mergeCardinality(key, value, n)
+	}
 	return n
 }
 
@@ -527,10 +577,7 @@ func (p *PropertyIndex) EdgeCardinality(key string, value []byte) int {
 // materialises the entire index — but it does allocate the key's distinct values
 // to order them, for the reason postings.forEach gives.
 func (p *PropertyIndex) ForEachNodeEntry(key string, fn func(id store.NodeID, value []byte) bool) {
-	sh := p.shardFor(key)
-	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-	sh.nodes.forEach(key, fn)
+	p.forEachNodeEntryBuf(key, nil, fn)
 }
 
 // forEachNodeEntryBuf is ForEachNodeEntry with the value buffer carried in, for
@@ -539,6 +586,10 @@ func (p *PropertyIndex) forEachNodeEntryBuf(key string, dst []string, fn func(id
 	sh := p.shardFor(key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
+	if s, hasBase := p.nodeBase(); hasBase {
+		dst, _ = s.mergeForEachEntry(key, sh.nodes.byKey[key], dst, nil, fn)
+		return dst
+	}
 	return sh.nodes.forEachBuf(key, dst, fn)
 }
 
@@ -552,6 +603,14 @@ func (p *PropertyIndex) ForEachNodeValue(key string, fn func(value []byte, ids [
 	sh := p.shardFor(key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
+	// Under a base the values arrive in ascending order rather than in the map's,
+	// because merging two sides needs both walked the same way. Nothing depended
+	// on the unordered form — forEachValue's callers are filter scans — and the
+	// order is not promised, so this is not a contract that has now changed.
+	if s, hasBase := p.nodeBase(); hasBase {
+		s.mergeForEachValue(key, sh.nodes.byKey[key], nil, nil, fn)
+		return
+	}
 	sh.nodes.forEachValue(key, fn)
 }
 
@@ -560,16 +619,17 @@ func (p *PropertyIndex) ForEachEdgeValue(key string, fn func(value []byte, ids [
 	sh := p.shardFor(key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
+	if s, hasBase := p.edgeBase(); hasBase {
+		s.mergeForEachValue(key, sh.edges.byKey[key], nil, nil, fn)
+		return
+	}
 	sh.edges.forEachValue(key, fn)
 }
 
 // ForEachEdgeEntry calls fn for every (id, value) registered under key.
 // Return false from fn to stop early.
 func (p *PropertyIndex) ForEachEdgeEntry(key string, fn func(id store.EdgeID, value []byte) bool) {
-	sh := p.shardFor(key)
-	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-	sh.edges.forEach(key, fn)
+	p.forEachEdgeEntryBuf(key, nil, fn)
 }
 
 // forEachEdgeEntryBuf is forEachNodeEntryBuf for edge properties.
@@ -577,6 +637,10 @@ func (p *PropertyIndex) forEachEdgeEntryBuf(key string, dst []string, fn func(id
 	sh := p.shardFor(key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
+	if s, hasBase := p.edgeBase(); hasBase {
+		dst, _ = s.mergeForEachEntry(key, sh.edges.byKey[key], dst, nil, fn)
+		return dst
+	}
 	return sh.edges.forEachBuf(key, dst, fn)
 }
 
@@ -604,8 +668,22 @@ func (p *PropertyIndex) forEachEdgeEntryBuf(key string, dst []string, fn func(id
 // and this order delivers it for close to nothing.
 //
 // This materialises the whole index; query paths should use ForEachNodeEntry.
+//
+// Under a base that includes the base, which is every byte of the index section
+// brought into the heap — the one thing the disk-resident index exists to stop
+// doing. It is still correct, because a caller asking for every entry is asking
+// for exactly that, and the base path streams through the merged walk so nothing
+// beyond the result itself is held at once. Compaction does not come here: it
+// takes ForEachNodeProperty, which is the same walk without the slice.
 func (p *PropertyIndex) NodeEntries() []NodePropEntry {
 	out := make([]NodePropEntry, 0, p.nodeEntryCount())
+	if _, hasBase := p.nodeBase(); hasBase {
+		p.ForEachNodeProperty(func(id store.NodeID, key string, value []byte) bool {
+			out = append(out, NodePropEntry{ID: id, Key: key, Value: bytes.Clone(value)})
+			return true
+		})
+		return out
+	}
 	vals := make([]string, 0, 64)
 	for _, key := range p.nodePropKeys() {
 		sh := p.shardFor(key)
@@ -629,6 +707,13 @@ func (p *PropertyIndex) NodeEntries() []NodePropEntry {
 // (Key, Value, ID). See NodeEntries for why the order is a contract.
 func (p *PropertyIndex) EdgeEntries() []EdgePropEntry {
 	out := make([]EdgePropEntry, 0, p.edgeEntryCount())
+	if _, hasBase := p.edgeBase(); hasBase {
+		p.ForEachEdgeProperty(func(id store.EdgeID, key string, value []byte) bool {
+			out = append(out, EdgePropEntry{ID: id, Key: key, Value: bytes.Clone(value)})
+			return true
+		})
+		return out
+	}
 	vals := make([]string, 0, 64)
 	for _, key := range p.edgePropKeys() {
 		sh := p.shardFor(key)
@@ -680,6 +765,9 @@ func (p *PropertyIndex) nodePropKeys() []string {
 		}
 		sh.mu.RUnlock()
 	}
+	if s, hasBase := p.nodeBase(); hasBase {
+		out = s.mergeKeys(out)
+	}
 	slices.Sort(out)
 	return out
 }
@@ -694,6 +782,9 @@ func (p *PropertyIndex) edgePropKeys() []string {
 		}
 		sh.mu.RUnlock()
 	}
+	if s, hasBase := p.edgeBase(); hasBase {
+		out = s.mergeKeys(out)
+	}
 	slices.Sort(out)
 	return out
 }
@@ -701,6 +792,11 @@ func (p *PropertyIndex) edgePropKeys() []string {
 // EntryCounts returns the number of indexed (id, key, value) triples, split by
 // entity kind. Both are exact: each shard keeps a running count, so this does
 // not walk the index.
+//
+// Under a base they are upper bounds. The base reports its own total without
+// being walked, and the entries it holds for an id retracted since it was written
+// are still in that total — finding out how many would mean the pass this figure
+// exists to avoid.
 func (p *PropertyIndex) EntryCounts() (nodes, edges int) {
 	return p.nodeEntryCount(), p.edgeEntryCount()
 }
@@ -717,6 +813,9 @@ func (p *PropertyIndex) nodeEntryCount() int {
 		total += sh.nodes.count
 		sh.mu.RUnlock()
 	}
+	if s, hasBase := p.nodeBase(); hasBase {
+		total += s.base().TotalEntries(NodeKind)
+	}
 	return total
 }
 
@@ -727,6 +826,9 @@ func (p *PropertyIndex) edgeEntryCount() int {
 		sh.mu.RLock()
 		total += sh.edges.count
 		sh.mu.RUnlock()
+	}
+	if s, hasBase := p.edgeBase(); hasBase {
+		total += s.base().TotalEntries(EdgeKind)
 	}
 	return total
 }
@@ -746,6 +848,11 @@ func (p *PropertyIndex) edgeEntryCount() int {
 // It cannot check whether an indexed value still reflects the entity's current
 // properties — values are caller-encoded opaque bytes, so only the caller knows
 // that. See store.ReindexPolicy for how that staleness is managed.
+//
+// Under a base it checks the delta and reports any fault already read out of the
+// base, but it does not verify the base's own structure. That is a pass over the
+// whole index section with O(1) memory, which belongs to the bounded verifier
+// that exists to pay for it rather than to a function every test calls.
 func (p *PropertyIndex) Verify() error {
 	return p.VerifyCtx(context.Background())
 }
@@ -756,6 +863,9 @@ func (p *PropertyIndex) Verify() error {
 // point at which stopping is unsafe. That is the whole reason it is cancellable
 // where RebuildIndexes largely is not.
 func (p *PropertyIndex) VerifyCtx(ctx context.Context) error {
+	if err := p.BaseFault(); err != nil {
+		return err
+	}
 	cc := store.NewCancelCheck(ctx)
 	if err := cc.Check(); err != nil {
 		return err
@@ -832,6 +942,12 @@ func (p *PropertyIndex) ForEachIndexedNodeID(fn func(store.NodeID) bool) {
 			return
 		}
 	}
+	// The base's ids come after the delta's, retracted ones omitted. An id both
+	// sides carry is visited from each, which is the same repeat the shards
+	// already produce and costs the same callers nothing.
+	if s, hasBase := p.nodeBase(); hasBase {
+		s.forEachID(fn)
+	}
 }
 
 // ForEachIndexedEdgeID is ForEachIndexedNodeID for edges; the same shard-repeat
@@ -845,6 +961,9 @@ func (p *PropertyIndex) ForEachIndexedEdgeID(fn func(store.EdgeID) bool) {
 		if !done {
 			return
 		}
+	}
+	if s, hasBase := p.edgeBase(); hasBase {
+		s.forEachID(fn)
 	}
 }
 
@@ -1493,6 +1612,13 @@ func (p *PropertyIndex) NodeEntriesOf(id store.NodeID) []PropEntry {
 		})
 		sh.mu.RUnlock()
 	}
+	// A retracted id has no base entries at all, which one bit settles without
+	// searching the base's reverse direction for an id that is not there.
+	if s, hasBase := p.nodeBase(); hasBase && !s.gone.has(uint64(id)) {
+		out = s.appendEntriesOf(out, uint64(id))
+		sortPropEntries(out)
+		return dedupPropEntries(out)
+	}
 	sortPropEntries(out)
 	return out
 }
@@ -1508,6 +1634,11 @@ func (p *PropertyIndex) EdgeEntriesOf(id store.EdgeID) []PropEntry {
 			return true
 		})
 		sh.mu.RUnlock()
+	}
+	if s, hasBase := p.edgeBase(); hasBase && !s.gone.has(uint64(id)) {
+		out = s.appendEntriesOf(out, uint64(id))
+		sortPropEntries(out)
+		return dedupPropEntries(out)
 	}
 	sortPropEntries(out)
 	return out
@@ -1537,6 +1668,9 @@ func (p *PropertyIndex) NodeHasEntries(id store.NodeID) bool {
 			return true
 		}
 	}
+	if s, hasBase := p.nodeBase(); hasBase {
+		return s.hasEntries(uint64(id))
+	}
 	return false
 }
 
@@ -1550,6 +1684,9 @@ func (p *PropertyIndex) EdgeHasEntries(id store.EdgeID) bool {
 		if has {
 			return true
 		}
+	}
+	if s, hasBase := p.edgeBase(); hasBase {
+		return s.hasEntries(uint64(id))
 	}
 	return false
 }

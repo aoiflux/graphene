@@ -117,7 +117,19 @@ func (p *PropertyIndex) NodeRangeCardinality(f store.PropertyFilter) (int, bool)
 	if !ok {
 		return 0, false
 	}
-	return idx.estimateRange(lo, hi), true
+	// The base's share of the window is estimated in the same two regimes, from
+	// run lengths the base reports without reading an id. It has to be counted
+	// here or the planner would size a range against the writes since the last
+	// compaction and drive from it against a label that is smaller.
+	est := idx.estimateRange(lo, hi)
+	if s, hasBase := p.nodeBase(); hasBase {
+		sc, scannable := orderedScanFor(f)
+		if !scannable {
+			return 0, false
+		}
+		est += s.rangeEntries(f.Key, f, sc)
+	}
+	return est, true
 }
 
 // EdgeRangeCardinality is NodeRangeCardinality for edge properties.
@@ -133,5 +145,13 @@ func (p *PropertyIndex) EdgeRangeCardinality(f store.PropertyFilter) (int, bool)
 	if !ok {
 		return 0, false
 	}
-	return idx.estimateRange(lo, hi), true
+	est := idx.estimateRange(lo, hi)
+	if s, hasBase := p.edgeBase(); hasBase {
+		sc, scannable := orderedScanFor(f)
+		if !scannable {
+			return 0, false
+		}
+		est += s.rangeEntries(f.Key, f, sc)
+	}
+	return est, true
 }

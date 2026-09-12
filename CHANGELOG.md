@@ -5,6 +5,133 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### The property index can be a base plus a delta: `base ∪ delta − retracted`
+
+`PropertyIndex` can now answer from two halves. Attach an `index.Base` — the
+reader the entry below describes — and the shards become the *delta* over it:
+everything registered since the base was written, plus one bit per base id
+naming what has been removed. Every read path merges the three terms, and the
+answer is the one a single resident index would have given. Nothing attaches a
+base yet except tests, so no production path changes, the image version is still
+8, and no file that loads today loads differently.
+
+**The retraction bit is how §14.7 is answered, not audited around.**
+`TECHNICAL_DETAILS.md` §14.7 records the hazard that sank the earlier attempt at
+a lazily-loaded index: a structure that reads part of the base into memory to
+answer a query can re-read an entry deleted after it was loaded, and hand back
+an entity that is gone. A bit removes the second copy rather than policing it.
+The base is never written to and never read into a resident structure; the bit
+is consulted on the way out of every read; resurrection is unrepresentable
+rather than prevented. `TestUnion_NoResurrectionAcrossReindex` and
+`TestUnion_MatchesResidentAfterRemoveAll` are that scenario, the second in the
+shape the program's consumer actually runs — delete every entity of a type,
+write a new generation, and the base must answer for none of the old ones.
+
+One bit per *entity*, not per entry, because that is exactly the grain the
+update path can express: the index has no per-key purge, so a caller changing
+what one entity is indexed under drops every entry for it and registers the
+whole new set. `NodeEntriesOf` now merges both sides and deduplicates so that a
+caller re-registering what it was handed is not handed the same pair twice.
+
+The set is an atomic bitset with no lock on either path, where the plan had an
+RWMutex and a lock order to keep — shard, then retracted, with `RemoveNode`
+taking retracted first. Its length is fixed when the base is attached, since an
+id above the base's highest was never in it, so there is no resize to serialise
+and a retraction is one atomic OR. The words are allocated on the first
+retraction, so a process that only reads never allocates them: at this program's
+sizes that is several megabytes a read-only consumer does not hold.
+
+**What the planner is told, and where it is now an upper bound.**
+`NodeCardinality`, `EntryCounts` and the per-key entry counts add the base's
+figures, which the base reports from its key directory without being walked.
+They over-count an id held by both sides and a retracted id the base still
+holds. That is sound and it is the point: a driver has to be a *superset* of the
+answer, so an over-count costs a worse plan and can never cost a wrong result —
+counting exactly would turn a constant into a pass over a postings list on a
+path the planner takes once per candidate filter per query.
+
+Ranges keep their declared semantics. A base's values are not in the delta's
+ordered index and cannot be — absorbing them is the residency this item removes
+— so `NodesMatchingOrdered` walks the base from the filter's own lower bound,
+stops at its upper bound, and merges value by value. Falling back to the scan
+path instead would have been easier and wrong: the two compare differently, and
+a declared key that silently started comparing numerically because it acquired
+a base answers a different question than the one it was declared for.
+
+Uniqueness is checked against both sides inside the shard write lock, so the
+check and the insert stay one step. A declaration no longer walks the base in
+the usual case: the base reports a key's distinct-value and entry counts, and
+`entries == distinct` says every run holds one id, so no base value can conflict
+with itself and only the delta's values need probing. A key that has always been
+unique therefore costs a walk of the delta rather than a sequential read of the
+whole index section at every open. When the two counts disagree the walk is what
+the answer costs, and the caller is about to be told about a conflict anyway.
+
+`DeclareUniqueNodeKey` and `DeclareUniqueEdgeKey` now return an error beside
+their conflicts, which means something different: not "the data violates this"
+but "the data could not be read, so whether it violates this is unknown".
+Nothing is declared then. It is a return value rather than a recorded fault
+because a declaration is the one place a constraint is established over data
+that already exists — every later registration is gated by `IndexNodeUnique`,
+which refuses on the same fault under the same lock.
+
+Everywhere else a damaged base is recorded rather than returned, because most of
+these methods have no error to return: `NodesByProperty` returns a slice. The
+read answers from the delta, which is undamaged, and the fault is recorded on
+the index where `BaseFault`, `Verify` and a store's statistics can all see it.
+Reporting an unreadable run as "that value has no ids" would turn a damaged file
+into a wrong answer, which is what `index.Base`'s own contract refuses.
+
+**Method.** The suite compares two indexes loaded with the same triples — one
+whole, one split into a base and a delta — and fails on any difference, across a
+swept split point, a deliberate overlap so every merge has to deduplicate rather
+than concatenate, and three densities of removal. The base here is a fake built
+from maps, because `index` cannot import `disk`; it is itself checked against a
+resident `PropertyIndex`, which composes with `disk`'s own checks of `gpixBase`
+against one to give the chain the item needs. Nine mutants, each a guard
+removed: all nine killed.
+
+Three things this found. The merged walk did not honour an early stop: a base's
+`ForEachValue` reports a caller's stop and a completed walk the same way, as no
+error, so the delta's leftover values were drained into a callback that had
+already said it wanted nothing more. It needed its own flag. The differential
+assertions could not see it — they all walk to the end — so it took reading the
+code back, and `TestUnion_WalksStopWhenAsked` now checks every stop position on
+every key, because stopping inside the base's half and stopping while draining
+the delta's leftovers are two different paths through one function. Compaction's
+payload source and the export path are both callers that stop.
+
+A base key can outlive its last entry — retracting every id that held it leaves
+the key in the base's directory until a compaction declines to write it — which is
+invisible to every caller because a key with no live entry contributes nothing
+to any walk, and is now written down where the key list is built. And the first
+run of the suite retracted no edge at all and said nothing about it, because a
+split taken at a fraction of an unshuffled corpus puts one whole entity kind on
+one side of it; the corpus is shuffled now, which also hands the base an
+arbitrary subset of triples rather than a prefix, a stronger base than a real
+one.
+
+What the merges deliberately do not check is the base's own ordering: runs
+ascend and values ascend because that is the base's promise, and re-checking it
+per probe would make every query pay for the file being sound. A base that broke
+it makes a merged result mis-ordered or a delta value visited twice — bounded,
+since every walk here is guarded by its own slice length rather than by the
+base's claims, but wrong. Establishing the order over a whole section is an
+O(entries) pass, and that pass is the bounded verifier's.
+
+**Cost, measured.** The path with no base pays one inlined atomic load of a nil
+pointer and a branch: **+3 ns on a 57 ns warm equality lookup, about +5%**, four
+order-alternated interleaved passes against a control tree, with
+`BenchmarkPointLookupNode_Memory` — which touches no changed code — flat across
+the same passes, so the difference is the change and not the trees. The
+mechanism is a cache line the lookup did not previously touch. Allocations are
+unchanged on every arm. Under the P0-memory rule this program runs to, that is
+reported and accepted. With a base attached the merge allocates exactly once,
+for the result the public API must hand back: 80 ns and 8 B/op against a 50,000
+all-distinct-value key, 3.2 µs and 8 KB for a value holding a thousand ids. Those
+are against a heap-backed fake, so they price the merge and not the image; the
+mapped figures land with the flip.
+
 ### GPIX and GPIR are readable: `index.Base`
 
 The two sections the entry below describes now have a reader, and it answers

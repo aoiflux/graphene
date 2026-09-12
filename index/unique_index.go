@@ -47,41 +47,63 @@ type LiveEdge func(store.EdgeID) bool
 // Declaring a key already declared is a no-op and returns nothing, which is what
 // makes it safe to declare at every Open — the same contract the ordered and
 // composite declarations carry.
-func (p *PropertyIndex) DeclareUniqueNodeKey(key string, live LiveNode) []store.UniqueConflict {
+//
+// The error is separate from the conflicts and means something else entirely: not
+// "the data violates this" but "the data could not be read, so whether it violates
+// this is unknown". Only a damaged base produces one, and nothing is declared when
+// it does. It is a return value rather than a recorded fault because a declaration
+// is the one place a constraint is established over data that already exists —
+// every later registration is gated by IndexNodeUnique, which has its own error and
+// its own lock hold, but nothing re-checks the existing entries afterwards.
+func (p *PropertyIndex) DeclareUniqueNodeKey(key string, live LiveNode) ([]store.UniqueConflict, error) {
 	sh := p.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
 	if _, exists := sh.uniqueNodeKeys[key]; exists {
-		return nil
+		return nil, nil
 	}
-	conflicts := conflictsUnder(sh.nodes.byKey[key], func(id store.NodeID) bool {
-		return live == nil || live(id)
-	})
+	isLive := func(id store.NodeID) bool { return live == nil || live(id) }
+	var conflicts []store.UniqueConflict
+	if s, hasBase := p.nodeBase(); hasBase {
+		var err error
+		if conflicts, err = s.mergeConflicts(key, sh.nodes.byKey[key], isLive); err != nil {
+			return nil, err
+		}
+	} else {
+		conflicts = conflictsUnder(sh.nodes.byKey[key], isLive)
+	}
 	if len(conflicts) > 0 {
-		return conflicts
+		return conflicts, nil
 	}
 	sh.uniqueNodeKeys[key] = struct{}{}
-	return nil
+	return nil, nil
 }
 
 // DeclareUniqueEdgeKey is DeclareUniqueNodeKey for edge properties.
-func (p *PropertyIndex) DeclareUniqueEdgeKey(key string, live LiveEdge) []store.UniqueConflict {
+func (p *PropertyIndex) DeclareUniqueEdgeKey(key string, live LiveEdge) ([]store.UniqueConflict, error) {
 	sh := p.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
 	if _, exists := sh.uniqueEdgeKeys[key]; exists {
-		return nil
+		return nil, nil
 	}
-	conflicts := conflictsUnder(sh.edges.byKey[key], func(id store.EdgeID) bool {
-		return live == nil || live(id)
-	})
+	isLive := func(id store.EdgeID) bool { return live == nil || live(id) }
+	var conflicts []store.UniqueConflict
+	if s, hasBase := p.edgeBase(); hasBase {
+		var err error
+		if conflicts, err = s.mergeConflicts(key, sh.edges.byKey[key], isLive); err != nil {
+			return nil, err
+		}
+	} else {
+		conflicts = conflictsUnder(sh.edges.byKey[key], isLive)
+	}
 	if len(conflicts) > 0 {
-		return conflicts
+		return conflicts, nil
 	}
 	sh.uniqueEdgeKeys[key] = struct{}{}
-	return nil
+	return nil, nil
 }
 
 // conflictsUnder collects every value in bucket held by two or more live ids.
@@ -171,10 +193,25 @@ func (p *PropertyIndex) collectUniqueKeys(pick func(*propertyShard) map[string]s
 // when the value is unheld, and also when it is held by more than one entity,
 // which cannot happen under a declaration and is not this function's business to
 // diagnose.
+//
+// # Why a damaged base reports "unheld" here and does not return an error
+//
+// Under a base the answer spans both sides, and a base that will not decode makes
+// it unknown. ok is false then, and the fault is recorded on the index
+// (BaseFault), because every caller of this reaches the shard lock again before
+// anything is committed: an upsert that fails to resolve a key goes on to register
+// the value through IndexNodeUnique, and a transaction's pre-check is re-run by
+// txcheck under the same lock the apply holds. Both of those return an error, and
+// both refuse. So a fault costs a caller a wasted resolve, not a duplicate — and
+// the fourteen call sites that would have to thread an error do not have to.
 func (p *PropertyIndex) NodeUniqueOwner(key string, value []byte) (store.NodeID, bool) {
 	sh := p.shardFor(key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
+	if s, hasBase := p.nodeBase(); hasBase {
+		id, ok, err := s.soleHolder(key, value, sh.nodes.byKey[key][string(value)])
+		return id, ok && err == nil
+	}
 	return soleHolder(sh.nodes.byKey[key], string(value))
 }
 
@@ -183,7 +220,35 @@ func (p *PropertyIndex) EdgeUniqueOwner(key string, value []byte) (store.EdgeID,
 	sh := p.shardFor(key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
+	if s, hasBase := p.edgeBase(); hasBase {
+		id, ok, err := s.soleHolder(key, value, sh.edges.byKey[key][string(value)])
+		return id, ok && err == nil
+	}
 	return soleHolder(sh.edges.byKey[key], string(value))
+}
+
+// soleHolderLocked is the uniqueness predicate both gates use, with the shard
+// already held: the one id holding value under key, across the base and the delta.
+//
+// It is written once over the kind rather than twice over the ID type because the
+// two gates want the answer as a uint64 either way, and a generic over T would
+// need the shard's postings passed in as well as the kind — which is the argument
+// that both parameters describe the same thing.
+func (p *PropertyIndex) soleHolderLocked(sh *propertyShard, kind EntityKind, key, value string) (uint64, bool, error) {
+	if kind == EdgeKind {
+		if s, hasBase := p.edgeBase(); hasBase {
+			id, ok, err := s.soleHolder(key, unsafeBytes(value), sh.edges.byKey[key][value])
+			return uint64(id), ok, err
+		}
+		id, ok := soleHolder(sh.edges.byKey[key], value)
+		return uint64(id), ok, nil
+	}
+	if s, hasBase := p.nodeBase(); hasBase {
+		id, ok, err := s.soleHolder(key, unsafeBytes(value), sh.nodes.byKey[key][value])
+		return uint64(id), ok, err
+	}
+	id, ok := soleHolder(sh.nodes.byKey[key], value)
+	return uint64(id), ok, nil
 }
 
 func soleHolder[T entityID](bucket map[string][]T, value string) (T, bool) {
@@ -229,14 +294,26 @@ func (e *ErrUniqueTaken) Error() string {
 // Re-registering the same (id, key, value) is not a conflict. An entity holding
 // its own value is the steady state an idempotent re-ingest arrives at, and the
 // underlying insert is already a no-op for it.
+// Under a base the check reads the base inside the shard write lock, which can
+// mean a page fault while a writer's shard is held. That is the price of the check
+// and the insert being one step, and the alternative — read the base first, then
+// take the lock — is the window the constraint exists to close.
 func (p *PropertyIndex) IndexNodeUnique(id store.NodeID, key string, value []byte) error {
 	vk := string(value)
 	sh := p.shardFor(key)
 	sh.mu.Lock()
 	if _, unique := sh.uniqueNodeKeys[key]; unique {
-		if owner, held := soleHolder(sh.nodes.byKey[key], vk); held && owner != id {
+		owner, held, err := p.soleHolderLocked(sh, NodeKind, key, vk)
+		if err != nil {
 			sh.mu.Unlock()
-			return &ErrUniqueTaken{Key: key, Value: []byte(vk), Owner: uint64(owner)}
+			// A gate that cannot read cannot pass. Every other read path in this
+			// package answers from the delta and records the fault; this one is
+			// the one whose wrong answer is a duplicate.
+			return err
+		}
+		if held && store.NodeID(owner) != id {
+			sh.mu.Unlock()
+			return &ErrUniqueTaken{Key: key, Value: []byte(vk), Owner: owner}
 		}
 	}
 	sh.nodes.add(id, key, vk)
@@ -257,9 +334,14 @@ func (p *PropertyIndex) IndexEdgeUnique(id store.EdgeID, key string, value []byt
 	sh := p.shardFor(key)
 	sh.mu.Lock()
 	if _, unique := sh.uniqueEdgeKeys[key]; unique {
-		if owner, held := soleHolder(sh.edges.byKey[key], vk); held && owner != id {
+		owner, held, err := p.soleHolderLocked(sh, EdgeKind, key, vk)
+		if err != nil {
 			sh.mu.Unlock()
-			return &ErrUniqueTaken{Key: key, Value: []byte(vk), Owner: uint64(owner)}
+			return err
+		}
+		if held && store.EdgeID(owner) != id {
+			sh.mu.Unlock()
+			return &ErrUniqueTaken{Key: key, Value: []byte(vk), Owner: owner}
 		}
 	}
 	sh.edges.add(id, key, vk)

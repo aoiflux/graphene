@@ -53,7 +53,7 @@ func modBuild(n int, unique, ordered []string, comps [][]string) (uint64, *Prope
 
 	p := NewPropertyIndex()
 	for _, k := range unique {
-		if c := p.DeclareUniqueNodeKey(k, nil); len(c) > 0 {
+		if c, err := p.DeclareUniqueNodeKey(k, nil); err != nil || len(c) > 0 {
 			panic(c)
 		}
 	}

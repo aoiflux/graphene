@@ -369,18 +369,31 @@ func (p *PropertyIndex) edgeCardinality(key string, value []byte) int {
 
 // nodeKeyEntryCount is the number of (id, value) entries registered under key,
 // which is what a scan of that key would visit.
+//
+// Under a base it includes the base's entries for the key, which the base reports
+// from its key directory without being walked. It is an upper bound, for the same
+// reason NodeCardinality is: what it decides is probe versus build, and a count
+// that is too high makes the wrong choice, never the wrong answer.
 func (p *PropertyIndex) nodeKeyEntryCount(key string) int {
 	sh := p.shardFor(key)
 	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-	return sh.nodes.perKey[key]
+	n := sh.nodes.perKey[key]
+	sh.mu.RUnlock()
+	if s, hasBase := p.nodeBase(); hasBase {
+		return s.mergeKeyEntryCount(key, n)
+	}
+	return n
 }
 
 func (p *PropertyIndex) edgeKeyEntryCount(key string) int {
 	sh := p.shardFor(key)
 	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-	return sh.edges.perKey[key]
+	n := sh.edges.perKey[key]
+	sh.mu.RUnlock()
+	if s, hasBase := p.edgeBase(); hasBase {
+		return s.mergeKeyEntryCount(key, n)
+	}
+	return n
 }
 
 // noResiduals reports that the driver already applied every filter, so there is

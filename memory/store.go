@@ -453,7 +453,10 @@ func (s *Store) OrderedEdgeProperties() []string { return s.propIdx.OrderedEdgeK
 func (s *Store) DeclareUniqueNodeProperty(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	conflicts := s.propIdx.DeclareUniqueNodeKey(key, s.nodeExistsLocked)
+	conflicts, err := s.propIdx.DeclareUniqueNodeKey(key, s.nodeExistsLocked)
+	if err != nil {
+		return err
+	}
 	if len(conflicts) > 0 {
 		return &store.UniqueViolationsError{Kind: "node", Key: key, Conflicts: conflicts}
 	}
@@ -464,7 +467,10 @@ func (s *Store) DeclareUniqueNodeProperty(key string) error {
 func (s *Store) DeclareUniqueEdgeProperty(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	conflicts := s.propIdx.DeclareUniqueEdgeKey(key, s.edgeExistsLocked)
+	conflicts, err := s.propIdx.DeclareUniqueEdgeKey(key, s.edgeExistsLocked)
+	if err != nil {
+		return err
+	}
 	if len(conflicts) > 0 {
 		return &store.UniqueViolationsError{Kind: "edge", Key: key, Conflicts: conflicts}
 	}

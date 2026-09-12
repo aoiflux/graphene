@@ -581,7 +581,14 @@ func (s *Store) applyCatalogueConstraints(c Catalogue, policy ConstraintPolicy) 
 	var dropped []DroppedDeclaration
 
 	for _, k := range c.UniqueNodeKeys {
-		if conflicts := s.propIdx.DeclareUniqueNodeKey(k, s.nodeExistsLocked); len(conflicts) > 0 {
+		conflicts, err := s.propIdx.DeclareUniqueNodeKey(k, s.nodeExistsLocked)
+		switch {
+		case err != nil:
+			// Not "the data violates this" but "the data could not be read", which
+			// is a dropped declaration for the same reason a conflict is: whether
+			// the key is unique is unknown, and unknown is not declared.
+			dropped = append(dropped, DroppedDeclaration{Kind: "unique-node", Key: k, Reason: err})
+		case len(conflicts) > 0:
 			dropped = append(dropped, DroppedDeclaration{
 				Kind: "unique-node", Key: k,
 				Reason: &store.UniqueViolationsError{Kind: "node", Key: k, Conflicts: conflicts},
@@ -589,7 +596,11 @@ func (s *Store) applyCatalogueConstraints(c Catalogue, policy ConstraintPolicy) 
 		}
 	}
 	for _, k := range c.UniqueEdgeKeys {
-		if conflicts := s.propIdx.DeclareUniqueEdgeKey(k, s.edgeExistsLocked); len(conflicts) > 0 {
+		conflicts, err := s.propIdx.DeclareUniqueEdgeKey(k, s.edgeExistsLocked)
+		switch {
+		case err != nil:
+			dropped = append(dropped, DroppedDeclaration{Kind: "unique-edge", Key: k, Reason: err})
+		case len(conflicts) > 0:
 			dropped = append(dropped, DroppedDeclaration{
 				Kind: "unique-edge", Key: k,
 				Reason: &store.UniqueViolationsError{Kind: "edge", Key: k, Conflicts: conflicts},
