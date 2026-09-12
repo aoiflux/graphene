@@ -28,12 +28,18 @@ package disk
 //	               publish
 //
 // The middle stage is safe outside the lock because compactPlan shares nothing
-// mutable with the store. A CSRGraph is immutable once published, so the plan
-// holds the image itself rather than a copy of its records and reads it in the
-// build; the delta's records are copied under the lock, and a *store.Node in the
-// delta is replaced rather than edited when it changes, so the Labels slice a
-// plan holds is not written again; the property entries and redaction ledger are
-// copies taken under the lock.
+// mutable with the store, with one deliberate exception. A CSRGraph is immutable
+// once published, so the plan holds the image itself rather than a copy of its
+// records and reads it in the build; the delta's records are copied under the
+// lock, and a *store.Node in the delta is replaced rather than edited when it
+// changes, so the Labels slice a plan holds is not written again; the redaction
+// ledger is a copy taken under the lock.
+//
+// The exception is the property index, which the plan holds by pointer and the
+// build streams -- see compactPlan.propIdx for the whole argument. It is there
+// because materialising the index was the largest allocation left in a
+// compaction after the image itself, and the merge below is what makes streaming
+// it sound.
 //
 // # What the released lock costs
 //
@@ -57,6 +63,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/merkle"
 	"github.com/aoiflux/graphene/store"
 )
@@ -146,6 +153,35 @@ type compactPlan struct {
 	// plus every delta entry. The compaction metric reports it, and it is a
 	// figure the pin can take for free — both counts are maintained.
 	examined int64
+
+	// propIdx is the store's property index, held by pointer: the one thing in
+	// this plan the store goes on mutating while the build runs. The build
+	// streams it -- see nodePropSeq -- rather than the pin materialising every
+	// entry, which on the store this program is aimed at was 28 million entries
+	// of 48 bytes plus a copied value each, built under the store lock.
+	//
+	// Three things make that sound, and none of them is "the index does not
+	// change":
+	//
+	// The index is not epoch-versioned, so the build sees entries registered
+	// after the pin. Every index mutation is journaled to the WAL before it is
+	// applied, under s.mu, so an entry the build happens to catch is an entry the
+	// log also carries; and retireLog only truncates the log whole when nothing
+	// landed during the build, in which case index-at-build is index-at-pin.
+	// Otherwise the tail survives and replay re-applies each mutation as an
+	// idempotent upsert or purge. So the image and the log converge on the same
+	// index whichever entries the stream caught.
+	//
+	// An entry naming an entity the image does not hold would be an orphan
+	// against invariant 15.5 until that replay, which is a worse state than
+	// "stale": it is a posting pointing at nothing. That one is closed by
+	// construction rather than by convergence -- nodePropSeq filters every entry
+	// against the built image, which is O(1) per entry on the page table.
+	//
+	// And a live reader replaces its index wholesale on reload (live.go), which
+	// would leave this pointer addressing an abandoned one. A live reader cannot
+	// compact: Compact goes through mustWrite first.
+	propIdx *index.PropertyIndex
 
 	payload csrPayload
 
@@ -447,13 +483,18 @@ func (s *Store) compactPin() (*compactPlan, error) {
 		walFraming:     s.wal.Framing(),
 		keyTimelineLen: len(s.keyTimeline),
 
-		// Carrying the property index into the CSR so it no longer has to be
-		// reconstructed from the WAL on the next open. Ordered-key declarations
-		// travel with the image too; without them every reopen silently turned
+		propIdx: s.propIdx,
+
+		// The image carries the property index so it no longer has to be
+		// reconstructed from the WAL on the next open, and the ordered-key
+		// declarations with it; without those every reopen silently turned
 		// declared range queries back into scans.
+		//
+		// NodeProps and EdgeProps are deliberately absent here: build attaches
+		// them once the image exists, because the filter that keeps them honest
+		// needs it. What is left is declarations and projections -- small, and
+		// the pin is the right place to read them.
 		payload: csrPayload{
-			NodeProps:         s.propIdx.NodeEntries(),
-			EdgeProps:         s.propIdx.EdgeEntries(),
 			CompositeNodeKeys: s.propIdx.CompositeNodeKeys(),
 			CompositeEdgeKeys: s.propIdx.CompositeEdgeKeys(),
 			OrderedNodeKeys:   s.propIdx.OrderedNodeKeys(),
@@ -579,6 +620,49 @@ func (p *compactPlan) edgeSeq() iter.Seq[rawEdge] {
 	}
 }
 
+// nodePropSeq yields the property-index entries the new image will carry: every
+// entry the live index holds for a node the image holds, in the (key, value, id)
+// order the format's byte-determinism contract requires.
+//
+// The filter is the point. The stream runs during the build, so it can see an
+// entry registered for a node committed after the pin -- a node this image does
+// not contain. Writing it would put a posting into the image naming nothing,
+// which is exactly the orphan invariant 15.5 forbids, and it would stay that way
+// until the log replayed. csr.containsNode is one page-table probe against the
+// image the entries are being written for, so the section cannot contain one.
+//
+// The other direction needs no filter: an entry the stream misses because its
+// key was already walked is in the log tail, and replay registers it.
+//
+// Values are not copied. ForEachNodeProperty owns the bytes it yields for the
+// duration of the call, the writer copies them into its output buffer and the
+// Merkle stream hashes them immediately, and nothing else here retains them --
+// which is the allocation this item removes, one per entry.
+//
+// Re-runnable, as csrPayload requires: each walk re-enters the index.
+func (p *compactPlan) nodePropSeq(csr *CSRGraph) iter.Seq[index.NodePropEntry] {
+	return func(yield func(index.NodePropEntry) bool) {
+		p.propIdx.ForEachNodeProperty(func(id store.NodeID, key string, value []byte) bool {
+			if !csr.containsNode(id) {
+				return true
+			}
+			return yield(index.NodePropEntry{ID: id, Key: key, Value: value})
+		})
+	}
+}
+
+// edgePropSeq is nodePropSeq for edge properties.
+func (p *compactPlan) edgePropSeq(csr *CSRGraph) iter.Seq[index.EdgePropEntry] {
+	return func(yield func(index.EdgePropEntry) bool) {
+		p.propIdx.ForEachEdgeProperty(func(id store.EdgeID, key string, value []byte) bool {
+			if !csr.containsEdge(id) {
+				return true
+			}
+			return yield(index.EdgePropEntry{ID: id, Key: key, Value: value})
+		})
+	}
+}
+
 // build turns the plan into a serialised image on disk, with no lock held.
 //
 // A failure here changes nothing: the log is intact, the image on disk is the
@@ -628,6 +712,13 @@ func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string,
 	newCSR.edgeSeqHW = p.edgeSeqHW
 	newCSR.commitSeqHW = p.commitSeqHW
 	newCSR.lastCompactUnixNano = p.compactedAt.UnixNano()
+
+	// The property index travels as a stream over the live index, filtered
+	// against the image that has just been built. It is attached here rather
+	// than at the pin for two reasons: the filter needs the image, and a
+	// cancelled build should not have walked the index at all.
+	p.payload.NodeProps = p.nodePropSeq(newCSR)
+	p.payload.EdgeProps = p.edgePropSeq(newCSR)
 
 	// The last place a cancellation is free. Past this the image is written and
 	// fsynced, and the caller has paid for it whether or not it is installed.

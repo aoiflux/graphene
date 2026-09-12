@@ -22,6 +22,7 @@ package graphene_test
 import (
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/aoiflux/graphene"
 )
@@ -53,7 +54,9 @@ func BenchmarkRSS_CompactIncremental(b *testing.B) {
 
 	b.ResetTimer()
 	var compactErr error
+	started := time.Now()
 	peak, samples := samplePeakDuring(func() { compactErr = g.Compact() })
+	elapsed := time.Since(started)
 	b.StopTimer()
 
 	runtime.ReadMemStats(&m1)
@@ -74,6 +77,10 @@ func BenchmarkRSS_CompactIncremental(b *testing.B) {
 		b.ReportMetric(float64(peak.Total-before.Total)/bytesPerMiB, "compactDeltaMiB")
 	}
 	b.ReportMetric(float64(samples), "samples")
+	// Explicit, because reportRSS zeroes ns/op: a residency figure taken over one
+	// iteration is not a rate, and suppressing it is right. The program still
+	// reports wall clock for every change, so the compaction times itself.
+	b.ReportMetric(float64(elapsed.Milliseconds()), "compactMs")
 	b.Logf("before compaction: rss %.2f MiB, heap objects %.2f MiB",
 		float64(before.Total)/bytesPerMiB, float64(beforeHeap.Objects)/bytesPerMiB)
 	reportRSS(b, g)

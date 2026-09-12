@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/aoiflux/graphene/store"
@@ -22,7 +23,11 @@ import (
 // Record order is not the risk — Build() scatters into an ID-indexed array and
 // Serialise walks it, so records are emitted in ascending ID order regardless of
 // the order they were collected in. The index section is the risk: it is written
-// from PropertyIndex.NodeEntries()/EdgeEntries(), which range over Go maps.
+// from a walk of the PropertyIndex, which ranges over Go maps inside each of its
+// sixteen shards. A compaction streams that walk through ForEachNodeProperty;
+// TestCompact_IdenticalStoresProduceIdenticalBytes below is the arm that covers
+// it end to end, and index.TestPropertyIndex_StreamingWalkMatchesNodeEntries is
+// the one that pins the streaming order to the materialised order.
 
 // determinismFixture writes a store whose property index spans many shards and
 // many keys, so a difference in map iteration order actually shows up in the
@@ -183,8 +188,8 @@ func TestCompact_IsByteDeterministic(t *testing.T) {
 
 	payload := func() csrPayload {
 		return csrPayload{
-			NodeProps:         s.propIdx.NodeEntries(),
-			EdgeProps:         s.propIdx.EdgeEntries(),
+			NodeProps:         slices.Values(s.propIdx.NodeEntries()),
+			EdgeProps:         slices.Values(s.propIdx.EdgeEntries()),
 			OrderedNodeKeys:   s.propIdx.OrderedNodeKeys(),
 			OrderedEdgeKeys:   s.propIdx.OrderedEdgeKeys(),
 			WithSnapshotRoots: true,

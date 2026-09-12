@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/aoiflux/graphene/index"
@@ -59,15 +60,15 @@ func goldenCSRFixture() ([]nodeRecord, []rawEdge, csrPayload) {
 	}
 
 	payload := csrPayload{
-		NodeProps: []index.NodePropEntry{
+		NodeProps: slices.Values([]index.NodePropEntry{
 			{ID: 1, Key: "path", Value: []byte("/a")},
 			{ID: 4096, Key: "path", Value: []byte("/b")},
 			{ID: 8191, Key: "sha256", Value: []byte("00ff")},
-		},
-		EdgeProps: []index.EdgePropEntry{
+		}),
+		EdgeProps: slices.Values([]index.EdgePropEntry{
 			{ID: 1, Key: "rel", Value: []byte("contains")},
 			{ID: 9, Key: "rel", Value: []byte("similar")},
-		},
+		}),
 		OrderedNodeKeys:   []string{"path"},
 		CompositeNodeKeys: [][]string{{"path", "sha256"}},
 		WithSnapshotRoots: true,

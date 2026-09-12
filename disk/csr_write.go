@@ -36,7 +36,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"iter"
 	"math"
+	"slices"
 
 	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/merkle"
@@ -200,8 +202,23 @@ func (g *CSRGraph) Serialise() []byte {
 // be added without a format change, and a signature that has to change for each
 // one would put the friction straight back.
 type csrPayload struct {
-	NodeProps []index.NodePropEntry
-	EdgeProps []index.EdgePropEntry
+	// NodeProps and EdgeProps are the property-index entries the image carries,
+	// in (key, value, id) order -- a byte-determinism contract, stated on
+	// PropertyIndex.NodeEntries.
+	//
+	// Sequences rather than slices because after the image itself this was the
+	// largest thing a compaction materialised: one entry per indexed triple, 48
+	// bytes of header and a copied value each, built under the store lock and
+	// held until the file had been written. On the store this program is aimed at
+	// that is 28 million entries. Streaming them costs the entry being written.
+	//
+	// A sequence here must be re-runnable, because the caller above may retry a
+	// write. slices.Values is, and so is a walk of the property index.
+	//
+	// Nil means the image carries no property index. It is written as a section
+	// holding two zero counts, which is exactly what an empty slice produced.
+	NodeProps iter.Seq[index.NodePropEntry]
+	EdgeProps iter.Seq[index.EdgePropEntry]
 
 	// Keys declared ordered. Only the declarations travel — the entries are
 	// already in the property index section, and the ordered structure is
@@ -237,13 +254,35 @@ type csrPayload struct {
 	PrevAttestation [attestationIDSize]byte
 }
 
+// withPropStreams returns the payload with both property-entry sequences
+// guaranteed non-nil.
+//
+// An image carrying no property index is a legitimate payload -- a fixture, a
+// test graph, Serialise itself -- and a nil iter.Seq cannot be ranged over,
+// because the range is a call. Absorbed once per serialisation rather than
+// guarded at each walk, and shared with the verifier that re-derives an image's
+// roots, so the two cannot come to disagree about what nil means. The receiver
+// is a value, so a caller's payload is untouched.
+func (p csrPayload) withPropStreams() csrPayload {
+	if p.NodeProps == nil {
+		p.NodeProps = slices.Values([]index.NodePropEntry(nil))
+	}
+	if p.EdgeProps == nil {
+		p.EdgeProps = slices.Values([]index.EdgePropEntry(nil))
+	}
+	return p
+}
+
 // SerialiseWithIndex writes the CSR plus the given property-index entries.
 //
 // Retained for callers that carry nothing but the property index; everything
 // else goes through SerialiseWithPayload. Cannot fail, because the only failure
 // SerialiseWithPayload has is a signer erroring and this path configures none.
 func (g *CSRGraph) SerialiseWithIndex(nodeProps []index.NodePropEntry, edgeProps []index.EdgePropEntry) []byte {
-	out, err := g.SerialiseWithPayload(csrPayload{NodeProps: nodeProps, EdgeProps: edgeProps})
+	out, err := g.SerialiseWithPayload(csrPayload{
+		NodeProps: slices.Values(nodeProps),
+		EdgeProps: slices.Values(edgeProps),
+	})
 	if err != nil {
 		panic("SerialiseWithIndex: unreachable, no signer configured: " + err.Error())
 	}
@@ -282,6 +321,7 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 // is a property of the image, and the CSRGraph that produced it is the one
 // object that can report it afterwards.
 func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error {
+	payload = payload.withPropStreams()
 	if _, err := dst.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("serialise: seek to start: %w", err)
 	}
@@ -378,19 +418,35 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 
 	indexOffset := iw.at()
 	iw.str(csrIndexSectionMagic)
-	iw.u64(uint64(len(payload.NodeProps)))
-	for _, e := range payload.NodeProps {
+	// Each half of the section is counted in a u64 that precedes it, and a
+	// streamed payload has no length to write there. So the counts go down as
+	// zeros and are patched after the flush -- which is what the header's
+	// sectionTableOffset has always done, for the same reason, and the digest
+	// pass reads the file back after both. The bytes that end up in the file are
+	// the bytes the counted form wrote.
+	//
+	// The values are also owned by whoever yielded them: writePropEntry copies
+	// into the output buffer and addPropEntry hashes immediately, so nothing
+	// here outlives the iteration step. That is what lets the property index
+	// hand out its own bytes instead of a copy per entry.
+	nodePropsCountPos := int64(iw.at())
+	iw.u64(0)
+	var nodePropCount, edgePropCount uint64
+	for e := range payload.NodeProps {
 		writePropEntry(iw, uint64(e.ID), e.Key, e.Value)
 		if roots != nil {
 			roots.addPropEntry(uint64(e.ID), e.Key, e.Value)
 		}
+		nodePropCount++
 	}
-	iw.u64(uint64(len(payload.EdgeProps)))
-	for _, e := range payload.EdgeProps {
+	edgePropsCountPos := int64(iw.at())
+	iw.u64(0)
+	for e := range payload.EdgeProps {
 		writePropEntry(iw, uint64(e.ID), e.Key, e.Value)
 		if roots != nil {
 			roots.addPropEntry(uint64(e.ID), e.Key, e.Value)
 		}
+		edgePropCount++
 	}
 	sections = append(sections, csrSection{
 		// Optional: a reader that skips it answers every query correctly and
@@ -483,7 +539,17 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 		return fmt.Errorf("serialise: %w", err)
 	}
 
-	if err := patchAt(dst, sectionTableOffsetPos, binary.LittleEndian.AppendUint64(nil, sectionTableOffset)); err != nil {
+	// Every field written above as zeros, patched now that its value is known.
+	patchU64 := func(off int64, v uint64) error {
+		return patchAt(dst, off, binary.LittleEndian.AppendUint64(nil, v))
+	}
+	if err := patchU64(nodePropsCountPos, nodePropCount); err != nil {
+		return err
+	}
+	if err := patchU64(edgePropsCountPos, edgePropCount); err != nil {
+		return err
+	}
+	if err := patchU64(sectionTableOffsetPos, sectionTableOffset); err != nil {
 		return err
 	}
 

@@ -394,6 +394,7 @@ func (s *snapshotRootStream) finish(tombstones []Tombstone, prev merkle.Hash) Sn
 // the writer drives, from a graph and a payload already in hand, so a
 // verification costs the same constant memory a compaction does.
 func computeSnapshotRootsAs(version uint8, g *CSRGraph, payload csrPayload, prev merkle.Hash) SnapshotRoots {
+	payload = payload.withPropStreams()
 	s := newSnapshotRootStream(version)
 	for n := range g.Nodes() {
 		s.addNode(n)
@@ -403,10 +404,10 @@ func computeSnapshotRootsAs(version uint8, g *CSRGraph, payload csrPayload, prev
 	}
 	// Nodes then edges, which is the order the GIDX section is written in and
 	// therefore the order the index leaves were always hashed in.
-	for _, e := range payload.NodeProps {
+	for e := range payload.NodeProps {
 		s.addPropEntry(uint64(e.ID), e.Key, e.Value)
 	}
-	for _, e := range payload.EdgeProps {
+	for e := range payload.EdgeProps {
 		s.addPropEntry(uint64(e.ID), e.Key, e.Value)
 	}
 	return s.finish(payload.Tombstones, prev)

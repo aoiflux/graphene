@@ -4518,6 +4518,131 @@ because the pass found nothing else did.
 
 ---
 
+### 14.19 Taken: the compaction payload is streamed, not materialised
+
+The last large allocation a compaction made was the property index.
+
+`compactPin` called `PropertyIndex.NodeEntries()` and `EdgeEntries()`, which
+return every indexed triple in the store as a slice of
+`{ID uint64, Key string, Value []byte}` — 48 bytes of header each, plus a copy of
+the value, because the API hands the caller ownership and two entries of a
+multi-ID posting sharing one backing array would alias. Both were built **under
+the store lock**, and both were held from the pin until the image had been
+written.
+
+On the store this program is aimed at that is about 28 million entries: roughly
+1.3 GiB of slice and copies, built while every writer waited, and alive at the
+same moment as the freshly built CSR and the plan. §14.16 removed the image
+buffer and §14.17 removed the plan's copy of the records; this is the third of
+the three terms, and the only one still proportional to something the store
+holds.
+
+#### The shape
+
+`csrPayload.NodeProps` and `EdgeProps` are `iter.Seq` rather than slices, and
+`build` fills them in with a walk of the live index:
+
+```go
+p.payload.NodeProps = p.nodePropSeq(newCSR)
+
+func (p *compactPlan) nodePropSeq(csr *CSRGraph) iter.Seq[index.NodePropEntry] {
+	return func(yield func(index.NodePropEntry) bool) {
+		p.propIdx.ForEachNodeProperty(func(id store.NodeID, key string, value []byte) bool {
+			if !csr.containsNode(id) {
+				return true
+			}
+			return yield(index.NodePropEntry{ID: id, Key: key, Value: value})
+		})
+	}
+}
+```
+
+`ForEachNodeProperty` was already there — it is `NodeEntries`' streaming form,
+written for bulk export, and `index.TestPropertyIndex_StreamingWalkMatchesNodeEntries`
+already pinned it to the same `(key, value, id)` order over twenty rounds. That
+order is the format's byte-determinism contract, so this item did not have to
+establish it; it only had to use it.
+
+Nothing copies the value. The index owns the bytes for the duration of the
+callback, `writePropEntry` copies them into the output buffer and the Merkle
+stream hashes them immediately, and nothing downstream retains them. That is the
+per-entry allocation, gone.
+
+The section's two counts are written as zeros and patched after the flush, the
+way the header's `sectionTableOffset` already was and for the same reason: a
+stream has no length, and the count precedes the entries in the format. The
+digest pass reads the finished file back, so it covers the patched bytes. The
+bytes that reach the file are the bytes the counted form wrote, which
+`csr_golden_bytes_test.go` asserts against a fixture captured before any of this.
+
+#### What it costs, and the three things that make it sound
+
+The plan holds the property index **by pointer**, and the build walks it with no
+lock held. That is the one thing in a `compactPlan` the store goes on mutating —
+the file comment says so explicitly, because the rest of the plan's safety
+argument is that it shares nothing mutable. The index is not epoch-versioned, so
+the entries a compaction writes are read *during* the build rather than at the
+pinned epoch.
+
+Three separate arguments make that correct, and none of them is "the index does
+not change":
+
+**Convergence, for an entry the stream caught.** Every index mutation is
+journaled to the WAL before it is applied, under `s.mu`. So an entry the stream
+happens to see is an entry the log also carries. `retireLog` truncates the log
+whole only when nothing landed during the build — in which case
+index-at-build *is* index-at-pin. Otherwise the tail survives (branch 2 rebuilds
+over it, branch 3 keeps the log) and replay re-applies every post-pin mutation as
+an idempotent upsert or purge. The image and the log converge on the same index
+whichever entries the stream caught.
+
+**A filter, for an entry no convergence can repair.** A node committed after the
+pin is not in the image — the merge never saw it — but its entries *are* in the
+live index by the time the stream runs. Writing them would put a posting into the
+image naming a node the image does not contain: an orphan against invariant
+§15.5, standing until the log was replayed and visible to every read in between.
+This one is closed by construction rather than by convergence. `containsNode` is
+one page-table probe (§14.15) against the image the entries are being written
+for, so the section cannot contain such an entry. It is the reason the streams
+are attached in `build` rather than at the pin: the filter needs the image.
+
+The filter is deliberately one-directional. A node *deleted* during the build is
+the mirror case — its record is in the image, because the pin held it, and its
+entries are gone from the live index, so the image carries a record with no
+postings. That is not an orphan and not a contradiction, only an index that
+disagrees with its records until the tail is replayed. Filtering it out is right;
+adding its entries back would be wrong.
+
+**A refusal, for the one caller that would break it.** A live reader replaces its
+property index wholesale on reload (`live.go`), which would leave this pointer
+addressing an abandoned one. A live reader cannot compact: `Compact` goes through
+`mustWrite` first.
+
+#### The lock that moved
+
+Under `NodeEntries`, every shard read lock was taken at the pin, with `s.mu`
+held. Under the stream, `ForEachNodeProperty` takes one shard read lock per key,
+during the build, with no store lock held. So the shard lock is now held across
+part of a file write rather than across a slice append.
+
+That is a real trade and it is the right way round. The pin got shorter by the
+whole enumeration, which is the interval every writer in the process waits on;
+what got longer is a per-key read lock that blocks only writers touching that
+key's shard, and only for as long as that key's entries take to write. Nothing
+can deadlock on it: the build holds no store lock and asks for nothing further.
+
+#### What it did not do
+
+The on-disk format did not move, and neither did the read path. `NodeEntries` and
+`EdgeEntries` still exist and are still the materialising form, used by tests and
+by anything that genuinely wants a slice; what changed is that a compaction is no
+longer one of their callers. Measured figures are in `docs/benchmarks.md`.
+
+R3 rewrites this walk as a base ∪ delta merge over the mapped GPIX sections, at
+which point the stream's source changes and its shape does not. That is why the
+payload is an `iter.Seq` rather than a callback: the seam is already where R3
+needs it.
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.
@@ -4532,7 +4657,10 @@ Any change must preserve these. Each is enforced by tests.
 4. **No edge outlives its endpoints.** `DeleteNode` cascades under one lock hold;
    `AddEdge` validates endpoints under the same hold.
 5. **No index entry outlives its entity.** Checked by `VerifyIndexes`; hidden
-   from reads by the live-filter if it occurs.
+   from reads by the live-filter if it occurs. A compacted image is held to the
+   stronger form — it carries no entry for an entity it does not itself hold,
+   enforced by construction rather than by convergence, because a compaction now
+   reads the index while the store is still mutating it (§14.19).
 6. **Every ID a read returns named a live entity at the moment it was checked** —
    and explicitly not stronger (§10.1).
 7. **A reader on the lock-free path never observes a superseded CSR** (§9.2).

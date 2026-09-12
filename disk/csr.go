@@ -878,6 +878,23 @@ func (g *CSRGraph) GetNode(id store.NodeID) (nodeRecord, bool) {
 	return n, n.ID == id
 }
 
+// containsNode is GetNode's presence half without the record copy.
+//
+// The record is two slice headers beside its identifier, so copying one is
+// cheap -- but this is asked once per property-index entry while an image is
+// being written, which on the store this program is aimed at is 28 million
+// times, and the answer wanted there is a bool.
+func (g *CSRGraph) containsNode(id store.NodeID) bool {
+	s := g.nodeSlot(id)
+	return s >= 0 && g.nodeRecs[s].ID == id
+}
+
+// containsEdge is containsNode for edges.
+func (g *CSRGraph) containsEdge(id store.EdgeID) bool {
+	s := g.edgeSlot(id)
+	return s >= 0 && g.edgeRecs[s].ID == id
+}
+
 // GetEdge returns the rawEdge for the given ID.
 func (g *CSRGraph) GetEdge(id store.EdgeID) (rawEdge, bool) {
 	s := g.edgeSlot(id)

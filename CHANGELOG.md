@@ -5,6 +5,65 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### A compaction no longer materialises the property index
+
+`compactPin` used to call `PropertyIndex.NodeEntries()` and `EdgeEntries()`,
+which return every indexed triple in the store as a slice — 48 bytes of entry
+header and a copy of the value each, because those functions hand the caller
+ownership. Both were built under the store lock and held from the pin until the
+image had been written. It was the last allocation a compaction made that was
+proportional to something the store holds.
+
+`csrPayload.NodeProps` and `EdgeProps` are `iter.Seq` now, and `build` fills them
+with a walk of the live index through `ForEachNodeProperty` — the streaming form
+that already existed for bulk export, whose `(key, value, id)` order was already
+pinned to the materialised one. Nothing copies the value: the index owns the
+bytes for the callback, the writer copies them into its output buffer, the Merkle
+stream hashes them, and nothing retains them.
+
+Measured on the consumer's index shape, thirteen entries per node, interleaved
+against the previous tree:
+
+| | 100k nodes (1.3M entries) | 200k nodes (2.6M entries) |
+|---|---|---|
+| bytes allocated by `Compact` | 95,870,000 → **14,250,000** (-85.1%) | 191,800,000 → **28,520,000** (-85.1%) |
+| allocations by `Compact` | 1,317,000 → **3,541** (-99.7%) | 2,633,000 → **6,892** (-99.7%) |
+| polled peak above steady state | 90.94 MiB → **13.45 MiB** (-85.2%) | 182.0 MiB → **27.23 MiB** (-85.0%) |
+
+Both arms double exactly between the two sizes, which is what says the term
+removed is proportional to the entries rather than to the records: about 66 bytes
+per entry, the 48-byte entry header plus the copied value. A compaction of a
+200k-node store with 2.6 million indexed triples now makes under seven thousand
+allocations in total. The first compaction of a store, where everything is still
+in the delta, falls by half rather than by 85% — the payload is one of two large
+transients there. Steady-state residency does not move and must not: 183.1 MiB of
+heap before and after at 100k.
+
+The cost is 43 ms on a 1,143 ms compaction, **+3.8%** with non-overlapping
+spreads, and `Forensic_Compact` agrees at +4.5% to +6.9% on fixtures small enough
+that only the overhead shows. Accepted under this program's priority rule, and
+stated plainly: the compaction got 43 ms slower and stopped touching 82 MiB.
+
+The cost is a lock that moved rather than a lock that grew. The pin got shorter by
+the whole enumeration, which is the interval every writer in the process waits
+on; what got longer is one shard read lock per key, held during the build with no
+store lock, blocking only writers touching that key's shard.
+
+Because the walk now happens during the build rather than at the pin, the entries
+a compaction writes are read from an index the store is still mutating. Three
+things make that sound and none of them is "the index does not change": every
+index mutation is journaled before it is applied, so an entry the stream caught
+is in the log too and replay converges; an entry naming an entity the image does
+not hold is filtered out by construction, against the image itself, because that
+one is an orphan no convergence repairs; and a live reader, the one caller whose
+index is replaced underneath it, cannot compact. `TECHNICAL_DETAILS.md` §14.19
+has the argument and invariant §15.5 gained the stronger form it enforces.
+
+The on-disk format did not move. The section's two entry counts are written as
+zeros and patched after the flush, which is what the header's
+`sectionTableOffset` already did, and `csr_golden_bytes_test.go` holds the result
+to bytes captured before any of this.
+
 ### The compacted image is memory-mapped instead of copied into the heap
 
 Opening a store read `graphene.csr` with one `os.ReadFile` and then copied every

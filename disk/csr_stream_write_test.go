@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"testing"
 
 	"github.com/aoiflux/graphene/index"
@@ -73,8 +74,8 @@ func streamFixture(t *testing.T, n int) (*CSRGraph, csrPayload) {
 	g.lastCompactUnixNano = 1_757_000_000_000_000_000
 
 	return g, csrPayload{
-		NodeProps:         nodeProps,
-		EdgeProps:         edgeProps,
+		NodeProps:         slices.Values(nodeProps),
+		EdgeProps:         slices.Values(edgeProps),
 		OrderedNodeKeys:   []string{"path"},
 		CompositeNodeKeys: [][]string{{"path", "kind"}},
 		WithSnapshotRoots: true,
@@ -159,7 +160,7 @@ func TestSerialiseTo_CrossesTheBufferCleanly(t *testing.T) {
 			t.Fatalf("build: %v", err)
 		}
 		payload := csrPayload{
-			NodeProps:         []index.NodePropEntry{{ID: 2, Key: "blob", Value: blob}},
+			NodeProps:         slices.Values([]index.NodePropEntry{{ID: 2, Key: "blob", Value: blob}}),
 			WithSnapshotRoots: true,
 		}
 		assertImageReparses(t, serialiseToFile(t, g, payload), g, payload)

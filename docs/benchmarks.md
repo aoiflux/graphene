@@ -2469,3 +2469,131 @@ GRAPHENE_RSS_NODES=100000 go test ./tests/ -tags=stress -run=^$ \
 # The same store held both ways, for anything above.
 #   disk.OpenWithOptions(dir, disk.Options{ImageMode: disk.ImageHeap})
 ```
+
+## The compaction payload is streamed instead of materialised (2026-09-12)
+
+The change: `compactPin` no longer calls `PropertyIndex.NodeEntries()` and
+`EdgeEntries()`. `csrPayload.NodeProps` and `EdgeProps` are `iter.Seq`, and
+`build` fills them with a walk of the live index through `ForEachNodeProperty`,
+filtered against the image it has just built. `TECHNICAL_DETAILS.md` §14.19 has
+the design and the soundness argument.
+
+Conditions: Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, go 1.26,
+NVMe, 4 KiB pages. Interleaved A/B against a copy of the previous tree (R1(iii)
+plus R2, uncommitted on `0977ad2`), three rounds, alternating arms, one
+sub-benchmark per process. Minima, maxima and medians; never best-of.
+
+Fixture: `GRAPHENE_RSS_NODES` nodes, 512-byte blobs, and the consumer's declared
+index shape — 8 unique keys (one a 32-byte all-distinct digest), 5 ordered, 2
+composite, every key on every node. **Thirteen index entries per node**, so 1.3M
+entries at 100k and 2.6M at 200k.
+
+### What a compaction allocates
+
+`BenchmarkRSS_CompactIncremental` opens a compacted store from disk, writes a
+delta of one per cent, and compacts. `compactAllocB` and `compactAllocs` are
+`runtime.MemStats` deltas across the `Compact` call — exact, not sampled.
+
+| | 100k nodes / 1.3M entries | 200k nodes / 2.6M entries |
+|---|---|---|
+| bytes allocated, before | 95,870,000 | 191,800,000 |
+| bytes allocated, after | **14,250,000** | **28,520,000** |
+| | **−85.1%** | **−85.1%** |
+| allocations, before | 1,317,000 | 2,633,000 |
+| allocations, after | **3,541** | **6,892** |
+| | **−99.7%** | **−99.7%** |
+
+Both arms double exactly between the two sizes, which is the check that the term
+removed is proportional to the *entries* rather than to the records: 81.6 MiB at
+1.3M entries and 163.3 MiB at 2.6M, or about 66 bytes per entry — 48 bytes of
+entry header plus the copied value, which is what `NodeEntries` is documented to
+produce.
+
+The allocation count is the figure that says what the shape of the change is. A
+compaction of a 200k-node store with 2.6M indexed triples now makes under seven
+thousand allocations in total. Nothing in the payload path allocates per entry
+any more; what is left is the writer's buffers, the Merkle builders and the
+records.
+
+Spreads are tight and non-overlapping on every row: `compactAllocB` varies by
+under 0.02% across three rounds on either arm.
+
+### What a compaction peaks at
+
+`compactDeltaMiB` is resident set above the settled figure, polled on a ticker
+during the compaction — the instrument Phase 0 built for exactly this. It is a
+sampled maximum, so it is noisier than the allocation figures above and is
+reported as such.
+
+| | 100k | 200k | first compaction, 100k |
+|---|---|---|---|
+| peak above steady state, before | 90.94 MiB | 182.0 MiB | 141.7 MiB |
+| peak above steady state, after | **13.45 MiB** | **27.23 MiB** | **71.36 MiB** |
+| | **−85.2%** | **−85.0%** | **−49.6%** |
+| whole-process peak during compaction, before | 436.2 MiB | 793.0 MiB | 449.6 MiB |
+| whole-process peak during compaction, after | **343.3 MiB** | **654.5 MiB** | **380.1 MiB** |
+| | **−21.3%** | **−17.5%** | **−15.5%** |
+
+The polled peak agrees with the allocation figures to within the sampling error,
+which is the useful thing about having both: one is exact and blind to when, the
+other sees when and is approximate.
+
+The third column is `BenchmarkRSS_Compact` — the *first* compaction of a store,
+where every record is in the delta rather than in an image. It halves rather than
+falling by 85%, and that is the right shape: the payload is one of two large
+transients there, the other being the delta copy the pin takes, which this item
+does not touch.
+
+Steady-state residency does not move, and must not: `heapMiB` is 183.1 MiB before
+and after at 100k, 364.3 before and after at 200k. This item is about the
+transient.
+
+### What it costs
+
+Wall clock, measured by an explicit `compactMs` added to the benchmark on both
+arms — `reportRSS` zeroes `ns/op` deliberately, so there was no time reading
+otherwise:
+
+| | before | after | |
+|---|---|---|---|
+| `Compact`, 100k nodes / 1.3M entries | 1,143 ms (1,109–1,153) | **1,186 ms** (1,159–1,213) | **+3.8%** |
+
+The spreads do not overlap, so this is a real cost and not this host's variance.
+Two things pay for it: each entry now arrives through two nested closures rather
+than being read out of a slice, and the walk takes one shard read lock per key
+instead of taking them all at the pin.
+
+`BenchmarkForensic_Compact` agrees, on fixtures small enough that the payload
+saves nothing and only the overhead shows: `ns/op` +4.5% to +6.9% across the six
+arms, spreads overlapping on five of the six, with `B/op` within +1.6% and
+`allocs/op` within +0.8%. That is the cost isolated from the benefit, which is
+what a fixture with almost no indexed properties measures.
+
+Accepted under the program's priority rule — memory is P0 and speed regressions
+are accepted and reported — and worth stating plainly: a compaction of this store
+got 43 ms slower and stopped touching 82 MiB.
+
+### Controls
+
+| control | before | after | reading |
+|---|---|---|---|
+| `Footprint_DiskFileSize` B/node | 175.0 | 175.0 | format unchanged |
+| `Footprint_DiskFileSize` B/edge | 87.50 | 87.50 | format unchanged |
+| `Footprint_DiskFileSize` CSR_MiB | 16.69 | 16.69 | format unchanged |
+| `RSS_Open` heapMiB, 100k | 182.1 | 182.1 | the loader is untouched |
+| `Forensic_Open` B/op, verified | 3,999,000 | 3,999,000 | ditto |
+| `PointLookupNode_Disk` ns/op | 43.68 | 45.59 | spreads overlap |
+| `PointLookupNode_Memory` ns/op | 26.31 | 26.15 | spreads overlap |
+| `NodesByProperty_Equal_Disk` ns/op | 79.48 | 89.02 | spreads overlap (75–93 vs 85–100) |
+
+The image is byte-identical, which `csr_golden_bytes_test.go` asserts directly
+against a fixture captured before the streamed writer existed, and
+`TestCompact_IdenticalStoresProduceIdenticalBytes` asserts between two
+independently built stores.
+
+One control moved for a reason worth recording: `Footprint_DiskFileSize` reports
+`B/op` 287.6M → 269.2M (−6.4%) and `allocs/op` 4.295M → 3.995M (−7.0%). That
+benchmark builds its whole fixture inside the measurement, and building it
+includes a compaction — so 300,000 of its allocations were the payload. The
+bytes-per-node and bytes-per-edge figures it exists to report are unchanged to
+four significant figures.

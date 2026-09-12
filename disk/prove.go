@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/aoiflux/graphene/merkle"
 	"github.com/aoiflux/graphene/store"
@@ -236,8 +237,8 @@ func verifyCSRRootsOf(csr *CSRGraph, section *csrIndexSection) error {
 
 	payload := csrPayload{}
 	if section != nil {
-		payload.NodeProps = section.NodeProps
-		payload.EdgeProps = section.EdgeProps
+		payload.NodeProps = slices.Values(section.NodeProps)
+		payload.EdgeProps = slices.Values(section.EdgeProps)
 	}
 	// The tombstones the file carries are part of what its root describes.
 	// deserialiseCSR has already checked they produce the stored TombstoneRoot,
