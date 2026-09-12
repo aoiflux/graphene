@@ -27,6 +27,7 @@ package graphene_test
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -43,7 +44,50 @@ var (
 	rssNodes  = envIntDefault("GRAPHENE_RSS_NODES", 50_000)
 	rssBlob   = envIntDefault("GRAPHENE_RSS_BLOB", 512)
 	rssCycles = envIntDefault("GRAPHENE_RSS_CYCLES", 10)
+
+	// rssDir names a directory to build the fixture in once and reuse across
+	// processes. Empty means each process builds its own and deletes it.
+	//
+	// Two reasons, and the second invalidates figures rather than merely costing
+	// time. A 1.2 GiB fixture takes minutes to build, which is the annoyance. The
+	// build also peaks at several times what the finished store costs to open --
+	// near 7.5 GiB at 1.4M nodes against 2.7 GiB of settled residency -- and
+	// peakMiB is the high-water mark of the *process*, so a process that builds
+	// and then measures reports the build's peak under the name of the open's.
+	// Splitting the build into its own process is the only way that figure means
+	// what it says.
+	rssDir = os.Getenv("GRAPHENE_RSS_DIR")
+
+	// rssEdgeStride adds one edge per stride nodes; 0 writes none.
+	//
+	// Zero is the default because every figure recorded under "Program baselines"
+	// in docs/benchmarks.md was measured on a fixture with no edges, and silently
+	// adding them would make the next run incomparable to the last without
+	// anything in the output saying so. The adjacency arrays, the edge records and
+	// the delete-cascade path are all unmeasurable until it is set, which is the
+	// whole reason it exists.
+	rssEdgeStride = envIntDefault("GRAPHENE_RSS_EDGE_STRIDE", 0)
+
+	// rssBlobDist replaces the single blob size with the long-tailed shape the
+	// consumer reported -- "a few hundred bytes to 64 MiB" -- rather than one size
+	// for every node. See rssBlobSize for the shape and for why it is a small-N
+	// arm only.
+	rssBlobDist = os.Getenv("GRAPHENE_RSS_BLOB_DIST") == "1"
+
+	// rssNoIndex builds the fixture without declaring or populating any indexed
+	// property.
+	//
+	// It is a differencing arm and nothing else. The property index is the term
+	// this program exists to remove, and no instrument can see it directly: it is
+	// spread across sixteen shards, an intern table, five ordered indexes and two
+	// composites, and a heap profile attributes it to whichever map grew last. The
+	// only honest way to size it against a real store is to build the same store
+	// twice, once with the declarations and once without, and subtract.
+	rssNoIndex = os.Getenv("GRAPHENE_RSS_NOINDEX") == "1"
 )
+
+// rssShapeFile records, inside a persistent fixture, what it was built to.
+const rssShapeFile = "rss-fixture-shape.txt"
 
 // The consumer's declared index shape. Every one of these keys is populated on
 // every node, so entries-per-node is len(rssUniqueKeys)+len(rssOrderedKeys) and
@@ -85,9 +129,83 @@ func rssProps(i int) map[string][]byte {
 	return props
 }
 
+// rssBlobSize is the blob length for node i.
+//
+// With GRAPHENE_RSS_BLOB_DIST set it is the long-tailed shape rather than one
+// size for every node: 90% at blob, 9% at 128x, 1% at 8192x, which at the
+// default 512 is 512 B, 64 KiB and 4 MiB. The size is a function of the index
+// alone, so a fixture is reproducible and a reused one can be validated against
+// the parameters that built it.
+//
+// Note what the tail does to the mean: 48.3 KiB per node against 512 B fixed, a
+// factor of 94. This is not a knob to turn on at the sizes the rest of this file
+// runs at -- 1.4M nodes would be 67 GB of blob -- it is a small-N arm for one
+// question, whether a model term in mean blob bytes is the right term or whether
+// the distribution itself costs something.
+func rssBlobSize(i, blob int) int {
+	if !rssBlobDist {
+		return blob
+	}
+	switch m := i % 100; {
+	case m < 90:
+		return blob
+	case m < 99:
+		return blob * 128
+	default:
+		return blob * 8192
+	}
+}
+
+// rssWriteEdges connects the fixture's nodes, and returns how many edges it
+// wrote.
+//
+// One edge per stride nodes, each joining a node to one a prime distance ahead.
+// The distance matters: a fixture whose edges all point at the next slot would
+// lay the adjacency arrays out as one sequential run, which is neither what a
+// real graph looks like nor what its residency costs to walk.
+func rssWriteEdges(b *testing.B, g *graphene.Graph, ids []store.NodeID, stride int) int {
+	b.Helper()
+
+	if stride <= 0 || len(ids) < 2 {
+		return 0
+	}
+
+	const chunk = 10_000
+	written := 0
+	batch := make([]*store.Edge, 0, chunk)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if _, err := g.AddEdges(batch); err != nil {
+			b.Fatalf("AddEdges: %v", err)
+		}
+		written += len(batch)
+		batch = batch[:0]
+	}
+
+	for i := 0; i < len(ids); i += stride {
+		batch = append(batch, &store.Edge{
+			Src:    ids[i],
+			Dst:    ids[(i+7919)%len(ids)],
+			Labels: []store.EdgeType{store.EdgeTypeSimilarTo},
+			Weight: 0.5,
+		})
+		if len(batch) == chunk {
+			flush()
+		}
+	}
+	flush()
+	return written
+}
+
 // rssDeclare applies the declarations. They must precede any indexing, so every
 // fixture builder calls this immediately after Open.
 func rssDeclare(g *graphene.Graph) error {
+	if rssNoIndex {
+		return nil
+	}
 	for _, key := range rssUniqueKeys {
 		if err := g.DeclareUniqueProperty(key); err != nil {
 			return fmt.Errorf("declare unique %q: %w", key, err)
@@ -121,7 +239,7 @@ func rssWriteNodes(b *testing.B, g *graphene.Graph, from, n, blob int) []store.N
 		}
 		batch := make([]*store.Node, size)
 		for i := range batch {
-			payload := make([]byte, blob)
+			payload := make([]byte, rssBlobSize(from+base+i, blob))
 			binary.BigEndian.PutUint64(payload, uint64(from+base+i))
 			batch[i] = &store.Node{
 				Labels:     []store.NodeType{benchLabel(from + base + i)},
@@ -132,9 +250,11 @@ func rssWriteNodes(b *testing.B, g *graphene.Graph, from, n, blob int) []store.N
 		if err != nil {
 			b.Fatalf("AddNodes at %d: %v", base, err)
 		}
-		for i, id := range got {
-			if err := g.IndexNodeProperties(id, rssProps(from+base+i)); err != nil {
-				b.Fatalf("IndexNodeProperties at %d: %v", base+i, err)
+		if !rssNoIndex {
+			for i, id := range got {
+				if err := g.IndexNodeProperties(id, rssProps(from+base+i)); err != nil {
+					b.Fatalf("IndexNodeProperties at %d: %v", base+i, err)
+				}
 			}
 		}
 		ids = append(ids, got...)
@@ -142,17 +262,23 @@ func rssWriteNodes(b *testing.B, g *graphene.Graph, from, n, blob int) []store.N
 	return ids
 }
 
-// rssFixtureDir builds a store on disk once and returns its directory. The
-// caller reopens it, so the measurement covers a cold decode rather than the
-// residue of the build.
-func rssFixtureDir(b *testing.B, nodes, blob int) string {
-	b.Helper()
+// rssShape is the line written into a persistent fixture and checked on reuse.
+//
+// A reused fixture that quietly disagrees with the parameters of the run
+// measuring it is worse than no fixture at all: every figure comes out
+// plausible, and nothing in the output says the store held 400,000 nodes while
+// the heading said 1,400,000. So the shape is written down, and a mismatch is
+// fatal rather than a silent measurement of the wrong store.
+func rssShape(nodes, blob int) string {
+	return fmt.Sprintf(
+		"nodes=%d blob=%d blobdist=%t edgestride=%d noindex=%t unique=%d ordered=%d composite=%d\n",
+		nodes, blob, rssBlobDist, rssEdgeStride, rssNoIndex,
+		len(rssUniqueKeys), len(rssOrderedKeys), len(rssComposites))
+}
 
-	dir, err := os.MkdirTemp("", "graphene-rss-*")
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { os.RemoveAll(dir) })
+// rssBuildFixture writes the fixture into dir and compacts it.
+func rssBuildFixture(b *testing.B, dir string, nodes, blob int) {
+	b.Helper()
 
 	g, err := graphene.Open(dir)
 	if err != nil {
@@ -161,14 +287,142 @@ func rssFixtureDir(b *testing.B, nodes, blob int) string {
 	if err := rssDeclare(g); err != nil {
 		b.Fatal(err)
 	}
-	rssWriteNodes(b, g, 0, nodes, blob)
+	ids := rssWriteNodes(b, g, 0, nodes, blob)
+	rssWriteEdges(b, g, ids, rssEdgeStride)
 	if err := g.Compact(); err != nil {
 		b.Fatalf("Compact: %v", err)
 	}
 	if err := g.Close(); err != nil {
 		b.Fatalf("Close: %v", err)
 	}
-	return dir
+}
+
+// rssFixtureDir returns a fixture directory the caller reads and does not write.
+// The caller reopens it, so the measurement covers a cold decode rather than the
+// residue of the build.
+//
+// Without GRAPHENE_RSS_DIR the fixture is built in a temp directory and removed
+// afterwards, which is right for the sizes that run in CI. With it, the fixture
+// is built once and every later process measures a bare Open -- see the variable
+// for why that distinction decides whether peakMiB means anything.
+//
+// A benchmark that writes to the store wants rssMutableFixtureDir instead.
+func rssFixtureDir(b *testing.B, nodes, blob int) string {
+	b.Helper()
+
+	if rssDir == "" {
+		dir, err := os.MkdirTemp("", "graphene-rss-*")
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { os.RemoveAll(dir) })
+		rssBuildFixture(b, dir, nodes, blob)
+		return dir
+	}
+
+	want := rssShape(nodes, blob)
+	marker := filepath.Join(rssDir, rssShapeFile)
+	switch got, err := os.ReadFile(marker); {
+	case err == nil:
+		if string(got) != want {
+			b.Fatalf("fixture at %s was built to a different shape than this run wants:\n"+
+				"  have: %s  want: %s"+
+				"delete that directory, or point GRAPHENE_RSS_DIR elsewhere",
+				rssDir, got, want)
+		}
+		return rssDir
+	case !os.IsNotExist(err):
+		b.Fatalf("read %s: %v", marker, err)
+	}
+
+	// No marker. An absent or empty directory is ours to build in; anything else
+	// is either a store left by an interrupted build or something unrelated, and
+	// building over it would produce a fixture that is neither.
+	entries, err := os.ReadDir(rssDir)
+	switch {
+	case err == nil && len(entries) > 0:
+		b.Fatalf("GRAPHENE_RSS_DIR %s is not empty and carries no %s: "+
+			"delete it if it is an interrupted fixture build", rssDir, rssShapeFile)
+	case err != nil && !os.IsNotExist(err):
+		b.Fatalf("read dir %s: %v", rssDir, err)
+	}
+	if err := os.MkdirAll(rssDir, 0o755); err != nil {
+		b.Fatal(err)
+	}
+
+	rssBuildFixture(b, rssDir, nodes, blob)
+
+	// Written last, so an interrupted build leaves a directory the next run
+	// refuses rather than one it trusts.
+	if err := os.WriteFile(marker, []byte(want), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	return rssDir
+}
+
+// rssMutableFixtureDir is rssFixtureDir for a benchmark that writes to the store.
+//
+// With no persistent directory the two are the same thing: the fixture was built
+// for this process and dies with it. With one, the master is copied, because a
+// benchmark that adds a delta and compacts would otherwise hand the next run a
+// store that is larger and freshly compacted -- so the second run of the same
+// benchmark would measure a different store from the first, and the shape marker
+// would still say they matched.
+func rssMutableFixtureDir(b *testing.B, nodes, blob int) string {
+	b.Helper()
+
+	master := rssFixtureDir(b, nodes, blob)
+	if rssDir == "" {
+		return master
+	}
+
+	dst, err := os.MkdirTemp("", "graphene-rss-copy-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { os.RemoveAll(dst) })
+	rssCopyDir(b, master, dst)
+	return dst
+}
+
+// rssCopyDir copies a fixture's files. Flat by construction: a store directory
+// holds no subdirectories, and failing on one is better than skipping it.
+func rssCopyDir(b *testing.B, src, dst string) {
+	b.Helper()
+
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			b.Fatalf("copy fixture: unexpected subdirectory %s", e.Name())
+		}
+		if e.Name() == rssShapeFile {
+			continue
+		}
+		if err := rssCopyFile(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
+			b.Fatalf("copy %s: %v", e.Name(), err)
+		}
+	}
+}
+
+func rssCopyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // rssStoreBytes is the on-disk size of the whole store directory, reported

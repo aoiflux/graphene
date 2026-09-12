@@ -33,7 +33,7 @@ import (
 // more than that, but a small delta is what isolates the image term: whatever
 // the compaction spends here, it spends on records it did not need to touch.
 func BenchmarkRSS_CompactIncremental(b *testing.B) {
-	dir := rssFixtureDir(b, rssNodes, rssBlob)
+	dir := rssMutableFixtureDir(b, rssNodes, rssBlob)
 
 	g, err := graphene.Open(dir)
 	if err != nil {
