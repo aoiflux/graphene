@@ -4867,6 +4867,86 @@ backend does not implement it, checking `ctx.Err()` per value. So the helper nev
 fails for a missing capability, and a backend that gains the fast path changes nothing
 a caller can see except the time.
 
+### 14.22 Taken: a residual probe is costed from where the reverse index lives
+
+`probeIsCheaper` (`index/narrow.go`) decides how each residual filter is applied, and
+it had one line in it: `candidates < setSize`. That line was correct for as long as
+both sides of it meant the same thing. Probing cost one map lookup per candidate;
+building the filter's own set cost one slice element per entry. Counting them in the
+same unit compared like with like.
+
+The mapped index (§14.20, and `MEMORY_MODEL.md` §6.4 for `IndexMode`) moved the
+reverse direction into the image, and the unit broke. A probe of the base is
+`gpirLowerBound` — a binary search by id over a mapped array — so it is
+`bits.Len(entries)` reads rather than one: eighteen over the 220,000-entry fixture
+below, twenty-five at the twenty-eight million this program is aimed at. The
+comparison therefore preferred the probe for every candidate count between `setSize`
+and `25 × setSize`, which for a compacted store is most of them.
+
+**What it charges now.** `reverseProbeCost(entries)` is `bits.Len(uint(entries))`, and
+it is asserted against a loop that counts the searches rather than against a table
+somebody wrote down. Derived rather than fixed at a constant because the constant is
+wrong at both ends: a thousand-entry image charges ten, and an index with no base at
+all charges one — which is what this model did before bases existed, so
+`IndexResident`, the memory backend and every store before its first compaction make
+exactly the decisions they made before. The figure is computed once in `AttachBase`
+and held on `baseState`, per kind, because the base is immutable and the alternative
+is summing a key directory on every residual pass.
+
+What it deliberately does not charge: the walk of the entry run the search lands on.
+The run is contiguous in GPIR, but resolving each entry reads a value out of its own
+key's runs, so an entity carrying thirteen entries pays something nearer thirteen
+further reads. Leaving it out understates the probe, which is the safe direction.
+
+**The cap is a footprint bound, not an estimate.** Building the set materialises
+`setSize` ids; probing materialises nothing. A probe cost of twenty-five would
+otherwise license building a set twenty-five times the candidate slice the caller
+already holds — two hundred megabytes against an eight-megabyte candidate set, which
+is the shape of thing this program exists to remove. `residualBuildCap` is four
+million ids, 32 MiB: deliberately far above the sizes where the comparison is
+interesting and far below the sizes that threaten a budget, so it overrides no
+decision being made on the merits. Past it the probe is chosen however slow it is.
+
+**What it measured** (200,000 nodes, 2,000 candidates from an equality driver, a
+`Contains` residual estimated at 20,000 entries; five interleaved passes warm, three
+for the pages, minima):
+
+| | probe (before) | build (after) |
+|---|---|---|
+| warm query | 394 µs | 1,094 µs (2.8× slower) |
+| mapped pages faulted in | 5.58 MiB | 0.85 MiB (6.6× fewer) |
+| resident after the pass | 73.5 MiB | 68.9 MiB |
+| allocations | 4,006 | 30 |
+| bytes allocated | 243 KB | 203 KB |
+
+Three things worth reading off that table rather than past it.
+
+The warm regression is real and it is the honest cost. A probe's reads are random but
+they are in cache, and the build it is weighed against walks twenty thousand values
+and sorts what matches. The model's unit is *a read of the image*, which is right on
+an image that has not been read and pessimistic on one that has. There is no way to
+drop the page cache from a Go test on Windows, so the page column is the proxy: the
+same count of four-kilobyte reads, charged as faults here and as seeks there. On an
+NVMe image 5.58 MiB of random four-kilobyte reads is some hundreds of milliseconds
+against 1.1; on SATA it is seconds.
+
+The allocation column was not the point and is the strongest column. The probe's base
+half allocates two per candidate — `entryMatches` captures a bool by address and
+passes a closure through `Base.ForEachEntryOf`, so escape analysis moves both to the
+heap because the callback crosses an interface. Four thousand allocations to filter two
+thousand candidates is the opposite of what the probe path exists for, and it is a
+separate change: removing it means either a non-closure shape on `Base` or a receiver
+with a method rather than a literal.
+
+And the decision is reported. `QueryPlan.Residuals[i].Probe` is what
+`ExplainNodeQuery` prints, forecast against the candidate count the driver produced;
+the executor re-decides it per step because each step shrinks the set. Both call sites
+read the same cost, and a test watches the executor rather than the forecast —
+`ForEachValue` is the forward direction, so a walk of it means the set was built and no
+walk means the candidates were probed. Without that, a change reaching one call site
+and not the other leaves every assertion passing, because the answer is identical
+either way.
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.

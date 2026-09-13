@@ -2764,6 +2764,96 @@ go test ./disk/ -run '^$' -bench GPIXBaseLookup -benchmem -benchtime 2s
 GRAPHENE_BENCH_NODES=50000 go test -tags=stress ./tests/ -run '^$' -bench RSS_Open -benchtime 1x
 ```
 
+## What a residual probe costs on disk (2026-09-13)
+
+The change: `probeIsCheaper` costs a residual probe from the reverse section it would
+search rather than at one unit, and refuses to build a residual set past four million
+ids. `TECHNICAL_DETAILS.md` §14.22 has the design.
+
+Conditions: Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, go 1.26, NVMe,
+4 KiB pages, `GOGC` default. Interleaved A/B against a copy of `c131caa`, alternating
+arms within each pass, both benchmark files copied into the control tree so the two
+arms run identical code and differ only in the planner. Minima and every pass
+reported.
+
+The fixture (`tests/rss_residual_bench_test.go`, `stress`): 200,000 nodes, each
+carrying `grp` (one of a hundred values) and the first 20,000 carrying a distinct
+`tag`; compacted, then reopened, because a store acquires its disk-resident index at
+open and the handle that compacted goes on answering from the delta it already holds.
+The query drives from one `grp` value — 2,000 candidates — and leaves a `Contains`
+over `tag`, estimated at 20,000 entries and unserveable by any index. 220,000 reverse
+entries makes a probe eighteen reads, so the model costs the probe at 36,000 against
+the build's 20,000; before this change it costed it at 2,000 and probed. Both arms
+return the same 38 ids, and both report the route they took so an A/B across two trees
+cannot compare an arm against itself.
+
+### Warm, which is where the probe looks good
+
+`BenchmarkResidual_WideCandidates_Disk`, `-benchtime 30x`, five interleaved passes,
+µs per query:
+
+| pass | 1 | 2 | 3 | 4 | 5 | min | median |
+|---|---|---|---|---|---|---|---|
+| control, probes | 645.0 | 526.9 | 513.0 | **394.4** | 490.1 | 394.4 | 513.0 |
+| change, builds | 1277.4 | 1204.0 | 1118.3 | **1094.4** | 1266.6 | 1094.4 | 1204.0 |
+
+**2.8× slower on the minima, 2.3× on the medians.** That is the honest cost and it is
+not the case the change is for: a probe's reads are random but they are in cache, while
+the build walks twenty thousand values and sorts what matches. The model's unit is a
+*read of the image*, which is right on an image that has not been read and pessimistic
+on one that has.
+
+Allocation went the other way, and by more:
+
+| | B/op | allocs/op |
+|---|---|---|
+| control, probes | 243,008 | 4,006 |
+| change, builds | 202,912 | 30 |
+
+Identical in every pass, both arms. Four thousand allocations to filter two thousand
+candidates is two per candidate, and `go build -gcflags=-m` names them: at
+`index/union.go:294` `entryMatches` captures `matched` by address and passes a closure
+through `Base.ForEachEntryOf`, so `moved to heap: matched` and `func literal escapes to
+heap` — the callback crosses an interface, so neither can stay on the stack. That is
+a separate change and it is not made here; it is recorded because the probe path exists
+to avoid allocating proportionally to the candidate set, and it does not.
+
+### The pages, which is what the model is about
+
+`BenchmarkRSS_ResidualRoutePages`, `-benchtime 1x`, one arm per process, three
+interleaved passes. Each pass opens the compacted store, settles, runs the query once,
+settles again, and reports the difference: how much of the mapped image the residual
+pass pulled into the working set.
+
+| pass | control file → | change file → | control total after | change total after |
+|---|---|---|---|---|
+| 1 | 5.582 MiB | 0.852 MiB | 73.70 MiB | 68.95 MiB |
+| 2 | 5.625 MiB | 0.859 MiB | 73.46 MiB | 68.85 MiB |
+| 3 | 5.586 MiB | 0.848 MiB | 73.47 MiB | 68.88 MiB |
+
+**6.6× fewer image pages resident after one residual pass, and 4.6 MiB less held by
+the process.** The anonymous half is unmoved either way — 0 to 0.05 MiB in every pass of
+both arms, which is the build's id slice arriving and being collected inside the
+measurement.
+
+This is the proxy for the cold cost, and it is a proxy rather than the measurement: the
+page count is the same either way, but here they are faults against a warm page cache
+and on a cold image they are four-kilobyte reads from the disk. 5.58 MiB of random 4
+KiB reads is some hundreds of milliseconds on NVMe and seconds on SATA, against 1.1 for
+0.85 MiB read the same way. **That comparison is reasoned, not measured** — there is no
+way to drop the page cache from a Go test on Windows, which is the same gap the property
+batch's cold arm left open in the section below.
+
+### What did not move
+
+No format change. `QueryPlan.Residuals[i].Probe` reports the decision and has always
+been documented as diagnostic output whose choices may change; results do not. A store
+with no base on disk — `IndexResident`, the memory backend, any store before its first
+compaction — charges a probe one unit, which is what the model charged before this
+existed, so its decisions are unchanged rather than approximately unchanged. The whole
+untagged suite, the `stress` suite, both under `-race`, and five cross-compiled
+platforms are green.
+
 ## Resolving many values in one pass (2026-09-13)
 
 The change: `NodesByPropertyBatch` and `EdgesByPropertyBatch` resolve a list of

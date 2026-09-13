@@ -5,6 +5,47 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### Residual query planning knows what a probe costs on disk
+
+A query with more than one filter is driven from the most selective one the index can
+serve, and the rest are applied afterwards — each of them either by testing every
+candidate against its own registered values, or by resolving the filter to its own set
+and intersecting. Which is cheaper depends on how many candidates there are, and the
+planner has always decided it by comparing that count against the size of the set:
+probing cost one lookup per candidate, and a set element cost one.
+
+That comparison stopped being true when the property index moved into the image. A
+probe reads the *reverse* direction, and once that lives on disk it is a binary search
+of a mapped array — eighteen reads over this release's own fixture, twenty-five at
+the size this program is aimed at — while the set it is weighed against is built by
+a sequential walk of the same file. Charging the probe one unit made the planner prefer
+it across a band twenty-five times wide, which is to say for almost every residual
+filter a compacted store has.
+
+So a probe is now costed from the reverse section it would search, and a store with no
+base on disk — `IndexResident`, the memory backend, anything before its first
+compaction — charges one exactly as before and makes every decision it made before.
+The second half of the same decision is a footprint bound: building the set
+materialises it, probing materialises nothing, so a residual set past four million ids
+is probed however slow that is rather than held.
+
+**What it measures**, on a 200,000-node store with 2,000 candidates and a 20,000-entry
+residual, five interleaved passes, minima: **the query is 2.8× slower warm** (394 µs
+→ 1,094 µs) and **touches 6.6× less of the image** (5.58 MiB of mapped pages
+faulted in → 0.85 MiB), leaving the process holding 4.6 MiB less after the pass.
+Allocation falls from **4,006 to 30 per query**, which was not the point and is the
+clearest number here: the probe's base half allocates two per candidate, a captured
+bool and a closure that escapes because the callback crosses an interface.
+
+Warm is where the probe looks good and it is not the case this is for. The pages are
+the same count of four-kilobyte reads on an image that has not been read yet, where
+they are disk seeks rather than cache hits; that arm is the proxy, because there is no
+way to drop the page cache from a Go test on Windows. `ExplainNodeQuery` reports the
+decision per residual step, so the route is visible rather than inferred.
+
+No format change, no API removed. `QueryPlan` is diagnostic output and has always
+said its choices may change; results do not.
+
 ### A property join resolves many values in one pass
 
 `NodesByPropertyBatch(key, values, fn)` and `EdgesByPropertyBatch` answer a whole list

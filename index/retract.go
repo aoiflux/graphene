@@ -66,6 +66,13 @@ type baseState struct {
 	nodeGone retractSet
 	edgeGone retractSet
 
+	// nodeProbe and edgeProbe are what probing one candidate of each kind costs
+	// against this base. Computed once here rather than per query: the base is
+	// immutable, so the figure is too, and the alternative is summing the key
+	// directory on every residual pass. See reverseProbeCost.
+	nodeProbe int
+	edgeProbe int
+
 	// firstFault holds the first error read out of the base, if any. Most read
 	// paths on PropertyIndex have no error to return — NodesByProperty returns a
 	// slice and nothing else — so a run that will not decode is recorded here
@@ -214,6 +221,8 @@ func (p *PropertyIndex) AttachBase(b Base) error {
 	st := &baseState{b: b}
 	st.nodeGone.limit = b.MaxID(NodeKind)
 	st.edgeGone.limit = b.MaxID(EdgeKind)
+	st.nodeProbe = reverseProbeCost(b.TotalEntries(NodeKind))
+	st.edgeProbe = reverseProbeCost(b.TotalEntries(EdgeKind))
 	if !p.baseRef.CompareAndSwap(nil, st) {
 		return errIndexf("index: a base is already attached")
 	}

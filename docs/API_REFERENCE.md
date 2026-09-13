@@ -2629,6 +2629,16 @@ index for a range or prefix on a **declared** key, and the key's entry count
 otherwise — an upper bound rather than an estimate, because without an ordering
 there is nothing cheaper than a scan that could tighten it.
 
+**What a probe costs depends on where the reverse index is.** In the heap it is one
+map lookup per candidate, which is what `Cost` is counted against. In the image it is
+a binary search of a disk-resident array — eighteen reads over a 220,000-entry index,
+twenty-five over a twenty-eight-million-entry one — so the planner charges it that and
+prefers the filter's own set far sooner than it does under `IndexResident`. The same
+query over the same data can therefore plan differently before and after a `Compact`,
+and there is one further bound: a residual set past four million ids is probed rather
+than built however the costs compare, because probing holds nothing and building holds
+the set. Neither changes the answer; both are visible here.
+
 **What this is for.** A query can return exactly the right answer while doing far
 more work than it needed to, and the difference is invisible from the results —
 a test asserting only on results cannot tell an index lookup from a full scan

@@ -800,6 +800,33 @@ the whole batch (see the locking note in `TECHNICAL_DETAILS.md` §14.21), so a b
 a writer stall of its own duration: split a million values into chunks rather than
 passing them in one call.
 
+### 6.6 A multi-filter query, and which half of it is bounded
+
+A residual filter is applied one of two ways, and they have different footprints
+rather than different speeds.
+
+| route | holds | proportional to |
+|---|---|---|
+| probe | two allocations per candidate | the candidate set |
+| build | one id slice, plus the sort | the residual filter's own set |
+
+Neither is free and neither is always smaller, which is why the planner picks. What it
+picks from is a cost in *reads of the image*, so under a mapped index it prefers the
+build wherever the probe would be many searches — and the effect on residency is
+measurable in both classes at once. Over a 200,000-node store with 2,000 candidates
+and a 20,000-entry residual: the probe route leaves the process holding **5.58 MiB of
+mapped image pages** and makes 4,006 allocations; the build route holds **0.85 MiB**
+and makes 30. Total residency after the pass, 73.5 MiB against 68.9 MiB.
+
+Two consequences for sizing a query against a budget. A residual build is bounded —
+`residualBuildCap`, four million ids or 32 MiB — and past that bound the probe is taken
+however slow it is, because a probe's footprint does not scale with the filter. And the
+file-backed half of a probe is not something a heap budget sees: it is page cache the
+kernel can reclaim, but it is resident while the query runs, and on a machine at its
+ceiling that is the difference between reclaiming and swapping. `ExplainNodeQuery`
+names the route per residual step, which is the only way to know which of these two
+rows a given query is paying for.
+
 ## 7. Target architecture
 
 The store should hold, per live record and in anonymous memory, only what cannot be

@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"math/bits"
 	"sort"
 
 	"github.com/aoiflux/graphene/store"
@@ -56,7 +57,8 @@ func (p *PropertyIndex) NarrowNodesByFiltersCtx(ctx context.Context, candidates 
 	if err := cc.Check(); err != nil {
 		return nil, err
 	}
-	plan := p.planResiduals(filters, skip, p.nodeCosts())
+	costs := p.nodeCosts()
+	plan := p.planResiduals(filters, skip, costs)
 	for _, step := range plan {
 		if len(candidates) == 0 {
 			return candidates, nil
@@ -70,7 +72,7 @@ func (p *PropertyIndex) NarrowNodesByFiltersCtx(ctx context.Context, candidates 
 		// Decided here rather than when the plan was built: each step shrinks the
 		// candidate set, so a filter that was not worth probing against the
 		// original count often is against what survived the step before it.
-		if probeIsCheaper(len(candidates), step.step.Cost) {
+		if probeIsCheaper(len(candidates), step.step.Cost, costs.probe) {
 			var err error
 			candidates, err = p.probeNodes(candidates, step.filter, &cc)
 			if err != nil {
@@ -103,7 +105,8 @@ func (p *PropertyIndex) NarrowEdgesByFiltersCtx(ctx context.Context, candidates 
 	if err := cc.Check(); err != nil {
 		return nil, err
 	}
-	plan := p.planResiduals(filters, skip, p.edgeCosts())
+	costs := p.edgeCosts()
+	plan := p.planResiduals(filters, skip, costs)
 	for _, step := range plan {
 		if len(candidates) == 0 {
 			return candidates, nil
@@ -111,7 +114,7 @@ func (p *PropertyIndex) NarrowEdgesByFiltersCtx(ctx context.Context, candidates 
 		if err := cc.Check(); err != nil {
 			return nil, err
 		}
-		if probeIsCheaper(len(candidates), step.step.Cost) {
+		if probeIsCheaper(len(candidates), step.step.Cost, costs.probe) {
 			var err error
 			candidates, err = p.probeEdges(candidates, step.filter, &cc)
 			if err != nil {
@@ -143,22 +146,24 @@ type residualStep struct {
 // building its own set may end up probed once an earlier filter has thinned the
 // candidates. The order and the costs are exact; that one flag is a forecast.
 func (p *PropertyIndex) PlanNodeResiduals(filters []store.PropertyFilter, skip store.FilterMask, candidateCount int) []store.ResidualStep {
-	return exportSteps(p.planResiduals(filters, skip, p.nodeCosts()), candidateCount)
+	costs := p.nodeCosts()
+	return exportSteps(p.planResiduals(filters, skip, costs), candidateCount, costs.probe)
 }
 
 // PlanEdgeResiduals is PlanNodeResiduals for edge properties.
 func (p *PropertyIndex) PlanEdgeResiduals(filters []store.PropertyFilter, skip store.FilterMask, candidateCount int) []store.ResidualStep {
-	return exportSteps(p.planResiduals(filters, skip, p.edgeCosts()), candidateCount)
+	costs := p.edgeCosts()
+	return exportSteps(p.planResiduals(filters, skip, costs), candidateCount, costs.probe)
 }
 
-func exportSteps(plan []residualStep, candidateCount int) []store.ResidualStep {
+func exportSteps(plan []residualStep, candidateCount, probeCost int) []store.ResidualStep {
 	if len(plan) == 0 {
 		return nil
 	}
 	out := make([]store.ResidualStep, len(plan))
 	for i, s := range plan {
 		out[i] = s.step
-		out[i].Probe = probeIsCheaper(candidateCount, s.step.Cost)
+		out[i].Probe = probeIsCheaper(candidateCount, s.step.Cost, probeCost)
 	}
 	return out
 }
@@ -175,14 +180,41 @@ type filterCosts struct {
 	// reports false for a key that has none — in which case keyCount is all
 	// there is.
 	rangeCardinality func(store.PropertyFilter) (int, bool)
+	// probe is what one probe of one candidate costs, in the same unit the three
+	// above are counted in: one entry touched. It is a number rather than a
+	// function because it does not vary by filter — it is a property of where
+	// this kind's reverse direction lives. See reverseProbeCost.
+	probe int
 }
 
 func (p *PropertyIndex) nodeCosts() filterCosts {
-	return filterCosts{p.nodeKeyEntryCount, p.nodeCardinality, p.NodeRangeCardinality}
+	return filterCosts{p.nodeKeyEntryCount, p.nodeCardinality, p.NodeRangeCardinality, p.nodeProbeCost()}
 }
 
 func (p *PropertyIndex) edgeCosts() filterCosts {
-	return filterCosts{p.edgeKeyEntryCount, p.edgeCardinality, p.EdgeRangeCardinality}
+	return filterCosts{p.edgeKeyEntryCount, p.edgeCardinality, p.EdgeRangeCardinality, p.edgeProbeCost()}
+}
+
+// nodeProbeCost is what probing one node candidate costs.
+//
+// One atomic load for a store with no base, and the constant it then returns is
+// what this whole cost model assumed before there were bases.
+func (p *PropertyIndex) nodeProbeCost() int {
+	if st := p.baseRef.Load(); st != nil {
+		return st.nodeProbe
+	}
+	return 1
+}
+
+// edgeProbeCost is nodeProbeCost for edges. The two kinds are sized separately
+// because they are separate reverse arrays: a store with two million edge entries
+// and four hundred node entries should not plan its node residuals as though a
+// probe cost what an edge probe costs.
+func (p *PropertyIndex) edgeProbeCost() int {
+	if st := p.baseRef.Load(); st != nil {
+		return st.edgeProbe
+	}
+	return 1
 }
 
 // planResiduals costs every filter both ways and orders them most-selective-first.
@@ -409,8 +441,80 @@ func noResiduals(filters []store.PropertyFilter, skip store.FilterMask) bool {
 }
 
 // probeIsCheaper compares the two ways to apply one residual filter: probing
-// costs a reverse-map lookup per candidate, while building the filter's own set
-// costs its size plus a merge.
-func probeIsCheaper(candidates, setSize int) bool {
-	return candidates < setSize
+// costs probeCost per candidate, while building the filter's own set costs its
+// size plus a merge.
+//
+// probeCost was implicitly one, and was right to be, for as long as the reverse
+// direction was a map in the heap: a probe was one map lookup and a set element
+// was one slice element, so counting them in the same unit compared like with
+// like. Under a mapped base a probe is not a lookup at all — it is a binary
+// search of a disk-resident array — and charging it one unit made residual
+// planning prefer it in exactly the band where it had become the expensive
+// option. See reverseProbeCost for what it charges instead.
+//
+// The cap is the other half of the same decision, and it is a footprint bound
+// rather than a cost estimate. Building the set materialises setSize ids;
+// probing materialises nothing at all. A probeCost of twenty-five would
+// otherwise license building a set twenty-five times the candidate slice the
+// caller already holds — two hundred megabytes against an eight-megabyte
+// candidate set, which is the shape of thing this whole program exists to
+// remove. Past the cap the probe is chosen however slow it is, and that is the
+// trade this program sanctions: bounded and slower beats fast and unbounded.
+func probeIsCheaper(candidates, setSize, probeCost int) bool {
+	if setSize > residualBuildCap {
+		return true
+	}
+	// candidateCount reaches here from PlanNodeResiduals, which takes it from a
+	// caller; a negative one would otherwise widen to an enormous unsigned
+	// product and forecast a build for every filter.
+	if candidates < 0 {
+		candidates = 0
+	}
+	// Widened because this is the one place in the file where two counts
+	// multiply. candidates is bounded by the entity count and probeCost by the
+	// width of an int, so the product cannot overflow sixty-four bits — but it
+	// can overflow a thirty-two-bit int, and an overflowed comparison here is a
+	// planner that picks at random.
+	return uint64(candidates)*uint64(probeCost) < uint64(setSize)
+}
+
+// residualBuildCap bounds what one residual filter may materialise instead of
+// probing, in ids: 4Mi ids is 32 MiB of transient slice.
+//
+// It is deliberately well above the sizes where the cost comparison above is
+// interesting and well below the sizes that threaten a budget, so that it changes
+// no decision that was being made on the merits. A set larger than this was
+// already probed rather than built for every candidate count under the cap, so
+// the cap only ever overrides the case where the candidate set is larger still —
+// where the alternative is holding two enormous id slices at once in order to
+// intersect them.
+const residualBuildCap = 1 << 22
+
+// reverseProbeCost is what one probe of one candidate costs against a base whose
+// reverse direction holds this many entries, counted in the unit planResiduals
+// sizes a filter's set in: one entry touched.
+//
+// A probe of the base is gpirLowerBound — a binary search by id over a
+// disk-resident array — so it is bits.Len(entries) reads, each of them its own
+// cache line and, on an image that has not been read yet, its own page. At the
+// twenty-eight million entries this program is aimed at that is twenty-five,
+// against the one the model charged.
+//
+// Derived rather than fixed at a constant, because the constant would be wrong at
+// both ends. A store whose image holds a thousand entries charges ten, not
+// twenty-five, so a small base does not push every residual onto the forward
+// path; a store with no base charges one, which is what the model did before
+// bases existed and what the memory backend still does.
+//
+// What it deliberately does not count: the walk of the entry run the search lands
+// on. The run is contiguous in the reverse array, but resolving each of its
+// entries reads a value out of its own key's runs, so an entity carrying thirteen
+// entries pays something closer to thirteen further reads. Leaving that out
+// understates the probe, which is the safe direction — it keeps this from moving
+// a decision that the search term alone does not justify moving.
+func reverseProbeCost(entries int) int {
+	if entries <= 0 {
+		return 1
+	}
+	return bits.Len(uint(entries))
 }
