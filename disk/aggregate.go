@@ -139,6 +139,96 @@ func (s *Store) CountNodesByProperty(ctx context.Context, key string) (map[strin
 	return out, nil
 }
 
+var _ store.PropertyBatcher = (*Store)(nil)
+
+// NodesByPropertyBatch implements store.PropertyBatcher.
+//
+// The read lock is held for the whole batch, which is what CountNodesByProperty
+// already does for a whole key and for the same reason: the postings and the
+// records they are resolved against must come from one reader, or a Refresh
+// landing mid-pass would filter the new graph's postings through the old graph's
+// records. Writers therefore wait on a batch, and a batch over a million values
+// is not a short wait — a caller that cannot block writers for that long should
+// split its values across several calls, which costs one extra cursor per call
+// and nothing else.
+//
+// Liveness is resolved into a reused buffer rather than in place, because the ids
+// the index hands over are its own scratch. Nothing here allocates per value.
+func (s *Store) NodesByPropertyBatch(ctx context.Context, key string, values [][]byte,
+	fn func(i int, ids []store.NodeID) bool,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return err
+	}
+	r := s.readerLocked()
+	var live []store.NodeID
+	var stop error
+	err := s.propIdx.NodesByPropertyBatch(key, values, func(i int, ids []store.NodeID) bool {
+		live = live[:0]
+		for _, id := range ids {
+			if err := cc.Step(); err != nil {
+				stop = err
+				return false
+			}
+			if r.nodeExists(id) {
+				live = append(live, id)
+			}
+		}
+		// A value whose every holder is dead is a value with no holder, which is
+		// the one reading consistent with the index's own: it reports no callback
+		// for a value it does not hold, and a record layer that reports an empty
+		// one would make the two disagree about the same absence.
+		if len(live) == 0 {
+			return true
+		}
+		return fn(i, live)
+	})
+	if stop != nil {
+		return stop
+	}
+	return err
+}
+
+// EdgesByPropertyBatch implements store.PropertyBatcher.
+func (s *Store) EdgesByPropertyBatch(ctx context.Context, key string, values [][]byte,
+	fn func(i int, ids []store.EdgeID) bool,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return err
+	}
+	r := s.readerLocked()
+	var live []store.EdgeID
+	var stop error
+	err := s.propIdx.EdgesByPropertyBatch(key, values, func(i int, ids []store.EdgeID) bool {
+		live = live[:0]
+		for _, id := range ids {
+			if err := cc.Step(); err != nil {
+				stop = err
+				return false
+			}
+			if r.edgeExists(id) {
+				live = append(live, id)
+			}
+		}
+		if len(live) == 0 {
+			return true
+		}
+		return fn(i, live)
+	})
+	if stop != nil {
+		return stop
+	}
+	return err
+}
+
 // CountEdgesByProperty implements store.Aggregator.
 func (s *Store) CountEdgesByProperty(ctx context.Context, key string) (map[string]uint64, error) {
 	s.mu.RLock()

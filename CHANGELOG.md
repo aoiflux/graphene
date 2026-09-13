@@ -5,6 +5,58 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### A property join resolves many values in one pass
+
+`NodesByPropertyBatch(key, values, fn)` and `EdgesByPropertyBatch` answer a whole list
+of exact values against one key, carrying a position through the image's value table
+instead of searching it from scratch for every value. A consumer joining an external
+table against an indexed digest calls `NodesByProperty` a million times today and pays
+about twenty random probes over a sixteen-megabyte table for each of them; the values
+a base holds are sorted, so an *ascending* list of wants walks them monotonically and
+the pass becomes a sweep. `store.PropertyBatcher` is the optional interface, both
+backends implement it, and `Graph`'s helpers fall back to a loop where a backend does
+not — so this never fails for a missing capability.
+
+It is a callback and not a `[][]store.NodeID` on purpose: a million values returned
+that way is a million slice headers and a million backing arrays, which is the cost
+this whole release exists to remove. `i` is your own position in the list you passed,
+`ids` is scratch until the callback returns, values nothing holds produce no callback,
+and the callbacks arrive in value order rather than input order — that last is the
+observable trace of the sweep, and it is documented as unspecified rather than relied
+on. Your slice is never permuted.
+
+**What it measures.** 50,000 values, half of them absent, against a 50,000-node
+fixture's all-distinct 32-byte key, one arm per process, three interleaved passes:
+**2.7x faster than the loop when the values are already ascending** (98 ns/value
+against 262) and **1.17x slower when they are not** (307 ns/value). Residency is
+unmoved — 0.3 MiB more than the loop at 50,000 values, which is the sort scratch, and
+0.13 MiB *less* on ascending input where there is none — and allocation is flat: two
+allocations whether the batch holds 200 distinct values or 2,000. Isolated, the sweep
+costs a flat ~30 ns per value whether the key holds 256 distinct values or 262,144,
+against 24–77 ns for a search per value over the same range; the crossover is between
+256 and 4,096.
+
+The 1.17x is the honest cost of ordering the values, and it is stated rather than
+buried: warm, the sort does not pay for itself. It is expected to on a cold image,
+where a search per value is eighteen page faults instead of eighteen cache misses, and
+that has not been measured — there is no way to drop the page cache from a Go test on
+Windows. Supply ascending values and the question does not arise. See
+`docs/TECHNICAL_DETAILS.md` §14.21 for the design, including the two measurements that
+changed it.
+
+**The point lookup got faster on the way.** `NodesByProperty` against a mapped base is
+now **11% faster on an all-distinct key and 22% faster on a low-cardinality one** (ten
+interleaved passes, minima 90.3 → 79.9 ns and 74.7 → 58.6 ns). A key's values are
+strictly ascending and distinct, so a probe that compares equal *is* the answer; the
+search returns there, which removes two probes and a run read that the old shape spent
+confirming what it already knew. Getting there cost one false start worth recording:
+factoring the value comparison into a single tidy method put it over the inliner's
+budget and made the all-distinct lookup 11% *slower*, consistently, because a
+bisection's every probe became a call. The prefix comparison is now its own inlinable
+function and the run read is a call only where prefixes tie.
+
+No format change, no API removed, nothing on a write path touched.
+
 ### `store migrate -to` writes either format, in either direction
 
 The compatibility statement for v9 said `Options.IndexMode: IndexResident` plus one

@@ -487,6 +487,48 @@ type Aggregator interface {
 	CountEdgesByProperty(ctx context.Context, key string) (map[string]uint64, error)
 }
 
+// PropertyBatcher is an optional extension implemented by stores that can
+// resolve many exact property values in one pass.
+//
+// It exists for one shape of work: joining an external set of values against an
+// indexed key — a million content digests against the nodes holding them —
+// where calling NodesByProperty once per value is correct but pays a search of
+// the whole key for each. A backend whose index is disk-resident can do far
+// better by resolving them in sorted order, because then each search begins where
+// the last one ended and the pass sweeps the index forward instead of probing it
+// at random.
+//
+// Unlike Aggregator there *is* a correct fallback — NodesByProperty in a loop
+// — which is why this is not on GraphStore. A caller that wants it unconditionally
+// should ask for it and loop when it is absent, and Graph.NodesByPropertyBatch
+// does exactly that.
+type PropertyBatcher interface {
+	// NodesByPropertyBatch resolves values against key, calling fn once for each
+	// value that has at least one live node.
+	//
+	// fn receives the index of the value within values, not the value, and the id
+	// slice belongs to the store for the duration of the call: read it, do not
+	// retain it. Returning false ends the batch without an error.
+	//
+	// Three things are deliberately not promised. The callback order is not the
+	// input order — resolving in sorted order is the entire point, and which
+	// value a result belongs to is answered by i. Values with no live holder
+	// produce no callback, so a caller counting matches counts calls rather than
+	// assuming one per value. And values is not modified: an implementation that
+	// needs an ordering builds its own.
+	//
+	// The result is the same set of (value, ids) pairs NodesByProperty would give
+	// for each value, and is subject to the same liveness caveat: postings are
+	// resolved against the records, so every id handed over was live when it was
+	// checked and may be deleted the moment the batch returns.
+	NodesByPropertyBatch(ctx context.Context, key string, values [][]byte,
+		fn func(i int, ids []NodeID) bool) error
+
+	// EdgesByPropertyBatch is NodesByPropertyBatch for edges.
+	EdgesByPropertyBatch(ctx context.Context, key string, values [][]byte,
+		fn func(i int, ids []EdgeID) bool) error
+}
+
 // IndexVerifier is an optional extension implemented by stores that can
 // self-check their indexes against the records those indexes describe.
 type IndexVerifier interface {

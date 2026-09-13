@@ -99,6 +99,84 @@ func (s *Store) CountNodesByProperty(ctx context.Context, key string) (map[strin
 	return out, nil
 }
 
+var _ store.PropertyBatcher = (*Store)(nil)
+
+// NodesByPropertyBatch implements store.PropertyBatcher.
+//
+// A memory store has no disk-resident index, so the batch buys it no ordering and
+// it does not pretend otherwise: the index walks the values as they came and this
+// resolves each against the records. It is here for parity of *answers* — a
+// caller that switched backends and found the method missing would have to write
+// the loop twice — and not for a saving it cannot make.
+func (s *Store) NodesByPropertyBatch(ctx context.Context, key string, values [][]byte,
+	fn func(i int, ids []store.NodeID) bool,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return err
+	}
+	var live []store.NodeID
+	var stop error
+	err := s.propIdx.NodesByPropertyBatch(key, values, func(i int, ids []store.NodeID) bool {
+		live = live[:0]
+		for _, id := range ids {
+			if err := cc.Step(); err != nil {
+				stop = err
+				return false
+			}
+			if s.nodeExistsLocked(id) {
+				live = append(live, id)
+			}
+		}
+		if len(live) == 0 {
+			return true
+		}
+		return fn(i, live)
+	})
+	if stop != nil {
+		return stop
+	}
+	return err
+}
+
+// EdgesByPropertyBatch implements store.PropertyBatcher.
+func (s *Store) EdgesByPropertyBatch(ctx context.Context, key string, values [][]byte,
+	fn func(i int, ids []store.EdgeID) bool,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return err
+	}
+	var live []store.EdgeID
+	var stop error
+	err := s.propIdx.EdgesByPropertyBatch(key, values, func(i int, ids []store.EdgeID) bool {
+		live = live[:0]
+		for _, id := range ids {
+			if err := cc.Step(); err != nil {
+				stop = err
+				return false
+			}
+			if s.edgeExistsLocked(id) {
+				live = append(live, id)
+			}
+		}
+		if len(live) == 0 {
+			return true
+		}
+		return fn(i, live)
+	})
+	if stop != nil {
+		return stop
+	}
+	return err
+}
+
 // CountEdgesByProperty implements store.Aggregator.
 func (s *Store) CountEdgesByProperty(ctx context.Context, key string) (map[string]uint64, error) {
 	s.mu.RLock()

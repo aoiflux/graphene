@@ -132,6 +132,35 @@ func (r IDRun) First() (uint64, bool) {
 	return r.At(0), true
 }
 
+// ValueCursor is a position in one key's values that can only move forward.
+//
+// It exists because resolving many exact values costs far less when they are
+// resolved in order. A base's values are sorted, so for an ascending sequence of
+// wants each answer is at or after the last one, and a search that starts where
+// the previous one finished never re-examines the part of the key it has already
+// passed. Under a mapped image that is the difference between a random probe per
+// query and one forward sweep for the whole batch — the reason
+// NodesByPropertyBatch exists, stated as the one operation it needs.
+//
+// A cursor is not safe for concurrent use and is not meant to outlive the call
+// that made it. The base it reads is immutable, so nothing here can go stale;
+// the cursor's own position is what is unshareable.
+type ValueCursor interface {
+	// Seek positions at the first value not less than want, and returns that
+	// value's ids together with whether it equals want. An absent want yields an
+	// empty run and false, and leaves the cursor at the first value above it, so
+	// the next Seek continues from there.
+	//
+	// A want below the previous one is refused with an error rather than
+	// answered. This is the one place in the read paths where a caller's mistake
+	// is reported instead of absorbed, and it is because of what the alternative
+	// would be: a forward-only position asked to look backward can only say
+	// "absent" for a value that is present, which is a wrong answer produced
+	// silently by an index. An *equal* want is not a descent — the cursor stays
+	// where it is and answers again — so a batch may name the same value twice.
+	Seek(want []byte) (ids IDRun, found bool, err error)
+}
+
 // Base is a disk-resident property index: the forward direction (key and value
 // to ids) and the reverse (entity to the keys it is indexed under), read in
 // place.
@@ -154,6 +183,15 @@ type Base interface {
 	// Lookup returns the ids indexed under key=value, ascending. An absent key
 	// or value yields an empty run and no error.
 	Lookup(kind EntityKind, key string, value []byte) (IDRun, error)
+
+	// Cursor returns a forward-only cursor over key's values.
+	//
+	// A base that does not carry key returns a cursor that finds nothing rather
+	// than nil, so a caller resolving a thousand values against a key the image
+	// never held is written once instead of twice. It is not an error and not a
+	// missing capability: the delta may well hold the key, and the batch path
+	// merges the two sides exactly as every other read path does.
+	Cursor(kind EntityKind, key string) ValueCursor
 
 	// ForEachValue walks key's distinct values in ascending byte order,
 	// beginning at the first value not less than from. A nil from starts at the

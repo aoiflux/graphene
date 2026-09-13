@@ -62,14 +62,20 @@ type fakeBase struct {
 	// walks counts calls to ForEachValue, so a test can assert what a path read
 	// out of the base rather than only what it concluded. Atomic because one base
 	// is read by sixty-four goroutines in the uniqueness test.
-	walks atomic.Int64
+	walks     atomic.Int64
+	seeks     atomic.Int64
+	seekSteps atomic.Int64
 }
 
 // valueWalks is how many times ForEachValue has been entered.
 func (b *fakeBase) valueWalks() int { return int(b.walks.Load()) }
 
 // resetCounts zeroes the counters, for a test that reuses one base across arms.
-func (b *fakeBase) resetCounts() { b.walks.Store(0) }
+func (b *fakeBase) resetCounts() {
+	b.walks.Store(0)
+	b.seeks.Store(0)
+	b.seekSteps.Store(0)
+}
 
 type fakeSide struct {
 	keys      []string                     // ascending
@@ -162,6 +168,12 @@ func sortPackedIDs(packed []byte) []byte {
 	return out
 }
 
+// seeks and seekSteps are what the batch tests read: how many times a cursor was
+// asked, and how many values it stepped over in total.
+func (b *fakeBase) seekCounts() (seeks, steps int64) {
+	return b.seeks.Load(), b.seekSteps.Load()
+}
+
 func (b *fakeBase) fail(key string) error {
 	if b.failKey != "" && b.failKey == key {
 		return b.failErr
@@ -207,6 +219,51 @@ func (b *fakeBase) ForEachValue(kind EntityKind, key string, from []byte, fn fun
 		}
 	}
 	return nil
+}
+
+func (b *fakeBase) Cursor(kind EntityKind, key string) ValueCursor {
+	return &fakeCursor{b: b, vals: b.sides[kind].values[key], ids: b.sides[kind].ids[key], key: key}
+}
+
+// fakeCursor walks a sorted []string forward, one value at a time.
+//
+// Linear on purpose: it counts every value it steps over in b.seekSteps, so a
+// test can assert that a batch of N values over D distinct ones costs O(N+D)
+// steps rather than O(N*D) — which is the whole claim the batch path makes, and
+// which a cursor that bisected would hide behind its own cleverness.
+type fakeCursor struct {
+	b       *fakeBase
+	key     string
+	vals    []string
+	ids     map[string][]byte
+	at      int
+	last    []byte
+	hasLast bool
+}
+
+// Seek is deliberately allocation-free, which for a fake is not fussiness: the
+// batch's own claim is that it allocates a fixed amount however many values it is
+// given, and a fake that allocated per Seek would be the thing
+// TestBatch_AllocatesNothingPerValue measured. last is a reused buffer for the
+// same reason the real cursor keeps one, and the value comparisons go through
+// unsafeBytes rather than converting the other way.
+func (c *fakeCursor) Seek(want []byte) (IDRun, bool, error) {
+	if c.hasLast && bytes.Compare(want, c.last) < 0 {
+		return IDRun{}, false, fmt.Errorf("fake cursor: %x is below %x", want, c.last)
+	}
+	c.last, c.hasLast = append(c.last[:0], want...), true
+	c.b.seeks.Add(1)
+	if err := c.b.fail(c.key); err != nil {
+		return IDRun{}, false, err
+	}
+	for c.at < len(c.vals) && bytes.Compare(unsafeBytes(c.vals[c.at]), want) < 0 {
+		c.at++
+		c.b.seekSteps.Add(1)
+	}
+	if c.at >= len(c.vals) || !bytes.Equal(unsafeBytes(c.vals[c.at]), want) {
+		return IDRun{}, false, nil
+	}
+	return NewIDRun(c.ids[c.vals[c.at]]), true, nil
 }
 
 func (b *fakeBase) ForEachEntryOf(kind EntityKind, id uint64, fn func(string, []byte) bool) error {

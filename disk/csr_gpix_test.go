@@ -136,7 +136,7 @@ func encodeMappedIndexFrom(src gpixSource) (gpix, gpir []byte, dirs []gpixKeyDir
 }
 
 // encode writes the fixture as a GPIX body.
-func (f *gpixFixture) encode(t *testing.T) []byte {
+func (f *gpixFixture) encode(t testing.TB) []byte {
 	t.Helper()
 	body, err := encodeGPIXFrom(f.source(t.TempDir(), 0, 0))
 	if err != nil {
@@ -708,7 +708,7 @@ func TestGPIX_RefusesBadHeader(t *testing.T) {
 
 // --- GPIR ---
 
-func encodeGPIR(t *testing.T, nodes, edges []gpirEntry) []byte {
+func encodeGPIR(t testing.TB, nodes, edges []gpirEntry) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	iw := newImageWriter(&buf, make([]byte, 0, 4096))

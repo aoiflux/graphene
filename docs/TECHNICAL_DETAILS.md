@@ -4754,6 +4754,119 @@ pass plus a binary search per reverse entry. Allocations went from 240 B and 6 t
 416 B and 13 — **identical at both sizes**, which is the boundedness requirement
 `Base.Verify` states, observed at the store level rather than argued.
 
+### 14.21 Taken: a property join carries its position
+
+A consumer joining an external table against an indexed key calls
+`NodesByProperty` once per row. Each call searches the whole key: about log2 of the
+distinct values, each probe a 16-byte read at an unrelated offset in a value table
+that at a million distinct values is sixteen megabytes. A million rows is twenty
+million random touches over the whole table, and on a cold image most of them are a
+page fault. The arithmetic is right for one lookup and wrong for a join.
+
+What makes a join different from a million lookups is that the *answers* are ordered
+if the questions are. A base's values ascend, so an ascending sequence of wants walks
+them monotonically and a search that begins where the last one ended never revisits a
+page. That is the whole idea; everything below is where it had to be put and what it
+actually measured.
+
+**Where the position lives.** `disk` imports `index`, so the reader must be in `disk`
+and the merge with the delta and the retraction set must be in `index`. The seam is
+`index.ValueCursor`, one method:
+
+```go
+type ValueCursor interface {
+	Seek(want []byte) (ids IDRun, found bool, err error)
+}
+```
+
+One interface dispatch per value, which is the granularity `index.Base` already
+blesses for `ForEachValue`. The alternative — pushing the whole batch across the
+boundary — would have put the retraction set and the shard locks in `disk`. A want
+below the previous one is refused with an error naming both values rather than
+answered, because a cursor that silently re-bisected would make the API's cost
+unpredictable in a way no caller could see. An *equal* want is not a descent: the
+cursor stays where it is and answers again, which is what makes a repeated value cost
+one probe.
+
+**Why a callback and not `[][]NodeID`.** A million values would be a million slice
+headers and a million backing arrays: tens of megabytes and a million allocations, in
+a program whose entire purpose is to stop doing exactly that. The primitive is
+therefore `fn(i int, ids []NodeID) bool`, where `i` is the caller's own index into
+the list it passed and `ids` is scratch that is overwritten on the next value. Three
+things are deliberately not promised, and are documented as not promised: the order
+of the callbacks (it is value order, not input order, and that is the observable
+trace of the sweep), a callback for a value nothing holds (there is none), and
+anything about the input slice (it is not permuted — a caller indexes its own rows by
+those positions).
+
+**Two measurements changed the design.** Both are in
+[benchmarks.md](benchmarks.md#resolving-many-values-in-one-pass-2026-09-13).
+
+*The comparison cannot be a function call.* Factoring "compare the i'th value against
+want, reading the run only if the prefix ties" into one method read well and cost 11%
+of the all-distinct point lookup, consistently, across five interleaved passes. At
+`cost 101` against the inliner's budget of 80 it stayed a call, and a bisection makes
+twenty of them over a table it is already walking. So `comparePrefixAt` is its own
+function and inlines at all three probe sites, `compareRunAt` is a call only on the
+probes whose prefixes tie, and the composition is written out three times. That is the
+ordering rule in one place and the dispatch in three, which is the trade; the tidier
+shape measured +11% on the path this section exists to protect.
+
+*An equal probe is the answer.* A key's values are strictly ascending and distinct, so
+the first value not less than want equals want exactly when some probe compares equal
+— there is no earlier equal value to keep looking for. Returning there removed two
+probes and a run read from every hit: the old shape had the doubling search find the
+value, the bisection converge on it again, and a final confirmation read its run a
+third time. With no probe able to finish having found equality, that confirmation
+became dead code rather than a saving. Bisection already assumes the ordering, so this
+assumes nothing further. The point lookup came out **11% faster on an all-distinct key
+and 22% faster on a low-cardinality one** than before the batch existed.
+
+**What the sweep is worth, and where it is not.** Flat, about 30 ns per value, whether
+the key holds two hundred distinct values or a quarter of a million — against 24 ns to
+77 ns for a search per value over the same range. The crossover is between 256 and
+4,096 distinct values; below it the cursor loses by about 4 ns per value to its own
+position, guard and dispatch. End to end, 50,000 values against a 50,000-distinct key:
+**2.7x faster than the loop when the caller's values ascend, 1.17x slower when they do
+not.**
+
+That second figure is the one worth stating plainly. Warm, the ordering does not pay
+for itself: 108 ns per value to sort, and then about 200 ns per value to walk the
+caller's value table in an order different from the one it was allocated in — two
+cache misses the sequential arm never pays, and the price of promising not to permute
+the caller's slice. The unsorted case is expected to win *cold*, where a search per
+value is eighteen page faults rather than eighteen cache misses, and that has not been
+measured: there is no way to drop the page cache from a Go test on Windows. It is an
+open measurement, not a claim. The documented advice — supply ascending values — is
+what the numbers actually support today.
+
+**The ordering itself.** `[]batchKey{prefix uint32, at int32}`, eight bytes per value,
+sorted unstably. Each half was chosen against a measurement. Bare `[]int32` positions
+cost 2.5x more because every comparison dereferenced two slice headers; a stable sort
+cost 2.4x more for a property the contract does not promise (pdqsort is deterministic
+for a given input, so a test over repeated values stays reproducible either way); and a
+four-byte prefix beat an eight-byte one on *both* axes, so there was nothing to weigh.
+An already-ascending input allocates none of it — `ascendingOrder` returns nil and the
+batch walks the caller's slice as it is.
+
+**Locking.** The delta read must not copy — that would be the million allocations
+again — so it happens under the shard's read lock, through `postings.lookupRef`, which
+returns the shard's own slice. The base read, the only thing here that can page-fault,
+happens *outside* it. That is strictly less lock-holding than the existing union walks
+in `index/union.go`, which hold a shard lock across a whole key's base reads. At the
+store level both methods hold `s.mu.RLock` for the whole batch, which is the choice
+`CountNodesByProperty` already makes and for the same reason — postings and records
+from one reader — with the consequence stated on the method: a very large batch stalls
+writers for its duration, so split it.
+
+**Why it is not on `GraphStore`.** `store.PropertyBatcher` is an optional interface,
+like `Aggregator`, but for the opposite reason. `Aggregator` is optional because there
+is no correct fallback; `PropertyBatcher` is optional because there *is* one —
+`NodesByProperty` in a loop, which `Graph.NodesByPropertyBatchCtx` runs when the
+backend does not implement it, checking `ctx.Err()` per value. So the helper never
+fails for a missing capability, and a backend that gains the fast path changes nothing
+a caller can see except the time.
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.

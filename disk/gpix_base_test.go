@@ -42,7 +42,7 @@ type basePair struct {
 
 // newBasePair loads the same triples into a resident index and an encoded,
 // parsed GPIX/GPIR pair.
-func newBasePair(t *testing.T, triples []propTriple) *basePair {
+func newBasePair(t testing.TB, triples []propTriple) *basePair {
 	t.Helper()
 
 	resident := index.NewPropertyIndex()
@@ -94,7 +94,7 @@ func newBasePair(t *testing.T, triples []propTriple) *basePair {
 // entries are thousands and holding them is the cheapest way to be sure the
 // reader is judged against entries a writer could actually have produced: every
 // valueOff is derived from the section the forward encoder wrote, not asserted.
-func buildGPIRFor(t *testing.T, sec *gpixSection) []byte {
+func buildGPIRFor(t testing.TB, sec *gpixSection) []byte {
 	t.Helper()
 	var nodes, edges []gpirEntry
 	for ki := range sec.keys {

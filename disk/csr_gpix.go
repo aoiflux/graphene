@@ -729,51 +729,169 @@ func (k *gpixKey) runOffsetAt(i uint64) uint64 {
 	return binary.LittleEndian.Uint64(k.vtab[i*gpixVtabEntry+8:])
 }
 
+// comparePrefixAt orders the i'th value's prefix against want's, and returns 0 to
+// mean the vtab cannot decide — not that the values are equal.
+//
+// # How a probe is written, and why it is written three times
+//
+// Every probe of every search is this, and then compareRunAt only on a 0:
+//
+//	cmp := k.comparePrefixAt(i, wantPrefix)
+//	if cmp == 0 {
+//		if cmp, err = k.compareRunAt(i, want); err != nil { ... }
+//	}
+//
+// That pair was one function, compareAt, which read better and cost 11% of the
+// all-distinct point lookup: at cost 101 against the inliner's budget of 80 it
+// stayed a call, and a call is the wrong shape for something a bisection does
+// twenty times over a table it is already walking. Measured across five
+// interleaved passes, every one of them, so the composition is written out at the
+// three places that probe and the ordering rule lives here.
+//
+// The two halves cost differently and that difference is the whole reason the
+// prefix is in the vtab at all. A prefix comparison is one aligned 8-byte load
+// from a table the search is already walking; reading the run is a second touch
+// at an unrelated offset, which under a mapped image may be a page that is not
+// resident. So all but the last probe or two of a search stay inside the table.
+func (k *gpixKey) comparePrefixAt(i uint64, wantPrefix uint64) int {
+	p := k.prefixAt(i)
+	if p < wantPrefix {
+		return -1
+	}
+	if p > wantPrefix {
+		return 1
+	}
+	return 0
+}
+
+// compareRunAt compares the i'th value itself against want, for the probes whose
+// prefixes tied.
+//
+// A malformed run makes it fail rather than answer: a comparison that treated an
+// unreadable run as "not equal" would report a present value as absent, which is
+// the one outcome a corrupt index must not produce silently.
+func (k *gpixKey) compareRunAt(i uint64, want []byte) (int, error) {
+	have, _, err := k.runAt(i)
+	if err != nil {
+		return 0, err
+	}
+	return bytes.Compare(have, want), nil
+}
+
 // search returns the index of the first value not less than want, and whether
 // that value equals it.
-//
-// The comparison is the prefix where the prefixes differ and the values
-// themselves where they do not — exact either way, for the reason the prefix
-// discussion above gives. A malformed run makes the search fail rather than
-// answer: a search that treated an unreadable run as "not equal" would report a
-// present value as absent, which is the one outcome a corrupt index must not
-// produce silently.
 func (k *gpixKey) search(want []byte) (uint64, bool, error) {
+	return k.searchFrom(0, want)
+}
+
+// searchFrom is search over the values at or after from.
+//
+// # Why a lower bound is worth a second entry point
+//
+// A search over a key with a million distinct values is twenty probes at
+// unrelated offsets in a 16 MiB table. That is the right cost for one lookup and
+// the wrong cost for a million of them: a pass that resolves a million values
+// one at a time makes twenty million random touches over the whole table, and on
+// a cold image most of them are a page fault. Sorted, the same pass is
+// monotonic — each answer is at or after the last one — so each search needs
+// only the values it has not already passed.
+//
+// # Bisect from zero, gallop from anywhere else
+//
+// from == 0 is a plain bisection over the whole table, byte for byte what a
+// point lookup did before this function existed. That is deliberate: the point
+// lookup is the hot path and it must not pay for the batch path's existence.
+//
+// From a position, the window is unbounded above but the answer is usually just
+// past it, so bisecting [from, Distinct) would throw away everything the cursor
+// knows and probe the middle of the table again. Instead the position itself is
+// tested first — which answers a repeated value, and a value whose answer is
+// the one already reached, in a single probe — and then the bound is doubled
+// out from it until it passes want. That brackets the answer in log2 of the
+// *gap* rather than log2 of the table, and every probe is forward of a page the
+// last search already touched. A dense sweep therefore walks the vtab
+// sequentially; a sparse one costs at worst about twice a bisection, paid once
+// at the start of the sweep where the gap is still large.
+func (k *gpixKey) searchFrom(from uint64, want []byte) (uint64, bool, error) {
+	if from >= k.Distinct {
+		// Past the end. Not an error: a batch whose remaining values are all
+		// above every value the key holds ends up here and they are simply
+		// absent.
+		return k.Distinct, false, nil
+	}
 	wantPrefix := gpixPrefixOf(want)
-	var err error
-	lo, hi := uint64(0), k.Distinct
-	for lo < hi {
-		mid := (lo + hi) / 2
-		cmp := 0
-		if p := k.prefixAt(mid); p != wantPrefix {
-			if p < wantPrefix {
-				cmp = -1
-			} else {
-				cmp = 1
-			}
-		} else {
-			var have []byte
-			if have, _, err = k.runAt(mid); err != nil {
+	lo, hi := from, k.Distinct
+	if from > 0 {
+		cmp := k.comparePrefixAt(from, wantPrefix)
+		if cmp == 0 {
+			var err error
+			if cmp, err = k.compareRunAt(from, want); err != nil {
 				return 0, false, err
 			}
-			cmp = bytes.Compare(have, want)
 		}
-		if cmp < 0 {
+		if cmp >= 0 {
+			// The position is already at or past want, so it is the answer and
+			// the comparison has already said whether it matches. One probe.
+			return from, cmp == 0, nil
+		}
+		// value(from) < want, so the answer is above from. below is the highest
+		// position known to be below want; the doubling stops at the first probe
+		// that is not, which brackets the answer in (below, hi).
+		below, step := from, uint64(1)
+		for {
+			probe := below + step
+			if probe >= k.Distinct {
+				lo, hi = below+1, k.Distinct
+				break
+			}
+			if cmp = k.comparePrefixAt(probe, wantPrefix); cmp == 0 {
+				var err error
+				if cmp, err = k.compareRunAt(probe, want); err != nil {
+					return 0, false, err
+				}
+			}
+			if cmp == 0 {
+				return probe, true, nil
+			}
+			if cmp > 0 {
+				// probe is above want, so the answer is in (below, probe] —
+				// probe included, which is why hi is probe rather than probe+1,
+				// and why the bisection below never probes it a second time.
+				lo, hi = below+1, probe
+				break
+			}
+			below, step = probe, step*2
+		}
+	}
+	for lo < hi {
+		mid := (lo + hi) / 2
+		cmp := k.comparePrefixAt(mid, wantPrefix)
+		if cmp == 0 {
+			var err error
+			if cmp, err = k.compareRunAt(mid, want); err != nil {
+				return 0, false, err
+			}
+		}
+		switch {
+		case cmp == 0:
+			return mid, true, nil
+		case cmp < 0:
 			lo = mid + 1
-		} else {
+		default:
 			hi = mid
 		}
 	}
-	if lo >= k.Distinct {
-		return lo, false, nil
-	}
-	// One confirmation read: lo is the first value not less than want, which is
-	// equal to it or greater, and only reading it says which.
-	have, _, err := k.runAt(lo)
-	if err != nil {
-		return 0, false, err
-	}
-	return lo, bytes.Equal(have, want), nil
+	// No probe compared equal, and that settles found without another read.
+	//
+	// A key's values are strictly ascending and distinct — one run per distinct
+	// value, which the writer guarantees and verifyGPIX checks — so the first
+	// value not less than want equals want only if some probe compared equal, and
+	// every probe that could have has run. What is left in lo is either Distinct
+	// or an index a probe found strictly above want; neither is a match. The
+	// confirmation this used to end with read a run to learn something already
+	// known. (Bisection assumes that ordering to work at all, so this assumes
+	// nothing the search did not already.)
+	return lo, false, nil
 }
 
 // idsOf returns the raw id bytes for an exact value, or nil if it is absent.

@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/aoiflux/graphene/index"
@@ -128,6 +129,77 @@ func (b *gpixBase) ForEachValue(kind index.EntityKind, key string, from []byte,
 	return k.forEachValue(start, func(value, ids []byte) bool {
 		return fn(value, index.NewIDRun(ids))
 	})
+}
+
+// Cursor returns a forward-only cursor over key's values.
+//
+// The cursor is where a batch's saving lives, and it is worth being precise
+// about where it does not: nothing here is faster than Lookup for one value.
+// What it does is carry the position of the last answer from one value to the
+// next, which turns N searches over the whole vtab into one sweep across it. A
+// caller with a single value should call Lookup, which is that sweep with no
+// position to carry.
+func (b *gpixBase) Cursor(kind index.EntityKind, key string) index.ValueCursor {
+	// A nil key is not a nil cursor. The image simply does not carry this key —
+	// it was declared since the last compaction, or every entry under it has been
+	// retracted — and the batch still has a delta to merge against.
+	return &gpixCursor{k: b.fwd.key(kindOf(kind), key)}
+}
+
+// gpixCursor is a position in one key's vtab, and the previous want.
+//
+// last is kept as a copy rather than as the caller's slice: the values a batch
+// walks belong to the caller and may be reused between calls, and a guard that
+// compared against memory the caller had since overwritten would refuse a valid
+// sequence or accept an invalid one. It is appended into in place, so it grows
+// once to the widest value in the batch and allocates nothing after that.
+type gpixCursor struct {
+	k       *gpixKey
+	at      uint64
+	last    []byte
+	hasLast bool
+}
+
+// Seek implements index.ValueCursor.
+func (c *gpixCursor) Seek(want []byte) (index.IDRun, bool, error) {
+	if c.hasLast && bytes.Compare(want, c.last) < 0 {
+		return index.IDRun{}, false, fmt.Errorf(
+			"gpix: cursor has passed %s and cannot seek back to %s",
+			gpixShortValue(c.last), gpixShortValue(want))
+	}
+	c.last, c.hasLast = append(c.last[:0], want...), true
+	if c.k == nil {
+		return index.IDRun{}, false, nil
+	}
+	i, found, err := c.k.searchFrom(c.at, want)
+	if err != nil {
+		return index.IDRun{}, false, err
+	}
+	// The position moves to the answer and not past it, so a repeated want is
+	// found again rather than skipped. searchFrom treats a position at Distinct
+	// as past the end, which is what a batch whose values run off the top of the
+	// key wants.
+	c.at = i
+	if !found {
+		return index.IDRun{}, false, nil
+	}
+	_, ids, err := c.k.runAt(i)
+	if err != nil {
+		return index.IDRun{}, false, err
+	}
+	return index.NewIDRun(ids), true, nil
+}
+
+// gpixShortValue renders a value for an error message, truncated.
+//
+// Index values are caller-supplied and may be large; an error that pasted a
+// 64 KiB value into a log would be its own problem.
+func gpixShortValue(v []byte) string {
+	const max = 16
+	if len(v) > max {
+		return fmt.Sprintf("%x\u2026(%d bytes)", v[:max], len(v))
+	}
+	return fmt.Sprintf("%x", v)
 }
 
 // ForEachEntryOf walks the entries registered for one entity.

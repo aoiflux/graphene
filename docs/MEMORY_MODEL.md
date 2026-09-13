@@ -770,6 +770,36 @@ observed — the store most likely to be verified is the one nearest its ceiling
 `docs/TECHNICAL_DETAILS.md` §14.20 has the argument that makes an O(1)-memory check
 of both directions exhaustive rather than partial.
 
+### 6.5 Reading many values without holding many answers
+
+A join is the one read shape whose memory cost is set by the *API* rather than by the
+store. `NodesByProperty` returns a freshly allocated `[]store.NodeID` per call, which is
+right for a lookup and, over a million rows, is a million slice headers and a million
+backing arrays — tens of megabytes of garbage churned through a heap this document
+spends six sections trying to shrink.
+
+`NodesByPropertyBatch` is the same question asked so that the answer need not be held.
+The caller gets a callback per matching value with the ids as scratch, and what the
+engine holds for the whole pass is:
+
+| term | bytes | when |
+|---|---|---|
+| id scratch | the widest run in the batch × 8 B | always, reused |
+| the cursor | one allocation, ~48 B | always |
+| sort keys | 8 B per value | only when the caller's values are not ascending |
+
+Nothing else, and nothing per value. Measured at 50,000 values against an all-distinct
+key: **2 allocations, unchanged between 200 and 2,000 distinct values**, and 0.3 MiB of
+growth over the loop's 3.25 MiB — which is the 400 KiB of sort keys plus GC slack. On
+ascending input there are no sort keys and the batch holds *less* than the loop.
+
+Two consequences for anyone sizing a join against a budget. The sort scratch is
+8 B × values, so a million-row join wants 8 MiB it would not otherwise need, and
+supplying ascending values removes that term entirely. And the store lock is held for
+the whole batch (see the locking note in `TECHNICAL_DETAILS.md` §14.21), so a batch is also
+a writer stall of its own duration: split a million values into chunks rather than
+passing them in one call.
+
 ## 7. Target architecture
 
 The store should hold, per live record and in anonymous memory, only what cannot be

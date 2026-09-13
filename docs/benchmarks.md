@@ -2764,6 +2764,177 @@ go test ./disk/ -run '^$' -bench GPIXBaseLookup -benchmem -benchtime 2s
 GRAPHENE_BENCH_NODES=50000 go test -tags=stress ./tests/ -run '^$' -bench RSS_Open -benchtime 1x
 ```
 
+## Resolving many values in one pass (2026-09-13)
+
+The change: `NodesByPropertyBatch` and `EdgesByPropertyBatch` resolve a list of
+exact values against one key, carrying a position through the image's value table
+instead of searching it once per value. `TECHNICAL_DETAILS.md` §14.21 has the design
+and the two measurements that changed it.
+
+Conditions: Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, go 1.26,
+NVMe, 4 KiB pages, `GOGC` default. Interleaved A/B against a copy of `4d2b4eb`,
+alternating arms within each pass. Minima and every pass reported; never best-of.
+Residency arms run **one arm per process**, because `peakMiB` is a high-water mark
+of the process and two arms in one process measure the second one's peak against
+the first one's working set — the first attempt at this section did that and its
+file-backed figures disagreed by 10 MiB between passes for no other reason.
+
+### What the sweep is worth, by how large the key is
+
+`BenchmarkGPIXSweepScale` (in `disk/`, untagged) holds the shape of the key constant
+— 32-byte values with distinct leading eight bytes, the content-digest shape this
+exists for — and varies only how many distinct values it holds. Both arms resolve
+every value the key has, ascending. Three passes, ns per value:
+
+| distinct values | vtab | a search per value | a cursor sweep |
+|---|---|---|---|
+| 256 | 4 KiB | 23.9 / 25.0 / 25.5 | 28.4 / 29.2 / 30.0 |
+| 4,096 | 64 KiB | 51.5 / 53.2 / 57.6 | 30.4 / 31.8 / 37.3 |
+| 65,536 | 1 MiB | 60.4 / 62.0 / 64.9 | 31.3 / 34.9 / 35.7 |
+| 262,144 | 4 MiB | 68.2 / 75.7 / 76.5 | 30.1 / 31.7 / 38.4 |
+
+The sweep is flat: about 30 ns per value whether the key holds two hundred values or
+a quarter of a million, because a dense ascending sequence advances the position by
+one and the doubling search stops at its first probe. A search per value grows with
+log of the table and with how far outside the caches it has fallen. The crossover is
+between 256 and 4,096 distinct values, and below it the cursor loses by ~4 ns per
+value to its own bookkeeping — the position, the backward guard and one interface
+call. The older `BenchmarkGPIXCursorSweep` measures 200 four-byte values and puts the
+two arms level at ~28 ns; it is kept because that is a real shape, and it is not the
+shape that could ever have answered this question.
+
+### What a join costs end to end
+
+`BenchmarkRSS_PropertyBatch` and `BenchmarkRSS_PropertyBatchSorted` (stress-tagged,
+in `tests/`) join 50,000 values — half of them present, half not, drawn so they
+interleave in value order — against the 50,000-node fixture's all-distinct 32-byte
+`digest` key, on a store reopened from disk with the open warmed out of the
+measurement. `-benchtime 1x`, one arm per process, three passes:
+
+| arm | join, ms | ns per value |
+|---|---|---|
+| `NodesByProperty` in a loop | 13.10 / 13.99 / 17.23 | 262 |
+| batch, caller's values unsorted | 15.35 / 15.57 / 55.51 | 307 |
+| batch, caller's values ascending | **5.10 / 4.88 / 20.55** | **98** |
+
+Pass 3 is contaminated — every arm of it is three to four times its own pass-1 figure
+— and it is printed rather than dropped because that is what the method says to do.
+The ns-per-value column is from the minima.
+
+So: **2.7x faster when the caller's values are already ascending, and 1.17x slower
+when they are not.** The second figure is the honest cost of the ordering, and it
+breaks down as 108 ns per value to sort and roughly 200 ns per value to then walk the
+caller's own value table in a different order from the one it was allocated in — two
+cache misses per value that the sequential arm does not pay. That second term is the
+price of promising not to permute the caller's slice, and there is no version of this
+that avoids it without copying the values somewhere contiguous, which is 32+ bytes
+per value of scratch and against the point of the exercise.
+
+Warm, therefore, the sort does not pay for itself; the win on unsorted input is
+expected to arrive cold, where a search per value is eighteen page faults rather than
+eighteen cache misses and the sort's 108 ns disappears beside them. **That has not
+been measured here** — there is no way to drop the page cache from a Go test on
+Windows — and it is recorded as an open measurement rather than claimed.
+
+### What it holds
+
+| MiB, during the join | loop | batch, unsorted | batch, ascending |
+|---|---|---|---|
+| peak resident, total | 62.70 / 62.56 / 62.44 | 62.99 / 62.98 / 62.60 | 65.66 / 65.71 / 65.35 |
+| growth during the join | 3.293 / 3.246 / 3.246 | 3.574 / 3.570 / 3.559 | 3.113 / 3.129 / 3.168 |
+
+Compare the second row and only within a benchmark function: the `Sorted` arms run in
+a process that built two value lists before measuring, so their absolute peak is 3 MiB
+above the others for a reason that has nothing to do with the join. The growth figure
+is the one that answers the question, and it says the batch costs **0.3 MiB more than
+the loop at 50,000 values** — which is the 400 KiB of sort keys and GC slack over it —
+and **0.13 MiB less** when the caller's values are already ascending, because then
+there are no sort keys at all.
+
+`TestBatch_AllocatesNothingPerValue` is the same claim at the allocation level:
+**2 allocations, unchanged between 200 and 2,000 distinct values.** Those two are the
+id scratch buffer and the cursor.
+
+### How the values get ordered
+
+The ordering was the whole of the batch's cost when this was first measured, and it
+was the wrong ordering twice over. Four ways, 50,000 32-byte digests, three runs each:
+
+| ordering | 50,000 | 200,000 | scratch per value |
+|---|---|---|---|
+| `SortStableFunc` over `[]int32` | 29 / 49 / 36 ms | 156 / 176 / 235 ms | 4 B |
+| `SortFunc` over `[]int32` | 13.4 / 13.4 / 14.4 ms | 99 / 116 / 109 ms | 4 B |
+| `SortFunc` over `{uint64, int32}` | 6.6 / 6.6 / 6.7 ms | 30 / 30 / 32 ms | 16 B |
+| `SortFunc` over `{uint32, int32}` | **5.7 / 5.4 / 5.4 ms** | **25 / 27 / 24 ms** | **8 B** |
+
+Stability cost 2.4x for a property the contract does not promise, and sorting bare
+positions cost another 2.5x because every comparison dereferenced two slice headers
+into a table the caller allocated wherever it liked. The four-byte prefix is the
+cheapest of the fast three *and* the fastest of the four, so there was no trade to
+weigh. An already-ascending input allocates none of it.
+
+### The controls
+
+`BenchmarkGPIXBaseLookup` guards the point lookup, which this change rewrote: the
+value comparison was factored out of the bisection and the search now returns at the
+first probe that compares equal. Ten interleaved passes, `-benchtime 1s`, ns/op:
+
+| | before | after |
+|---|---|---|
+| AllDistinct | 104.5 101.1 98.4 100.8 101.5 96.9 95.5 93.5 96.1 90.3 | 104.8 91.5 105.9 87.9 88.0 90.3 84.4 86.3 79.9 80.0 |
+| minimum | 90.29 | **79.87** |
+| LowCardinality | 115.0 78.7 102.1 87.2 87.1 78.6 75.2 77.6 74.7 75.3 | 92.7 68.2 85.3 65.7 92.1 68.7 63.8 61.2 59.1 58.6 |
+| minimum | 74.68 | **58.55** |
+
+The point lookup is **11% faster on an all-distinct key and 22% faster on a
+low-cardinality one**, winning 8 of 10 and 10 of 10 passes. Both arms allocate
+nothing. Ten passes rather than three because the first attempt measured the
+all-distinct key 11% *slower* and consistently so: factoring the comparison into a
+function put it over the inliner's budget (`cost 101 exceeds budget 80`), so every
+probe of every bisection became a call where it had been a load and two comparisons
+in the loop. The prefix comparison is now its own function, inlines at all three
+probe sites, and the run read is a call only on the probes whose prefixes tie.
+
+`BenchmarkNodesByProperty_{Equal,Miss}_Disk` is the same control one layer up, where
+the search is a minority of the work and the instrument is correspondingly blunt. Five
+interleaved passes, ns/op:
+
+| | before | after |
+|---|---|---|
+| Equal | 110.4 / 118.5 / 118.8 / 129.4 / 129.2 | 110.5 / 132.4 / 89.5 / 124.2 / 133.2 |
+| Miss | 75.3 / 70.4 / 70.9 / 77.0 / 52.8 | 46.7 / 78.8 / 71.2 / 81.6 / 83.2 |
+
+Minima favour the new tree on both (110.4 → 89.5 and 52.8 → 46.7) and the medians are
+indistinguishable, which is the expected reading: at this layer the store lock, the
+liveness check and the result allocation dominate whatever the search saved.
+`BenchmarkGPIXBaseLookup` above is the sensitive instrument and the one the claim rests
+on.
+
+`BenchmarkRSS_Open` at 50,000 nodes, three interleaved passes, confirms nothing about
+opening a store moved — as it must not have, since no format or load path changed:
+
+| after Open | before | after |
+|---|---|---|
+| Go heap, MiB | 17.38 / 17.38 / 17.38 | 17.38 / 17.38 / 17.38 |
+| anonymous RSS, MiB | 56.71 / 56.58 / 56.47 | 56.53 / 56.40 / 56.46 |
+| image on disk, MiB | 60.46 | 60.46 |
+
+### Reproducing
+
+```
+go test ./disk/ -run '^$' -bench GPIXSweepScale -benchtime 1s -count=3
+go test ./disk/ -run '^$' -bench GPIXBaseLookup -benchtime 1s -count=3
+GRAPHENE_RSS_NODES=50000 GRAPHENE_RSS_DIR=/some/fixture \
+  go test -tags=stress ./tests/ -run '^$' -bench 'RSS_PropertyBatch/^Loop$' -benchtime 1x
+GRAPHENE_RSS_NODES=50000 GRAPHENE_RSS_DIR=/some/fixture \
+  go test -tags=stress ./tests/ -run '^$' -bench 'RSS_PropertyBatch/^Batch$' -benchtime 1x
+GRAPHENE_RSS_NODES=50000 GRAPHENE_RSS_DIR=/some/fixture \
+  go test -tags=stress ./tests/ -run '^$' -bench 'RSS_PropertyBatchSorted/^Sorted$' -benchtime 1x
+```
+
+Build the fixture into `GRAPHENE_RSS_DIR` with one `RSS_Open` run first, and keep the
+join arms in separate processes; both are the method, not a convenience.
+
 ## The memory architecture review (2026-09-12)
 
 The Phase 2 measurement campaign. Interpretation, the models fitted to these numbers

@@ -985,6 +985,60 @@ hits, _ := g.NodesByProperty("sha256", []byte("deadbeef"))
 Property keys are at most 65535 bytes, which is what a property-index record can
 encode a key length into. A longer key is refused rather than truncated.
 
+### 9.1 Resolving many values at once
+
+```go
+func (g *Graph) NodesByPropertyBatch(key string, values [][]byte,
+	fn func(i int, ids []store.NodeID) bool) error
+func (g *Graph) EdgesByPropertyBatch(key string, values [][]byte,
+	fn func(i int, ids []store.EdgeID) bool) error
+func (g *Graph) NodesByPropertyBatchCtx(ctx context.Context, key string, values [][]byte,
+	fn func(i int, ids []store.NodeID) bool) error
+func (g *Graph) EdgesByPropertyBatchCtx(ctx context.Context, key string, values [][]byte,
+	fn func(i int, ids []store.EdgeID) bool) error
+```
+
+For joining an external table against one indexed key: a million digests resolved in
+one pass rather than a million calls. `i` is the position in the `values` slice you
+passed, so you can index your own rows by it.
+
+```go
+err := g.NodesByPropertyBatch("sha256", digests, func(i int, ids []store.NodeID) bool {
+	fmt.Printf("row %d matched %d nodes\n", i, len(ids))
+	return true // false stops the batch
+})
+```
+
+Four things to know, in descending order of how likely they are to surprise you.
+
+**The callbacks do not arrive in your input order.** They arrive in *value* order,
+because that is what makes the pass a sweep rather than a million searches. If you need
+input order, collect and sort afterwards, or pass ascending values.
+
+**Pass ascending values when you can.** Ascending input is the fast path and by a
+wide margin: measured at 50,000 values against an all-distinct key, ascending input
+resolves **2.7x faster** than `NodesByProperty` in a loop, and unsorted input **1.17x
+slower**, because the batch then has to order the values itself and read them back out
+of order. Ascending input also allocates nothing for the ordering. Sorting is by
+`bytes.Compare` on the value, which is the same order the index holds.
+
+**A value nothing holds gets no callback at all.** The batch reports matches, not rows.
+Count the callbacks if you need to know how many of your values missed.
+
+**`ids` is scratch.** It is valid until your callback returns and is overwritten by the
+next value. Copy it if you need to keep it. This is the whole reason the API is a
+callback: returning `[][]store.NodeID` for a million values would be a million slice
+headers and a million backing arrays.
+
+Repeated values are reported once per position, so duplicates in your input are not
+silently collapsed. An empty `values` is not an error. The batch never modifies the
+slice you passed.
+
+The `Ctx` forms cancel between values. Both forms work on every backend: where the
+store implements `store.PropertyBatcher` (the disk and memory stores both do) you get
+the sweep, and otherwise the helper falls back to `NodesByProperty` in a loop, so this
+never fails for a missing capability.
+
 ---
 
 ## 9a. Ordered (range) keys

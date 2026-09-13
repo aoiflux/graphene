@@ -149,6 +149,81 @@ func (g *Graph) CountEdgesByPropertyCtx(ctx context.Context, key string) (map[st
 	return a.CountEdgesByProperty(ctx, key)
 }
 
+// NodesByPropertyBatch resolves many exact values against one indexed key in a
+// single pass, calling fn with the live nodes for each value that has any.
+//
+// Use it to join a set of values you already have — content digests, external
+// ids — against the nodes indexed under them. It is the same answer as calling
+// NodesByProperty once per value, and on a store whose index is disk-resident it
+// is dramatically cheaper, because the values are resolved in sorted order and
+// the index is swept forward once instead of being searched per value.
+//
+// Three things to hold on to. fn is given the *index* of the value within values,
+// because results do not arrive in input order. A value with no live node
+// produces no call at all. And the id slice belongs to the store for the duration
+// of the call: copy anything you keep.
+//
+// Unlike the other optional extensions this one has no error for a backend that
+// lacks it, because it has an exact fallback: NodesByProperty in a loop, which is
+// what runs. So this is always callable and the only thing a backend without
+// PropertyBatcher costs is the speed.
+func (g *Graph) NodesByPropertyBatch(key string, values [][]byte,
+	fn func(i int, ids []store.NodeID) bool,
+) error {
+	return g.NodesByPropertyBatchCtx(context.Background(), key, values, fn)
+}
+
+// NodesByPropertyBatchCtx is NodesByPropertyBatch, cancellable.
+func (g *Graph) NodesByPropertyBatchCtx(ctx context.Context, key string, values [][]byte,
+	fn func(i int, ids []store.NodeID) bool,
+) error {
+	if b, ok := g.GraphStore.(store.PropertyBatcher); ok {
+		return b.NodesByPropertyBatch(ctx, key, values, fn)
+	}
+	for i, v := range values {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ids, err := g.NodesByProperty(key, v)
+		if err != nil {
+			return err
+		}
+		if len(ids) > 0 && !fn(i, ids) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// EdgesByPropertyBatch is NodesByPropertyBatch for edges.
+func (g *Graph) EdgesByPropertyBatch(key string, values [][]byte,
+	fn func(i int, ids []store.EdgeID) bool,
+) error {
+	return g.EdgesByPropertyBatchCtx(context.Background(), key, values, fn)
+}
+
+// EdgesByPropertyBatchCtx is EdgesByPropertyBatch, cancellable.
+func (g *Graph) EdgesByPropertyBatchCtx(ctx context.Context, key string, values [][]byte,
+	fn func(i int, ids []store.EdgeID) bool,
+) error {
+	if b, ok := g.GraphStore.(store.PropertyBatcher); ok {
+		return b.EdgesByPropertyBatch(ctx, key, values, fn)
+	}
+	for i, v := range values {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ids, err := g.EdgesByProperty(key, v)
+		if err != nil {
+			return err
+		}
+		if len(ids) > 0 && !fn(i, ids) {
+			return nil
+		}
+	}
+	return nil
+}
+
 // StorageStats reports the backend's storage state, and whether it could.
 //
 // Cheaper than Stats when only the operational figures are wanted: it does not

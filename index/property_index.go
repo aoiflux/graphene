@@ -1228,6 +1228,28 @@ func (p *postings[T]) lookup(key, value string) []T {
 	return out
 }
 
+// lookupRef returns the shard's own postings list for key=value, without copying
+// it.
+//
+// The caller must hold the shard's read lock and must not retain or mutate the
+// result: it is the index's slice, and the next write under this key may
+// reallocate or reorder it. lookup is the safe form and every public read path
+// uses it; this one exists for the batch path, which merges the two sides into
+// its own reused buffer under the lock and so would pay for a copy it
+// immediately discards — a million of them over a batch, which is the cost that
+// API exists to remove.
+//
+// The []byte parameter is the point. A string key would put a conversion on the
+// call, and the compiler elides one only where it is written as a map index
+// directly, which is here.
+func (p *postings[T]) lookupRef(key string, value []byte) []T {
+	bucket := p.byKey[key]
+	if bucket == nil {
+		return nil
+	}
+	return bucket[string(value)]
+}
+
 // cardinality returns the postings-list length without copying.
 func (p *postings[T]) cardinality(key, value string) int {
 	bucket := p.byKey[key]
