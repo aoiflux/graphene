@@ -2269,11 +2269,34 @@ than succeeding silently.
 ```go
 est, err := disk.PreflightOpen(dir)
 // est.ImageBytes          — the compacted image on disk
-// est.ImageHeapBytes      — modelled heap for the image alone (see below)
+// est.ImageHeapBytes      — modelled heap for the image, worst case over Options
+// est.WALHeapBytes        — modelled heap for replaying the log
 // est.WALReplayBytes      — the log's records region: what a replay reads
 // est.WALRecords          — what a replay would apply
 // est.WALRecordsBuffered  — what it would read, hold, and discard
+
+// And the figure for the Options you are actually going to open with:
+need := est.HeapBytesFor(disk.Options{})            // the defaults
+cost := est.HeapBytesFor(disk.Options{              // what asking for the old
+    ImageMode: disk.ImageHeap,                      // behaviour would cost
+    IndexMode: disk.IndexResident,
+})
 ```
+
+**`HeapBytesFor` is the one to gate on**, and the difference between it and
+`ImageHeapBytes` is not a rounding. The same 2,000-node store models at 736 KB under
+the defaults and 1.45 MB under `ImageHeap` with a resident index, because
+`ImageMode` decides whether the property blobs are copied into arenas or addressed in
+the file, `IndexMode` whether the index costs 108 bytes an entry or 88 bytes a
+declared key, and `Adjacency` whether two arrays per node slot exist at all.
+
+It resolves the three modes the way an `Open` resolves them rather than trusting
+their names, which matters in the cases where they differ: a live reader holds no
+lock, so under the default `ImageMode` it reads the image into the heap; a platform
+with no mapping primitive does the same; and a v8 image is read into a resident index
+whatever `IndexMode` asks, because GIDX is the only form it carries. Measured against
+the store it predicts, it runs 1.00× under the defaults and up to 1.38× on a v8
+image in the heap.
 
 `Open` is the one operation whose cost nobody can see in advance. An image is a
 file whose size is on disk; a log that was never compacted is a whole write
@@ -2312,15 +2335,20 @@ Four things to know before setting either.
   small to hold the budget's worth of records — every compacted store — and stops
   as soon as the count passes the budget. `MaxReplayBytes` costs nothing and
   bounds records implicitly, since no record is under nine bytes; prefer it.
-- **`ImageHeapBytes` models the image only, as retained heap.** WAL replay is not
-  in it, so it is *not* a whole-store figure, and on a never-compacted store it is
-  zero while the true cost is at its highest. Resident memory ran 1.19–1.54× live
-  heap on the one fixture measured, so read it as a floor.
-  It is also an upper bound in the other direction: records are stored in pages
-  of 4096 identifiers and the header cannot say how many pages an image touches,
-  so the model charges one page per record until the identifier space runs out
-  of pages to charge. A dense image costs far less than the figure; a maximally
-  sparse one costs exactly it.
+- **`ImageHeapBytes` models the image only, and for the Options that hold the most
+  of it** — a heap image, a resident index, eager adjacency. It is the figure to use
+  before you have chosen anything; once you have, use `HeapBytesFor`. WAL replay is
+  not in it either: that is `WALHeapBytes`, and on a never-compacted store it is the
+  entire cost. Resident memory ran 1.19–1.54× live heap on the one fixture measured,
+  so read either as a floor on RSS rather than a prediction of it.
+
+  Where it is loose, and why it cannot be tighter: records are stored in pages of
+  4,096 identifiers, and the header cannot say which pages an image actually
+  materialises — that is only knowable by walking every record, which is the parse
+  this surface exists to avoid. So the model charges every page in the band between
+  the lowest identifier present, which is one addressed read, and the high-water
+  mark. A store whose live records are spread thinly over that band costs less than
+  the figure; one that fills it costs exactly the figure.
 
 A refused `Open` is not a no-op on disk: the directory is created if missing, a
 stranded rebuilt log is adopted, and an empty log is given its container header.

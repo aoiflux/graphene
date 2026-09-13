@@ -302,7 +302,19 @@ func (s *Store) openImage(path string) (*imageSource, error) {
 
 // imageMappingAllowed reports why this store will not map, or nil.
 func (s *Store) imageMappingAllowed() error {
-	switch s.imageMode {
+	return imageMappingAllowedFor(s.imageMode, s.live)
+}
+
+// imageMappingAllowedFor is the rule itself, as a function of the mode and
+// whether the opener is a live reader.
+//
+// Separated from the method so that PreflightOpen's OpenEstimate.HeapBytesFor can
+// answer "what would this cost under those Options" by asking the rule rather
+// than by restating it. A second copy of this switch is a second thing to keep in
+// step, and the one that matters most is the case where the answer is not the
+// mode the caller named.
+func imageMappingAllowedFor(mode ImageMode, live bool) error {
+	switch mode {
 	case ImageHeap:
 		return errors.New("Options.ImageMode is ImageHeap")
 	case ImageMappedUnlocked:
@@ -317,7 +329,7 @@ func (s *Store) imageMappingAllowed() error {
 	// The default mode maps only where something excludes a concurrent writer
 	// from the directory. A live reader holds no lock by construction, and on a
 	// platform with no locking primitive even an exclusive open holds nothing.
-	if s.live || !lockingEnforced {
+	if live || !lockingEnforced {
 		return errImageMappingNotAllowed
 	}
 	return nil

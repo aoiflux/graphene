@@ -387,13 +387,20 @@ func TestPreflightOpen_ModelFollowsTheIdentifierSpaceNotTheRecordCount(t *testin
 	// burned identifiers cost thirty pages of slots — about 8.8 B each — where
 	// one slot per identifier would have cost 72 B each. That difference is
 	// R10(b) stated as a budget.
+	//
+	// denseSlot is what the array-per-identifier layout charged for one node
+	// identifier: the record, plus the two adjacency offsets indexed by slot.
+	// Spelled out here rather than read from a constant, because the production
+	// model deliberately no longer has one — the two halves are gated separately,
+	// since AdjacencyLazy removes the second and not the first.
+	const denseSlot = sizeofNodeRecord + 2*sizeofOffset
 	perID := float64(after.ImageHeapBytes-base) / float64(burned)
-	wantPerID := float64(est.ImageNodeCount*csrPageSlots*estNodeSlotBytes) / float64(burned)
+	wantPerID := float64(est.ImageNodeCount*csrPageSlots*denseSlot) / float64(burned)
 	if perID < wantPerID*0.9 || perID > wantPerID*1.1 {
 		t.Errorf("model charges %.1f B per burned identifier, expected about %.1f",
 			perID, wantPerID)
 	}
-	if dense := float64(burned * estNodeSlotBytes); float64(after.ImageHeapBytes) > dense/4 {
+	if dense := float64(burned * denseSlot); float64(after.ImageHeapBytes) > dense/4 {
 		t.Errorf("model charges %d B, which is not far enough below the %.0f B a slot "+
 			"per identifier would have cost", after.ImageHeapBytes, dense)
 	}
@@ -815,4 +822,483 @@ func FuzzPreflightWalk(f *testing.F) {
 			}
 		}
 	})
+}
+
+// --- the Options-aware model (R5) ---
+
+// modelFixture leaves a compacted image. burn>0 first writes and deletes that
+// many nodes, so the surviving records sit in a sparse identifier space -- the
+// shape the paged-slot model exists to account for and the shape a rebuild
+// workload produces.
+func modelFixture(t *testing.T, w Options, nodes, burn int) string {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := OpenWithOptions(dir, w)
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	for i := 0; i < burn; i++ {
+		id := addNodeD(t, s, store.NodeTypeMicroArtefact)
+		if err := s.DeleteNode(id); err != nil {
+			t.Fatalf("DeleteNode: %v", err)
+		}
+	}
+	var ids []store.NodeID
+	for i := 0; i < nodes; i++ {
+		id := addNodeD(t, s, store.NodeTypeEvidenceFile)
+		if err := s.IndexNodeProperty(id, "bucket", []byte(fmt.Sprintf("b%06d", i))); err != nil {
+			t.Fatalf("IndexNodeProperty: %v", err)
+		}
+		if err := s.IndexNodeProperty(id, "shard", []byte(fmt.Sprintf("s%d", i%13))); err != nil {
+			t.Fatalf("IndexNodeProperty: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	for i := 1; i < len(ids); i++ {
+		addEdgeD(t, s, ids[i-1], ids[i], store.EdgeTypeContains)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return dir
+}
+
+// The load-bearing test of the model: what a preflight says an Open will hold,
+// against what the opened store reports holding, under the Options that decide it.
+//
+// It is a relation between two models and not a constant, for the same reason
+// TestPreflightOpen_CountsWhatReplayWouldApply drives the real replay: a pre-open
+// estimate that agrees with nothing is a number, and the shape of its error is
+// invisible until the one configuration where the two disagree.
+//
+// Both bounds are asserted. At or above the actual, because estimate.go's header
+// makes that the whole posture -- a figure an operation is refused on must decline
+// work that would have fit rather than admit work that will not -- and because
+// this model was under by up to a factor of two before R5, on the default Options.
+// And within a band above it, because a model that returned the largest int64
+// would satisfy the first assertion and be useless.
+func TestPreflight_ModelTracksTheOpenStore(t *testing.T) {
+	shapes := []struct {
+		name        string
+		nodes, burn int
+		writer      Options
+		// band is how far above the actual the model may sit. It is per shape
+		// rather than global because what makes it loose is the format and the
+		// mode, and both are named here rather than averaged away.
+		band float64
+	}{
+		{"v9 dense", 600, 0, Options{}, 1.25},
+		{"v9 sparse", 600, 9000, Options{}, 1.25},
+		// v8 is looser and cannot be otherwise: GIDX states an exact node count
+		// and bounds the pair by the section's length, so the entry term carries
+		// that bound rather than a count.
+		{"v8 dense", 600, 0, Options{IndexMode: IndexResident}, 1.75},
+		{"v8 sparse", 600, 9000, Options{IndexMode: IndexResident}, 1.75},
+	}
+	readers := []struct {
+		name string
+		opts Options
+	}{
+		{"defaults", Options{}},
+		{"resident index", Options{IndexMode: IndexResident}},
+		{"heap image", Options{ImageMode: ImageHeap}},
+		{"lazy adjacency", Options{Adjacency: AdjacencyLazy}},
+		{"heap image, resident index", Options{ImageMode: ImageHeap, IndexMode: IndexResident}},
+	}
+
+	for _, sh := range shapes {
+		t.Run(sh.name, func(t *testing.T) {
+			dir := modelFixture(t, sh.writer, sh.nodes, sh.burn)
+			est, err := PreflightOpen(dir)
+			if err != nil {
+				t.Fatalf("PreflightOpen: %v", err)
+			}
+
+			for _, r := range readers {
+				t.Run(r.name, func(t *testing.T) {
+					s, err := OpenWithOptions(dir, r.opts)
+					if err != nil {
+						t.Fatalf("OpenWithOptions: %v", err)
+					}
+					defer s.Close()
+
+					actual := s.EstimateResident().Total
+					model := est.HeapBytesFor(r.opts)
+					st := s.StorageStats()
+					if actual <= 0 {
+						t.Fatalf("the opened store reports %d bytes held, so this "+
+							"test compares nothing", actual)
+					}
+					if model < actual {
+						t.Errorf("model says %d, the store holds %d (%.3fx): a budget "+
+							"fed this admits a store that will not fit. Holding "+
+							"%s/%s/%s.", model, actual, float64(model)/float64(actual),
+							st.ImageMode, st.IndexMode, st.Adjacency)
+					}
+					if ratio := float64(model) / float64(actual); ratio > sh.band {
+						t.Errorf("model says %d against %d held (%.2fx, band %.2fx): "+
+							"too loose to refuse anything with. Holding %s/%s/%s.",
+							model, actual, ratio, sh.band,
+							st.ImageMode, st.IndexMode, st.Adjacency)
+					}
+				})
+			}
+		})
+	}
+}
+
+// The model has to distinguish the configurations, not merely bound them. A
+// HeapBytesFor that ignored Options would pass the bands above on any shape whose
+// worst case it returned, so this asserts the orderings the modes imply.
+func TestPreflight_ModelSeparatesTheModes(t *testing.T) {
+	dir := modelFixture(t, Options{}, 600, 0)
+	est, err := PreflightOpen(dir)
+	if err != nil {
+		t.Fatalf("PreflightOpen: %v", err)
+	}
+
+	defaults := est.HeapBytesFor(Options{})
+	lazy := est.HeapBytesFor(Options{Adjacency: AdjacencyLazy})
+	resident := est.HeapBytesFor(Options{IndexMode: IndexResident})
+	heap := est.HeapBytesFor(Options{ImageMode: ImageHeap})
+
+	if lazy >= defaults {
+		t.Errorf("AdjacencyLazy modelled at %d against AdjacencyEager's %d: the "+
+			"adjacency term is not gated, which is what folding it into a per-slot "+
+			"constant prevented", lazy, defaults)
+	}
+	if resident <= defaults {
+		t.Errorf("IndexResident modelled at %d against IndexMapped's %d: the index "+
+			"term is not gated, and it is the largest term on an indexed store",
+			resident, defaults)
+	}
+	if heap <= defaults {
+		t.Errorf("ImageHeap modelled at %d against ImageMapped's %d: the payload "+
+			"term is not gated", heap, defaults)
+	}
+	// A live reader holds no lock, so under the default ImageMode it reads the
+	// image into the heap -- and an index cannot be read in place out of a heap
+	// image. The model must follow the rule rather than the option's name.
+	if live := est.HeapBytesFor(Options{LiveReader: true}); live <= defaults {
+		t.Errorf("a live reader modelled at %d, the same store at %d: the default "+
+			"ImageMode maps only where something excludes a concurrent writer, and "+
+			"a live reader excludes nothing", live, defaults)
+	}
+}
+
+// A v9 image carries GPIX and GPIR and no GIDX. The preflight matched "GIDX" and
+// nothing else, so on every store the current defaults produce it reported no
+// property entries at all and the resident model omitted the term that dominates
+// an indexed store.
+func TestPreflight_ReadsTheIndexOfAV9Image(t *testing.T) {
+	const nodes = 200
+	dir := modelFixture(t, Options{}, nodes, 0)
+
+	est, err := PreflightOpen(dir)
+	if err != nil {
+		t.Fatalf("PreflightOpen: %v", err)
+	}
+	if est.ImageVersion != csrVersionMappedIndex {
+		t.Fatalf("fixture wrote v%d, so this test is not about a v9 image",
+			est.ImageVersion)
+	}
+	if !est.ImageIndexMapped {
+		t.Error("a v9 image was not reported as carrying a mapped index; " +
+			"HeapBytesFor then charges it as resident, which is the wrong term " +
+			"by three orders of magnitude")
+	}
+	// Two keys per node, and GPIR states both counts exactly rather than bounding
+	// the pair the way GIDX's length does.
+	if want := int64(nodes * 2); est.ImagePropertyNodeEntries != want {
+		t.Errorf("ImagePropertyNodeEntries = %d, want %d", est.ImagePropertyNodeEntries, want)
+	}
+	if want := int64(nodes * 2); est.ImagePropertyEntriesMax != want {
+		t.Errorf("ImagePropertyEntriesMax = %d, want %d exactly: GPIR carries both "+
+			"counts, so this is a sum and not a bound", est.ImagePropertyEntriesMax, want)
+	}
+	if est.ImagePropertyKeys != 2 {
+		t.Errorf("ImagePropertyKeys = %d, want 2: it is the key count and not the "+
+			"entry count that a mapped index's resident cost follows",
+			est.ImagePropertyKeys)
+	}
+}
+
+// A page is materialised whole, so the identifier space does not bound the slots.
+// pagedSlots capped its answer at seqHW+1 until R5, which on a store whose
+// identifiers fit inside one page removed nine tenths of the dominant term.
+func TestPreflight_SlotsAreWholePages(t *testing.T) {
+	// Far fewer records than a page holds, and a high-water mark well inside it.
+	if got := pagedSlots(600, 700); got != csrPageSlots {
+		t.Errorf("pagedSlots(600 records, hw 700) = %d, want %d: one page is "+
+			"materialised whole however few identifiers have been issued",
+			got, csrPageSlots)
+	}
+	// Two pages spanned, and enough records to occupy both.
+	if got := pagedSlots(9000, 5000); got != 2*csrPageSlots {
+		t.Errorf("pagedSlots(9000 records, hw 5000) = %d, want %d", got, 2*csrPageSlots)
+	}
+	// Fewer records than pages spanned: the record count is the bound, because a
+	// page needs a record in it to exist.
+	if got := pagedSlots(3, 100_000); got != 3*csrPageSlots {
+		t.Errorf("pagedSlots(3 records, hw 100000) = %d, want %d", got, 3*csrPageSlots)
+	}
+}
+
+// No page below the lowest identifier present holds a record, and the record
+// stream is ascending, so one addressed read bounds the band from below. This is
+// the whole of the rebuild workload's sparsity: delete the low identifiers, write
+// new ones at the top, and a bound counting from zero charges for every page in
+// between.
+func TestPreflight_LivePagesStartAtTheLowestIdentifier(t *testing.T) {
+	const nodes = 200
+	burned := modelFixture(t, Options{}, nodes, 9000)
+
+	est, err := PreflightOpen(burned)
+	if err != nil {
+		t.Fatalf("PreflightOpen: %v", err)
+	}
+	if !est.ImageFirstNodeIDKnown {
+		t.Fatal("the lowest identifier was not readable from a v9 image, so the " +
+			"band is bounded from zero and this test proves nothing")
+	}
+	if est.ImageFirstNodeID <= csrPageSlots {
+		t.Fatalf("lowest identifier is %d, inside the first page: the fixture did "+
+			"not burn enough to put the records above one", est.ImageFirstNodeID)
+	}
+
+	// The records occupy at most ceil(nodes/4096)+1 pages wherever they sit, so
+	// the slot term must reflect that and not the pages below them.
+	pages := est.nodePages()
+	if want := int64(2); pages > want {
+		t.Errorf("model charges %d node pages for %d records above identifier %d; "+
+			"at most %d hold anything", pages, nodes, est.ImageFirstNodeID, want)
+	}
+
+	// And the model as a whole must be close to the store, which is the check that
+	// would fail if the lower bound were applied to a term it does not govern.
+	s, err := Open(burned)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	actual := s.EstimateResident().Total
+	model := est.HeapBytesFor(Options{})
+	if model < actual {
+		t.Errorf("model %d under the %d held: the lower bound was applied to a term "+
+			"the lowest identifier does not govern -- the page directories are "+
+			"indexed by identifier space, and a dead page still costs its entry",
+			model, actual)
+	}
+	if ratio := float64(model) / float64(actual); ratio > 1.25 {
+		t.Errorf("model %d against %d held (%.2fx): the lower bound is not being "+
+			"applied, so every page up to the high-water mark is charged for",
+			model, actual, ratio)
+	}
+}
+
+// A store that has never been compacted has no image, so every image field is
+// zero and the log is the entire cost. An estimate that stopped at the image
+// reported nothing for it -- and it is exactly the shape B6's notes name as the
+// way to replay into an OOM.
+func TestPreflight_NeverCompactedStoreIsNotFree(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 200; i++ {
+		id := addNodeD(t, s, store.NodeTypeEvidenceFile)
+		if err := s.IndexNodeProperty(id, "bucket", []byte(fmt.Sprintf("b%d", i))); err != nil {
+			t.Fatalf("IndexNodeProperty: %v", err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	est, err := PreflightOpen(dir)
+	if err != nil {
+		t.Fatalf("PreflightOpen: %v", err)
+	}
+	if est.ImageBytes != 0 {
+		t.Fatalf("the fixture compacted, so this is not the never-compacted case")
+	}
+	if est.ImageHeapBytes != 0 {
+		t.Errorf("ImageHeapBytes = %d with no image", est.ImageHeapBytes)
+	}
+	if est.WALHeapBytes <= 0 {
+		t.Fatalf("WALHeapBytes = %d for a log holding %d records: the only heap "+
+			"figure covers the image, so the whole cost of a never-compacted store "+
+			"reads as nothing", est.WALHeapBytes, est.WALRecords)
+	}
+
+	// And it must bound what the store actually holds once the log is replayed.
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	e := s2.EstimateResident()
+	if model := est.HeapBytesFor(Options{}); model < e.Total {
+		t.Errorf("model %d under the %d held after replaying the log (delta %d, "+
+			"index %d)", model, e.Total, e.Delta, e.Index)
+	}
+}
+
+// The log half survives a compaction: work written after one is in the log and
+// lands in the delta, and the model has to cover both halves at once rather than
+// whichever is larger.
+func TestPreflight_CoversBothHalvesAtOnce(t *testing.T) {
+	dir := modelFixture(t, Options{}, 400, 0)
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 300; i++ {
+		id := addNodeD(t, s, store.NodeTypeTag)
+		if err := s.IndexNodeProperty(id, "late", []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatalf("IndexNodeProperty: %v", err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	est, err := PreflightOpen(dir)
+	if err != nil {
+		t.Fatalf("PreflightOpen: %v", err)
+	}
+	if est.ImageBytes == 0 || est.WALReplayBytes == 0 {
+		t.Fatalf("fixture has image %d B and log %d B: both halves must be "+
+			"populated for this to test anything", est.ImageBytes, est.WALReplayBytes)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	e := s2.EstimateResident()
+	model := est.HeapBytesFor(Options{})
+	if model < e.Total {
+		t.Errorf("model %d under the %d held: image %d + delta %d + index %d",
+			model, e.Total, e.RecordArrays, e.Delta, e.Index)
+	}
+}
+
+// The lowest-identifier read only ever shrinks the estimate, so a file whose
+// first record claims an identifier above its own high-water mark must not be
+// believed. Two fields of the same header disagreeing is the shape that turns a
+// reduction into an under-report.
+func TestPreflight_FirstIdentifierAboveTheHighWaterMarkIsRefused(t *testing.T) {
+	dir := modelFixture(t, Options{}, 200, 0)
+	est, err := PreflightOpen(dir)
+	if err != nil {
+		t.Fatalf("PreflightOpen: %v", err)
+	}
+	if !est.ImageFirstNodeIDKnown {
+		t.Fatal("the lowest identifier was not readable, so there is nothing to refuse")
+	}
+	base := est.HeapBytesFor(Options{})
+
+	// Stamp a first identifier far above the high-water mark, leaving the header's
+	// own counts alone. The model reads the record stream's first eight bytes and
+	// never parses a record, so this is the whole of the change it can see.
+	p := filepath.Join(dir, csrFileName)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint64(data[csrV8HeaderSize:], est.ImageNodeSeqHW+1_000_000)
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := PreflightOpen(dir)
+	if err != nil {
+		t.Fatalf("PreflightOpen: %v", err)
+	}
+	if after.ImageFirstNodeIDKnown {
+		t.Errorf("a first identifier of %d was accepted against a high-water mark "+
+			"of %d", after.ImageFirstNodeID, after.ImageNodeSeqHW)
+	}
+	if got := after.HeapBytesFor(Options{}); got < base {
+		t.Errorf("model fell from %d to %d on a file that disagrees with itself: "+
+			"a bound read out of one field was applied against another that "+
+			"contradicts it", base, got)
+	}
+}
+
+// Under a mapped image the property blobs are addressed in the file, so they cost
+// no heap: that is what R2 bought and what the arena term must be gated on. Two
+// stores holding the same records with very different blobs must model alike when
+// mapped and differ by the blobs when read into the heap.
+//
+// Asserted this way round because the obvious comparison does not test it. A heap
+// image also forces a resident index, so "heap models above mapped" holds whether
+// or not the arena term is gated, and a mutation charging every image for its
+// arenas survived exactly that check.
+func TestPreflight_MappedModelDoesNotFollowTheBlobBytes(t *testing.T) {
+	const nodes = 300
+
+	build := func(blob int) (string, OpenEstimate) {
+		t.Helper()
+		dir := t.TempDir()
+		s, err := Open(dir)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		payload := bytes.Repeat([]byte("x"), blob)
+		for i := 0; i < nodes; i++ {
+			if _, err := s.AddNode(&store.Node{
+				Labels:     []store.NodeType{store.NodeTypeEvidenceFile},
+				Properties: payload,
+			}); err != nil {
+				t.Fatalf("AddNode: %v", err)
+			}
+		}
+		if err := s.Compact(); err != nil {
+			t.Fatalf("Compact: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		est, err := PreflightOpen(dir)
+		if err != nil {
+			t.Fatalf("PreflightOpen: %v", err)
+		}
+		return dir, est
+	}
+
+	const small, large = 16, 4096
+	_, thin := build(small)
+	_, fat := build(large)
+
+	grew := fat.ImageBytes - thin.ImageBytes
+	if want := int64(nodes * (large - small) / 2); grew < want {
+		t.Fatalf("the two fixtures' images differ by %d B, which is not enough "+
+			"blob to tell the two modes apart", grew)
+	}
+
+	// Mapped: the difference must be a rounding, not the blobs.
+	mappedThin := thin.HeapBytesFor(Options{})
+	mappedFat := fat.HeapBytesFor(Options{})
+	if d := mappedFat - mappedThin; d > grew/4 {
+		t.Errorf("mapped model rose by %d B when the image grew by %d: the arena "+
+			"term is charged to a mapped image, which is the whole of what "+
+			"ImageMapped removes", d, grew)
+	}
+
+	// Heap: the difference must be the blobs, or the term is not being charged at
+	// all and the mode has stopped meaning anything.
+	heapThin := thin.HeapBytesFor(Options{ImageMode: ImageHeap})
+	heapFat := fat.HeapBytesFor(Options{ImageMode: ImageHeap})
+	if d := heapFat - heapThin; d < grew/2 {
+		t.Errorf("heap model rose by only %d B when the image grew by %d: the "+
+			"arena term is not charged to a heap image either", d, grew)
+	}
 }

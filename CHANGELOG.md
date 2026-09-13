@@ -5,6 +5,63 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### The pre-open estimate now describes the store you are about to open
+
+`PreflightOpen` answers "what will this cost" from a header, in memory bounded by a
+constant. It was answering it for a configuration nobody runs, and by a margin that
+went both ways — measured against the opened store on a mode matrix, the model ran
+between 0.51x and 1.72x of what the store actually held. `estimate.go`'s own header
+states the posture it was breaking: a figure an operation is refused on must be wrong
+in the direction that declines work that would have fit, never in the direction that
+admits work that will not.
+
+- **`OpenEstimate.HeapBytesFor(opts)`** is the figure that depends on Options, and
+  the reason it has to exist is that the same store differs by more than a factor of
+  two across them. `ImageMode` decides whether the property blobs are copied into
+  arenas or addressed in the file; `IndexMode` decides whether the index costs 108
+  bytes an entry or 88 bytes a key; `Adjacency` decides whether two arrays per node
+  slot exist at all. The three modes are resolved the way an `Open` resolves them,
+  which matters most where the answer is not the mode that was asked for — a live
+  reader holds no lock and therefore reads a heap image under the default
+  `ImageMode`, and a v8 image is read into a resident index whatever `IndexMode`
+  says, because GIDX is the only form it has.
+
+  Measured against the store it predicts: 1.00x under the defaults on both a dense
+  and a sparse identifier space, rising to 1.38x on a v8 image in the heap, where the
+  looseness is the format's — GIDX bounds its entry count by the section's length
+  where GPIR states it.
+
+- **A v9 image's property index is read at last.** The preflight matched `GIDX` and
+  nothing else, so on every store the current defaults produce it reported *zero*
+  property entries and omitted the term that dominates an indexed store. v9 carries
+  GPIX and GPIR and no GIDX, deliberately. The new fields — `ImagePropertyEdgeEntries`,
+  `ImagePropertyKeys`, `ImageIndexMapped` — come out of those two headers, and the
+  counts are better than v8's: GPIR states both exactly where GIDX leaves the edge
+  half past every variable-length node entry.
+
+- **`WALHeapBytes`** is the log half, and it closes the case the whole surface exists
+  for. A store that has never been compacted has no image, so every image field was
+  zero and the only heap figure on the struct read as nothing — for the one store
+  shape that replays its entire history into memory on every open.
+
+- **`ImageHeapBytes` will report a larger number than it did**, for two reasons that
+  were both under-reports. Record slots were capped at the identifier space, which a
+  paged layout does not obey: a page is materialised whole, so an image whose
+  identifiers stop at 2,000 holds 4,096 slots and the model said 2,001. And the
+  inverse page table, the live-before prefix and the by-label postings were not
+  counted at all. Its documentation now says what it is — the worst case over
+  Options, not the default one.
+
+  It is also *tighter* on the workload this program was commissioned for. The record
+  stream is ascending by identifier, so one addressed read of the first record bounds
+  the materialised pages from below. A rebuild cycle deletes the low identifiers and
+  writes new ones at the top; a bound counting from zero charges for every page in
+  between.
+
+- **`estPropertyEntryBytes` raised from 107 to 108**, because the index's own
+  `ResidentBytes` reports 107.128 bytes per entry on an all-distinct key and a
+  constant meant to bound it was below it.
+
 ### Compacting on what the delta holds, not on what it counts
 
 `StorageStats.DeltaBytes` arrived with nothing able to act on it. Its own

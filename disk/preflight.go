@@ -37,49 +37,96 @@ import (
 	"path/filepath"
 )
 
-// Bytes per entity, for the resident model in imageHeapBytes.
+// Bytes per entity, for the models below.
 //
-// These are measured, not derived, and the measurements are in
-// docs/benchmarks.md under "Program baselines". Each is named here with what it
-// covers so a later change to the layout has somewhere obvious to disagree.
+// The structural sizes are not here. They are estimate.go's — sizeofNodeRecord,
+// sizeofRawEdge, sizeofOffset and the rest — and quoting them rather than
+// restating them is the point: that file's constants are audited against
+// unsafe.Sizeof by estimate_test.go, so a struct that grows a field fails a test
+// instead of quietly under-reporting in one of two models that were supposed to
+// agree. This file's own copies said 72 bytes for a node slot, which was 56 B of
+// record with the two adjacency offsets folded in, and a folded term cannot be
+// removed when Options say adjacency is deferred.
+//
+// What is here is what no struct layout gives: bytes per entry, per label and per
+// key, measured. The measurements are in docs/benchmarks.md under "Program
+// baselines" and in docs/MEMORY_MODEL.md.
 const (
-	// estNodeSlotBytes is what one node slot costs whether or not a record
-	// occupies it: 56 B of nodeRecord plus one uint64 in each of outOffset and
-	// inOffset, both of which are indexed by slot. Measured at 72 B per burned
-	// identifier, against 79 B of resident memory once the runtime's own
-	// overhead is counted. Since the records were paged the count of slots is
-	// no longer the identifier space but the pages it touches, which is what
-	// imageHeapBytes models; the per-slot figure is unchanged.
-	estNodeSlotBytes = 72
-
-	// estEdgeSlotBytes is one rawEdge, which is 80 B by unsafe.Sizeof and was
-	// measured at 80 B per burned edge identifier. Note that no fixture in this
-	// repository exercises edges at scale: the number follows from the struct
-	// layout and from the delete-cascade arithmetic, not from an edge-heavy
-	// benchmark.
-	estEdgeSlotBytes = 80
-
-	// estLiveEdgeBytes is the adjacency cost of an edge that is actually
-	// present: one EdgeID in outEdges and one in inEdges. Sized by the live
-	// count, not by the identifier space, which is why it is a separate term.
+	// estPropertyEntryBytes is one property-index entry held resident. The tree
+	// reports this figure three times from three dates — 107 B in
+	// docs/benchmarks.md, 103.9 B in TECHNICAL_DETAILS §14.5, and 93.4 B once the
+	// arity split and key interning are counted — and value interning then moves
+	// it by between −34% and 0% depending on a value cardinality no header can
+	// see. The largest of them is used deliberately: this term dominates an
+	// indexed store, and the direction to be wrong in is up.
 	//
-	// It assumes AdjacencyEager, and PreflightOpen has no way not to: it reads a
-	// directory and takes no Options, so it cannot know that the store about to
-	// be opened will defer the build. Under AdjacencyLazy the estimate is high by
-	// this term and by the two per-slot uint64s inside estNodeSlotBytes. High is
-	// the direction a budget refusal should be wrong in — it declines a store
-	// that would have fit rather than admitting one that will not — so this is
-	// stated rather than corrected. An Options-aware estimate is N2's.
-	estLiveEdgeBytes = 16
+	// Raised from 107 to 108 by measurement against the authority. The resident
+	// index's own ResidentBytes reports 428,512 B for 4,000 entries on an
+	// all-distinct key -- 107.128 B each -- so 107 was below the figure it was
+	// meant to bound, by 512 B on that fixture, and "the largest of them" was not
+	// the largest. All-distinct is the right end to bound from: value interning
+	// only ever reduces the per-entry cost.
+	estPropertyEntryBytes = 108
 
-	// estPropertyEntryBytes is one property-index entry. The tree reports this
-	// figure three times from three dates — 107 B in docs/benchmarks.md, 103.9 B
-	// in TECHNICAL_DETAILS §14.5, and 93.4 B once the arity split and key
-	// interning are counted — and value interning then moves it by between −34%
-	// and 0% depending on a value cardinality no header can see. The largest of
-	// them is used deliberately: this term dominates an indexed store, and the
-	// direction to be wrong in is up.
-	estPropertyEntryBytes = 107
+	// estMappedKeyBytes is one declared key of an index read in place, and is
+	// gpixBase.ResidentBytes' own per-key figure: a name header, Kind and KeyID
+	// with their padding, Distinct, Entries, and the two slice headers. There is
+	// deliberately no term here that mentions entries, because that base holds
+	// none — a 28M-entry key and an empty one cost the same.
+	//
+	// The key names themselves are not counted. Reading them means reading the
+	// key directory, which is O(keys) of addressed reads this surface could
+	// afford but which buys tens of bytes on a term measured in hundreds. It is
+	// named as an under-report rather than left implicit.
+	estMappedKeyBytes = 16 + 8 + 8 + 8 + 24 + 24
+
+	// estMappedIndexFixedBytes is what a mapped base costs before any key: the
+	// two slice headers over the reverse section.
+	estMappedIndexFixedBytes = 48
+
+	// estMappedKeyNameBytes is the allowance for one key's name, which the base
+	// holds beside its directory entry. An allowance rather than a measurement:
+	// reading the names means reading the key directory, and 64 bytes covers any
+	// key name anyone writes. A longer one under-reports by the excess, on a term
+	// whose whole magnitude was 235 B for two keys.
+	estMappedKeyNameBytes = 64
+
+	// estLabelPostingBytes is one entry of one by-label id list: an identifier in
+	// nodesByLabel or edgesByLabel.
+	//
+	// Charged once per record, which assumes one label per entity. A record
+	// carrying three labels is in three postings, and no header states how many
+	// labels a record carries — so this is the second place the estimate can
+	// under-report, after an image below v5 having no identifier high-water mark
+	// to read. It is a small term (16 B per entity against 136 B of record slot)
+	// and it is named rather than buried.
+	estLabelPostingBytes = sizeofNodeID
+
+	// estReplayRecordBytes is what one replayed record costs beyond its own
+	// payload bytes.
+	//
+	// A record becomes one of two things and this is the larger: a property index
+	// entry, at estPropertyEntryBytes, or a delta version, whose structure is a
+	// map slot, a type posting and — for an edge — two adjacency list entries,
+	// about 45 B between them. Telling which would mean decoding payloads, which
+	// is the work this surface exists not to do, so every record is charged the
+	// larger and a log of pure node writes is over-charged by the difference.
+	//
+	// Over-charged is the direction to be wrong in, and the term it sits beside
+	// dominates it in any case: a record with a blob costs hundreds of payload
+	// bytes and tens of structural ones.
+	estReplayRecordBytes = estPropertyEntryBytes
+
+	// estLabelSequenceBytes is a record's label sequence in the heap arena the
+	// parse copies it into: one uint16 per label, and so again once per record
+	// under the one-label assumption.
+	//
+	// This is the whole payload term of a mapped image. Property blobs stay in
+	// the file under ImageMapped; label sequences do not, because a label is a
+	// uint16 at an odd offset inside the record and cannot be aliased out of a
+	// mapping without a cast. Confirmed exactly: 7,998 B for 2,000 nodes and
+	// 1,999 edges.
+	estLabelSequenceBytes = 2
 )
 
 // preflightChunk is the streaming buffer walkRecords pushes record payloads
@@ -164,6 +211,25 @@ type OpenEstimate struct {
 	ImageNodeSeqHW uint64
 	ImageEdgeSeqHW uint64
 
+	// ImageFirstNodeID is the lowest node identifier the image holds a record
+	// for, and ImageFirstNodeIDKnown says whether it was readable.
+	//
+	// The record stream is ascending by identifier, so this is one addressed read
+	// at the end of the header. It matters because it is the only figure available
+	// in constant time that bounds the materialised pages from *below*: no page
+	// under it holds a record. On a rebuild workload -- delete the low
+	// identifiers, write new ones at the top -- that is the difference between
+	// charging for every page up to the high-water mark and charging for the band
+	// the records occupy. Measured on a fixture that burns 12,000 identifiers
+	// before writing 500: 4 pages charged against 2 materialised, against 2 and 2
+	// once this is read.
+	//
+	// Known only for v8 and above. Below that the record stream starts at a
+	// different offset per version, and reading it at the wrong one would present
+	// a record's bytes as an identifier.
+	ImageFirstNodeID      uint64
+	ImageFirstNodeIDKnown bool
+
 	// ImageSeqHWKnown reports whether the two fields above were read from the
 	// file or are simply absent from its format. Images below v5 carry no
 	// high-water marks at all, and for those the resident model falls back to
@@ -180,24 +246,68 @@ type OpenEstimate struct {
 	// ImagePropertyEntriesMax.
 	ImagePropertyNodeEntries int64
 
-	// ImagePropertyEntriesMax bounds node and edge entries together, from the
-	// GIDX section's length against the smallest an entry can be. It is what the
-	// resident model uses, because the property index is the dominant term on an
-	// indexed store and the bound is the only figure available in constant time.
+	// ImagePropertyEdgeEntries is the edge half, and is only ever populated for a
+	// v9 image. GPIR's header carries both counts; GIDX puts the edge count past
+	// every variable-length node entry, which is the walk this surface does not
+	// spend. Zero against a non-zero ImagePropertyNodeEntries therefore means
+	// "not reachable in constant time from this format", not "no edge entries" --
+	// ImageIndexMapped is how a caller tells which.
+	ImagePropertyEdgeEntries int64
+
+	// ImagePropertyEntriesMax bounds node and edge entries together. It is what
+	// the resident model uses, because the property index is the dominant term on
+	// an indexed store.
+	//
+	// For a v9 image it is the sum of two exact counts rather than a bound,
+	// because GPIR states both. For v8 it is the GIDX section's length against
+	// the smallest an entry can be, which is the only figure available in
+	// constant time there.
 	ImagePropertyEntriesMax int64
 
-	// ImageHeapBytes models the Go heap the image alone retains once it is
-	// loaded and the parse has settled.
+	// ImagePropertyKeys is how many distinct keys the image's index declares,
+	// node and edge keys together, from GPIX's header. Zero for a v8 image, whose
+	// GIDX section carries no key count.
 	//
-	// It is a model, not a measurement, and three things about it must be read
-	// with it. It covers the image only: replaying the log is not in it, and on a
-	// store that has never been compacted the log is the entire cost. It names
-	// retained heap, not resident memory: on the one fixture that has been
-	// measured, resident ran between 1.19x and 1.54x the live heap across three
-	// runs of an identical store, so this is a floor on RSS rather than a
-	// prediction of it. And it is built from bytes-per-entity constants measured
-	// on one fixture, one OS and one Go version, with no edges in it — the edge
-	// terms follow from the struct layout and have never been measured at scale.
+	// It is reported because it, and not the entry count, is what a mapped
+	// index's resident cost follows: the entries stay in the file and what a
+	// handle holds is per-key directory. Measured at 235 B for 4,000 entries
+	// under two keys, against 428,512 B for the same entries held resident.
+	ImagePropertyKeys int64
+
+	// ImageIndexMapped reports that the image carries its property index in the
+	// mapped form -- GPIX and GPIR -- rather than the resident one, GIDX.
+	//
+	// This is a fact about the file and not about the Options an Open will use,
+	// and both decide what the index costs: a v8 image is read into the resident
+	// index whatever IndexMode says, because GIDX is the only form it has, while
+	// a v9 image is read into the resident index only if IndexMode asks for it.
+	// See HeapBytesFor, which is where the two are combined.
+	ImageIndexMapped bool
+
+	// ImageHeapBytes models the Go heap the image alone retains once it is
+	// loaded and the parse has settled, under the Options that hold the most of
+	// it: a heap image, a resident index, eager adjacency.
+	//
+	// That it is the worst case and not the default one is the first thing to know
+	// about it. Under the defaults — ImageMapped and IndexMapped — the two largest
+	// terms here are very nearly absent: the property blobs are addressed in the
+	// file rather than copied into arenas, and the index is a per-key directory
+	// rather than 108 bytes an entry. On a 2,000-node fixture with 4,000 entries
+	// the two configurations are 736 KB and 1.45 MB of the same store. The field
+	// stays the worst case because it is the figure a caller has before they have
+	// chosen anything; HeapBytesFor is how to ask about a configuration, and it is
+	// what Options.MemoryBudget compares against.
+	//
+	// Four more things must be read with it. It covers the image only: replaying
+	// the log is not in it, and on a store that has never been compacted the log
+	// is the entire cost — that is WALHeapBytes. It names retained heap, not
+	// resident memory: on the one fixture that has been measured, resident ran
+	// between 1.19x and 1.54x the live heap across three runs of an identical
+	// store, so this is a floor on RSS rather than a prediction of it. It is built
+	// from bytes-per-entity constants measured on one fixture, one OS and one Go
+	// version, with no edges in it — the edge terms follow from the struct layout
+	// and have never been measured at scale. And two of its terms assume one label
+	// per record, which a multi-label store exceeds; see estLabelPostingBytes.
 	//
 	// It is still worth reporting, because the term that dominates it is the one
 	// no file-size-based guess predicts: identifier slots that were issued,
@@ -264,6 +374,28 @@ type OpenEstimate struct {
 	// WALRecords when nothing is wrong.
 	WALCheckpointed bool
 
+	// WALHeapBytes models the Go heap replaying this log would retain, and is the
+	// log half of what ImageHeapBytes is for the image.
+	//
+	// It is the term that makes the estimate usable on the store shape it most
+	// needs to be usable on. A store that has never been compacted has no image
+	// at all, so every image field is zero and the log is the entire cost; an
+	// estimate that stopped at the image would report nothing for it.
+	//
+	// Two upper bounds, both loose in the safe direction. Every byte in the
+	// records region is charged as though it lands, when in fact a log that
+	// rewrites the same entity repeatedly keeps one version per entity and drops
+	// the rest — the retention floor is one idle version, so a log of ten updates
+	// to one node is charged ten times what it will hold. And every record is
+	// charged estReplayRecordBytes whether it turns out to be an index entry or a
+	// delta version.
+	//
+	// Not in it: what replay costs in transient memory beyond what it retains.
+	// Records buffered inside a batch that never commits are held and discarded
+	// (see WALRecordsBuffered), and their bytes are inside the records region, so
+	// the figure covers them by construction rather than by a separate term.
+	WALHeapBytes int64
+
 	// WALError is non-empty when replay would refuse the log outright rather
 	// than stop at a torn tail — a nested batch begin, a malformed marker, a
 	// batch claiming more records than the file can hold, an unrecognised record
@@ -325,6 +457,7 @@ func PreflightOpen(dir string) (OpenEstimate, error) {
 		return est, err
 	}
 	est.ImageHeapBytes = est.imageHeapBytes()
+	est.WALHeapBytes = est.walHeapBytes()
 	return est, nil
 }
 
@@ -375,8 +508,35 @@ func (e *OpenEstimate) readImage(path string) error {
 	}
 	if e.ImageVersion >= csrVersionSectioned && n >= csrV8HeaderSize {
 		e.readIndexSection(f, binary.LittleEndian.Uint64(buf[62:70]))
+		e.readFirstNodeID(f)
 	}
 	return nil
+}
+
+// readFirstNodeID reads the identifier of the first node record, which is the
+// lowest one the image holds.
+//
+// Silent on failure for the reason readIndexSection is: an unreadable figure
+// means the bound stays where it was, which is correct and merely loose. The
+// caller of a preflight is told a file is broken by InspectCSR, whose full parse
+// has the bounds checks to say so.
+func (e *OpenEstimate) readFirstNodeID(f *os.File) {
+	if e.ImageNodeCount == 0 || e.ImageBytes < csrV8HeaderSize+8 {
+		return
+	}
+	var buf [8]byte
+	if _, err := f.ReadAt(buf[:], csrV8HeaderSize); err != nil {
+		return
+	}
+	id := binary.LittleEndian.Uint64(buf[:])
+	// A first identifier above the high-water mark is not a lower bound on
+	// anything; it is a file disagreeing with itself. Left unset rather than
+	// believed, because this figure only ever makes an estimate smaller.
+	if e.ImageSeqHWKnown && id > e.ImageNodeSeqHW {
+		return
+	}
+	e.ImageFirstNodeID = id
+	e.ImageFirstNodeIDKnown = true
 }
 
 // readIndexSection sizes the property index from the section directory.
@@ -407,15 +567,17 @@ func (e *OpenEstimate) readIndexSection(f *os.File, tableOffset uint64) {
 		return
 	}
 
-	// GIDX is magic(4), nodeCount(8), node entries, edgeCount(8), edge entries.
-	// The node count is one addressed read; the edge count sits past every
-	// variable-length node entry and is not reachable in constant time, so what
-	// is reported for the pair is a bound rather than a count.
-	const gidxCountsSize = csrIndexSectionMagicSize + 8 + 8
-
+	// Three section magics carry a property index and the loop takes all of them,
+	// because a v9 image splits the index in two: GPIX holds the values and their
+	// directories, GPIR the reverse entries, and the counts this wants are in
+	// GPIR's header while the key count is in GPIX's. Returning on the first
+	// match, as this did while GIDX was the only form, reads whichever of the two
+	// the directory happens to list first and stops.
 	for i := 0; i < count; i++ {
 		ent := dir[i*csrSectionEntry:]
-		if string(ent[0:4]) != csrSectionPropIndex {
+		magic := string(ent[0:4])
+		if magic != csrSectionPropIndex &&
+			magic != csrSectionMappedIndex && magic != csrSectionMappedReverse {
 			continue
 		}
 		off := binary.LittleEndian.Uint64(ent[8:16])
@@ -423,78 +585,319 @@ func (e *OpenEstimate) readIndexSection(f *os.File, tableOffset uint64) {
 		if off > size || length > size-off {
 			return
 		}
-		if length >= gidxCountsSize {
-			e.ImagePropertyEntriesMax = int64(length-gidxCountsSize) / minPropEntryBytes
+		switch magic {
+		case csrSectionPropIndex:
+			e.readGIDXCounts(f, off, length)
+		case csrSectionMappedIndex:
+			e.readGPIXKeys(f, off, length)
+		case csrSectionMappedReverse:
+			e.readGPIRCounts(f, off, length)
 		}
-		var head [csrIndexSectionMagicSize + 8]byte
-		if _, err := f.ReadAt(head[:], int64(off)); err != nil {
-			return
-		}
-		if string(head[0:csrIndexSectionMagicSize]) != csrIndexSectionMagic {
-			return
-		}
-		e.ImagePropertyNodeEntries = int64(binary.LittleEndian.Uint64(head[csrIndexSectionMagicSize:]))
-		return
 	}
 }
 
-// pagedSlots is how many record slots an image holds: one page of slots per
-// page its identifiers fall in, bounded above by the record count (no page
-// exists without a record in it) and by the identifier space itself.
-func pagedSlots(count int64, seqHW uint64) int64 {
-	space := int64(seqHW) + 1
-	pages := int64(seqHW>>csrPageBits) + 1
+// readGIDXCounts fills the index fields from a v8 GIDX section.
+//
+// GIDX is magic(4), nodeCount(8), node entries, edgeCount(8), edge entries. The
+// node count is one addressed read; the edge count sits past every
+// variable-length node entry and is not reachable in constant time, so what is
+// reported for the pair is a bound rather than a count.
+func (e *OpenEstimate) readGIDXCounts(f *os.File, off, length uint64) {
+	const gidxCountsSize = csrIndexSectionMagicSize + 8 + 8
+	if length >= gidxCountsSize {
+		e.ImagePropertyEntriesMax = int64(length-gidxCountsSize) / minPropEntryBytes
+	}
+	var head [csrIndexSectionMagicSize + 8]byte
+	if _, err := f.ReadAt(head[:], int64(off)); err != nil {
+		return
+	}
+	if string(head[0:csrIndexSectionMagicSize]) != csrIndexSectionMagic {
+		return
+	}
+	e.ImagePropertyNodeEntries = int64(binary.LittleEndian.Uint64(head[csrIndexSectionMagicSize:]))
+}
+
+// readGPIXKeys reads the key counts out of a v9 GPIX header, and is what sets
+// ImageIndexMapped: GPIX is the section whose presence means the entries are in
+// the file in searchable form rather than waiting to be loaded.
+func (e *OpenEstimate) readGPIXKeys(f *os.File, off, length uint64) {
+	if length < gpixHeaderSize {
+		return
+	}
+	var head [gpixHeaderSize]byte
+	if _, err := f.ReadAt(head[:], int64(off)); err != nil {
+		return
+	}
+	if string(head[0:4]) != csrSectionMappedIndex {
+		return
+	}
+	if v := binary.LittleEndian.Uint16(head[4:6]); v != gpixBodyVersion {
+		return
+	}
+	e.ImageIndexMapped = true
+	e.ImagePropertyKeys = int64(binary.LittleEndian.Uint32(head[8:12])) +
+		int64(binary.LittleEndian.Uint32(head[12:16]))
+}
+
+// readGPIRCounts reads both entry counts out of a v9 GPIR header.
+//
+// These are exact, and they are also checked against the section's own length
+// before they are believed. A count read from a file that cannot hold the entries
+// it claims is the one shape this surface must not pass on to an estimate that
+// sizes an allocation, however honest the arithmetic downstream.
+func (e *OpenEstimate) readGPIRCounts(f *os.File, off, length uint64) {
+	if length < gpirHeaderSize {
+		return
+	}
+	var head [gpirHeaderSize]byte
+	if _, err := f.ReadAt(head[:], int64(off)); err != nil {
+		return
+	}
+	if string(head[0:4]) != csrSectionMappedReverse {
+		return
+	}
+	if v := binary.LittleEndian.Uint16(head[4:6]); v != gpirBodyVersion {
+		return
+	}
+	nodes := binary.LittleEndian.Uint64(head[8:16])
+	edges := binary.LittleEndian.Uint64(head[16:24])
+	if room := (length - gpirHeaderSize) / gpirEntrySize; nodes > room || edges > room-nodes {
+		return
+	}
+	e.ImagePropertyNodeEntries = int64(nodes)
+	e.ImagePropertyEdgeEntries = int64(edges)
+	e.ImagePropertyEntriesMax = int64(nodes + edges)
+}
+
+// spacePages is how many pages the identifier space spans up to the high-water
+// mark. It sizes the page directory, which is the one term that follows the
+// identifiers issued rather than the records held.
+func spacePages(seqHW uint64) int64 {
+	return int64(seqHW>>csrPageBits) + 1
+}
+
+// livePages is how many pages of one kind the image materialises, bounded above
+// by the pages the identifier space spans and by the record count — a page needs
+// a record in it to exist. It sizes the record slots, the inverse page table and
+// the live-before prefix.
+func livePages(count int64, seqHW uint64) int64 {
+	return livePagesFrom(count, seqHW, 0)
+}
+
+// livePagesFrom is livePages with the band bounded from below as well: no page
+// under the lowest identifier present holds a record, so the span to charge for
+// starts there rather than at zero.
+//
+// firstPage is only ever a reduction, and a caller that does not know the lowest
+// identifier passes zero and gets the old bound. See ImageFirstNodeID for what
+// this is worth and on which workload.
+func livePagesFrom(count int64, seqHW uint64, firstPage int64) int64 {
+	pages := spacePages(seqHW) - firstPage
+	if pages < 1 {
+		pages = 1
+	}
 	if count < pages {
 		pages = count
 	}
-	slots := pages * csrPageSlots
-	if slots > space {
-		slots = space
+	return pages
+}
+
+// nodePages is how many node pages the image materialises, using the lowest
+// identifier present when the file states it.
+func (e *OpenEstimate) nodePages() int64 {
+	var firstPage int64
+	if e.ImageFirstNodeIDKnown {
+		firstPage = int64(e.ImageFirstNodeID >> csrPageBits)
 	}
-	return slots
+	return livePagesFrom(e.ImageNodeCount, e.ImageNodeSeqHW, firstPage)
+}
+
+// edgePages is the edge half. There is no matching lower bound for it: the edge
+// record stream begins past every variable-length node record, so its first
+// identifier is not addressable in constant time.
+func (e *OpenEstimate) edgePages() int64 {
+	return livePages(e.ImageEdgeCount, e.ImageEdgeSeqHW)
+}
+
+// pagedSlots is how many record slots an image holds: one whole page of slots per
+// live page.
+//
+// Note what does not bound it. This capped its answer at the identifier space
+// until R5, on the reasoning that an image cannot hold more slots than
+// identifiers have been issued — which is true of an array indexed by identifier
+// and false of this one. A page is materialised whole, so an image whose
+// identifiers stop at 2,000 holds 4,096 node slots, and the cap reported 2,001.
+// It fired on exactly the stores where it was most wrong: the smaller the
+// high-water mark relative to a page, the larger the share of the dominant term
+// it removed. Measured before the fix, ImageHeapBytes was 0.51x-0.85x of what the
+// opened store held.
+func pagedSlots(count int64, seqHW uint64) int64 {
+	return livePages(count, seqHW) * csrPageSlots
 }
 
 // directoryBytes is the page directory of one kind: one int32 per page of the
-// identifier space up to the high-water mark. It is the term that does follow
-// the identifier space rather than the records — 4 MiB per kind at the ceiling.
+// identifier space up to the high-water mark — 4 MiB per kind at the ceiling.
 func directoryBytes(seqHW uint64) int64 {
-	return (int64(seqHW>>csrPageBits) + 1) * 4
+	return spacePages(seqHW) * sizeofDirEntry
 }
 
-// imageHeapBytes is the model behind ImageHeapBytes, kept apart from the fields
-// so the arithmetic is one readable expression and every term is attributable.
+// imageSlots is how many record slots of each kind the image holds.
+//
+// Below v5 there is no identifier high-water mark to read and the record count is
+// the only figure available. That is a floor rather than a bound — a sparse v4
+// image costs more than this says — and ImageSeqHWKnown is how a caller is told
+// which of the two they have.
+func (e *OpenEstimate) imageSlots() (nodeSlots, edgeSlots int64) {
+	if !e.ImageSeqHWKnown {
+		return e.ImageNodeCount, e.ImageEdgeCount
+	}
+	return e.nodePages() * csrPageSlots, e.edgePages() * csrPageSlots
+}
+
+// recordArrayBytes mirrors CSRGraph.recordArrayBytes, term for term, from what a
+// header states instead of from slice lengths.
+//
+// This is the term the identifier space drives rather than the record count, and
+// therefore the cost no estimate derived from file size predicts: a page is
+// materialised whole, so an image holds a page of slots for every page its
+// identifiers fall in whether or not the records fill them.
+func (e *OpenEstimate) recordArrayBytes() int64 {
+	nodeSlots, edgeSlots := e.imageSlots()
+	total := nodeSlots*sizeofNodeRecord + edgeSlots*sizeofRawEdge
+	if !e.ImageSeqHWKnown {
+		return total
+	}
+	pages := e.nodePages() + e.edgePages()
+	// The directories are indexed by page of the identifier space and are the one
+	// term the lower bound does not reduce: a dead page below the records still
+	// costs its four bytes of "no page here".
+	total += directoryBytes(e.ImageNodeSeqHW) + directoryBytes(e.ImageEdgeSeqHW)
+	total += pages * sizeofPageEntry
+	total += pages * sizeofLiveBefore
+	return total
+}
+
+// adjacencyBytes mirrors CSRGraph.adjacencyBytes: two offset arrays indexed by
+// slot with a sentinel, and two identifier arrays indexed by live edge.
+//
+// Zero under AdjacencyLazy, which is the whole reason the offsets are no longer
+// folded into a per-slot constant.
+func (e *OpenEstimate) adjacencyBytes() int64 {
+	nodeSlots, _ := e.imageSlots()
+	return (nodeSlots+1)*2*sizeofOffset + e.ImageEdgeCount*2*sizeofEdgeID
+}
+
+// labelPostingBytes mirrors CSRGraph.labelPostingBytes under the one-label
+// assumption estLabelPostingBytes states.
+//
+// The two maps are charged for one distinct label each, which is the floor for a
+// store that holds records at all. A store with many distinct labels pays more
+// per map and this says less, which is the same under-report the posting count
+// itself carries and is named in the same place.
+func (e *OpenEstimate) labelPostingBytes() int64 {
+	if e.ImageNodeCount == 0 && e.ImageEdgeCount == 0 {
+		return 0
+	}
+	const labelMapKeyVal = 2 + 24 // a NodeType or EdgeType, and a slice header
+	return (e.ImageNodeCount+e.ImageEdgeCount)*estLabelPostingBytes +
+		2*residentMapBytes(1, labelMapKeyVal)
+}
+
+// payloadBytes is what the record payloads cost in the heap, which is the one
+// term ImageMode changes by more than a rounding.
+//
+// Mapped, only the label sequences are copied out; the property blobs are
+// addressed in the file. In the heap, every blob and every label sequence is
+// copied into one of four arenas, and what those hold is a quantity no header
+// carries — so the file's own size bounds it. Bounding it that way also covers
+// the two property arenas being presized to a quarter of the image between them
+// before a single byte is appended.
+func (e *OpenEstimate) payloadBytes(mapped bool) int64 {
+	if mapped {
+		return (e.ImageNodeCount + e.ImageEdgeCount) * estLabelSequenceBytes
+	}
+	return e.ImageBytes
+}
+
+// indexBytes is the property index, resident or read in place.
+//
+// The two differ by three orders of magnitude on the same entries, which is why
+// the whole of R3 happened and why a pre-open estimate that cannot tell them
+// apart is not usable as a budget: 107 B per entry against 88 B per declared key.
+func (e *OpenEstimate) indexBytes(resident bool) int64 {
+	if resident {
+		return e.ImagePropertyEntriesMax * estPropertyEntryBytes
+	}
+	if !e.ImageIndexMapped {
+		return 0
+	}
+	return e.ImagePropertyKeys*(estMappedKeyBytes+estMappedKeyNameBytes) +
+		estMappedIndexFixedBytes
+}
+
+// imageHeapBytes is the model behind ImageHeapBytes: the image's heap under the
+// configuration that holds the most of it.
+//
+// Deliberately the worst case over Options rather than the default one. This is
+// the figure a caller has before they have chosen anything, and the field is
+// documented as such; HeapBytesFor is how to ask about a configuration.
 func (e *OpenEstimate) imageHeapBytes() int64 {
 	if e.ImageBytes == 0 {
 		return 0
 	}
+	return e.recordArrayBytes() + e.adjacencyBytes() + e.labelPostingBytes() +
+		e.payloadBytes(false) + e.indexBytes(true)
+}
 
-	// Slots, not records — but paged slots, not one per identifier ever issued.
-	// A record's page is materialised whole, so the arrays cost a page of slots
-	// for every page the identifiers fall in; the record count bounds those
-	// pages above (a page needs a record to exist), and so does the identifier
-	// space itself. That gap — between the identifiers issued and the pages they
-	// occupy — is the cost no estimate derived from file size predicts. Below v5
-	// there is no high-water mark to read and the record count is the only figure
-	// available; it is a floor, and ImageSeqHWKnown is how a caller is told.
-	nodeSlots, edgeSlots := e.ImageNodeCount, e.ImageEdgeCount
-	var dirBytes int64
-	if e.ImageSeqHWKnown {
-		nodeSlots = pagedSlots(e.ImageNodeCount, e.ImageNodeSeqHW)
-		edgeSlots = pagedSlots(e.ImageEdgeCount, e.ImageEdgeSeqHW)
-		dirBytes = directoryBytes(e.ImageNodeSeqHW) + directoryBytes(e.ImageEdgeSeqHW)
+// walHeapBytes is the model behind WALHeapBytes.
+//
+// Buffered records are counted with the landed ones rather than instead of them:
+// the two together are what the process holds at the moment replay stops, which is
+// its peak, and a budget is asked about a peak.
+func (e *OpenEstimate) walHeapBytes() int64 {
+	if e.WALReplayBytes == 0 {
+		return 0
 	}
+	return e.WALReplayBytes +
+		(e.WALRecords+e.WALRecordsBuffered)*estReplayRecordBytes
+}
 
-	total := nodeSlots*estNodeSlotBytes + edgeSlots*estEdgeSlotBytes + dirBytes
-	total += e.ImageEdgeCount * estLiveEdgeBytes
-	total += e.ImagePropertyEntriesMax * estPropertyEntryBytes
+// HeapBytesFor is what opening this store under opts would retain in the Go heap,
+// image and log together.
+//
+// This is the figure Options.MemoryBudget is compared against, and the reason it
+// takes Options rather than being a field is that the same store differs by more
+// than a factor of two across them: on a 2,000-node fixture with 4,000 index
+// entries, 735,997 B under the defaults against 1,236,992 B under ImageHeap with
+// a resident index. A budget fed the wrong one of those refuses stores that fit
+// or admits stores that do not, and which of the two it does depends on which
+// way the caller happened to be wrong.
+//
+// The three modes are resolved the way an Open resolves them, by asking the
+// functions that own each rule rather than by restating it here:
+// imageMappingAllowedFor for the image, indexBaseAllowedFor for the index. That
+// matters most where the answer is not the mode the caller named — a live reader
+// holds no lock and therefore reads a heap image under the default ImageMode, a
+// platform with no mapping primitive does the same, and a v8 image is read into a
+// resident index whatever IndexMode asks for, because GIDX is the only form it
+// has.
+//
+// Retained heap, not resident set size, and an estimate throughout. Read
+// ImageHeapBytes' three caveats before acting on it: they all apply here.
+func (e OpenEstimate) HeapBytesFor(opts Options) int64 {
+	mapped := e.ImageBytes > 0 &&
+		imageMappingAllowedFor(opts.ImageMode, opts.LiveReader) == nil
+	resident := indexBaseAllowedFor(opts.IndexMode, mapped) != nil || !e.ImageIndexMapped
 
-	// The arenas. Every blob and every label sequence is copied out of the file
-	// buffer into one of four arenas, so what they hold is the record payload — a
-	// quantity the header does not carry. The file's own size bounds it, and
-	// bounding it that way also covers the two property arenas being presized to
-	// a quarter of the image between them before a single byte is appended.
-	total += e.ImageBytes
-	return total
+	var total int64
+	if e.ImageBytes > 0 {
+		total = e.recordArrayBytes() + e.labelPostingBytes() +
+			e.payloadBytes(mapped) + e.indexBytes(resident)
+		if opts.Adjacency != AdjacencyLazy {
+			total += e.adjacencyBytes()
+		}
+	}
+	return total + e.WALHeapBytes + defaultWALRingCapacity*sizeofWALSlot
 }
 
 // --- the log walk ---

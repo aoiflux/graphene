@@ -131,7 +131,14 @@ func IndexModeForCSRVersion(v uint16) (IndexMode, bool) {
 // mapped is whether the image itself is mapped, which the caller knows and this
 // cannot: an image source is consumed by the parse.
 func (s *Store) indexBaseAllowed(mapped bool) error {
-	if s.indexMode != IndexMapped {
+	return indexBaseAllowedFor(s.indexMode, mapped)
+}
+
+// indexBaseAllowedFor is the rule itself, as a function of the mode and whether
+// the image is mapped — separated from the method for the reason
+// imageMappingAllowedFor is, and consumed by the same caller.
+func indexBaseAllowedFor(mode IndexMode, mapped bool) error {
+	if mode != IndexMapped {
 		return errors.New("Options.IndexMode is IndexResident")
 	}
 	if !mapped {
