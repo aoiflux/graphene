@@ -1,6 +1,7 @@
 package graphene_test
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -75,26 +76,50 @@ func TestConsistency_ReadsAreInternallyCoherent(t *testing.T) {
 
 			var violations atomic.Int64
 			var checks atomic.Int64
-			var wg sync.WaitGroup
+			var wg, started sync.WaitGroup
 			stop := make(chan struct{})
 
+			// An error is not agreement. These reads are entitled to exactly one
+			// failure -- the node was deleted under them -- so anything else is
+			// counted and fails. Discarding every error made a store that failed
+			// every read indistinguishable from a reader that never ran.
+			var readErrs atomic.Int64
+			var firstErr error
+			var errOnce sync.Once
+			note := func(err error) {
+				var nf *store.ErrNotFound
+				if errors.As(err, &nf) {
+					return
+				}
+				readErrs.Add(1)
+				errOnce.Do(func() { firstErr = err })
+			}
+
+			// Each reader completes one pass before mutation starts. Without this
+			// the readers race the delete loop for their first scheduling slot,
+			// and losing it reports as "no checks" rather than as the flake it is.
+			started.Add(6)
 			for r := 0; r < 6; r++ {
 				wg.Add(1)
 				go func(seed int) {
 					defer wg.Done()
 					i := seed
-					for {
-						select {
-						case <-stop:
-							return
-						default:
+					for passes := 0; ; passes++ {
+						if passes > 0 {
+							select {
+							case <-stop:
+								return
+							default:
+							}
 						}
 						i = (i + 17) % len(ids)
 						id := ids[i]
 
 						// EdgesOf: every edge must be incident to id.
 						edges, err := g.EdgesOf(id, store.DirectionBoth, nil)
-						if err == nil {
+						if err != nil {
+							note(err)
+						} else {
 							for _, e := range edges {
 								checks.Add(1)
 								if e.Src != id && e.Dst != id {
@@ -107,7 +132,9 @@ func TestConsistency_ReadsAreInternallyCoherent(t *testing.T) {
 
 						// Neighbours: the reported node must be the far endpoint.
 						nbs, err := g.Neighbours(id, store.DirectionBoth, nil)
-						if err == nil {
+						if err != nil {
+							note(err)
+						} else {
 							for _, nb := range nbs {
 								checks.Add(1)
 								far := nb.Edge.Dst
@@ -121,11 +148,15 @@ func TestConsistency_ReadsAreInternallyCoherent(t *testing.T) {
 								}
 							}
 						}
+						if passes == 0 {
+							started.Done()
+						}
 					}
 				}(r * 61)
 			}
 
 			// Mutate underneath them.
+			started.Wait()
 			for i := 0; i < len(ids); i += 4 {
 				if err := g.DeleteNode(ids[i]); err != nil {
 					t.Errorf("DeleteNode: %v", err)
@@ -144,8 +175,12 @@ func TestConsistency_ReadsAreInternallyCoherent(t *testing.T) {
 			if v := violations.Load(); v != 0 {
 				t.Fatalf("%d incoherent reads out of %d checks", v, checks.Load())
 			}
+			if n := readErrs.Load(); n != 0 {
+				t.Errorf("%d reads failed with an error other than not-found; first: %v",
+					n, firstErr)
+			}
 			if checks.Load() == 0 {
-				t.Fatal("readers performed no checks")
+				t.Fatal("every reader ran a pass before mutation began, and none saw an edge")
 			}
 		})
 	}
@@ -233,19 +268,41 @@ func TestConsistency_LookupsNeverReturnCompletedDeletions(t *testing.T) {
 			var violations atomic.Int64  // (A) — must be zero
 			var benign atomic.Int64      // (B) — reported only
 			var checks atomic.Int64
-			var wg sync.WaitGroup
+			var wg, started sync.WaitGroup
 			stop := make(chan struct{})
 
+			// An error is not agreement. These reads are entitled to exactly one
+			// failure -- the node was deleted under them -- so anything else is
+			// counted and fails. Discarding every error made a store that failed
+			// every read indistinguishable from a reader that never ran.
+			var readErrs atomic.Int64
+			var firstErr error
+			var errOnce sync.Once
+			note := func(err error) {
+				var nf *store.ErrNotFound
+				if errors.As(err, &nf) {
+					return
+				}
+				readErrs.Add(1)
+				errOnce.Do(func() { firstErr = err })
+			}
+
+			// Each reader completes one pass before mutation starts. Without this
+			// the readers race the delete loop for their first scheduling slot,
+			// and losing it reports as "no checks" rather than as the flake it is.
+			started.Add(6)
 			for r := 0; r < 6; r++ {
 				wg.Add(1)
 				go func(seed int) {
 					defer wg.Done()
 					i := seed
-					for {
-						select {
-						case <-stop:
-							return
-						default:
+					for passes := 0; ; passes++ {
+						if passes > 0 {
+							select {
+							case <-stop:
+								return
+							default:
+							}
 						}
 						i = (i + 13) % len(ids)
 
@@ -259,6 +316,7 @@ func TestConsistency_LookupsNeverReturnCompletedDeletions(t *testing.T) {
 							mark := int(deletedUpTo.Load())
 							hits, err := g.NodesByProperty(probe[0], []byte(probe[1]))
 							if err != nil {
+								note(err)
 								continue
 							}
 							for _, id := range hits {
@@ -269,13 +327,18 @@ func TestConsistency_LookupsNeverReturnCompletedDeletions(t *testing.T) {
 								}
 								if _, err := g.GetNode(id); err != nil {
 									benign.Add(1)
+									note(err)
 								}
 							}
+						}
+						if passes == 0 {
+							started.Done()
 						}
 					}
 				}(r * 71)
 			}
 
+			started.Wait()
 			for i := range ids {
 				if err := g.DeleteNode(ids[i]); err != nil {
 					t.Errorf("DeleteNode: %v", err)
@@ -291,8 +354,12 @@ func TestConsistency_LookupsNeverReturnCompletedDeletions(t *testing.T) {
 			if v := violations.Load(); v != 0 {
 				t.Fatalf("%d results named entities whose deletion had already completed", v)
 			}
+			if n := readErrs.Load(); n != 0 {
+				t.Errorf("%d reads failed with an error other than not-found; first: %v",
+					n, firstErr)
+			}
 			if checks.Load() == 0 {
-				t.Fatal("readers performed no checks")
+				t.Fatal("every reader ran a pass before mutation began, and none saw a result")
 			}
 		})
 	}
@@ -330,24 +397,47 @@ func TestConsistency_QueriesNeverReturnCompletedDeletions(t *testing.T) {
 			var violations atomic.Int64
 			var benign atomic.Int64
 			var checks atomic.Int64
-			var wg sync.WaitGroup
+			var wg, started sync.WaitGroup
 			stop := make(chan struct{})
 
+			// An error is not agreement. These reads are entitled to exactly one
+			// failure -- the node was deleted under them -- so anything else is
+			// counted and fails. Discarding every error made a store that failed
+			// every read indistinguishable from a reader that never ran.
+			var readErrs atomic.Int64
+			var firstErr error
+			var errOnce sync.Once
+			note := func(err error) {
+				var nf *store.ErrNotFound
+				if errors.As(err, &nf) {
+					return
+				}
+				readErrs.Add(1)
+				errOnce.Do(func() { firstErr = err })
+			}
+
+			// Each reader completes one pass before mutation starts. Without this
+			// the readers race the delete loop for their first scheduling slot,
+			// and losing it reports as "no checks" rather than as the flake it is.
+			started.Add(6)
 			for r := 0; r < 6; r++ {
 				wg.Add(1)
 				go func(seed int) {
 					defer wg.Done()
 					q := seed
-					for {
-						select {
-						case <-stop:
-							return
-						default:
+					for passes := 0; ; passes++ {
+						if passes > 0 {
+							select {
+							case <-stop:
+								return
+							default:
+							}
 						}
 						q = (q + 1) % len(queries)
 						mark := int(deletedUpTo.Load())
 						got, err := g.QueryNodeIDs(queries[q])
 						if err != nil {
+							note(err)
 							continue
 						}
 						for _, id := range got {
@@ -358,12 +448,17 @@ func TestConsistency_QueriesNeverReturnCompletedDeletions(t *testing.T) {
 							}
 							if _, err := g.GetNode(id); err != nil {
 								benign.Add(1)
+								note(err)
 							}
+						}
+						if passes == 0 {
+							started.Done()
 						}
 					}
 				}(r)
 			}
 
+			started.Wait()
 			for i := range ids {
 				if err := g.DeleteNode(ids[i]); err != nil {
 					t.Errorf("DeleteNode: %v", err)
@@ -379,8 +474,12 @@ func TestConsistency_QueriesNeverReturnCompletedDeletions(t *testing.T) {
 			if v := violations.Load(); v != 0 {
 				t.Fatalf("%d results named entities whose deletion had already completed", v)
 			}
+			if n := readErrs.Load(); n != 0 {
+				t.Errorf("%d reads failed with an error other than not-found; first: %v",
+					n, firstErr)
+			}
 			if checks.Load() == 0 {
-				t.Fatal("readers performed no checks")
+				t.Fatal("every reader ran a pass before mutation began, and none saw a result")
 			}
 		})
 	}

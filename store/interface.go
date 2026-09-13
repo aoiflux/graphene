@@ -1006,6 +1006,18 @@ type StorageStats struct {
 	// backend that does not track it.
 	DeltaBytes int64
 
+	// DeltaOverBudget reports that DeltaBytes has reached Options.DeltaSoftLimit.
+	//
+	// Soft is the whole of it: nothing fails, nothing is refused, and the next
+	// write is accepted exactly as the last one was. A store that cannot stop
+	// accepting writes and does not compact on its own needs somewhere to say
+	// that it is holding more than it was asked to, and this is that place.
+	// MetricDeltaOverBudget is the same fact pushed to a sink rather than polled.
+	//
+	// False when no limit was set, and false again once a compaction brings the
+	// delta back under it.
+	DeltaOverBudget bool
+
 	// EstimatedResidentBytes is the heap the backend is holding, totalled from
 	// the structures themselves in bounded time.
 	//
@@ -1163,6 +1175,22 @@ type CompactionPolicy struct {
 	// MaxDeltaRecords fires when the in-memory delta exceeds this many records.
 	MaxDeltaRecords int
 
+	// MaxDeltaBytes fires when the delta's records hold this many bytes.
+	//
+	// This is the memory rule, and the other three are proxies for it. A hundred
+	// records carrying 64 MiB blobs and a hundred thousand carrying none are the
+	// same MaxDeltaRecords and are four orders of magnitude apart in what they
+	// cost. A log large enough to trip MaxWALBytes says how much has been
+	// written rather than how much is still held, so a store that overwrites the
+	// same records repeatedly trips it while holding almost nothing. On a machine
+	// with a memory limit, this is the figure that runs out.
+	//
+	// Counted as StorageStats.DeltaBytes counts it: the version cells, the
+	// records, and their labels and property blobs. Zero from a backend that does
+	// not report DeltaBytes, so there the rule never fires rather than firing
+	// always.
+	MaxDeltaBytes int64
+
 	// MaxWALBytes fires when the log grows past this size.
 	MaxWALBytes int64
 
@@ -1181,9 +1209,16 @@ type CompactionPolicy struct {
 // records or a 256 MB log are both well inside what the engine handles, and
 // both are far past the point where a compaction would have been cheap.
 // Callers with a measured workload should replace them.
+//
+// MaxDeltaBytes is half the log figure rather than equal to it, and that is not
+// tidiness. Every delta record was logged, so the log is a superset of the delta
+// and a byte limit equal to it would almost never be the rule that fired. Half
+// of it fires first on the workload the rule exists for -- few records, large
+// blobs -- and stays quiet on the one MaxWALBytes already covers.
 func DefaultCompactionPolicy() CompactionPolicy {
 	return CompactionPolicy{
 		MaxDeltaRecords: 100_000,
+		MaxDeltaBytes:   128 << 20,
 		MaxWALBytes:     256 << 20,
 		MaxDeltaRatio:   0.5,
 	}
@@ -1200,6 +1235,10 @@ func (p CompactionPolicy) Evaluate(s StorageStats) (bool, string) {
 	if p.MaxDeltaRecords > 0 && delta >= p.MaxDeltaRecords {
 		return true, fmt.Sprintf("delta holds %d records, at or past the %d limit",
 			delta, p.MaxDeltaRecords)
+	}
+	if p.MaxDeltaBytes > 0 && s.DeltaBytes >= p.MaxDeltaBytes {
+		return true, fmt.Sprintf("delta records hold %d bytes, at or past the %d limit",
+			s.DeltaBytes, p.MaxDeltaBytes)
 	}
 	if p.MaxWALBytes > 0 && s.WALBytes >= p.MaxWALBytes {
 		return true, fmt.Sprintf("write-ahead log is %d bytes, at or past the %d limit",

@@ -254,9 +254,10 @@ func runStoreSnapshot(cx *Context) (Result, error) {
 // --- store health ---
 
 type healthOpts struct {
-	maxDelta int
-	maxWAL   int64
-	ratio    float64
+	maxDelta      int
+	maxDeltaBytes int64
+	maxWAL        int64
+	ratio         float64
 }
 
 var storeHealth = cmd(Command{
@@ -275,6 +276,8 @@ var storeHealth = cmd(Command{
 		def := store.DefaultCompactionPolicy()
 		fs.IntVar(&o.maxDelta, "max-delta", def.MaxDeltaRecords,
 			"compaction is due past this many delta records")
+		fs.Int64Var(&o.maxDeltaBytes, "max-delta-bytes", def.MaxDeltaBytes,
+			"compaction is due past this many bytes held in the delta")
 		fs.Int64Var(&o.maxWAL, "max-wal", def.MaxWALBytes,
 			"compaction is due past this log size in bytes")
 		fs.Float64Var(&o.ratio, "max-ratio", def.MaxDeltaRatio,
@@ -295,7 +298,8 @@ func runStoreHealth(cx *Context, o *healthOpts) (Result, error) {
 	s.Add("edges", Uint(st.EdgeCount))
 
 	due, why := g.ShouldCompact(store.CompactionPolicy{
-		MaxDeltaRecords: o.maxDelta, MaxWALBytes: o.maxWAL, MaxDeltaRatio: o.ratio,
+		MaxDeltaRecords: o.maxDelta, MaxDeltaBytes: o.maxDeltaBytes,
+		MaxWALBytes: o.maxWAL, MaxDeltaRatio: o.ratio,
 	})
 	s.Add("compaction due", Bool(due))
 	if due {

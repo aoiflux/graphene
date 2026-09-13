@@ -2094,6 +2094,19 @@ crash recoverable. A cancelled compaction leaves the store exactly as it found
 it. Calling `Compact` while one is already running returns
 `disk.ErrCompactionInProgress` rather than queueing.
 
+**Identifiers survive it.** A compaction rewrites the image and does not renumber
+it, so a `NodeID` or `EdgeID` you are holding names the same record afterwards —
+across one compaction or across any number of them. Identifiers are never reused,
+and the sequence counters have high-water marks in the image header, so reopening
+the store does not reissue them either. This is a guarantee, and it is what makes a
+background compaction safe for code holding a slice of ids it collected minutes
+ago.
+
+What does *not* survive is a `[]byte` a read returned, under the default mapped
+image: those address the image file and are valid until the compaction after next.
+`store.CloneNode` and `store.CloneEdge` are the way out for anything you cache. See
+`ImageMode`.
+
 ### Compacting automatically
 
 Nothing bounds delta growth on its own: everything written since the last
@@ -2108,6 +2121,22 @@ if due, why := g.ShouldCompact(store.DefaultCompactionPolicy()); due {
     _ = g.Compact()
 }
 ```
+
+`CompactIfDue` is those four lines, so that the decision and the action cannot
+drift apart:
+
+```go
+did, why, err := g.CompactIfDue(store.DefaultCompactionPolicy())
+if did {
+    log.Printf("compacted: %s", why)
+}
+```
+
+`why` comes back whether or not anything was compacted — it is empty exactly when
+the store was not due, and non-empty beside an error when the compaction was
+attempted and failed. `CompactIfDueCtx` takes a context, which cancels the build.
+On a backend that reports no storage statistics, such as the in-memory store,
+nothing is ever due and this is a no-op.
 
 Or hand it to the engine, which is off by default:
 
@@ -2126,7 +2155,43 @@ This starts a background goroutine, which `Close` cancels and waits for. Set the
 observer: a background compaction has no caller to return an error to, so without
 one a failing compaction fails silently and repeats.
 
-`store.DefaultCompactionPolicy()` is a starting point, not a tuned setting.
+`store.DefaultCompactionPolicy()` is a starting point, not a tuned setting. Its
+four rules fire on delta records (100k), **delta bytes (128 MB)**, log size
+(256 MB), and the delta as a fraction of the image (50%). A zero field disables its
+rule, so a zero policy never fires.
+
+`MaxDeltaBytes` is the memory rule and the other three are proxies for it: a
+hundred records carrying 64 MiB blobs and a hundred thousand carrying none are the
+same record count and four orders of magnitude apart in what they cost. It is set
+to half the log limit rather than to the same figure because every delta record was
+logged, so a byte limit equal to the log's would almost never be the rule that
+fired.
+
+### Knowing when the delta is larger than you wanted
+
+If you compact on your own schedule, `Options.DeltaSoftLimit` tells you when that
+schedule is not keeping up:
+
+```go
+s, _ := disk.OpenWithOptions(dir, disk.Options{
+    DeltaSoftLimit: 512 << 20,
+    Metrics:        sink,
+})
+```
+
+Soft is the contract. **No write fails for this**, none is delayed, and nothing is
+spilled or silently degraded — the delta is where a commit goes, so refusing to
+grow it would mean refusing data you have nowhere else to put. What happens is that
+`StorageStats.DeltaOverBudget` turns true, and one `MetricDeltaOverBudget` is
+emitted for the crossing with `Bytes` set to what the delta holds and `Examined` to
+the limit.
+
+Once per crossing, not once per commit: a store sitting above its limit while the
+compaction it needs is scheduled would otherwise emit an event per write. A
+compaction that brings the delta back under the limit re-arms it.
+
+Reach for `CompactionPolicy.MaxDeltaBytes` instead when you would rather the engine
+act on the figure than report it.
 
 `Close()` flushes and releases the backend. Always defer it.
 

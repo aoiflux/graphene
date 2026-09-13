@@ -882,5 +882,6 @@ func (s *Store) applyTransaction(ops []store.TxOp, checks []store.ReadCheck, ctx
 		return fmt.Errorf("ApplyTransaction: wal: %w", cerr)
 	}
 	s.publishEpoch(epoch)
+	s.reportDeltaBudget()
 	return nil
 }

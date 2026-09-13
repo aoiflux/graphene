@@ -54,6 +54,7 @@ func (s *Store) putNode(epoch uint64, n *store.Node) {
 	head := &nodeVersion{epoch: epoch, node: n, prev: prev}
 	d.bytes += nodeVersionBytes(n)
 	d.bytes -= truncateNodeChain(head, retain, held)
+	s.noteDeltaBytesLocked(d.bytes)
 	d.nodes[n.ID] = head
 
 	s.indexNodeLabels(d, n.ID, n.Labels)
@@ -95,6 +96,7 @@ func (s *Store) putEdge(epoch uint64, e *store.Edge, fresh bool) {
 	head := &edgeVersion{epoch: epoch, edge: e, prev: prev}
 	d.bytes += edgeVersionBytes(e)
 	d.bytes -= truncateEdgeChain(head, retain, held)
+	s.noteDeltaBytesLocked(d.bytes)
 	d.edges[e.ID] = head
 
 	s.indexEdgeLabels(d, e.ID, e.Labels)
@@ -140,6 +142,7 @@ func (s *Store) tombstoneNode(epoch uint64, id store.NodeID) {
 	head := &nodeVersion{epoch: epoch, node: nil, prev: prev}
 	d.bytes += nodeVersionBytes(nil)
 	d.bytes -= truncateNodeChain(head, retain, held)
+	s.noteDeltaBytesLocked(d.bytes)
 	d.nodes[id] = head
 
 	// The adjacency entry stays. Its edges are tombstoned by the cascade, and a
@@ -174,6 +177,7 @@ func (s *Store) tombstoneEdge(epoch uint64, id store.EdgeID) {
 	head := &edgeVersion{epoch: epoch, edge: nil, prev: prev}
 	d.bytes += edgeVersionBytes(nil)
 	d.bytes -= truncateEdgeChain(head, retain, held)
+	s.noteDeltaBytesLocked(d.bytes)
 	d.edges[id] = head
 
 	s.propIdx.RemoveEdge(id)

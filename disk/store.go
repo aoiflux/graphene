@@ -153,6 +153,22 @@ type Store struct {
 	nodeHeadroomWarned atomic.Bool
 	edgeHeadroomWarned atomic.Bool
 
+	// deltaSoftLimit is Options.DeltaSoftLimit as given: the delta size above
+	// which the store says so. Zero disables it. Set once at Open.
+	deltaSoftLimit int64
+
+	// deltaOverBudget is whether the delta is currently above that limit, and
+	// deltaBudgetReported whether the crossing has been announced to a metrics
+	// sink. Both are maintained by noteDeltaBytesLocked under the store lock and
+	// read without it, which is why they are atomics rather than guarded fields.
+	//
+	// The pair is the identifier-headroom warning's shape with one difference:
+	// that figure only rises, so having warned once is the end of it, while a
+	// delta comes back down. A compaction that brings it under the limit clears
+	// both, so the next crossing is announced too.
+	deltaOverBudget     atomic.Bool
+	deltaBudgetReported atomic.Bool
+
 	// commitSeq numbers batch commits. Like nodeSeq and edgeSeq it has a
 	// high-water mark in the CSR header (v8, commitSeqHW), so compaction
 	// truncating the log no longer resets it: on open it resumes from the larger
@@ -376,6 +392,7 @@ func (s *Store) StorageStats() store.StorageStats {
 	// lock already held, and neither costs a pass: see estimate.go, which has to
 	// be free because AutoCompact evaluates a policy against this on a ticker.
 	st.DeltaBytes = v.delta.bytes
+	st.DeltaOverBudget = s.deltaOverBudget.Load()
 	st.EstimatedResidentBytes = s.estimateResidentLocked().Total
 
 	st.HighestNodeID = s.nodeSeq.Load()
@@ -384,6 +401,58 @@ func (s *Store) StorageStats() store.StorageStats {
 	st.NodeIDHeadroom = idHeadroom(st.HighestNodeID)
 	st.EdgeIDHeadroom = idHeadroom(st.HighestEdgeID)
 	return st
+}
+
+// noteDeltaBytesLocked records whether the delta has reached
+// Options.DeltaSoftLimit. Caller holds s.mu.
+//
+// Called from every path that changes the delta's byte count rather than from the
+// commit paths, so a store written one record at a time reports what a store
+// written in batches reports. It is a comparison the caller has already paid for
+// and two atomic stores, which is what lets it sit on the write path.
+//
+// Clearing deltaBudgetReported on the way back under the limit is what re-arms
+// the metric for the next crossing.
+func (s *Store) noteDeltaBytesLocked(bytes int64) {
+	if s.deltaSoftLimit <= 0 {
+		return
+	}
+	over := bytes >= s.deltaSoftLimit
+	s.deltaOverBudget.Store(over)
+	if !over {
+		s.deltaBudgetReported.Store(false)
+	}
+}
+
+// reportDeltaBudget emits MetricDeltaOverBudget for a crossing not yet announced.
+// Called with no lock held, after a commit has published.
+//
+// The flag is read twice: once without the lock, which is the point -- every
+// commit that is not at the limit pays one atomic load and leaves -- and once
+// under it, beside the byte figure the event carries, so the two agree.
+//
+// A compaction that resolves the crossing between that read and the
+// compare-and-swap costs one event describing a delta which has just come back
+// under the limit. That is an advisory event arriving a moment late rather than a
+// wrong one, and excluding it would mean holding the store lock across a call into
+// a caller's sink.
+func (s *Store) reportDeltaBudget() {
+	if !s.deltaOverBudget.Load() || !s.metricsOn() {
+		return
+	}
+
+	s.mu.RLock()
+	over, bytes := s.deltaOverBudget.Load(), s.cur().delta.bytes
+	s.mu.RUnlock()
+
+	if !over || !s.deltaBudgetReported.CompareAndSwap(false, true) {
+		return
+	}
+	s.record(store.Metric{
+		Kind:     store.MetricDeltaOverBudget,
+		Bytes:    bytes,
+		Examined: s.deltaSoftLimit,
+	})
 }
 
 // defaultIDHeadroomWarn is the fraction of the identifier space at which a
@@ -780,6 +849,22 @@ type Options struct {
 	// take that decision on the operator's behalf.
 	IDHeadroomWarn float64
 
+	// DeltaSoftLimit is how many bytes of delta records the store may hold before
+	// it reports that it is over budget. Zero, the default, disables the report.
+	//
+	// Soft, and the word is the contract: no write fails for this, none is
+	// delayed, and nothing is spilled or degraded. What happens is that
+	// StorageStats.DeltaOverBudget turns true and one MetricDeltaOverBudget is
+	// emitted for the crossing. A limit that refused writes would be a different
+	// feature and a worse one -- the delta is where a commit goes, so refusing to
+	// grow it means refusing data the caller has nowhere else to put.
+	//
+	// It is for the deployment that compacts on its own schedule and wants to know
+	// when that schedule is not keeping up. A caller that would rather the engine
+	// act on the figure wants CompactionPolicy.MaxDeltaBytes, with AutoCompact or
+	// Graph.CompactIfDue.
+	DeltaSoftLimit int64
+
 	// ImageMode decides whether the compacted image is mapped or copied into the
 	// heap. The zero value, ImageMapped, maps it — which is the default because
 	// the blob half of an image is the largest single thing a store holds and
@@ -1089,6 +1174,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 
 		maxSnapshotAge: opts.MaxSnapshotAge,
 		idHeadroomWarn: opts.IDHeadroomWarn,
+		deltaSoftLimit: opts.DeltaSoftLimit,
 		imageMode:      opts.ImageMode,
 		indexMode:      opts.IndexMode,
 		adjacency:      opts.Adjacency,
@@ -1433,6 +1519,7 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 		return nil, fmt.Errorf("AddNodesBatch: wal: %w", cerr)
 	}
 	s.publishEpoch(epoch)
+	s.reportDeltaBudget()
 	return ids, nil
 }
 
@@ -1603,6 +1690,7 @@ func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 		return nil, fmt.Errorf("AddEdgesBatch: wal: %w", cerr)
 	}
 	s.publishEpoch(epoch)
+	s.reportDeltaBudget()
 	return ids, nil
 }
 

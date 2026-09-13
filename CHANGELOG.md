@@ -5,6 +5,49 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### Compacting on what the delta holds, not on what it counts
+
+`StorageStats.DeltaBytes` arrived with nothing able to act on it. Its own
+documentation named a `CompactionPolicy.MaxDeltaBytes` that did not exist, which is
+a fair summary of the gap: the engine could measure the thing that runs a machine
+out of memory and could only be told to compact on proxies for it.
+
+- **`CompactionPolicy.MaxDeltaBytes`** is the rule on the figure itself. The other
+  three are proxies: a hundred records holding 64 MiB blobs and a hundred thousand
+  holding none are the same `MaxDeltaRecords` and four orders of magnitude apart in
+  cost, and `MaxWALBytes` measures what has been written rather than what is still
+  held — a store that overwrites the same records repeatedly trips it while holding
+  almost nothing.
+
+  **`DefaultCompactionPolicy` now sets it, to 128 MB.** That is a behaviour change
+  for anyone using the default with `AutoCompact`: a blob-heavy store will compact
+  sooner than it did. The figure is half the log limit rather than equal to it, and
+  not for symmetry — every delta record was logged, so the log is a superset of the
+  delta and a byte limit equal to it would almost never be the rule that fired.
+
+- **`Graph.CompactIfDue(policy)`** and `CompactIfDueCtx` are the loop every caller
+  was writing by hand: evaluate, and compact if the answer is yes. Both halves
+  already existed; putting them together is what stops a caller evaluating one
+  policy and compacting on another, or compacting having forgotten to ask. The rule
+  that fired comes back whether or not the compaction succeeded, because that is the
+  line an operator needs in a log when it did not.
+
+- **`Options.DeltaSoftLimit`** is for the deployment that compacts on its own
+  schedule and wants to know when the schedule is not keeping up. Soft is the
+  contract: no write fails, none is delayed, nothing is spilled or degraded.
+  `StorageStats.DeltaOverBudget` is the polled form and `MetricDeltaOverBudget` the
+  pushed one — once per crossing rather than once per commit, re-armed by a
+  compaction that resolves it. A limit that refused writes would be a worse feature
+  than none: the delta is where a commit goes, so refusing to grow it means refusing
+  data the caller has nowhere else to put.
+
+- **Identifiers survive a compaction, and that is now written down as a guarantee**
+  rather than left as something true of the implementation. A `NodeID` held across
+  any number of compactions names the same record; identifiers are never reused and
+  the sequence counters have high-water marks in the image header, so a reopen does
+  not reissue them either. What does not survive is a `[]byte` a read returned under
+  a mapped image — see `ImageMode` and `store.CloneNode`.
+
 ### The store can say what it is holding
 
 Until now the only way to find out what a graphene store cost in memory was to measure

@@ -121,6 +121,21 @@ const (
 	// nothing in that file to read in place, and the next compaction is what
 	// produces one.
 	MetricIndexFallback
+
+	// MetricDeltaOverBudget is emitted when the delta's records first reach
+	// Options.DeltaSoftLimit. Bytes is what they hold and Examined is the limit.
+	//
+	// Once per crossing, not once per commit: a store sitting above its limit
+	// while the compaction it needs is scheduled would otherwise emit an event
+	// per write. A compaction that brings the delta back under the limit re-arms
+	// it, so a store that crosses, compacts and crosses again reports twice.
+	//
+	// Nothing fails when this fires -- it is the advisory half of a soft limit.
+	// See StorageStats.DeltaOverBudget for the polled form, and
+	// CompactionPolicy.MaxDeltaBytes for the figure that acts rather than reports.
+	//
+	// Appended at the end, per MetricIDHeadroomLow's note.
+	MetricDeltaOverBudget
 )
 
 // String names the kind, for a sink that labels its output.
@@ -150,6 +165,8 @@ func (k MetricKind) String() string {
 		return "image-fallback"
 	case MetricIndexFallback:
 		return "index-fallback"
+	case MetricDeltaOverBudget:
+		return "delta-over-budget"
 	default:
 		return "unknown"
 	}

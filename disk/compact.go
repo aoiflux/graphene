@@ -239,6 +239,19 @@ func (s *Store) Compact() error {
 
 // CompactCtx is Compact, abandoned if ctx is cancelled.
 //
+// # Identifiers survive it
+//
+// A compaction rewrites the image and does not renumber it. A NodeID or EdgeID
+// held across one names the same record afterwards, and so does one held across
+// any number of them; identifiers are never reused, and the sequence counters
+// have high-water marks in the image header so a reopen does not reissue them
+// either. This is a guarantee rather than an implementation detail, and it is
+// what makes a background compaction safe for a caller holding a slice of ids it
+// collected minutes ago.
+//
+// What does not survive is a []byte a read returned, under a mapped image: see
+// ImageMode for the lifetime those have and store.CloneNode for the way out.
+//
 // Cancellation reaches the build and stops there. Once the commit begins —
 // the flush, the rename, the retire — the compaction runs to completion
 // whatever ctx says, because those steps are the ordering that makes a crash
@@ -933,6 +946,13 @@ func (s *Store) compactCommit(p *compactPlan, newCSR *CSRGraph, tmpPath string) 
 	// the garbage collector reclaims it when the last one closes.
 	spliced, shadowed := s.cur().delta.since(p.epoch, newCSR)
 	s.publishCompacted(newCSR, spliced, shadowed)
+
+	// The delta this compaction leaves behind is what the soft limit is about from
+	// here. Re-evaluated rather than cleared: a compaction that ran while a large
+	// commit was landing can publish a delta still over the limit, and reporting
+	// that as resolved would announce the next crossing only after the one after
+	// it.
+	s.noteDeltaBytesLocked(spliced.bytes)
 
 	// Everything folded into the image is durable in it, including any commit
 	// that had been written but was still waiting on its fsync when this

@@ -363,6 +363,42 @@ func (g *Graph) ShouldCompact(p store.CompactionPolicy) (bool, string) {
 	return p.Evaluate(s)
 }
 
+// CompactIfDue compacts when policy says the store is due, and reports which
+// rule fired.
+//
+// The two halves have always been here -- ShouldCompact reads the figures and
+// Compact acts -- and every caller that wanted the pair wrote the same four lines
+// around them. This is those four lines, so that the decision and the action
+// cannot drift apart: a caller cannot evaluate one policy and compact on another,
+// and cannot compact having forgotten to ask.
+//
+// The reason comes back whether or not anything was compacted, because it is what
+// an operator needs in a log line. It is empty exactly when the store was not due.
+//
+// A backend that reports no storage statistics is never due, so this is a no-op on
+// the in-memory store rather than an unconditional compaction of something that
+// has nothing to compact.
+//
+// Identifiers survive a compaction, so a slice of ids collected before this call
+// is still valid after it. See disk.Store.CompactCtx.
+func (g *Graph) CompactIfDue(p store.CompactionPolicy) (bool, string, error) {
+	return g.CompactIfDueCtx(context.Background(), p)
+}
+
+// CompactIfDueCtx is CompactIfDue, with the compaction abandoned if ctx is
+// cancelled. The policy is evaluated first and is not cancellable: it is a read
+// lock and four comparisons.
+func (g *Graph) CompactIfDueCtx(ctx context.Context, p store.CompactionPolicy) (bool, string, error) {
+	due, why := g.ShouldCompact(p)
+	if !due {
+		return false, "", nil
+	}
+	if err := g.CompactCtx(ctx); err != nil {
+		return false, why, err
+	}
+	return true, why, nil
+}
+
 // --- Batch reads ---
 
 // GetNodes fetches multiple nodes by ID in the order given.
