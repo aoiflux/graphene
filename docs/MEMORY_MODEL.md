@@ -746,6 +746,16 @@ question, not the warm figure.
 **The composites are still resident**, exactly as the caution below says, and are now
 the largest remaining term. Nothing has measured a store that declares many of them.
 
+**Verifying the mapped index costs nothing resident.** Worth stating here because it
+is the one operation that touches every entry in the index on purpose, and therefore
+the obvious place for the residency win to be handed straight back. It is not:
+`VerifyIndexes` holds one counter per declared key plus a buffer sized by the widest
+value, measured at 416 bytes and thirteen allocations whether the index holds 25,000
+entries or 100,000. The time is ~76 ns per entry. That was designed for rather than
+observed — the store most likely to be verified is the one nearest its ceiling — and
+`docs/TECHNICAL_DETAILS.md` §14.20 has the argument that makes an O(1)-memory check
+of both directions exhaustive rather than partial.
+
 ## 7. Target architecture
 
 The store should hold, per live record and in anonymous memory, only what cannot be

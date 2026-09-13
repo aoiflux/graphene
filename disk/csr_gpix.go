@@ -688,8 +688,8 @@ func (k *gpixKey) runAt(i uint64) (value []byte, ids []byte, err error) {
 	if i >= k.Distinct {
 		return nil, nil, fmt.Errorf("gpix: value %d of %d", i, k.Distinct)
 	}
-	start := binary.LittleEndian.Uint64(k.vtab[i*gpixVtabEntry+8:])
-	end := binary.LittleEndian.Uint64(k.vtab[(i+1)*gpixVtabEntry+8:])
+	start := k.runOffsetAt(i)
+	end := k.runOffsetAt(i + 1)
 	if start > end || end > uint64(len(k.runs)) {
 		return nil, nil, fmt.Errorf("gpix: value %d spans %d..%d of %d bytes of runs",
 			i, start, end, len(k.runs))
@@ -716,6 +716,17 @@ func (k *gpixKey) runAt(i uint64) (value []byte, ids []byte, err error) {
 // prefixAt returns the i'th vtab entry's value prefix.
 func (k *gpixKey) prefixAt(i uint64) uint64 {
 	return binary.BigEndian.Uint64(k.vtab[i*gpixVtabEntry:])
+}
+
+// runOffsetAt returns the i'th vtab entry's run offset, relative to the key's
+// runs region.
+//
+// i may be Distinct, which addresses the sentinel: its offset is the end of the
+// last run, and that is what makes every run's extent the difference of two
+// adjacent entries. Both are inside the vtab because parseGPIX bounded a region
+// of Distinct+1 entries before either was read.
+func (k *gpixKey) runOffsetAt(i uint64) uint64 {
+	return binary.LittleEndian.Uint64(k.vtab[i*gpixVtabEntry+8:])
 }
 
 // search returns the index of the first value not less than want, and whether

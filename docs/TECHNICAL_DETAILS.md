@@ -4652,6 +4652,78 @@ which point the stream's source changes and its shape does not. That is why the
 payload is an `iter.Seq` rather than a callback: the seam is already where R3
 needs it.
 
+### 14.20 Taken: the mapped index is checked once, by whoever asks
+
+The question this settles is where the invariants of a disk-resident index get
+checked. There were three candidates and only one of them is affordable.
+
+**At parse time** is what an ordinary section reader does, and GPIX's parser does
+do part of it: the header, the footer, the key directory's extent and order, each
+key's name bytes, and each key's value table and runs regions against the body and
+against the declared counts. That is everything a *bound* needs, and it is O(keys).
+What it cannot include is anything about the runs themselves — that values ascend,
+that a run's postings ascend, that the counts in the directory are what the runs
+hold, that every reverse entry names a forward run that lists its id. Each of
+those is O(entries), and doing it at parse time would mean every `Open` walking
+the whole index: exactly the pass the mapped index exists to stop paying, given
+back at the moment the store starts.
+
+**On every read** is worse and is worth naming only to dismiss it: a lookup that
+re-established the ordering it was about to binary-search would be a linear scan
+wearing a search's clothes.
+
+**Once, on request** is what shipped. `Store.VerifyIndexes` — `graphene verify`,
+and what `store migrate` runs after it rewrites an image — pays the O(entries)
+pass, and nothing else does. `index.Base.Verify` is the interface method that
+carries it, so the check lives with the encoding rather than with whoever holds
+the concrete type; `PropertyIndex.VerifyBase` is the entry point and is separate
+from `PropertyIndex.Verify`, which checks the delta and is called far more often.
+
+#### Why the cross-check is exhaustive rather than merely thorough
+
+GPIR's entries of one kind are strictly ascending in `(id, keyID, valueOff)`, so
+they are distinct; each resolves to one `(run, id)` pair, which is one GPIX entry;
+so the map from reverse entries to forward entries is **injective**. The per-key
+counts then establish that the two sets are the same size. An injection between
+finite sets of equal size is a bijection — so those two checks together prove the
+two directions describe exactly the same entries, with no structure materialised
+on either side. That is the property a delete cascade rests on: an entity's
+entries are found through the reverse direction, and a forward entry the reverse
+direction does not know about is an entry that outlives its entity (invariant
+15.5) with nothing to notice it.
+
+#### Why it has to be there at all
+
+A value table prefix that disagrees with the value it indexes changes no entry, no
+record and therefore no Merkle root. So the digest matches, `VerifyCSRRoots`
+passes, the store opens and serves — and the binary search that prefix steers
+goes down the wrong half and reports a present value as **absent**. Every other
+check in the engine looks at content; this is the only one that looks at the
+tables that find it. `TestVerifyIndexes_NamesDamageInTheImagesIndex` constructs
+exactly that file, digest repaired, and asserts that the other three checks pass
+and this one does not.
+
+The same argument covers the two fields nothing reads: the value table's sentinel
+prefix and GPIR's two padding bytes. Both are covered by the digest, so a
+difference in either makes two compactions of the same content produce different
+files — and nothing else in the engine would ever look.
+
+#### What it costs
+
+Measured on the machine in `README.md`, five keys per node, interleaved against a
+control tree, three passes:
+
+| `VerifyIndexes` | 25,000 entries | 100,000 entries |
+|---|---|---|
+| without the base check | 0.44–0.59 ms | 1.84–2.10 ms |
+| with it | 2.24–2.28 ms | 9.20–9.71 ms |
+| added | ~1.8 ms | ~7.6 ms |
+
+That is **~76 ns per entry**, flat between the two sizes, which is the forward
+pass plus a binary search per reverse entry. Allocations went from 240 B and 6 to
+416 B and 13 — **identical at both sizes**, which is the boundedness requirement
+`Base.Verify` states, observed at the store level rather than argued.
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.
@@ -4662,7 +4734,9 @@ Any change must preserve these. Each is enforced by tests.
 2. **Postings are strictly ascending and duplicate-free**, everywhere.
 3. **The reverse map agrees with the postings in both directions**, and an id
    lives in exactly one of `ref1`/`refN`, with `refN` holding only ids that have
-   two or more entries in that shard.
+   two or more entries in that shard. A mapped index holds the same invariant
+   between GPIR and GPIX, and there it is checked exhaustively rather than
+   sampled — see §14.20 for why an injection plus equal counts is a proof.
 4. **No edge outlives its endpoints.** `DeleteNode` cascades under one lock hold;
    `AddEdge` validates endpoints under the same hold.
 5. **No index entry outlives its entity.** Checked by `VerifyIndexes`; hidden

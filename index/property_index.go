@@ -863,8 +863,8 @@ func (p *PropertyIndex) edgeEntryCount() int {
 //
 // Under a base it checks the delta and reports any fault already read out of the
 // base, but it does not verify the base's own structure. That is a pass over the
-// whole index section with O(1) memory, which belongs to the bounded verifier
-// that exists to pay for it rather than to a function every test calls.
+// whole index section, and it belongs to VerifyBase, which exists to pay for it,
+// rather than to a function every test calls.
 func (p *PropertyIndex) Verify() error {
 	return p.VerifyCtx(context.Background())
 }

@@ -5,6 +5,75 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### `VerifyIndexes` now checks the image's own property index
+
+A v9 image carries its property index as two sections read in place, and until now
+nothing established that those sections were *consistent* — only that reading them
+could not address memory outside them. Those are very different guarantees, and the
+gap between them is where a file that opens cleanly answers wrongly.
+
+**What is checked.** Per key: that the value table is tiled by its runs with no
+gap and no slack, that each 8-byte value prefix is the prefix of the value its run
+holds, that values ascend strictly, that a run's postings ascend strictly, that no
+value is present with no postings behind it, and that the directory's distinct and
+entry counts are what the runs actually hold. Per reverse entry: that it names a
+key of its own kind, addresses the *start* of a real run rather than a point
+inside one, agrees with that run's value length, and names an id that run lists.
+Then, per key, that the two directions hold the same number of entries.
+
+**The last two together are exhaustive, not thorough.** The reverse entries are
+strictly ascending in `(id, key, value offset)`, so they are distinct, so the map
+from a reverse entry to the forward entry it resolves to is injective; the counts
+then say the two sets are the same size. An injection between finite sets of equal
+size is a bijection, so the two directions are *proved* to describe the same
+entries — with neither side materialised. That is the property a delete cascade
+rests on: entries are found through the reverse direction, and a forward entry the
+reverse direction has never heard of outlives its entity with nothing to notice.
+
+**Why it cannot live anywhere cheaper.** The parser already checks every bound,
+and that is O(keys). Everything above is O(entries), so doing it at parse time
+would make every `Open` walk the whole index — which is the pass the mapped index
+exists to stop paying, handed straight back at startup. Doing it per read would be
+a linear scan dressed as a binary search. So it is paid once, by whoever asks:
+`graphene verify`, `store migrate` after it rewrites an image, or a caller with a
+store it has reason to doubt.
+
+**Why it is not redundant with what was already there.** A value table prefix
+edited to disagree with its value changes no entry, no record and therefore no
+Merkle root. The digest matches, `VerifyCSRRoots` passes, the store opens and
+serves — and the search that prefix steers goes down the wrong half and reports a
+present value as absent. Every other check in the engine looks at content; this is
+the only one that looks at the tables used to find it.
+`TestVerifyIndexes_NamesDamageInTheImagesIndex` builds exactly that file, digest
+repaired, asserts the other three checks pass, and asserts this one does not. The
+same reasoning covers the two fields no read ever looks at — the value table's
+sentinel prefix and the reverse entries' padding — because both are covered by the
+digest, so a difference in either makes two compactions of the same content
+produce different files.
+
+**What it costs, and what it must not cost.** Five keys per node, interleaved
+against a control tree, three passes:
+
+| `VerifyIndexes` | 25,000 entries | 100,000 entries |
+|---|---|---|
+| before | 0.44–0.59 ms | 1.84–2.10 ms |
+| after | 2.24–2.28 ms | 9.20–9.71 ms |
+
+About **76 ns per entry**, flat between the two sizes. Allocation went from 240 B
+and 6 allocations to 416 B and 13 — **the same at both sizes**, because memory is
+one counter per declared key plus one buffer sized by the widest value and nothing
+else. That is a requirement rather than a measurement: the store most in need of
+this check is the one nearest its memory ceiling, and a verifier proportional to
+the index would be unusable exactly when it was wanted.
+
+Nothing on the read or write path moved. `Base.Verify` is a new method on
+`index.Base`, which is what puts the check with the encoding that knows what it
+promises rather than with whoever happens to hold the concrete type;
+`PropertyIndex.VerifyBase` is the entry point and stays separate from
+`PropertyIndex.Verify`, which checks the delta and is called far more often. A
+store with no base — `IndexResident`, or a pre-v9 image — has nothing to check and
+says so by doing nothing.
+
 ### The index lives in the image: `IndexMapped` and v9 are the defaults
 
 **This is a format change and it is the default.** A store compacted by this build

@@ -1,6 +1,10 @@
 package index
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	"github.com/aoiflux/graphene/store"
+)
 
 // This file declares what a *disk-resident* property index looks like from the
 // index package's side: the Base interface, the entity kind it is addressed by,
@@ -179,4 +183,28 @@ type Base interface {
 
 	// TotalEntries returns the entry count across every key of kind.
 	TotalEntries(kind EntityKind) int
+
+	// Verify checks the base's own structure and returns the first
+	// inconsistency, or cc's error if it is cancelled.
+	//
+	// This is the pass the read paths above deliberately do not make. Every one
+	// of them is bounded — a malformed run makes a lookup fail rather than
+	// address memory it should not — but none of them establishes that the base
+	// is *consistent*: that its values ascend the way the search assumes, that
+	// its runs hold the number of entries its directory claims, that the forward
+	// and reverse directions describe the same set of entries. Each of those is
+	// a pass over every entry, and charging every query for one is the cost this
+	// whole design exists to remove.
+	//
+	// So it is a method rather than something a reader does on the way past, and
+	// it is on this interface rather than left to whoever happens to hold the
+	// concrete type: an implementation is the only thing that knows what its own
+	// encoding promises, and a base nobody can ask to check itself is a base that
+	// silently goes unchecked. PropertyIndex.VerifyBase is what calls it.
+	//
+	// Memory must be bounded — that is the requirement, not an observation: this
+	// is what a store runs on an index that is already near the ceiling the
+	// program is aimed at, so an implementation that materialised the entries in
+	// order to check them would be unusable exactly when it was needed.
+	Verify(cc *store.CancelCheck) error
 }

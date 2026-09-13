@@ -2598,6 +2598,80 @@ includes a compaction — so 300,000 of its allocations were the payload. The
 bytes-per-node and bytes-per-edge figures it exists to report are unchanged to
 four significant figures.
 
+## The mapped index is verified, boundedly (2026-09-13)
+
+The change: `Store.VerifyIndexes` also checks the image's GPIX and GPIR sections
+against each other. `index.Base.Verify` is the new interface method,
+`PropertyIndex.VerifyBase` the entry point, and nothing on a read or write path
+moved. `TECHNICAL_DETAILS.md` §14.20 has the design and the completeness argument.
+
+Conditions: Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, go 1.26,
+NVMe, 4 KiB pages. Interleaved A/B against a copy of `ea36377`, alternating arms
+within each pass. Minima, maxima and every pass reported; never best-of.
+
+### What the check costs
+
+`BenchmarkVerifyIndexes_Mapped` (stress-tagged, in `disk/`) writes a v9 image with
+five keys on every node, **reopens it** so the base under test is a mapping rather
+than something the compaction left in memory, and times `VerifyIndexes`. Three
+passes per arm, `-benchtime 3x`.
+
+| `VerifyIndexes` | 25,000 entries | 100,000 entries |
+|---|---|---|
+| before, ms | 0.441 / 0.588 / 0.456 | 1.880 / 2.096 / 1.842 |
+| after, ms | 2.246 / 2.281 / 2.236 | 9.611 / 9.710 / 9.200 |
+| added, ms | ~1.78 | ~7.64 |
+| added per entry | 71 ns | 76 ns |
+| B/op | 240 → **416** | 240 → **416** |
+| allocs/op | 6 → **13** | 6 → **13** |
+
+The last two rows are the point. Four times the entries, the same 416 bytes and
+the same thirteen allocations: memory is one counter per declared key plus one
+buffer sized by the widest value, and nothing else. That is what makes the check
+runnable on a store near its memory ceiling, which is the store most likely to
+need it. The time is linear in the entries, as a forward pass plus one binary
+search per reverse entry should be.
+
+### The controls
+
+`BenchmarkGPIXBaseLookup` guards the one read-path edit — `runAt` now reads its two
+run offsets through a `runOffsetAt` accessor instead of inlining the arithmetic
+twice. Four interleaved passes, ns/op:
+
+| | before | after |
+|---|---|---|
+| AllDistinct | 86.73 / 88.04 / 89.38 / 90.20 | 89.54 / 88.43 / 90.39 / 90.66 |
+| LowCardinality | 79.64 / 73.29 / 83.31 / 73.36 | 76.47 / 78.32 / 85.12 / 71.30 |
+
+Means differ by 1.6% and 1.5% with the ranges overlapping across most of their
+width; both arms allocate nothing. One earlier pass produced a 94.7 and a 99.1 on
+the new arm and neither reproduced in any of the four above, which is why there are
+four passes rather than one.
+
+`BenchmarkRSS_Open` at 50,000 nodes, two interleaved passes, confirms that nothing
+about opening a store changed — as it must not have, since the load path was not
+touched:
+
+| after Open | before | after |
+|---|---|---|
+| Go heap, MiB | 17.38 / 17.38 | 17.38 / 17.38 |
+| anonymous RSS, MiB | 92.34 / 91.64 | 91.34 / 91.42 |
+| file-backed RSS, MiB | 24.43 / 24.49 | 24.54 / 24.48 |
+| total RSS, MiB | 116.8 / 116.1 | 115.9 / 115.9 |
+| image on disk, MiB | 60.46 / 60.46 | 60.46 / 60.46 |
+| resident per disk | 1.931 / 1.921 | 1.917 / 1.917 |
+
+The heap figure is identical to four significant figures in every arm of every
+pass, and the image is the same size to two decimals: **no format change**.
+
+### Reproducing
+
+```
+go test -tags=stress ./disk/ -run '^$' -bench VerifyIndexes_Mapped -benchmem -benchtime 3x
+go test ./disk/ -run '^$' -bench GPIXBaseLookup -benchmem -benchtime 2s
+GRAPHENE_BENCH_NODES=50000 go test -tags=stress ./tests/ -run '^$' -bench RSS_Open -benchtime 1x
+```
+
 ## The memory architecture review (2026-09-12)
 
 The Phase 2 measurement campaign. Interpretation, the models fitted to these numbers

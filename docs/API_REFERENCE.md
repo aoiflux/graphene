@@ -2451,14 +2451,38 @@ and that no index entry outlives its entity. It cannot check that an indexed
 *value* still matches the entity's properties: those values are caller-encoded
 and opaque.
 
+Under `IndexMapped` it also checks the image's own index sections, which is the
+half of the question nothing else can ask. Parsing a v9 image establishes that no
+read can address memory outside GPIX or GPIR; it does not establish that the
+section is *consistent*, because that is a pass over every entry and charging
+every query for it is the cost the mapped index exists to avoid. So this is where
+it is paid: each key's value table is checked to be tiled by its runs, each
+8-byte value prefix against the value it indexes, values and postings against the
+orderings the binary searches assume, the directory's counts against what the
+runs hold, and every reverse entry against the forward run it names. The last two
+together are exhaustive — the reverse entries inject into the forward ones and
+the counts make the two sets the same size, so the two directions are shown to
+describe exactly the same entries.
+
+It is deliberately reachable: a value table whose prefix disagrees with its value
+leaves the entries, the records and therefore every Merkle root untouched, so the
+digest matches, `VerifyCSRRoots` passes, the store opens — and a present value is
+reported absent. This is the only check that says so.
+
+Memory stays bounded: one counter per declared key and one buffer sized by the
+widest value, whatever the index holds. That is a requirement rather than an
+observation, because the store most in need of the check is the one closest to
+its memory ceiling.
+
 `RebuildIndexes` recomputes everything derivable from the records — label
 postings and adjacency — and drops property entries whose entity is gone. It
 repairs structure, not content.
 
 **Neither runs automatically on `Open`.** Verification is O(V+E) — roughly 200 ms
-on a 100k-node store — and a damaged index section is already rejected while the
-file is parsed, so the scan would be a startup tax for little gain. Run them
-explicitly in tests, in CI, or when recovering a suspect store.
+on a 100k-node store, and O(entries) again on top of that for a mapped index —
+and a damaged index section is already rejected while the file is parsed, so the
+scan would be a startup tax for little gain. Run them explicitly in tests, in CI,
+or when recovering a suspect store. `graphene verify` is the packaged form.
 
 #### Cancelling them, and why only one of them cancels properly
 

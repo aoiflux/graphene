@@ -237,6 +237,64 @@ func (b *fakeBase) MaxID(kind EntityKind) uint64 { return b.sides[kind].maxID }
 
 func (b *fakeBase) TotalEntries(kind EntityKind) int { return b.sides[kind].entries }
 
+// Verify is the fake's own structural check, and it is a real one rather than a
+// stub returning nil.
+//
+// The point of it is that the index package can then test VerifyBase — the
+// fault-first ordering, the cancellation, the no-base case — without a file,
+// and can watch it report a base it has deliberately damaged. A stub would make
+// every one of those tests pass whatever VerifyBase did.
+//
+// It checks what a fake can: the two orderings the read paths assume, and that
+// the reverse direction names exactly the entries the forward one holds.
+func (b *fakeBase) Verify(cc *store.CancelCheck) error {
+	for kind := range b.sides {
+		s := &b.sides[kind]
+		forward := 0
+		for _, key := range s.keys {
+			if err := cc.Step(); err != nil {
+				return err
+			}
+			if err := b.fail(key); err != nil {
+				return err
+			}
+			vals := s.values[key]
+			for i, v := range vals {
+				if i > 0 && v <= vals[i-1] {
+					return fmt.Errorf("fake base: %v key %q values are not ascending: %q after %q",
+						EntityKind(kind), key, v, vals[i-1])
+				}
+				run := NewIDRun(s.ids[key][v])
+				for j := 1; j < run.Len(); j++ {
+					if run.At(j) <= run.At(j-1) {
+						return fmt.Errorf("fake base: %v key %q value %q ids are not ascending at %d",
+							EntityKind(kind), key, v, j)
+					}
+				}
+				forward += run.Len()
+			}
+		}
+		reverse := 0
+		for id, entries := range s.entriesOf {
+			if err := cc.Step(); err != nil {
+				return err
+			}
+			for _, e := range entries {
+				if !NewIDRun(s.ids[e.Key][string(e.Value)]).Contains(id) {
+					return fmt.Errorf("fake base: %v %d is listed under %q=%q, which does not hold it",
+						EntityKind(kind), id, e.Key, e.Value)
+				}
+				reverse++
+			}
+		}
+		if forward != reverse {
+			return fmt.Errorf("fake base: %v holds %d entries forward and %d reverse",
+				EntityKind(kind), forward, reverse)
+		}
+	}
+	return nil
+}
+
 var _ Base = (*fakeBase)(nil)
 
 // --- the corpus ---

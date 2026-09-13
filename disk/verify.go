@@ -53,6 +53,20 @@ func (s *Store) VerifyIndexesCtx(ctx context.Context) error {
 	if err := s.propIdx.VerifyCtx(ctx); err != nil {
 		return err
 	}
+	// And then the image's own index sections, which VerifyCtx above deliberately
+	// does not read: their check is a pass over every entry in the index, so it
+	// belongs to the routine an operator runs on a store they doubt rather than to
+	// the one a store runs at open.
+	//
+	// Paid here without apology. This function already walks every indexed id to
+	// find entries that outlived their entity, so it is O(entries) under a base
+	// whatever this adds; what it adds is the half of the question the walk cannot
+	// ask, which is whether the section those ids came out of describes what it
+	// claims. Both are bounded in memory, which is what makes them safe to run on
+	// the store that most needs them — see index.Base.Verify.
+	if err := s.propIdx.VerifyBaseCtx(ctx); err != nil {
+		return err
+	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()

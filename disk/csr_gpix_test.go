@@ -2,6 +2,7 @@ package disk
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"runtime"
 	"sort"
 	"testing"
+
+	"github.com/aoiflux/graphene/store"
 )
 
 // --- fixtures ---
@@ -995,6 +998,49 @@ func FuzzParseGPIR(f *testing.F) {
 	})
 }
 
+// FuzzVerifyMappedIndex fuzzes the bounded check over *both* sections together,
+// which is the only way the reverse half of it can be reached: a GPIR entry means
+// nothing without the GPIX runs its offsets address, so a target taking one body
+// can only ever exercise the forward pass.
+//
+// The pair is arbitrary rather than related, which is the point. A reverse section
+// describing a forward section it has nothing to do with is exactly the input the
+// cross-check has to survive without addressing memory outside either body, and it
+// is not an input any writer produces.
+func FuzzVerifyMappedIndex(f *testing.F) {
+	fx := newGPIXFixture()
+	fx.add(gpixKindNode, "k", "aa", 1, 2)
+	fx.add(gpixKindNode, "k", "bb", 3)
+	fx.add(gpixKindEdge, "r", "x", 4)
+	fwd, rev, _, err := encodeMappedIndexFrom(fx.source("", 0, 0))
+	if err != nil {
+		f.Fatalf("encode: %v", err)
+	}
+	f.Add(fwd, rev)
+	f.Add(newGPIXSeedEmpty(), rev)
+	f.Add(fwd, []byte{})
+	f.Add([]byte{}, []byte{})
+
+	f.Fuzz(func(t *testing.T, gpix, gpir []byte) {
+		fwdSec, err := parseGPIX(gpix)
+		if err != nil {
+			return
+		}
+		revSec, err := parseGPIR(gpir)
+		if err != nil {
+			return
+		}
+		b, err := newGPIXBase(fwdSec, revSec)
+		if err != nil {
+			return
+		}
+		cc := store.NewCancelCheck(context.Background())
+		// An error is the expected outcome for almost every input. A panic is not,
+		// and is what this target exists to find.
+		_ = b.Verify(&cc)
+	})
+}
+
 // --- helpers ---
 
 // drainGPIX exercises every read a parsed section offers, so that a bound
@@ -1029,8 +1075,17 @@ func drainGPIXFuzz(sec *gpixSection) {
 			})
 			for i := uint64(0); i <= k.Distinct+1; i++ {
 				_, _, _ = k.runAt(i)
+				_, _ = k.runIndexOfValueAt(k.runOffsetAt(min(i, k.Distinct)) + 4)
 			}
+			_, _ = k.runIndexOfValueAt(0)
+			_, _ = k.runIndexOfValueAt(^uint64(0))
 			_, _ = sec.valueOf(gpirEntry{KeyID: k.KeyID, ValLen: 8, ValueOff: 0})
+			// The verifier's forward pass is a reader of the same untrusted
+			// section, so it belongs in the drain: a bound parseGPIX did not
+			// establish must surface as a failure here rather than as a panic in
+			// whatever runs `graphene verify`.
+			cc := store.NewCancelCheck(context.Background())
+			_ = verifyGPIXKey(k, &cc)
 		}
 	}
 }

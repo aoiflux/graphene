@@ -47,6 +47,7 @@ package index
 // compaction simply does not write them.
 
 import (
+	"context"
 	"math/bits"
 	"sync"
 	"sync/atomic"
@@ -288,6 +289,48 @@ func (p *PropertyIndex) BaseFault() error {
 		return f.err
 	}
 	return nil
+}
+
+// VerifyBase checks the structure of the disk-resident half of the index, and
+// returns nil when there is none.
+//
+// Separate from Verify, and the separation is the point. Verify is what a test
+// calls after a handful of writes; this is a pass over every entry the image
+// holds, in order to establish the things the read paths assume and cannot
+// afford to re-check — the value ordering a binary search depends on, the id
+// ordering an IDRun promises, and the agreement between the forward and reverse
+// directions that a delete cascade depends on. Rolling the two together would put
+// an O(index) pass behind a call this package makes on every store that opens
+// with a Verifier.
+//
+// So the two are called together by the one caller that means "check everything":
+// Store.VerifyIndexes, which is what `graphene verify` runs and what an operator
+// runs on a store they have reason to doubt.
+//
+// Cancellation is honoured throughout and costs nothing to abandon: the whole
+// thing is read-only, so a cancelled check means only that the question went
+// unanswered. See Base.Verify for what the implementation must bound.
+func (p *PropertyIndex) VerifyBase() error {
+	return p.VerifyBaseCtx(context.Background())
+}
+
+// VerifyBaseCtx is VerifyBase, abandoned if ctx is cancelled.
+func (p *PropertyIndex) VerifyBaseCtx(ctx context.Context) error {
+	st := p.baseRef.Load()
+	if st == nil {
+		return nil
+	}
+	cc := store.NewCancelCheck(ctx)
+	if err := cc.Check(); err != nil {
+		return err
+	}
+	// The recorded fault first. A run that would not decode has already been read
+	// once, and reporting the damage that was actually hit beats reporting
+	// whatever the structural pass reaches first.
+	if f := st.firstFault.Load(); f != nil {
+		return f.err
+	}
+	return st.b.Verify(&cc)
 }
 
 // RetractedCounts returns how many base ids of each kind have been retracted,
