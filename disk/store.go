@@ -448,12 +448,14 @@ const (
 	//
 	// v9 is chosen by the payload rather than by the build: it means "this image
 	// carries the property index as GPIX and GPIR", which is a decision about how
-	// the index is held, not about how new the writer is. So a build reads v9 from
-	// the change that teaches it to, and writes v9 from the change that makes that
+	// the index is held, not about how new the writer is. So a build read v9 from
+	// the change that taught it to, and writes v9 from this one, which made that
 	// the default. Anything asking which version an operator's next compaction
 	// will produce wants csrVersionCurrent; anything bounding a file it is about
-	// to parse wants csrVersionMax.
-	csrVersionCurrent        = csrVersionSectioned
+	// to parse wants csrVersionMax. Options.IndexMode: IndexResident still writes
+	// csrVersionSectioned, so the two constants are not the same number and the
+	// distinction they were introduced for outlives the flip.
+	csrVersionCurrent        = csrVersionMappedIndex
 	csrVersionMax            = csrVersionMappedIndex
 	csrV6HeaderSize          = 46 // magic4 + version2 + counts16 + seqHW16 + indexOffset8
 	csrV5HeaderSize          = 38
@@ -782,15 +784,23 @@ type Options struct {
 	ImageMode ImageMode
 
 	// IndexMode decides whether a property index the image carries is read in
-	// place or rebuilt in the heap at Open. The zero value, IndexResident,
-	// rebuilds it, which is what every version before the format could carry a
-	// readable one did.
+	// place or rebuilt in the heap at Open, and which of the two encodings the
+	// next compaction writes.
 	//
-	// IndexMapped is the memory this section of the program is about: the index
-	// stops being a function of the number of entries and becomes a fence per key.
-	// It requires a mapped image and falls back with a metric otherwise.
+	// The zero value, IndexMapped, reads it in place: the index stops being a
+	// function of the number of entries and becomes a directory and a value table
+	// per key. It is the memory this section of the program is about, and it is
+	// the default because nothing else in the engine is within an order of
+	// magnitude of the index's residency.
 	//
-	// See index_mode.go for what the choice actually costs on each side.
+	// Two consequences a caller has to know about. A point lookup becomes a binary
+	// search through file-backed pages, so it is slower warm and much slower cold
+	// — NodesByPropertyBatch turns a pass of many cold lookups back into a
+	// sequential sweep. And the image the next compaction writes is v9, which no
+	// earlier build opens: IndexResident writes v8 and is the way back.
+	//
+	// See index_mode.go for the whole argument, including why a store that could
+	// not map its image still writes the format it was asked for.
 	IndexMode IndexMode
 }
 

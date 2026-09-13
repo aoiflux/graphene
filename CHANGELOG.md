@@ -5,6 +5,147 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### The index lives in the image: `IndexMapped` and v9 are the defaults
+
+**This is a format change and it is the default.** A store compacted by this build
+writes v9, and no earlier build opens a v9 image — GPIX and GPIR are critical
+sections, so an older reader refuses the file rather than answering property
+queries out of an index it cannot read. `Options.IndexMode: IndexResident` plus one
+`Compact()` writes v8 again and is the supported way back; `store migrate --to 8`
+is the convenient form of the same thing and lands next.
+
+Everything before this change made the mapped index *possible*. This is the one
+that measures it against the alternative and moves the default, which is the only
+change in the sequence that was ever going to be interesting.
+
+**What it is worth.** The consumer's index shape — eight unique keys including a
+32-byte all-distinct digest, five ordered, two composites, thirteen entries on
+every node — reopened from disk through `tests/rss_bench_test.go`, interleaved
+against a control tree, two sizes:
+
+| after Open | 50,000 nodes (650k entries) | 200,000 nodes (2.6M entries) |
+|---|---|---|
+| Go heap | 92.14 → 17.38 MiB (−81.1%) | 362.0 → 66.32 MiB (−81.7%) |
+| anonymous RSS | 149.9–157.8 → 80.3–91.4 MiB | 439.5–442.4 → 146.9–171.1 MiB |
+| file-backed RSS | 41.6–41.9 → 24.1–25.0 MiB | 172.9–173.8 → 103.8–103.9 MiB |
+| total RSS | 191.8–199.3 → 104.4–116.0 MiB | 613.3–615.2 → 250.7–275.0 MiB |
+| image on disk | 44.0 → 60.5 MiB (+37%) | 176.0 → 241.4 MiB (+37%) |
+| **resident per byte of store** | **4.36× → 1.73–1.92×** | **3.49× → 1.04–1.14×** |
+
+The heap figure is the term that was moved and it is identical to two decimals on
+both arms across every pass. The saving is **119–121 bytes per indexed entry** at
+both sizes, against the ~107 the cost model predicts — the model is slightly
+conservative because the 32-byte digest cannot be interned, which is exactly why
+that key is in the fixture.
+
+The last row is the one to read. A 200,000-node store cost 3.5× its own file in
+resident memory and now costs 1.04×, and the file-backed half of that *fell* while
+the file itself grew by 37%: rebuilding the index meant walking every byte of GIDX,
+so the old arrangement made the whole image resident on the way past. Reading a
+directory touches a fraction of a larger file.
+
+**What it costs, reported rather than buried.** A warm point lookup roughly
+doubles. `BenchmarkIndexMode_PointLookup` runs both arms over one file, three runs
+at 60,000 entries:
+
+| | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `IndexResident` | 118.6, 121.1, 120.5 | 8 | 1 |
+| `IndexMapped` | 219.4, 222.0, 260.4 | 8 | 1 |
+
+**Allocation is identical** — one slice of one id either way: the resident arm
+copies the postings list out from under the shard lock, and the mapped arm merges a
+run out of the image with an empty delta, which costs the same one slice. So the
+whole of the trade is in the nanoseconds and none of it is in garbage.
+
+The plan budgeted 0.3–0.8 µs for this, so +100 ns is inside the budget — but it
+corrects the "+4 ns" recorded when the loader landed. That figure came from a
+session whose *resident* arm happened to be running at 272 ns; the mapped arm's
+~220 ns is the stable half of the comparison across both sessions. A delta between
+two noisy arms is not a measurement. Cold is still unmeasured and is where the batch
+API earns its place.
+
+Compaction takes **2.76–2.82 s → 3.24–3.50 s (+15 to +24%)** at 200,000 nodes
+and its peak memory does not move (709–715 MiB against 720 MiB): the counting
+sort and the value-table spill trade wall clock for a bound they already had. Open is
+*faster*, because the resident arm rebuilds millions of entries and the mapped arm
+reads a directory: 81–108 ms → 21–28 ms at 150,000 entries.
+
+**A real bug, and it was the probe path.** A residual property filter is applied
+one of two ways: build the filter's own set and intersect it, or ask each candidate
+what it is indexed under and test the answer. The second reads the *reverse*
+direction, and the delta's reverse direction knows only about entities written
+since the last compaction — so under a base it concluded "no entry under this key,
+therefore no match" about every entity in the image, and every type-narrowed
+property query returned **an empty result**. Not a wrong one: empty, which is worse,
+because a scan that finds nothing looks like a graph that contains nothing.
+
+It was the one read path `base ∪ delta − retracted` had not reached, and nothing
+found it until the default made a base exist outside this package's own tests.
+`TestQueryParity_MemoryVsDisk_DeltaAndCompacted` — a test written long before any
+of this — is what caught it.
+
+What the fix does not do is tell the planner what a probe now costs.
+`probeIsCheaper` still compares a candidate count against a set size on the
+assumption that a probe is a map lookup; under a mapped index it is a binary search
+through file-backed pages, so the planner will sometimes choose to probe where
+building the set would have been cheaper. It is a plan-quality gap and not a
+correctness one — the answers are the same either way — and closing it is R3e's
+`probeCost()`.
+
+The lesson is about the oracle rather than the bug. Comparing the two arms of
+`IndexMode` through the index's own read methods compares them on the paths
+somebody had already thought about; reaching them through the *planner* is what
+asks the questions nobody had. The comparison now runs six filter shapes and both
+entity kinds through query planning, and the fixture carries a cohort of a rare
+type purely so that the planner has few enough candidates to choose the probe.
+
+**Two more things the flip found.** `VerifyCSRRoots` recomputed the index root from
+GIDX, which a v9 image does not carry — so it recomputed it from nothing and
+reported every v9 image as one whose roots did not describe it. An offline verifier
+that cannot verify the format the engine writes is worse than none: it is a tool
+that reports damage where there is none, which is how operators learn to ignore it.
+And `InspectCSR` reported zero property entries for a v9 image, which is
+indistinguishable from an image whose index is empty; it now reads the counts out
+of the key directory, so inspecting a multi-gigabyte index costs no more than
+inspecting a small one.
+
+**The Merkle identity does not change.** The index root is a tree over the property
+entries in `(key, value, id)` order, and the two encodings hold the same entries in
+the same order — so a store's snapshot root is the same number before and after
+this change. Had that not held, every root anyone had written down would have been
+invalidated, and the only symptom would have been a verification failure long
+afterwards. `TestSnapshotRoots_DoNotChangeWithTheIndexEncoding` pins it, and the
+CLI's golden corpus shows it incidentally: the recorded roots did not move when the
+sections did.
+
+**The writer checks the orders it is read through.** A value table is
+binary-searched and a run is handed out as an ascending `IDRun`, and neither order
+is checked when
+the section is parsed — verifying either is a pass over the whole index, and that
+pass belongs to the bounded verifier rather than to every open. So the encoder now
+refuses a stream whose keys, values or ids are not strictly ascending, at one
+comparison per key, per value and per entry. Failing the compaction is the point of
+failing at all: the previous image is still installed and the store is still
+serving, where a file written and then found unreadable at the next open is an
+unavailable store.
+
+**The encoding follows the option, not the machine.** A store that asked for a
+mapped index and could not have one — `ImageHeap`, or a platform without mmap —
+still writes v9. Two parties compacting the same content under the same options have
+to produce the same bytes, and they would not if the format depended on a runtime
+capability; what such a store cannot do is read *this* image in place, which is what
+`store.MetricIndexFallback` already reports.
+
+**Mutation testing found the hole the tests did not.** Twenty mutants, twenty
+killed — but one survived the first pass: a writer that ignored the base and wrote
+only the delta. Every fixture built a store from nothing and compacted it once, so
+the delta *was* the index and a walk that skipped the base produced a correct file.
+The second compaction is where that stops being true, and the second compaction is
+what every store that stays open past its first one does. It would have shipped as
+an index that quietly shrank to whatever had been written since the last compaction,
+noticed one reopen later.
+
 ### A store can open the mapped index: `Options.IndexMode`
 
 The two sections now have a reader on the other side of the loader. A v9 image

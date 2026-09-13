@@ -241,12 +241,18 @@ func (p *PropertyIndex) probeNodes(candidates []store.NodeID, f store.PropertyFi
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	ordered := sh.orderedNodeKeys[f.Key] != nil
+	// A probe reads the reverse direction, and the delta's reverse direction knows
+	// only what has been written since the last compaction — so under a base the
+	// delta saying "no entry under this key" is not an answer. See
+	// baseSide.entryMatches.
+	s, hasBase := p.nodeBase()
 	out := candidates[:0]
 	for _, id := range candidates {
 		if err := cc.Step(); err != nil {
 			return nil, err
 		}
-		if postingsMatch(&sh.nodes, id, f, ordered) {
+		if postingsMatch(&sh.nodes, id, f, ordered) ||
+			(hasBase && s.entryMatches(uint64(id), f, ordered)) {
 			out = append(out, id)
 		}
 	}
@@ -259,12 +265,14 @@ func (p *PropertyIndex) probeEdges(candidates []store.EdgeID, f store.PropertyFi
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	ordered := sh.orderedEdgeKeys[f.Key] != nil
+	s, hasBase := p.edgeBase() // see probeNodes
 	out := candidates[:0]
 	for _, id := range candidates {
 		if err := cc.Step(); err != nil {
 			return nil, err
 		}
-		if postingsMatch(&sh.edges, id, f, ordered) {
+		if postingsMatch(&sh.edges, id, f, ordered) ||
+			(hasBase && s.entryMatches(uint64(id), f, ordered)) {
 			out = append(out, id)
 		}
 	}
@@ -290,15 +298,7 @@ func postingsMatch[T entityID](p *postings[T], id T, f store.PropertyFilter, ord
 		// here made the probe path allocate proportionally to the candidate set
 		// it exists to avoid materialising. The predicates below only read it,
 		// which is the same contract the scan path already relies on.
-		v := unsafeBytes(ref.value)
-		if ordered {
-			if store.PropertyFilterMatchesOrdered(f, v) {
-				matched = true
-				return false
-			}
-			return true
-		}
-		if store.PropertyFilterMatches(f, v) {
+		if filterMatchesValue(f, unsafeBytes(ref.value), ordered) {
 			matched = true
 			return false
 		}

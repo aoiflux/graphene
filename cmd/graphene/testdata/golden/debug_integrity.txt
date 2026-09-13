@@ -3,7 +3,7 @@ exit 0
 --- stdout ---
 image                 
   digest              match
-  computed            4809bf20ee4ddbae14d3596b05f4e390341339367db7f5c81a60d76778e218e5
+  computed            d2a4baa296bb37e6d6a1092b9f4b753399f0aec00a4820ae215c917fa7c9bbf1
   roots               describe the records
                       
 indexes               

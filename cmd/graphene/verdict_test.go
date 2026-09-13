@@ -99,10 +99,22 @@ func TestBrokenCommandsStillReleaseTheLock(t *testing.T) {
 	// Whether this exits 0 or 1 is not the point; the lock is.
 	exec(t, "custody", "-node", "1", dir)
 
-	// The store is corrupt, so Open fails either way — the assertion has to be
-	// specifically about the lock, or it would pass for the wrong reason.
-	if _, err := disk.Open(dir); errors.Is(err, disk.ErrStoreLocked) {
+	// The assertion is specifically about the lock, because the store is corrupt
+	// and Open may well refuse it for that reason instead — which would pass for
+	// the wrong reason if the check were "did it open".
+	//
+	// Whether it refuses depends on *where* the flipped byte landed, and that is
+	// not something this test should be pinning: corruptCSR flips the middle byte,
+	// and the middle of a v9 image is inside GPIX, where a flipped value or id byte
+	// is a digest matter rather than a parse one. So the handle has to be closed
+	// when there is one, or a store that opens fine leaves this test holding the
+	// lock it is here to check nobody else holds.
+	g, err := disk.Open(dir)
+	if errors.Is(err, disk.ErrStoreLocked) {
 		t.Fatalf("a failed custody left the store locked: %v", err)
+	}
+	if err == nil {
+		_ = g.Close()
 	}
 }
 

@@ -336,11 +336,26 @@ func writeGPIXKind(iw *imageWriter, base uint64, dirs []gpixKeyDir, vtab *spillB
 	// TestGPIX_WriteAllocationIsFlatInEntries caught it; iw.num is the same trick
 	// for the same reason.
 	var ent [gpixVtabEntry]byte
-	for _, key := range keys {
+	// prev is the previous value of the key being written, for the order check
+	// below. Copied rather than retained: the walk owns the bytes it yields only
+	// for the duration of the call. It grows to the key's widest value, which is
+	// the one buffer here that is not flat in the entries.
+	var prev []byte
+	for i, key := range keys {
+		// The key directory is binary-searched by (kind, key), and parseGPIX
+		// refuses one that is out of order — so an unsorted key list here would
+		// write a file this build could not reopen. Failing the compaction instead
+		// leaves the previous image installed and the store running, which is the
+		// difference between a bad write and an unavailable store.
+		if i > 0 && key <= keys[i-1] {
+			return nil, fmt.Errorf("gpix: keys are not ascending: %q after %q", key, keys[i-1])
+		}
 		d := gpixKeyDir{Key: key, Kind: kind, KeyID: uint16(len(dirs))}
 		d.VtabOff = vtab.len() // spill-relative until writeGPIX places the region
 		d.RunsOff = iw.at() - base
 		var runAt, distinct, entries uint64
+		var orderErr error
+		havePrev := false
 		if err := walk(key, func(value []byte, ids []uint64) bool {
 			// A value no entity holds is not in the index and is not written. The
 			// merged walk a compaction reads from skips a value whose every id has
@@ -350,6 +365,26 @@ func writeGPIXKind(iw *imageWriter, base uint64, dirs []gpixKeyDir, vtab *spillB
 			// covers.
 			if len(ids) == 0 {
 				return true
+			}
+			// The two orders the format is read through, checked as they are
+			// written. A vtab whose values are not ascending is binary-searched
+			// wrongly, and a run whose ids are not ascending is handed to a caller
+			// as an IDRun that claims to be — and neither has a reader-side check,
+			// because verifying either one is a pass over the whole section and
+			// that pass is the bounded verifier's. The writer is where it costs one
+			// comparison per value and one per entry.
+			if havePrev && bytes.Compare(prev, value) >= 0 {
+				orderErr = fmt.Errorf("gpix: key %q values are not ascending: %q after %q",
+					key, value, prev)
+				return false
+			}
+			prev, havePrev = append(prev[:0], value...), true
+			for i := 1; i < len(ids); i++ {
+				if ids[i] <= ids[i-1] {
+					orderErr = fmt.Errorf("gpix: key %q value %q has ids out of order at %d: %d after %d",
+						key, value, i, ids[i], ids[i-1])
+					return false
+				}
 			}
 			binary.BigEndian.PutUint64(ent[0:8], gpixPrefixOf(value))
 			binary.LittleEndian.PutUint64(ent[8:16], runAt)
@@ -375,6 +410,11 @@ func writeGPIXKind(iw *imageWriter, base uint64, dirs []gpixKeyDir, vtab *spillB
 			return true
 		}); err != nil {
 			return nil, fmt.Errorf("gpix: walk %q values: %w", key, err)
+		}
+		// After the walk's own error, not before: a walk that failed for its own
+		// reason should say so rather than be reported as disordered.
+		if orderErr != nil {
+			return nil, orderErr
 		}
 		// The sentinel. Its prefix is never compared — a search stops at
 		// distinct — and its offset is the end of the last run, which is what

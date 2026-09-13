@@ -47,7 +47,11 @@ Four things a reader should take away before the detail.
 
 Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, 31.4 GiB RAM, go 1.26,
 NVMe, 4 KiB pages. Tree `d5ac514`. `ImageMode: ImageMapped`, `IndexMode`
-resident (there is no disk-resident index yet — that is R3).
+resident, which was the default when these figures were taken. It is not any more:
+R3 shipped and `IndexMapped` is the default, so §1 and §3 describe the arrangement
+this engine *replaced*. They are kept as written because they are what ranked the
+items — the index at 94–96% of everything is the reason R3 exists — and §6.4
+records what the flip then measured.
 
 The fixture is the one an embedding consumer reported against: 512-byte blobs and
 a declared index of 8 unique keys (one of them a 32-byte digest, distinct on every
@@ -650,8 +654,9 @@ OOM killer actually sees.
 |---|---:|---|
 | v0.6.0, pre-program (projected from the consumer's 4.06× ratio) | ~3,530 | +72% |
 | today — R1 + R10(b) + R2 shipped (**measured**) | **2,909** | **+42%** |
-| + R3 as designed (projected) | ~607 | **−70%** |
-| + R3 and the composites (projected) | ~205 | −90% |
+| + R3, `IndexMapped` the default (**measured at 200k, scaled**) | **~1,113** | **−46%** |
+| + R3 as designed (projected, superseded — see §6.4) | ~607 | −70% |
+| + the composites on disk too (projected) | ~205 | −90% |
 
 The arithmetic of the two projected rows, so it can be argued with: **161** measured with
 no index at all (§3), **+ 402** for the composites R3's design leaves resident (§6.1),
@@ -660,10 +665,11 @@ the key directory, ~110 KB for a 28M-entry key, plus the delta since the last co
 — **= 607**. Drop the composites to disk as well and the same sum is **205**, which is
 the no-index measurement plus R3's fences and nothing else.
 
-**R3 is the item that decides the target, and with it the target is reached with room to
-spare.** Nothing else in the program closes a 42% overshoot: R4 is 0.7% of anonymous
-residency and the runtime's own 5.3% is a `GOMEMLIMIT` setting rather than an engineering
-item.
+**R3 was the item that decided the target, and with it the target is reached.** Nothing
+else in the program closes a 42% overshoot: R4 is 0.7% of anonymous residency and the
+runtime's own 5.3% is a `GOMEMLIMIT` setting rather than an engineering item. §6.4 is the
+measurement and is the row to argue with; the ~607 projection below it is kept because the
+gap between the two is instructive.
 
 The floor those projections approach is not a guess. The no-index arm of §3 measures what
 this store costs when the property index is not in play at all — **161 MiB of anonymous
@@ -690,6 +696,55 @@ measures 6.40× and 0.139× on the same engine, the same index shape and the sam
 count — the blob distribution alone. Every ratio in this document belongs to a 512-byte
 fixture with thirteen index entries per node, and none of them should be quoted without
 that shape beside it.
+
+### 6.4 What the flip measured
+
+R3's default landed in three steps — the format, the loader, and this — and only the
+third one could be measured against the thing it replaced. Interleaved against a
+control tree at HEAD, each arm building its own fixture so that the format under test
+is the format that tree writes, `GRAPHENE_RSS_DIR` unset so nothing is shared:
+
+| after Open | 50,000 nodes | 200,000 nodes |
+|---|---|---|
+| Go heap objects | 92.14 → 17.38 MiB | 362.0 → 66.32 MiB |
+| anonymous RSS | 149.9–157.8 → 80.3–91.4 | 439.5–442.4 → 146.9–171.1 |
+| file-backed RSS | 41.6–41.9 → 24.1–25.0 | 172.9–173.8 → 103.8–103.9 |
+| total RSS | 191.8–199.3 → 104.4–116.0 | 613.3–615.2 → 250.7–275.0 |
+| image on disk | 44.0 → 60.5 | 176.0 → 241.4 |
+| resident per byte of store | 4.36× → 1.73–1.92× | 3.49× → 1.04–1.14× |
+
+Same fixture shape as the master here — 512-byte blobs, thirteen index entries per
+node — so the 200,000-node column scales by seven to the 1.4M-node store this
+document is otherwise about, and that scaling is checkable rather than asserted: the
+control arm's 441 MiB of anonymous memory scaled by seven is **3,087 MiB against the
+2,909 this document measured directly**, a 6% disagreement between two harnesses and
+two fixture builds. The mapped arm's 159 MiB scales to **~1,113 MiB**, which is the
+row in §6.3.
+
+**Why that is 1,113 and not the 607 projected.** The projection summed live
+structures: 161 measured with no index, + 402 for the composites, + ~44 for R3's own
+resident cost. What §6.3's column reports is *anonymous RSS*, which is the Go
+runtime's retained address space and not the live set — heap objects at 200,000 nodes
+are 66.3 MiB, and scaled that is 464 MiB, comfortably inside the sum. The projection
+was not wrong about the structures; it was answering a different question from the
+column it was written into. The measured row is the one to plan against, because it
+is the number an OOM killer reads.
+
+**The file-backed half fell while the file grew.** 172.9 → 103.8 MiB of resident
+file pages against an image that went from 176 to 241 MiB. Rebuilding the index meant
+walking every byte of GIDX, so the arrangement this replaced made essentially the
+whole image resident on the way past; reading a key directory touches a fraction of a
+larger file. It is the one result here that was not predicted at all.
+
+**What it costs.** A warm point lookup is ~100 ns resident against ~190 ns mapped at
+60,000 entries — it roughly doubles, inside the 0.3–0.8 µs the plan budgeted. Open is
+*faster*: 81–108 ms → 21–28 ms at 150,000 entries, because one arm rebuilds the
+entries and the other reads a directory. Compaction is 15–24% slower at 200,000 nodes
+with its peak unchanged. Cold lookup latency is still unmeasured and is the open
+question, not the warm figure.
+
+**The composites are still resident**, exactly as the caution below says, and are now
+the largest remaining term. Nothing has measured a store that declares many of them.
 
 ## 7. Target architecture
 

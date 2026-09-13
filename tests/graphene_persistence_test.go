@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/aoiflux/graphene"
+	"github.com/aoiflux/graphene/disk"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -154,8 +155,11 @@ func TestCSRv6_PropertyIndexSurvivesWithoutWAL(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if v := csrVersion(t, dir); v != 8 {
-		t.Fatalf("CSR version = %d, want 8", v)
+	// v9, because the default writes the property index as GPIX and GPIR. What
+	// this test is about is one step further on: the index is in the image at all,
+	// whichever encoding, so a reopen does not rebuild it from the log.
+	if v := csrVersion(t, dir); v != disk.CSRVersionCurrent {
+		t.Fatalf("CSR version = %d, want %d", v, disk.CSRVersionCurrent)
 	}
 
 	// Compaction used to re-emit every property entry into the fresh WAL. It
@@ -353,8 +357,8 @@ func TestCSRv5_StillReadableAndUpgrades(t *testing.T) {
 	if err := reopened.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if v := csrVersion(t, dir); v != 8 {
-		t.Fatalf("CSR version after upgrade compact = %d, want 8", v)
+	if v := csrVersion(t, dir); v != disk.CSRVersionCurrent {
+		t.Fatalf("CSR version after upgrade compact = %d, want %d", v, disk.CSRVersionCurrent)
 	}
 }
 

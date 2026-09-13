@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/merkle"
 )
 
@@ -169,7 +170,16 @@ func InspectCSR(path string) (CSRInfo, error) {
 	info.MaxEdgeID = uint64(csr.HighestEdgeID())
 	info.NodePages = csr.nodePageCount()
 	info.EdgePages = csr.edgePageCount()
-	if section != nil {
+	// The counts, whichever encoding carries them. A v9 image's are in its key
+	// directory, so this reads them rather than walking the runs — which is the
+	// point of the directory, and is why an operator inspecting a multi-gigabyte
+	// index waits no longer than one inspecting a small one.
+	switch {
+	case section == nil:
+	case section.Base != nil:
+		info.PropertyNodeEntries = section.Base.TotalEntries(index.NodeKind)
+		info.PropertyEdgeEntries = section.Base.TotalEntries(index.EdgeKind)
+	default:
 		info.PropertyNodeEntries = len(section.NodeProps)
 		info.PropertyEdgeEntries = len(section.EdgeProps)
 	}

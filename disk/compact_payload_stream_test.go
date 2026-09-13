@@ -26,6 +26,7 @@ package disk
 import (
 	"fmt"
 	"runtime"
+	"slices"
 	"testing"
 
 	"github.com/aoiflux/graphene/index"
@@ -69,8 +70,15 @@ func payloadFixture(t *testing.T, s *Store, n int) []store.NodeID {
 	return ids
 }
 
-// imageEntries reads back the property-index section of the image on disk.
-func imageEntries(t *testing.T, dir string) *csrIndexSection {
+// imageEntries reads back the property-index entries the image on disk carries,
+// in the (key, value, id) order it carries them in.
+//
+// Either encoding: GIDX holds the entries as a flat stream, GPIX and GPIR hold the
+// same entries grouped by value, and the whole point of the assertions below is
+// that a compaction writes the entries its index actually holds — which is a claim
+// about the entries and not about how they were spelled. So the tests judge both
+// writers, and did not have to be told about the second one.
+func imageEntries(t *testing.T, dir string) ([]index.NodePropEntry, []index.EdgePropEntry) {
 	t.Helper()
 	_, section, err := deserialiseCSR(readCSR(t, dir))
 	if err != nil {
@@ -79,7 +87,17 @@ func imageEntries(t *testing.T, dir string) *csrIndexSection {
 	if section == nil {
 		t.Fatal("the image carries no property-index section")
 	}
-	return section
+	if section.Base == nil {
+		return section.NodeProps, section.EdgeProps
+	}
+	var walkErr error
+	nodeSeq, edgeSeq := basePropSeqs(section.Base, &walkErr)
+	nodes := slices.Collect(nodeSeq)
+	edges := slices.Collect(edgeSeq)
+	if walkErr != nil {
+		t.Fatalf("walk the image's mapped index: %v", walkErr)
+	}
+	return nodes, edges
 }
 
 // imageNodeIDs is the set of node identifiers the image's records cover.
@@ -116,9 +134,9 @@ func TestCompact_StreamedPayloadMatchesTheLiveIndex(t *testing.T) {
 		t.Fatalf("Compact: %v", err)
 	}
 
-	section := imageEntries(t, dir)
-	assertNodeEntriesEqual(t, section.NodeProps, wantNodes)
-	assertEdgeEntriesEqual(t, section.EdgeProps, wantEdges)
+	imageNodes, imageEdges := imageEntries(t, dir)
+	assertNodeEntriesEqual(t, imageNodes, wantNodes)
+	assertEdgeEntriesEqual(t, imageEdges, wantEdges)
 }
 
 func assertNodeEntriesEqual(t *testing.T, got, want []index.NodePropEntry) {
@@ -195,7 +213,8 @@ func TestCompact_PayloadOmitsANodeCommittedDuringTheBuild(t *testing.T) {
 	}
 	s.afterPinHook = nil
 
-	if got := len(imageEntries(t, dir).NodeProps); got != wantEntries {
+	imageNodes, _ := imageEntries(t, dir)
+	if got := len(imageNodes); got != wantEntries {
 		t.Fatalf("the image carries %d node entries, want the %d registered before the pin: "+
 			"the filter is not skipping one entry, it is changing how many are written", got, wantEntries)
 	}
@@ -205,7 +224,7 @@ func TestCompact_PayloadOmitsANodeCommittedDuringTheBuild(t *testing.T) {
 		t.Fatalf("node %d was committed after the pin but is in the image; "+
 			"the fixture no longer sets up the case this test is about", during)
 	}
-	for _, e := range imageEntries(t, dir).NodeProps {
+	for _, e := range imageNodes {
 		if e.ID == during {
 			t.Fatalf("the image carries entry (%d,%q,%q) for a node it does not hold: "+
 				"a posting naming nothing, which is what nodePropSeq's filter exists to prevent",
@@ -245,7 +264,8 @@ func TestCompact_PayloadOmitsAnEdgeCommittedDuringTheBuild(t *testing.T) {
 	}
 	s.afterPinHook = nil
 
-	for _, e := range imageEntries(t, dir).EdgeProps {
+	_, imageEdges := imageEntries(t, dir)
+	for _, e := range imageEdges {
 		if e.ID == during {
 			t.Fatalf("the image carries edge entry (%d,%q,%q) for an edge it does not hold",
 				e.ID, e.Key, e.Value)

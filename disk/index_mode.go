@@ -47,25 +47,35 @@ import (
 type IndexMode uint8
 
 const (
-	// IndexResident rebuilds the index in the heap, one entry at a time, which is
-	// what every version before v9 did and the only thing a v8 image allows.
-	//
-	// This is the zero value and therefore the default. It is deliberately the
-	// behaviour this program is replacing: reading the index in place is a change
-	// to what a lookup costs as well as to what a store holds, and the default
-	// moves in the change that measures both against each other, not in the one
-	// that makes the reading possible.
-	IndexResident IndexMode = iota
-
 	// IndexMapped reads a v9 image's GPIX and GPIR sections in place, the
-	// in-memory index becoming the delta over them.
+	// in-memory index becoming the delta over them, and writes v9 at the next
+	// compaction.
+	//
+	// This is the zero value and therefore the default, which is the decision
+	// this whole section of the program was built to be able to make: a 1.2 GiB
+	// store's index was 94.5% of its anonymous memory and 42% over a 2 GiB budget
+	// on its own. Measured at the flip: see CHANGELOG and docs/MEMORY_MODEL.md.
+	//
+	// What it costs is stated rather than hidden. A warm point lookup is a binary
+	// search through pages instead of a map probe, and a cold one is a handful of
+	// random reads; NodesByPropertyBatch is the answer for a pass that does many.
+	// And the image it writes is v9, which no build before this one opens —
+	// IndexResident is how an operator asks for v8 back.
 	//
 	// Requires a mapped image, and falls back to IndexResident with
 	// store.MetricIndexFallback and StorageStats.IndexMode reporting it when the
 	// store has one in the heap instead — see this file's header for why. A v8
 	// image is read into the heap under this mode too, with no metric, because it
-	// carries nothing to read in place.
-	IndexMapped
+	// carries nothing to read in place; the next compaction gives it one.
+	IndexMapped IndexMode = iota
+
+	// IndexResident rebuilds the index in the heap, one entry at a time, and keeps
+	// writing v8 with GIDX. It is what every version before v9 did and the only
+	// thing a v8 image allows.
+	//
+	// Ask for it to trade the memory back for the latency, or to keep writing a
+	// format older builds can read.
+	IndexResident
 )
 
 // String names the mode for StorageStats and for an error message.

@@ -271,6 +271,57 @@ func (s baseSide[T]) forEachID(fn func(T) bool) {
 // The caller checks the retraction bit first: a retracted id has no base entries
 // at all, and testing one bit is cheaper than the reverse-section search this
 // would otherwise do.
+// entryMatches reports whether the base holds a value under f.Key for id that
+// satisfies f.
+//
+// The probe path's other half, and the reason it exists is worth stating: a probe
+// asks the *reverse* direction a question about one id, and the delta's reverse
+// direction knows only about ids written since the last compaction. So a probe
+// that consulted the delta alone answered "no entry under this key, therefore no
+// match" for every entity the image holds — which is most of them — and a
+// type-narrowed property query came back empty rather than wrong. That was the one
+// read path base ∪ delta − retracted had not reached, and it was invisible until
+// the mapped index became the default, because nothing else attaches a base.
+//
+// Retracted first: an id whose entries have all been dropped has no base entries
+// at all, which one bit settles without searching the reverse direction for it.
+// Nothing is cloned — the predicate only reads the value, the same contract
+// postingsMatch relies on for the delta's side.
+func (s baseSide[T]) entryMatches(id uint64, f store.PropertyFilter, ordered bool) bool {
+	if s.gone.has(id) {
+		return false
+	}
+	matched := false
+	err := s.base().ForEachEntryOf(s.kind, id, func(key string, value []byte) bool {
+		if key != f.Key {
+			return true
+		}
+		if filterMatchesValue(f, value, ordered) {
+			matched = true
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		s.fault(err)
+	}
+	return matched
+}
+
+// filterMatchesValue applies f to one value under the comparison rule the key was
+// declared with.
+//
+// Shared by both halves of the probe rather than written twice: ordered and
+// unordered keys compare differently, and a probe that picked the rule one way for
+// the delta and the other way for the base would disagree with itself about the
+// same entity depending on which side happened to hold its entry.
+func filterMatchesValue(f store.PropertyFilter, v []byte, ordered bool) bool {
+	if ordered {
+		return store.PropertyFilterMatchesOrdered(f, v)
+	}
+	return store.PropertyFilterMatches(f, v)
+}
+
 func (s baseSide[T]) appendEntriesOf(out []PropEntry, id uint64) []PropEntry {
 	err := s.base().ForEachEntryOf(s.kind, id, func(key string, value []byte) bool {
 		out = append(out, PropEntry{Key: key, Value: bytes.Clone(value)})

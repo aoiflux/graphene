@@ -3914,6 +3914,14 @@ largest at 512 bytes rather than flat across all three.
 
 #### There is no v9
 
+> **Superseded.** There is a v9, and since the 2026-09 memory program it is what a
+> compaction writes: it carries the property index as the GPIX and GPIR sections,
+> read in place out of the image. This subsection is about a *different* v9 — the one
+> the arena work below would have needed — and that one was correctly never built.
+> The distinction is the point: v9 exists because the index had to move out of the
+> heap, not because a load-path representation changed. See `docs/MEMORY_MODEL.md`
+> §6.4 and `Options.IndexMode`.
+
 The section above used to end by costing a durable format break: two arena
 sections, an offset table, and a third hand-rolled parser owing Phase 6 a fuzz
 target. **None of that is needed, and none of it was built.**

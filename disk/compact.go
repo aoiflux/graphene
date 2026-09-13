@@ -183,6 +183,20 @@ type compactPlan struct {
 	// compact: Compact goes through mustWrite first.
 	propIdx *index.PropertyIndex
 
+	// indexMode is which encoding of that index the image will carry: GPIX and
+	// GPIR under IndexMapped, GIDX under IndexResident.
+	//
+	// Taken from the option rather than from where the store's index currently
+	// lives, and the difference matters on a machine that could not map. An image
+	// is portable and its digest is an identity for its contents, so two parties
+	// compacting the same content under the same options have to produce the same
+	// bytes -- and they would not if the format followed a runtime capability
+	// instead of a configured intent. A store that asked for a mapped index and
+	// could not have one still writes a file that will give the next machine one;
+	// what it cannot do is read this one in place, which is what the fallback
+	// metric reports. IndexResident is how an operator asks for v8 back.
+	indexMode IndexMode
+
 	payload csrPayload
 
 	nodeSeqHW   uint64
@@ -483,7 +497,8 @@ func (s *Store) compactPin() (*compactPlan, error) {
 		walFraming:     s.wal.Framing(),
 		keyTimelineLen: len(s.keyTimeline),
 
-		propIdx: s.propIdx,
+		propIdx:   s.propIdx,
+		indexMode: s.indexMode,
 
 		// The image carries the property index so it no longer has to be
 		// reconstructed from the WAL on the next open, and the ordered-key
@@ -663,6 +678,68 @@ func (p *compactPlan) edgePropSeq(csr *CSRGraph) iter.Seq[index.EdgePropEntry] {
 	}
 }
 
+// mappedIndexSource is nodePropSeq and edgePropSeq in the shape GPIX is written
+// from: the same entries, the same filter against the built image, grouped by
+// value instead of flattened to one triple each.
+//
+// Grouped because that is what the format is: a value is stored once with its id
+// list, so the writer needs the group rather than having to detect the boundary
+// in a flat stream. The index has the grouping already — a posting list *is* the
+// group — so this is the cheaper walk of the two, not a concession to the format.
+//
+// The ids handed to the encoder are a buffer this reuses per value. The encoder
+// writes them and hands each to the reverse sorter by value, retaining nothing,
+// which is why one buffer does: it grows to the widest value's id list.
+//
+// Two buffers rather than one because the encoder walks node keys and edge keys
+// in sequence today and nothing in the format requires it to keep doing so.
+func (p *compactPlan) mappedIndexSource(csr *CSRGraph, dir string) *gpixSource {
+	nodeWalk := p.propIdx.NodeValueWalker()
+	edgeWalk := p.propIdx.EdgeValueWalker()
+	var nodeIDs, edgeIDs []uint64
+	return &gpixSource{
+		NodeKeys: p.propIdx.NodePropKeys(),
+		EdgeKeys: p.propIdx.EdgePropKeys(),
+		NodeValues: func(key string, fn func(value []byte, ids []uint64) bool) error {
+			nodeWalk(key, func(value []byte, ids []store.NodeID) bool {
+				nodeIDs = nodeIDs[:0]
+				for _, id := range ids {
+					if csr.containsNode(id) {
+						nodeIDs = append(nodeIDs, uint64(id))
+					}
+				}
+				// A value every one of whose holders the image dropped is not in
+				// the image's index. The encoder skips an empty list for the same
+				// reason, and says so there.
+				if len(nodeIDs) == 0 {
+					return true
+				}
+				return fn(value, nodeIDs)
+			})
+			return nil
+		},
+		EdgeValues: func(key string, fn func(value []byte, ids []uint64) bool) error {
+			edgeWalk(key, func(value []byte, ids []store.EdgeID) bool {
+				edgeIDs = edgeIDs[:0]
+				for _, id := range ids {
+					if csr.containsEdge(id) {
+						edgeIDs = append(edgeIDs, uint64(id))
+					}
+				}
+				if len(edgeIDs) == 0 {
+					return true
+				}
+				return fn(value, edgeIDs)
+			})
+			return nil
+		},
+		// The store's own directory, so an index too large to sort in memory
+		// spills onto the filesystem whose free space was sized for the image it
+		// is being written beside — not onto whatever /tmp happens to be.
+		ScratchDir: dir,
+	}
+}
+
 // build turns the plan into a serialised image on disk, with no lock held.
 //
 // A failure here changes nothing: the log is intact, the image on disk is the
@@ -717,8 +794,18 @@ func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string,
 	// against the image that has just been built. It is attached here rather
 	// than at the pin for two reasons: the filter needs the image, and a
 	// cancelled build should not have walked the index at all.
-	p.payload.NodeProps = p.nodePropSeq(newCSR)
-	p.payload.EdgeProps = p.edgePropSeq(newCSR)
+	//
+	// One encoding or the other, never both: they carry the same entries, and an
+	// image holding a second copy no reader of either kind would open is the
+	// largest single thing this program has taken out of a compaction. Which one
+	// is the mode's decision, made at the pin -- see compactPlan.indexMode -- and
+	// it is what stamps the image v8 or v9.
+	if p.indexMode == IndexMapped {
+		p.payload.MappedIndex = p.mappedIndexSource(newCSR, dir)
+	} else {
+		p.payload.NodeProps = p.nodePropSeq(newCSR)
+		p.payload.EdgeProps = p.edgePropSeq(newCSR)
+	}
 
 	// The last place a cancellation is free. Past this the image is written and
 	// fsynced, and the caller has paid for it whether or not it is installed.

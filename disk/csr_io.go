@@ -11,6 +11,7 @@ package disk
 import (
 	"encoding/binary"
 	"fmt"
+	"iter"
 	"math"
 	"time"
 
@@ -213,26 +214,76 @@ func (s *Store) loadIndex(section *csrIndexSection, mapped bool) error {
 // is also what makes this the expensive arm — it is the ~107 bytes an entry the
 // mapped index does not pay.
 func (s *Store) rebuildIndexFrom(b index.Base) error {
-	for _, key := range b.Keys(index.NodeKind) {
-		err := b.ForEachValue(index.NodeKind, key, nil, func(value []byte, ids index.IDRun) bool {
-			for i, n := 0, ids.Len(); i < n; i++ {
-				s.propIdx.IndexNode(store.NodeID(ids.At(i)), key, value)
-			}
-			return true
-		})
-		if err != nil {
-			return fmt.Errorf("deserialiseCSR: rebuilding node key %q from the image: %w", key, err)
-		}
+	if err := forEachBaseEntry(b, index.NodeKind, func(id uint64, key string, value []byte) bool {
+		s.propIdx.IndexNode(store.NodeID(id), key, value)
+		return true
+	}); err != nil {
+		return fmt.Errorf("deserialiseCSR: rebuilding the node index from the image: %w", err)
 	}
-	for _, key := range b.Keys(index.EdgeKind) {
-		err := b.ForEachValue(index.EdgeKind, key, nil, func(value []byte, ids index.IDRun) bool {
+	if err := forEachBaseEntry(b, index.EdgeKind, func(id uint64, key string, value []byte) bool {
+		s.propIdx.IndexEdge(store.EdgeID(id), key, value)
+		return true
+	}); err != nil {
+		return fmt.Errorf("deserialiseCSR: rebuilding the edge index from the image: %w", err)
+	}
+	return nil
+}
+
+// basePropSeqs presents a base's entries as the payload sequences, so a caller
+// that wants the entries out of a v9 image reaches them the same way it reaches a
+// v8 one's.
+//
+// Re-runnable, which csrPayload requires of both fields: each call walks the base
+// again. A fault lands in *err rather than stopping the walk silently, because an
+// iter.Seq has nowhere to put one and a truncated stream of entries is exactly
+// what would otherwise be mistaken for a file whose index is smaller than it is.
+func basePropSeqs(b index.Base, err *error) (iter.Seq[index.NodePropEntry], iter.Seq[index.EdgePropEntry]) {
+	return func(yield func(index.NodePropEntry) bool) {
+			e := forEachBaseEntry(b, index.NodeKind, func(id uint64, key string, value []byte) bool {
+				return yield(index.NodePropEntry{ID: store.NodeID(id), Key: key, Value: value})
+			})
+			if e != nil && *err == nil {
+				*err = fmt.Errorf("reading the image's node index: %w", e)
+			}
+		}, func(yield func(index.EdgePropEntry) bool) {
+			e := forEachBaseEntry(b, index.EdgeKind, func(id uint64, key string, value []byte) bool {
+				return yield(index.EdgePropEntry{ID: store.EdgeID(id), Key: key, Value: value})
+			})
+			if e != nil && *err == nil {
+				*err = fmt.Errorf("reading the image's edge index: %w", e)
+			}
+		}
+}
+
+// forEachBaseEntry walks one kind of a base as flat (id, key, value) triples, in
+// the (key, value, id) order the GIDX stream is in.
+//
+// That order is the whole reason this is one function rather than two similar
+// loops. It is a determinism contract -- PropertyIndex.NodeEntries states it at
+// length -- and the index root is a Merkle tree over the entries in it, so a
+// walk that reproduced the entries in some other order would rebuild a correct
+// index and compute a root that describes nothing. The two callers are the
+// resident rebuild and the root verifier, and they have to agree with each other
+// and with the GIDX path they replace.
+func forEachBaseEntry(b index.Base, kind index.EntityKind,
+	fn func(id uint64, key string, value []byte) bool,
+) error {
+	for _, key := range b.Keys(kind) {
+		stopped := false
+		err := b.ForEachValue(kind, key, nil, func(value []byte, ids index.IDRun) bool {
 			for i, n := 0, ids.Len(); i < n; i++ {
-				s.propIdx.IndexEdge(store.EdgeID(ids.At(i)), key, value)
+				if !fn(ids.At(i), key, value) {
+					stopped = true
+					return false
+				}
 			}
 			return true
 		})
 		if err != nil {
-			return fmt.Errorf("deserialiseCSR: rebuilding edge key %q from the image: %w", key, err)
+			return fmt.Errorf("key %q: %w", key, err)
+		}
+		if stopped {
+			return nil
 		}
 	}
 	return nil

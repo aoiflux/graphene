@@ -21,23 +21,33 @@ import (
 // Not "does the mapped path work" — both paths are reachable from one file by one
 // option, so the resident arm is the oracle and it is built from the same bytes.
 
-// v9Store builds a store, compacts it, rewrites its image with the index as GPIX
-// and GPIR, and returns the directory.
+// v9Store builds a store, compacts it, and returns the directory. Its image
+// carries the index as GPIX and GPIR, which is what the default writes.
 //
-// Rewriting rather than compacting into v9 is not a shortcut: nothing in the
-// engine asks for a mapped index yet, deliberately, because the default is a
-// separate change with its own measurement. What the rewrite produces is the same
-// image a compaction would — the same graph, the same entries in the same order,
-// one encoding of the index instead of the other — so a store opening it takes
-// every path a store opening a compaction's output will take.
+// It used to build a v8 image and re-encode its GIDX through the encoder's own
+// fixture, because nothing in the engine asked for a mapped index. The flip
+// deleted the need and improved the fixture at the same time: the file under test
+// is now the file a compaction actually produces, entries filtered against the
+// image and all, rather than one assembled to look like it.
 //
 // The declarations are part of the fixture because they are what makes the two
 // arms differ: an ordered key is answered from the base by a walk, and a
 // composite is the one resident structure a mapped index still has to build.
 func v9Store(t *testing.T) string {
+	return indexModeStore(t, IndexMapped)
+}
+
+// v8Store is v9Store's image in the older encoding: GIDX, no mapped sections,
+// which is what every file written before the flip is and what IndexResident goes
+// on writing.
+func v8Store(t *testing.T) string {
+	return indexModeStore(t, IndexResident)
+}
+
+func indexModeStore(t *testing.T, mode IndexMode) string {
 	t.Helper()
 	dir := t.TempDir()
-	s, err := Open(dir)
+	s, err := OpenWithOptions(dir, Options{IndexMode: mode})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -68,58 +78,38 @@ func v9Store(t *testing.T) string {
 			}
 		}
 	}
+	// A handful of entities of a second type, sharing the same keys and values.
+	//
+	// Their purpose is the planner's, not the index's: a residual filter is applied
+	// by probing when there are fewer candidates than the filter's own set has
+	// members, and every entity above is of one type — so narrowing by that type
+	// yields 48 candidates against sets of at most 13 and the planner never probes.
+	// Three of a rare type yields three, which does. Without these the probe path is
+	// unreachable from this fixture and the bug the flip found would still be
+	// invisible here.
+	for i := 0; i < 3; i++ {
+		id := addNodeD(t, s, store.NodeTypeTag)
+		for _, kv := range [][2]string{
+			{"seq", fmt.Sprintf("%04d", 100+i)},
+			{"bucket", fmt.Sprintf("b%d", i%4)},
+			{"shard", fmt.Sprintf("s%d", i%3)},
+		} {
+			if err := s.IndexNodeProperty(id, kv[0], []byte(kv[1])); err != nil {
+				t.Fatalf("IndexNodeProperty: %v", err)
+			}
+		}
+		e := addEdgeD(t, s, store.NodeID(1+i), id, store.EdgeTypeReuse)
+		if err := s.IndexEdgeProperty(e, "rel", []byte(fmt.Sprintf("r%d", i))); err != nil {
+			t.Fatalf("IndexEdgeProperty: %v", err)
+		}
+	}
 	if err := s.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	rewriteImageAsV9(t, dir)
 	return dir
-}
-
-// rewriteImageAsV9 re-encodes a store's image with the index in it.
-//
-// The entries come out of the image's own GIDX and go back in through the same
-// fixture the encoder's tests use, so what changes is the encoding and nothing
-// else. The digest and the roots are recomputed by the writer, as they are for
-// any image.
-func rewriteImageAsV9(t testing.TB, dir string) {
-	t.Helper()
-	path := filepath.Join(dir, csrFileName)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read image: %v", err)
-	}
-	csr, section, err := deserialiseCSR(data)
-	if err != nil {
-		t.Fatalf("parse image: %v", err)
-	}
-	if section == nil {
-		t.Fatal("the compacted image carries no property index")
-	}
-	f := newGPIXFixture()
-	for _, e := range section.NodeProps {
-		f.add(gpixKindNode, e.Key, string(e.Value), uint64(e.ID))
-	}
-	for _, e := range section.EdgeProps {
-		f.add(gpixKindEdge, e.Key, string(e.Value), uint64(e.ID))
-	}
-	src := f.source(t.TempDir(), 0, 0)
-	out, err := csr.SerialiseWithPayload(csrPayload{
-		MappedIndex:       &src,
-		OrderedNodeKeys:   section.OrderedNodeKeys,
-		OrderedEdgeKeys:   section.OrderedEdgeKeys,
-		CompositeNodeKeys: section.CompositeNodeKeys,
-		CompositeEdgeKeys: section.CompositeEdgeKeys,
-		WithSnapshotRoots: true,
-	})
-	if err != nil {
-		t.Fatalf("re-serialise as v9: %v", err)
-	}
-	if err := os.WriteFile(path, out, 0o600); err != nil {
-		t.Fatalf("write image: %v", err)
-	}
 }
 
 // indexAnswers is everything a store can be asked about its property index,
@@ -132,6 +122,8 @@ type indexAnswers struct {
 	EdgeProperty map[string][]store.EdgeID
 	Range        []store.NodeID
 	Composite    []store.NodeID
+	Narrowed     map[string][]store.NodeID
+	NarrowedEdge []store.EdgeID
 	EntriesOf    map[store.NodeID][]string
 	Keys         []string
 }
@@ -142,6 +134,7 @@ func askIndex(t *testing.T, s *Store) indexAnswers {
 		ByProperty:   map[string][]store.NodeID{},
 		EdgeProperty: map[string][]store.EdgeID{},
 		EntriesOf:    map[store.NodeID][]string{},
+		Narrowed:     map[string][]store.NodeID{},
 	}
 	a.Mode = s.StorageStats().IndexMode
 	st := s.StorageStats()
@@ -212,6 +205,52 @@ func askIndex(t *testing.T, s *Store) indexAnswers {
 		slices.Sort(out)
 		a.EntriesOf[id] = out
 	}
+	// Every filter shape, each narrowed by a type so the planner takes the probe
+	// path: a candidate set arrives from the label index and the filter is asked
+	// about one entity at a time, through the *reverse* direction.
+	//
+	// That is a different question from any of the above, and it is the one the
+	// flip found unanswered. The delta's reverse direction knows only what has
+	// been written since the last compaction, so under a base a probe that
+	// consulted it alone said "no entry under this key" about every entity in the
+	// image, and every type-narrowed property query came back empty. Not wrong —
+	// empty, which is the failure this whole index is meant to make impossible.
+	//
+	// The lesson is the shape of the oracle rather than the bug: comparing the two
+	// arms through the index's own read methods compared them on the paths that
+	// had already been thought about. Reaching them through the planner is what
+	// asks the question nobody had asked.
+	for name, f := range map[string]store.PropertyFilter{
+		"equal":  {Key: "bucket", Op: store.PropertyOpEqual, Value: []byte("b2")},
+		"prefix": {Key: "seq", Op: store.PropertyOpPrefix, Value: []byte("010")},
+		"gte":    {Key: "seq", Op: store.PropertyOpGreaterThanOrEqual, Value: []byte("0040")},
+		"lt":     {Key: "shard", Op: store.PropertyOpLessThan, Value: []byte("s2")},
+		"between": {Key: "seq", Op: store.PropertyOpBetweenInclusive,
+			Value: []byte("0100"), ValueUpper: []byte("0101")},
+		"contains": {Key: "bucket", Op: store.PropertyOpContains, Value: []byte("1")},
+		"miss":     {Key: "bucket", Op: store.PropertyOpEqual, Value: []byte("b99")},
+	} {
+		ids, err := s.QueryNodeIDs(store.NodeQuery{
+			Types:   []store.NodeType{store.NodeTypeTag},
+			Filters: []store.PropertyFilter{f},
+		})
+		if err != nil {
+			t.Fatalf("narrowed query %s: %v", name, err)
+		}
+		slices.Sort(ids)
+		a.Narrowed[name] = ids
+	}
+	// And the edge half of the same path, which has its own probe.
+	eids, err := s.QueryEdgeIDs(store.EdgeQuery{
+		Types:   []store.EdgeType{store.EdgeTypeReuse},
+		Filters: []store.PropertyFilter{{Key: "rel", Op: store.PropertyOpEqual, Value: []byte("r1")}},
+	})
+	if err != nil {
+		t.Fatalf("narrowed edge query: %v", err)
+	}
+	slices.Sort(eids)
+	a.NarrowedEdge = eids
+
 	a.Keys = s.index().OrderedNodeKeys()
 	return a
 }
@@ -238,6 +277,14 @@ func requireSameAnswers(t *testing.T, what string, want, got indexAnswers) {
 		if g := got.EntriesOf[id]; !slices.Equal(w, g) {
 			t.Errorf("%s: NodeEntriesOf(%d) = %v, want %v", what, id, g, w)
 		}
+	}
+	for k, w := range want.Narrowed {
+		if g := got.Narrowed[k]; !slices.Equal(w, g) {
+			t.Errorf("%s: type-narrowed %s query = %v, want %v", what, k, g, w)
+		}
+	}
+	if !slices.Equal(want.NarrowedEdge, got.NarrowedEdge) {
+		t.Errorf("%s: type-narrowed edge query = %v, want %v", what, got.NarrowedEdge, want.NarrowedEdge)
 	}
 	if !slices.Equal(want.Keys, got.Keys) {
 		t.Errorf("%s: ordered keys = %v, want %v", what, got.Keys, want.Keys)
@@ -391,8 +438,9 @@ func TestIndexMapped_FallsBackOnAHeapImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NodesByProperty: %v", err)
 	}
-	if len(ids) != 12 {
-		t.Errorf("bucket=b0 has %d nodes, want 12", len(ids))
+	// Twelve of the forty-eight, plus one of the three rare-type nodes.
+	if len(ids) != 13 {
+		t.Errorf("bucket=b0 has %d nodes, want 13", len(ids))
 	}
 }
 
@@ -416,10 +464,10 @@ func TestIndexResident_EmitsNoFallbackForAModeItWasGiven(t *testing.T) {
 			if tc.v9 {
 				dir = v9Store(t)
 			} else {
-				dir = v9Store(t)
-				// Undo the rewrite: a plain compaction of the same store is the v8
-				// arrangement, which is what every existing file is.
-				plain, err := Open(dir)
+				dir = v8Store(t)
+				// Nothing more to do: an IndexResident compaction wrote GIDX, which
+				// is the arrangement every file written before the flip is in.
+				plain, err := OpenWithOptions(dir, Options{IndexMode: IndexResident})
 				if err != nil {
 					t.Fatalf("open to recompact: %v", err)
 				}

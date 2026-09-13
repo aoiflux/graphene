@@ -236,7 +236,23 @@ func verifyCSRRootsOf(csr *CSRGraph, section *csrIndexSection) error {
 	}
 
 	payload := csrPayload{}
-	if section != nil {
+	// The index root is a tree over the property entries whichever encoding the
+	// file carries them in, and the two encodings hold the same entries in the
+	// same order -- so the root is recomputed from the entries rather than from
+	// the section, and a v9 image's root is checked by the same arithmetic that
+	// wrote it. Before this it was recomputed from an absent GIDX, which is to say
+	// from nothing, and every v9 image was reported as one whose roots did not
+	// describe it.
+	//
+	// walkErr carries a damaged run out of the sequences, which cannot return one.
+	// It is checked after the recomputation rather than before, because reaching
+	// the damage means walking to it.
+	var walkErr error
+	switch {
+	case section == nil:
+	case section.Base != nil:
+		payload.NodeProps, payload.EdgeProps = basePropSeqs(section.Base, &walkErr)
+	default:
 		payload.NodeProps = slices.Values(section.NodeProps)
 		payload.EdgeProps = slices.Values(section.EdgeProps)
 	}
@@ -251,6 +267,9 @@ func verifyCSRRootsOf(csr *CSRGraph, section *csrIndexSection) error {
 	// checked with this build's preferences would fail on the version alone and
 	// report it as a content mismatch.
 	recomputed := computeSnapshotRootsAs(stored.bodyVersion(), csr, payload, stored.PrevRoot)
+	if walkErr != nil {
+		return fmt.Errorf("verify roots: %w", walkErr)
+	}
 
 	switch {
 	case recomputed.NodeRoot != stored.NodeRoot:

@@ -1,5 +1,5 @@
 $ graphene -json node list -type MicroArtefact fx
 exit 0
 --- stdout ---
-{"schema":"graphene.cli/v1","command":"node list","status":"ok","exit":0,"target":"fx","data":{"nodes":[{"id":3,"labels":["MicroArtefact"],"properties":{"bytes":0,"human":"0 B"}},{"id":4,"labels":["MicroArtefact"],"properties":{"bytes":0,"human":"0 B"}}],"detail":{"labels":"MicroArtefact","shown":2}},"notices":["opens the store read-only (shared lock); refused while a writer holds it"],"version":{"version":"(devel)","dirty":false,"source":"unknown","go_version":"<GO>","os":"<OS>","arch":"<ARCH>","csr_format":8,"dependencies":[]}}
+{"schema":"graphene.cli/v1","command":"node list","status":"ok","exit":0,"target":"fx","data":{"nodes":[{"id":3,"labels":["MicroArtefact"],"properties":{"bytes":0,"human":"0 B"}},{"id":4,"labels":["MicroArtefact"],"properties":{"bytes":0,"human":"0 B"}}],"detail":{"labels":"MicroArtefact","shown":2}},"notices":["opens the store read-only (shared lock); refused while a writer holds it"],"version":{"version":"(devel)","dirty":false,"source":"unknown","go_version":"<GO>","os":"<OS>","arch":"<ARCH>","csr_format":9,"dependencies":[]}}
 --- stderr ---

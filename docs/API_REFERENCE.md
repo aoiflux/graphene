@@ -106,14 +106,33 @@ before §6's aliasing note surprises you:
 falls back to a heap copy wherever it is unavailable rather than refusing the
 open.
 
-`disk.Options.IndexMode` is the same shape of choice for the property index. The
-default, `IndexResident`, rebuilds it in the heap at open. `IndexMapped` reads it
-out of the image instead, which costs about a hundred bytes per indexed entry less
-memory and a few nanoseconds per warm lookup more — and needs both a mapped image
-and an image new enough to carry the index in a readable form. It does not change
-what a read hands back: property values are copied out of the index at every
-public boundary either way. `StorageStats.IndexMode` reports what is in force and
-`store.MetricIndexFallback` names any request that could not be honoured.
+`disk.Options.IndexMode` is the same shape of choice for the property index.
+
+| | index at open | next compaction writes |
+|---|---|---|
+| `IndexMapped` (default) | read in place out of the image | v9, index as GPIX and GPIR |
+| `IndexResident` | rebuilt in the heap, one entry at a time | v8, index as GIDX |
+
+The default reads it in place, which is about a hundred and twenty bytes per
+indexed entry of anonymous memory that is never allocated — on the shape this
+engine is sized for, the difference between a store costing 3.5× its own file in
+resident memory and one costing 1.1×. What it costs is a warm point lookup of
+roughly 190 ns instead of roughly 100: a binary search through file-backed pages
+rather than a map probe. A *cold* one costs a handful of random reads, so a pass
+that does many of them wants `NodesByPropertyBatch`.
+
+It does not change what a read hands back: property values are copied out of the
+index at every public boundary either way.
+
+Two things to know before taking the default. The image it writes is **v9, which
+no earlier build opens** — `IndexResident` plus one `Compact()` writes v8 again
+and is the supported way back. And reading in place needs a mapped image: under
+`ImageHeap` a base pointing into the heap buffer would pin the whole file to save a
+fraction of it, so the store rebuilds the index instead. It still writes the format
+it was asked for, because an image is portable and its digest is an identity for its
+contents — the encoding follows the option, not the machine.
+`StorageStats.IndexMode` reports what is in force and `store.MetricIndexFallback`
+names any request that could not be honoured.
 
 ```go
 g := graphene.NewInMemory()

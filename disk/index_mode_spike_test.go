@@ -47,10 +47,10 @@ import (
 
 // v9SpikeStore builds a store of n nodes with the brief's index shape in
 // miniature — one all-distinct key, one low-cardinality key, and two that are a
-// composite together — and rewrites its image with the index in it.
+// composite together — and compacts it, so its image carries the index.
 func v9SpikeStore(tb testing.TB, dir string, n int) {
 	tb.Helper()
-	s, err := Open(dir)
+	s, err := OpenWithOptions(dir, Options{IndexMode: IndexMapped})
 	if err != nil {
 		tb.Fatalf("Open: %v", err)
 	}
@@ -83,7 +83,7 @@ func v9SpikeStore(tb testing.TB, dir string, n int) {
 	if err := s.Close(); err != nil {
 		tb.Fatalf("Close: %v", err)
 	}
-	rewriteImageAsV9(tb, dir)
+
 }
 
 // TestIndexModeSpike reports the prize: the anonymous memory a store stops
@@ -183,4 +183,46 @@ func pctD(now, was uint64) float64 {
 		return 0
 	}
 	return (float64(now) - float64(was)) / float64(was) * 100
+}
+
+// BenchmarkIndexMode_PointLookup is the latency and allocation half of the trade,
+// both arms over one file.
+//
+// TestIndexModeSpike reports what a store *holds*; this reports what a lookup costs
+// once it is open. Two arms rather than an A/B against another tree, for the same
+// reason the correctness tests use two arms: the question is what the mode changes,
+// and one file answered both ways is a cleaner comparison than one question asked of
+// two builds.
+//
+// Allocation is the figure to watch alongside ns/op. A resident lookup copies the
+// postings list out from under the shard lock; a mapped one merges a run from the
+// image with whatever the delta holds, and with an empty delta that merge should
+// cost one slice and no more.
+func BenchmarkIndexMode_PointLookup(b *testing.B) {
+	dir := b.TempDir()
+	v9SpikeStore(b, dir, 20_000)
+
+	for _, mode := range []IndexMode{IndexResident, IndexMapped} {
+		b.Run(mode.String(), func(b *testing.B) {
+			s, err := OpenWithOptions(dir, Options{IndexMode: mode})
+			if err != nil {
+				b.Fatalf("Open: %v", err)
+			}
+			defer s.Close()
+			if got := s.StorageStats().IndexMode; got != mode.String() {
+				b.Fatalf("asked for %v, holding %q", mode, got)
+			}
+			keys := make([][]byte, 4096)
+			for i := range keys {
+				keys[i] = []byte(fmt.Sprintf("%08d", i*37%20_000))
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := s.NodesByProperty("seq", keys[i%len(keys)]); err != nil {
+					b.Fatalf("NodesByProperty: %v", err)
+				}
+			}
+		})
+	}
 }
