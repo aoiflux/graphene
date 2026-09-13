@@ -152,6 +152,15 @@ var _ store.PropertyBatcher = (*Store)(nil)
 // split its values across several calls, which costs one extra cursor per call
 // and nothing else.
 //
+// Because that lock is held across fn, **fn must not read this store**. A GetNode
+// or a query from inside the callback asks for a second read lock on a goroutine
+// that already holds one, and Go's RWMutex does not promise it while a writer is
+// queued: the pass deadlocks. That is the cost of the scratch buffer below, and it
+// is the whole reason store.PropertyStreamer exists as a separate contract — its
+// per-id sink is allowed to read the store precisely because it holds no lock
+// across the callback. Use NodesByPropertyFunc where the callback needs to load
+// what an id names.
+//
 // Liveness is resolved into a reused buffer rather than in place, because the ids
 // the index hands over are its own scratch. Nothing here allocates per value.
 func (s *Store) NodesByPropertyBatch(ctx context.Context, key string, values [][]byte,

@@ -529,6 +529,62 @@ type PropertyBatcher interface {
 		fn func(i int, ids []EdgeID) bool) error
 }
 
+// PropertyStreamer is an optional extension implemented by stores that can hand
+// over the ids under one exact property value without building the list of them.
+//
+// It exists for the shape PropertyBatcher does not cover: one key, one value, and
+// more ids under it than the caller wants to hold. A content-addressed key, a
+// tenant id, a type discriminator — the answer is a large fraction of the store
+// and the caller reads it one id at a time, loading and discarding whatever each
+// one names. NodesByProperty is correct for that and costs two arrays nobody
+// keeps: the index merges its resident and disk-resident sides into one, and the
+// store resolves liveness into another.
+//
+// A backend has a correct fallback — NodesByProperty and a range loop — which is
+// why this is not on GraphStore, and Graph.NodesByPropertyFunc runs that loop
+// when the backend lacks it. What it cannot fall back to is the saving.
+type PropertyStreamer interface {
+	// NodesByPropertyFunc calls fn once for each live node registered under
+	// key=value, in ascending id order, stopping early and without an error if
+	// fn returns false.
+	//
+	// The ids are the same set NodesByProperty would return, read at one
+	// instant, and subject to the same caveat: each was live when it was
+	// checked and may be deleted the moment fn returns.
+	//
+	// fn may read the store. That is the difference between this and
+	// NodesByPropertyBatch, which holds the store's read lock for its whole
+	// duration: an implementation here must not hold a lock across fn, because
+	// loading what each id names is the reason a caller would ask for ids one
+	// at a time.
+	NodesByPropertyFunc(ctx context.Context, key string, value []byte,
+		fn func(id NodeID) bool) error
+
+	// EdgesByPropertyFunc is NodesByPropertyFunc for edges.
+	EdgesByPropertyFunc(ctx context.Context, key string, value []byte,
+		fn func(id EdgeID) bool) error
+}
+
+// NodeQueryStreamer is an optional extension implemented by stores that can
+// deliver a node query's result to a callback.
+//
+// The saving is the caller's first and the engine's only sometimes. A query that
+// orders its result, windows it from the end, narrows a conjunction over several
+// filters or unions a set of labels has to have its candidates in hand before its
+// first row is known, and an implementation is free to run the query and hand the
+// slice over — which still spares the caller a copy of its own, and nothing more.
+// A query whose driver already produces the answer ascending can stream it
+// outright. Which is which is not part of the contract; the result is.
+type NodeQueryStreamer interface {
+	// ForEachNodeID calls fn once per matching node id, in the order
+	// QueryNodeIDs would have returned them, stopping early and without an
+	// error if fn returns false.
+	//
+	// The result is QueryNodeIDs' result. Offset and Limit are honoured, so a
+	// caller paginating gets the same page. fn may read the store.
+	ForEachNodeID(ctx context.Context, query NodeQuery, fn func(id NodeID) bool) error
+}
+
 // IndexVerifier is an optional extension implemented by stores that can
 // self-check their indexes against the records those indexes describe.
 type IndexVerifier interface {
@@ -935,6 +991,42 @@ type StorageStats struct {
 	PropertyNodeEntries int
 	PropertyEdgeEntries int
 
+	// DeltaBytes is what the delta layer's records hold in memory: the version
+	// cells, the records themselves, and their labels and property blobs.
+	//
+	// It is the figure the counts above cannot give. A hundred nodes carrying
+	// 64 MiB blobs and a hundred thousand carrying none are the same DeltaNodes
+	// and are four orders of magnitude apart in what they cost, and a policy that
+	// compacts on record counts alone will either compact the second far too often
+	// or the first far too late. Maintained on the write paths rather than derived,
+	// so reading it is free; see CompactionPolicy.MaxDeltaBytes.
+	//
+	// Records only, not the structure around them: the maps, the delta adjacency
+	// and the type postings are in EstimatedResidentBytes instead. Zero from a
+	// backend that does not track it.
+	DeltaBytes int64
+
+	// EstimatedResidentBytes is the heap the backend is holding, totalled from
+	// the structures themselves in bounded time.
+	//
+	// An estimate, and the word is meant. It is retained heap rather than
+	// resident set size -- on the one fixture measured for it, RSS ran between
+	// 1.19x and 1.54x the live heap across three runs of an identical store, so
+	// this is a floor on what the operating system will report rather than a
+	// prediction of it. It is useful for comparing two configurations of the same
+	// store, for watching one store move over time, and for refusing an operation
+	// that will not fit; it is not a number to put in a capacity plan without the
+	// ratio beside it.
+	//
+	// Mapped image bytes are deliberately not in it. Those are page cache the
+	// kernel may evict, so counting them as memory the process must keep would
+	// invert exactly the comparison a mapped image exists to win -- see
+	// ImageMappedBytes, which reports them separately.
+	//
+	// Zero from a backend that cannot estimate. On the disk backend the terms are
+	// available individually; see disk.Store.EstimateResident.
+	EstimatedResidentBytes int64
+
 	// WALBytes is the log's size on disk. It is bounded only by compaction, so
 	// it is also the best proxy for how long the next open will take.
 	WALBytes int64
@@ -1043,6 +1135,15 @@ func (s StorageStats) DeltaRecords() int {
 
 // CSRRecords is the total number of records in the compacted image.
 func (s StorageStats) CSRRecords() int { return s.CSRNodes + s.CSREdges }
+
+// IndexEntries is the total number of indexed (id, key, value) triples across
+// nodes and edges.
+//
+// A method rather than a field, because it is a sum of two fields already here
+// and a third copy of the same number is a third thing that can disagree.
+func (s StorageStats) IndexEntries() int {
+	return s.PropertyNodeEntries + s.PropertyEdgeEntries
+}
 
 // StorageReporter is implemented by stores that can describe their own storage
 // state. The in-memory backend does not: it has no delta, no log, and no

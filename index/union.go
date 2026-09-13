@@ -94,6 +94,85 @@ func (s baseSide[T]) mergeRun(dst []T, run IDRun, delta []T) []T {
 	return append(dst, delta[j:]...)
 }
 
+// runMerge is that same union, one id at a time and resumable, for the streaming
+// read paths: they hand each id to a sink and never build the union at all, which
+// for a key whose base run holds a million ids is eight megabytes not allocated to
+// be walked once and dropped.
+//
+// # Why this is a second loop and not the only one
+//
+// It was written as the only one first, with mergeRun above reduced to a loop over
+// it, because a mode with two implementations is a mode with two things to keep
+// agreeing. Measured, that cost BenchmarkUnionLookup's low-cardinality shape two
+// to three times its wall clock — 4278 and 3357 ns became 12059 and 7825 — on a
+// path that gains nothing from the change, because the tight loop above keeps i, n
+// and j in registers for the whole merge and a cursor must load and store them
+// through a pointer once per id. Slower is acceptable in this program where it
+// buys memory; this bought none, and charged NodesByProperty for it.
+//
+// So there are two loops, and what holds them together is
+// TestIDStream_AnswersExactlyWhatNodesByPropertyAnswers rather than a shared
+// function: it drains the stream and compares it to NodesByProperty over every
+// combination of base, delta and retraction the fixture can make. A divergence
+// fails there, which is what sharing the code was for.
+//
+// A cursor rather than a function taking a sink, because a sink is a closure and
+// the caller that needs to step away between batches cannot be written as one.
+//
+// The pending-base-id idiom is nodeScanCursor's in disk/scan.go, and for the same
+// reason: a retracted run of base ids has to be skipped before either side can be
+// compared, and skipping it inside the comparison means re-testing the same bit
+// once per delta id that precedes it.
+type runMerge[T entityID] struct {
+	gone  *retractSet
+	run   IDRun
+	i, n  int
+	delta []T
+	j     int
+
+	// cur is a live base id already drawn from the run and not yet emitted, and
+	// held says whether it means anything.
+	cur  uint64
+	held bool
+}
+
+func (s baseSide[T]) runMergeOf(run IDRun, delta []T) runMerge[T] {
+	return runMerge[T]{gone: s.gone, run: run, n: run.Len(), delta: delta}
+}
+
+// next returns the next id of the union, ascending, or false once both sides are
+// drained. An id both sides hold is returned once, from the delta.
+func (m *runMerge[T]) next() (T, bool) {
+	if !m.held {
+		for m.i < m.n {
+			id := m.run.At(m.i)
+			m.i++
+			if m.gone.has(id) {
+				continue
+			}
+			m.cur, m.held = id, true
+			break
+		}
+	}
+	if m.held {
+		if m.j < len(m.delta) {
+			if d := uint64(m.delta[m.j]); d <= m.cur {
+				m.j++
+				m.held = d != m.cur
+				return m.delta[m.j-1], true
+			}
+		}
+		m.held = false
+		return T(m.cur), true
+	}
+	if m.j < len(m.delta) {
+		m.j++
+		return m.delta[m.j-1], true
+	}
+	var zero T
+	return zero, false
+}
+
 // mergeLookup returns the ids under key=value across base and delta.
 //
 // delta is the copy postings.lookup already made, so this runs outside the shard
@@ -108,6 +187,23 @@ func (s baseSide[T]) mergeLookup(key string, value []byte, delta []T) []T {
 		return delta
 	}
 	return s.mergeRun(make([]T, 0, run.Len()+len(delta)), run, delta)
+}
+
+// lookupMerge is mergeLookup's cursor form: the same two sides, resumable, and
+// with no slice sized from the base's side of them.
+//
+// A base that cannot be read yields an empty run rather than an error, which is
+// what mergeLookup does with the same fault for the same reason: every read path
+// here has to fold an unreadable run into "the base holds nothing under this
+// value", because none of them has an error to return. The batch path is the one
+// exception and says why.
+func (s baseSide[T]) lookupMerge(key string, value []byte, delta []T) runMerge[T] {
+	run, err := s.base().Lookup(s.kind, key, value)
+	if err != nil {
+		s.fault(err)
+		run = IDRun{}
+	}
+	return s.runMergeOf(run, delta)
 }
 
 // mergeCardinality is the number of ids under key=value, as an upper bound.

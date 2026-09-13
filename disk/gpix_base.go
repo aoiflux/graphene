@@ -256,6 +256,32 @@ func (b *gpixBase) MaxID(kind index.EntityKind) uint64 {
 	return b.rev.maxIDOf(kindOf(kind))
 }
 
+// ResidentBytes is the heap this base holds, which is the directory and nothing
+// else.
+//
+// It implements index.ResidentReporter, and the arithmetic is the item's whole
+// claim written as code: one gpixKey per declared key plus that key's name, two
+// slice headers for the reverse section, and no term anywhere that mentions
+// Entries. A 28M-entry key and an empty one differ by nothing here. The bytes the
+// entries themselves occupy are the mapping, which is page cache the kernel may
+// evict rather than memory this process must keep, and they are reported as
+// StorageStats.ImageMappedBytes instead.
+//
+// The per-key figure is spelled out rather than taken from unsafe.Sizeof for the
+// reason disk/view.go's cell sizes are, and estimate_test.go checks it the same
+// way.
+func (b *gpixBase) ResidentBytes() int64 {
+	// Name header, Kind and KeyID with their padding, Distinct, Entries, and the
+	// vtab and runs slice headers.
+	const perKey = 16 + 8 + 8 + 8 + 24 + 24
+	total := int64(len(b.fwd.keys)) * perKey
+	for i := range b.fwd.keys {
+		total += int64(len(b.fwd.keys[i].Name))
+	}
+	// The reverse section is two slice headers over the same mapping.
+	return total + 48
+}
+
 // TotalEntries returns the entry count across every key of kind.
 //
 // Summed rather than stored: the count is per key in the directory, and the

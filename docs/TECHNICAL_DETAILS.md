@@ -5008,6 +5008,160 @@ the arrays quietly reappearing inside a verification nobody re-measures.
 
 Measured: `docs/benchmarks.md`, "What adjacency costs a process that never traverses".
 
+### 14.24 Taken: an identifier stream, and the lock that makes it usable
+
+A property read is `base ∪ delta − retracted`, and `mergeLookup` delivers it as a slice
+sized `run.Len() + len(delta)`. For a key half a million nodes hold that is four
+megabytes; for a million and a half, twelve. The caller walks it once. Nothing about
+the merge needs it to exist — both sides are already ascending, and the union is a
+two-finger walk that could hand over one identifier at a time.
+
+Two layers, and they solve different problems.
+
+**The index layer is where the memory is.** `IDStream` wraps a `runMerge` cursor: the
+same two-finger walk, resumable, reading `IDRun.At(i)` straight out of the image
+mapping. It holds one pending base identifier and two cursors. `Fill` draws up to a
+limit into a caller-owned slice and says whether the stream is drained — and refuses a
+non-positive limit by appending nothing and reporting *not* drained, so that a caller
+whose batch size is computed cannot turn an arithmetic bug into an infinite loop that
+also looks like a finished stream.
+
+**The store layer is where the lock is, and that is the harder half.** The reason to ask
+for identifiers one at a time is to load what each one names, so the callback must be
+able to read the store. `disk/scan.go` states the rule this obeys: yielding to caller
+code while holding `s.mu` "is a deadlock waiting for a caller that reads the store from
+inside its own loop", because Go's `RWMutex` does not promise a second read lock while a
+writer is queued. So the pass takes the lock, fills a batch, filters the dead
+identifiers *in place* — the write index never passes the read index, so no second array
+is needed — releases, and then calls out. The batch ramps 32 → 512, `scanChunked`'s
+constants, for the same reason: a caller that wants the first few rows should not wait
+for five hundred.
+
+`NodesByPropertyBatch` takes the opposite position on purpose and it is right to: its
+callback receives a value's whole run as scratch, so the lock is what makes the scratch
+safe, and it documents that writers wait. The difference is not a disagreement, it is
+that a per-value sink and a per-identifier sink want opposite things. The new
+`store.PropertyStreamer` contract says so in the interface's own doc: an implementation
+**must not** hold a lock across `fn`.
+
+**Pinning a reader across a lock release** is safe for the reason a snapshot is. The
+`reader` holds a `*view`, the view holds the CSR, and nothing frees an image a live
+reference names. `locked := s.cur() == r.v` is the test `snapshot.use()` makes: while
+the pinned view is still the current one the pass locks per batch, and once a compaction
+has published a new one the pinned view is frozen and no lock is needed at all.
+
+**Cancellation is checked once per batch as well as amortised inside it.** `CancelCheck.Step`
+checks every 256th call, which is right for a query over a large candidate set and wrong
+here: a batch takes the store lock and resolves up to five hundred records under it, and
+a value held by fifty identifiers would never reach the 256th step. `Check` at the top of
+each batch also makes cancellation land at a batch boundary rather than at a multiple of
+256, which is where a caller would expect it.
+
+**Which queries stream, and why the answer is conservative.** `ForEachNodeID` streams a
+single equality filter, `MatchAll`, ascending, no labels and no identifier list — the
+one shape where `driveNodeCandidates` is always `DriverEquality` over ascending postings
+with nothing left for the residual pass to narrow. `MatchAny` over one filter is the
+same query and a prefix or range filter on a declared ordered key also drives ascending;
+neither is admitted, because each would be a second thing to keep true as the planner
+changes. Everything else runs the query and walks the result, which is what the caller
+would have written. `TestStreamableNodeQuery_DecidesTheShape` exists because without it
+the differential against `QueryNodeIDs` is satisfied by a `ForEachNodeID` that never
+streams at all.
+
+**The engineering call that measurement reversed, which is the finding.** This was first
+written with `mergeRun` reduced to a loop over the cursor, so the merge had one
+implementation and two drivers — §14.23's lesson about a mode flag inviting two paths
+that each pass their own tests. The interleaved A/B refuted it:
+`BenchmarkUnionLookup/LowCardinality` went 4278 ns to 12059 and 3357 to 7825, two to
+three times slower, consistently. The reason is mechanical. The tight loop keeps `i`,
+`n` and `j` in registers for the whole merge; a cursor loads and stores them through a
+pointer once per identifier. That cost lands on `NodesByProperty`, which gains no memory
+from the rewrite — slower for memory is this program's accepted trade, slower for
+nothing is not. So `mergeRun` keeps its own loop, `index/union.go` is purely additive
+against the tree before it, and the agreement between the two loops is held by
+`TestIDStream_AnswersExactlyWhatNodesByPropertyAnswers`, which drains the stream and
+compares it to `NodesByProperty` over every combination of base, delta and retraction
+the fixture can build. A divergence fails there, which is what sharing the code was for.
+
+**What it does not save.** The delta's list is still copied under the shard read lock,
+because `postings.lookupRef` requires that lock held and holding a shard lock across
+caller code is the same deadlock in a smaller room. The delta is entries since the last
+compaction; the base is the store. So the saving is the base's side of the union, which
+is the side that scales.
+
+Measured: `docs/benchmarks.md`, "What an answer costs to hold, against what it costs to
+deliver".
+
+### 14.25 Taken: the store accounts for its own memory, in bounded time
+
+The consumer that started this program measured 9,290 MiB from outside and had no way
+to ask the engine where it went. Every figure in `MEMORY_MODEL.md` was obtained by
+building a process, settling it, and reading `/proc` — which is the right instrument for
+a document and useless to a running store, since the store cannot stop and re-measure
+itself before deciding whether to compact.
+
+So `StorageStats` carries `EstimatedResidentBytes`, and `disk.Store.EstimateResident`
+returns its seven terms individually. Three decisions in it were not obvious.
+
+**Bounded time is a requirement, not a property.** `AutoCompact` evaluates a
+`CompactionPolicy` against `StorageStats` on a ticker, so any term proportional to the
+store would put a pass over the whole store on a timer — and the structure whose size is
+the question is the one a 28M-entry store cannot afford to walk. That single constraint
+decides the shape of everything else: the index term comes from maintained counts rather
+than from the postings, the label postings are summed over *distinct labels* rather than
+over records, and the delta's payload had to become a maintained counter because deriving
+it means walking every version chain. Measured, the call is flat across a 25× change in
+store size in both arms of the A/B.
+
+**Three classes of figure, kept apart and labelled.** Counts are exact — slice lengths
+and counters the write paths already maintain. Per-item costs are measured: 107 B per
+resident index entry, the same figure `preflight.go` uses and arrived at the same way,
+deliberately not shared across the package boundary because one describes a file not yet
+opened and the other a structure in the heap now, and a later measurement may move one
+without the other. One figure is neither: the average length of an indexed value, which
+no counter carries and which cannot be totalled in bounded time. Naming which is which
+is most of what makes the estimate usable — a reader who knows the counts are exact knows
+that a disagreement with a profile is a per-item cost and not a miscount.
+
+**Where it is allowed to be wrong is a direction, not a magnitude.** A figure a caller
+refuses an operation on must be wrong towards declining work that would have fit. The
+same rule `preflight.go` states, and it decides each loose term: the delta's adjacency is
+charged two entries per delta edge, which is the maximum rather than the actual; the
+value length is the largest of the eight keys the program is sized against rather than
+an average; a graph a compaction has just published reports the payload its records
+*reference*, so blobs that are really page cache in the image being replaced are counted
+as heap until the next open.
+
+**What it is not.** Retained heap, not RSS. On the one fixture measured, resident ran
+1.19× to 1.54× live heap across three runs of an *identical* store, so the estimate is a
+floor and a ratio away. That is why the acceptance measurement compares it against
+retained heap rather than against RSS: a band wide enough to contain that ratio would be
+wide enough to contain a doubling of the per-record cost, which is the
+test-that-cannot-fail `CONTRIBUTING` §2 warns about. Differenced across three sizes, the
+marginal cost agreed to within one percent — 78.8 B per record modelled against 79.4
+measured — and the estimate was a floor at every size.
+
+**Mapped bytes are reported beside the total and not in it.** They are page cache the
+kernel may evict, and a total that included them would say that mapping the image made
+the store more expensive, which inverts the comparison §14.18 exists to win. Measured
+from outside: the same image opened mapped and opened on the heap differ by very nearly
+the blob bytes, in the mapped direction, which is what `TestEstimateResident_MappingMovesTheBlobsOutOfTheHeap`
+asserts.
+
+**A maintained counter needs something that recomputes it.** `DeltaBytes` is adjusted on
+four write paths and given back by one chain truncation, which is five places to forget.
+`verifyDelta` already recomputed the live and masked counts for exactly this reason, and
+the byte total joins them — walked over *every* version of every chain rather than over
+the heads, because the versions beneath a head are precisely what a truncation that
+failed to report itself would leave uncounted.
+
+One thing the size constants deliberately do not use: `unsafe.Sizeof`. Not because it
+would be wrong but because it cannot be *noticed* changing, and `tests/build_constraints`
+audits every production appearance of `unsafe` by exact set, which is an argument this
+kind of arithmetic should not have to make. The literals live in production and the
+`unsafe.Sizeof` comparison lives in a test, so a struct that grows a field fails at the
+line naming the number that needs revisiting.
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.

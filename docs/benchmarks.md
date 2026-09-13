@@ -3108,6 +3108,115 @@ GRAPHENE_RSS_NODES=50000 GRAPHENE_RSS_DIR=/some/fixture \
 Build the fixture into `GRAPHENE_RSS_DIR` with one `RSS_Open` run first, and keep the
 join arms in separate processes; both are the method, not a convenience.
 
+## What an answer costs to hold, against what it costs to deliver (2026-09-13)
+
+The change: `NodesByPropertyFunc`, `EdgesByPropertyFunc` and `ForEachNodeID` hand each
+identifier to a callback instead of returning a slice, over an `IDStream` cursor that
+merges the image's run with the delta's list one identifier at a time.
+`TECHNICAL_DETAILS.md` §14.24 has the design.
+
+Conditions: Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, go 1.26, NVMe,
+4 KiB pages, `GOGC` default. Two halves, three interleaved passes each.
+
+**The machine was noisy, and the cross-tree half is read accordingly.** Within the
+control tree alone, `UnionLookup/AllDistinct` measured 158.9, 506.4 and 755.3 ns across
+the three passes — a 4.7x spread with no code changing between them, from thermal drift
+over a six-minute run. So the cross-tree half resolves gross effects and nothing finer.
+That is what it is for here: it is the arm that caught a 2-3x regression in the first
+attempt at this change, and the arm that confirms the regression is gone.
+
+### The regression check: every existing read path, control against change
+
+Control is a `git archive` of `16b0f23`. `index/union.go` is **purely additive** against
+it — two diff hunks, both insertions — so the expectation is flat, and the arms are
+there to hold that claim to account rather than to discover anything.
+
+| benchmark | control (3 passes) | change (3 passes) | B/op, allocs/op |
+|---|---|---|---|
+| `UnionLookup/AllDistinct` | 158.9 / 506.4 / 755.3 ns | 146.4 / 575.0 / 710.4 ns | 8 B, 1 — both |
+| `UnionLookup/LowCardinality` | 4681 / 7842 / 8509 ns | 5128 / 8778 / 7830 ns | 8192 B, 1 — both |
+| `NodesByProperty_Equal_Disk` | 83.80 / 93.66 / 106.4 ns | 81.89 / 89.51 / 120.3 ns | 8 B, 1 — both |
+| `NodesByProperty_Miss_Disk` | 45.66 / 50.79 / 63.40 ns | 53.63 / 52.99 / 60.99 ns | 0 B, 0 — both |
+
+Every change range sits inside the control's own spread, and the allocation figures —
+which are exact and do not drift — are identical in every arm. `RSS_PropertyBatch` is
+the same story with one caveat worth recording: its total working set measured 67.9 MiB
+in some runs and 106.4 MiB in others *within the control tree*, depending on whether the
+mapped image's pages were already resident, and the anonymous term was 68.0–78.7 MiB
+control against 67.2–70.1 MiB change. When `PrivateUsage` reaches `WorkingSetSize` the
+Windows instrument clamps the file term to zero by design (`tests/rss_windows_test.go`),
+so a run whose page cache was cold and a run whose page cache was warm are not
+comparable on the total. Use the anonymous column.
+
+### The delivery cost: slice against stream, within one tree
+
+There is no control arm here, because the slice arm *is* the control behaviour —
+`NodesByProperty` is unchanged. The fixture is 500,000 nodes all carrying the same value
+under one key, compacted: the shape the saving is about, and a run as long as the store.
+
+| benchmark | pass 1 | pass 2 | pass 3 | B/op | allocs/op |
+|---|---|---|---|---|---|
+| `PropertyRead_Slice` | 21.93 ms | 7.46 ms | 24.11 ms | **4,005,888** | 1 |
+| `PropertyRead_Stream` | 29.29 ms | 10.30 ms | 24.94 ms | **128** | 3 |
+| `ForEachNodeID_Query` | 20.97 ms | 11.39 ms | 18.96 ms | **8,011,936** | 4 |
+| `ForEachNodeID_Streamed` | 27.22 ms | 15.27 ms | 34.55 ms | **128** | 3 |
+
+**B/op is the decisive figure and it is exact.** 4,005,888 → 128 bytes for the property
+read; 8,011,936 → 128 for the query form, which allocated the answer twice — once as the
+candidate set and once liveness-filtered. Comparing the fastest pass of each arm, the
+wall clock is **1.38x** for the property read and **1.34x** for the query form: a cursor
+call and a callback per identifier, roughly 6 ns each, where the slice form had neither.
+
+### The residency: what the process holds mid-pass
+
+One arm per process, because `peakMiB` is a process high-water mark. Sampled at the
+halfway point of the pass rather than at the end — at the end the slice is dead and the
+difference becomes a question about the collector rather than about the API — and with
+the slice alive in the slice arm, which is the state being measured.
+
+| arm | pass 1 | pass 2 | pass 3 | spread |
+|---|---|---|---|---|
+| `RSS_PropertyStream_Slice` midAnonMiB | 70.05 | 70.10 | 69.82 | 0.28 |
+| `RSS_PropertyStream_Stream` midAnonMiB | 64.20 | 64.19 | 64.18 | **0.02** |
+
+**5.6 MiB less held**, consistently: the four megabytes of array plus the collector's
+headroom over it. The streamed arm's spread is an order tighter than the slice arm's,
+which is what a working set bounded by a 512-identifier batch should look like on an
+instrument whose noise floor this same run put at 4.7x for a nanosecond benchmark. The
+file term was zero in all six runs, so anonymous is the total.
+
+### The attempt that was measured and thrown away
+
+The first version of this change made `mergeRun` a loop over the new cursor, so the merge
+had one implementation and two drivers. The cross-tree arm above is what refuted it:
+
+| benchmark | control | shared-cursor attempt |
+|---|---|---|
+| `UnionLookup/LowCardinality`, pass 1 | 4278 ns | **12059 ns** |
+| `UnionLookup/LowCardinality`, pass 2 | 3357 ns | **7825 ns** |
+
+Two to three times slower, consistently, on a path that gains no memory from the change:
+the tight loop keeps `i`, `n` and `j` in registers for the whole merge and a cursor loads
+and stores them through a pointer once per identifier. `mergeRun` was restored
+byte-for-byte and the cursor now serves the streaming path only. Recorded because a
+later reader will have the same idea, and because the numbers are the only reason not to.
+
+### Reproducing
+
+```
+go test ./index/ -run '^$' -bench BenchmarkUnionLookup -benchtime 2s
+go test -tags=stress ./tests/ -run '^$' -bench 'NodesByProperty_(Equal|Miss)_Disk' -benchtime 2s
+go test -tags=stress ./tests/ -run '^$' \
+  -bench 'PropertyRead_(Slice|Stream)|ForEachNodeID_(Query|Streamed)' -benchtime 1x
+go test -tags=stress ./tests/ -run '^$' -bench RSS_PropertyStream_Slice -benchtime 1x
+go test -tags=stress ./tests/ -run '^$' -bench RSS_PropertyStream_Stream -benchtime 1x
+```
+
+The two residency arms must be separate processes, and the delivery arms share one
+fixture built once per process — both are the method, not a convenience. Interleave the
+arms within each pass and report minima with the spread; a single pass of this suite on a
+laptop will not resolve the wall-clock ratios above.
+
 ## The memory architecture review (2026-09-12)
 
 The Phase 2 measurement campaign. Interpretation, the models fitted to these numbers
@@ -3288,3 +3397,119 @@ after teardown. Profiling a live store needs `pprof.WriteHeapProfile` inside the
 benchmark while the handle is open, which no current instrument does. The index figures
 above are differencing results for that reason, and for an index spread over a hundred
 maps differencing is the better method regardless.
+
+## What the store says it is holding, and what it costs to ask (2026-09-14)
+
+The change: `StorageStats` gains `EstimatedResidentBytes` and `DeltaBytes`, and
+`disk.Store.EstimateResident` returns the seven terms behind the first.
+`TECHNICAL_DETAILS.md` §14.25 has the design; `MEMORY_MODEL.md` §6.9 has the model and
+the breakdown.
+
+Conditions: Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, go 1.26, NVMe,
+4 KiB pages, `GOGC` default. Three interleaved passes, control first in each.
+
+**The control is not `HEAD`.** N4 is uncommitted on top of `16b0f23`, so an archive of
+HEAD would have measured N2 and N4 together against neither. The control is the working
+tree with N2 removed: eight of the nine files N2 modified were clean before it, so their
+pre-N2 content came straight out of `git show HEAD:`, and `store/interface.go` — the one
+file N4 had already touched — had exactly the N2 block deleted. The control builds, vets
+and passes its own suite.
+
+### What the change could cost
+
+Four delta write paths each gained two arithmetic operations and a call. Chain truncation
+now walks the tail it drops in order to total it — one iteration in the common case, where
+it previously did none. `buildSeq` gained one add per record placed. `StorageStats` went
+from reading counters to totalling seven terms.
+
+### Write paths, control against change
+
+| benchmark | touched by N2 | control ns (3 passes) | change ns (3 passes) | fastest ratio |
+|---|---|---|---|---|
+| `Ingest_AddNode_Disk` | **yes** | 4262 / 4314 / 4587 | 4338 / 4369 / 4381 | 1.018 |
+| `Ingest_AddNodes_Batch1000` | **yes** | 718481 / 866374 / 854158 | 734876 / 739833 / 752548 | 1.023 |
+| `DeleteNode_WithPropertyIndex` | **yes** | 2048 / 2067 / 2394 | 2010 / 2111 / 2096 | 0.981 |
+| `DeleteNode_HotLabel_10k` | **yes** | 1037 / 1008 / 1018 | 1004 / 1103 / 1011 | 0.996 |
+| `Ingest_AddNode_Single` | no — in-memory backend | 739 / 655 / 759 | 756 / 766 / 750 | **1.146** |
+| `Ingest_AddEdge_Single` | no — in-memory backend | 439 / 426 / 428 | 413 / 407 / 429 | **0.955** |
+| `PointLookupNode_Disk` | no — read path | 34.8 / 35.1 / 33.7 | 36.0 / 34.6 / 36.4 | 1.028 |
+| `PointLookupNode_Memory` | no — read path | 21.0 / 20.3 / 22.6 | 23.4 / 22.2 / 20.0 | 0.985 |
+
+`B/op` and `allocs/op` are unchanged on every disk arm. The two in-memory arms report
+263→255 B and 313→307 B, which is where a benchmark's amortised slice growth lands at
+different `b.N`, not an effect of the change: the in-memory backend has no `deltaLayer`
+and N2 does not touch a line of its write path.
+
+**Read the last four rows first.** `Ingest_AddNode_Single` runs code N2 does not modify
+and moved **+14.6%**; `Ingest_AddEdge_Single`, also untouched, moved **−4.5%**. The two
+read controls moved +2.8% and −1.5%. So this machine cannot resolve the +1.8% on the one
+arm that genuinely changed, and the honest statement is that the write paths are
+**between flat and about two percent slower, and the measurement cannot separate that
+from zero**. The within-arm spread says the same thing from the other side:
+`Batch1000`'s control passes span 718k to 866k, a 21% spread with no code changing
+between them.
+
+Note which way the spreads point. The change arm is the *tighter* of the two on both
+batch arms — 2.4% against the control's 21%, and 2% against 16% on `AddNode_Single` —
+which is thermal drift over a fourteen-minute run landing differently on each pass, and
+a reminder that "control first in each pass" removes ordering bias and not drift.
+
+### Asking the store what it holds
+
+| benchmark | control (3 passes) | change (3 passes) | fastest ratio | B/op, allocs/op |
+|---|---|---|---|---|
+| `StorageStats_2k` | 5689 / 5562 / 5516 | 5990 / 6018 / 6022 | 1.086 | 112 B, 1 → 112 B, 1 |
+| `StorageStats_50k` | 5336 / 6020 / 6745 | 5871 / 7002 / 7984 | 1.100 | 112 B, 1 → 112 B, 1 |
+
+**About 9% more, allocating nothing extra.** The call was already 5.5 µs because
+`EntryCounts` takes thirty-two shard locks; the estimate takes them again and walks the
+label postings, for roughly 500 ns.
+
+**And it is flat in the store's size, which is the claim that mattered.** 2,000 records
+against 50,000 — a 25× difference — costs the same in both arms. `AutoCompact` evaluates
+its policy against `StorageStats` on a ticker, so a term proportional to the store would
+have put a pass over the whole store on a timer. It does not.
+
+### Residency, three passes each
+
+| arm | control anonMiB | change anonMiB | control peak | change peak |
+|---|---|---|---|---|
+| `RSS_Compact` | 183.1 / 178.7 / 183.4 | 180.3 / 180.6 / 179.7 | 224.4 / 220.0 / 224.7 | 221.6 / 222.3 / 221.0 |
+| `RSS_BulkWrite` | 182.6 / 183.1 / 184.5 | 185.1 / 182.0 / 180.0 | 237.8 / 235.7 / 247.4 | 235.0 / 238.7 / 251.8 |
+
+Every change range sits inside the control's own, and `heapMiB` is identical to the
+tenth of a MiB in every arm (118.6 on the compaction arm, 120.2 on the write arm). The
+change adds a `int64` field to one struct per store and a few words to a stats call; flat
+is what it should be, and this is the arm that would have caught the byte counter
+retaining what it was meant to release.
+
+### The acceptance measurement: is the model right?
+
+Compared against retained heap rather than RSS, and as a slope rather than at one size,
+for reasons `MEMORY_MODEL.md` §6.9 gives. Fixture: 256-byte blobs, two indexed keys per
+record, compacted and reopened.
+
+| records | estimate | retained heap | ratio |
+|---|---|---|---|
+| 2,000 | 356,238 B | 396,824 B | 1.11× |
+| 8,000 | 711,166 B | 756,720 B | 1.06× |
+| 32,000 | 2,720,734 B | 2,780,240 B | 1.02× |
+
+Differenced across the ends: **78.8 B per record modelled against 79.4 measured, a ratio
+of 0.99**, and the estimate is a floor at every size. `TestEstimatedResident_WithinBand`
+holds it, with a band of [0.5, 2.0] — loose because it has to survive the race detector
+and a GC, and tight enough that a term wired to the wrong quantity leaves it.
+
+### Reproducing
+
+```sh
+go test ./tests/ -run TestEstimatedResident_WithinBand -v
+go test -tags=stress ./tests/ -run '^$' -bench 'BenchmarkStorageStats' -benchtime 2s
+go test -tags=stress ./tests/ -run '^$' \
+  -bench 'BenchmarkIngest_AddNode_Disk$|BenchmarkDeleteNode_WithPropertyIndex$' -benchtime 2s
+```
+
+Every write-path benchmark in this repository is behind the `stress` tag. The first run of
+this A/B omitted the tag, compiled a test binary containing none of them, and reported
+`ok` for a run of nothing — which is worth knowing about, because a benchmark arm that
+silently measures nothing looks exactly like an arm that measured no difference.

@@ -594,6 +594,13 @@ func deserialiseCSRFrom(data []byte, mapped bool, adj AdjacencyMode) (*CSRGraph,
 	if mapped {
 		csr.imgBytes = int64(len(data))
 	}
+	// The arenas' capacity rather than buildSeq's sum of what it placed. Both
+	// describe the same payload; this one includes the slack an append-grown
+	// arena is holding, and under ImageMapped it correctly omits the property
+	// half, which is in the mapping and counted as ImageMappedBytes. See
+	// CSRGraph.payloadBytes.
+	csr.payloadBytes = int64(cap(nodePropArena)+cap(edgePropArena)) +
+		int64(cap(nodeLabelArena)+cap(edgeLabelArena))*sizeofLabel
 	csr.nodeSeqHW = nodeSeqHW
 	csr.edgeSeqHW = edgeSeqHW
 	csr.commitSeqHW = trailer.CommitSeqHW

@@ -5,6 +5,85 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### The store can say what it is holding
+
+Until now the only way to find out what a graphene store cost in memory was to measure
+the process from outside. That is the right instrument for a document and no use to a
+running store, which cannot stop and re-measure itself before deciding whether to
+compact — and it is exactly what the consumer that prompted this work had to do, arriving
+at 9,290 MiB with no way to ask the engine where any of it went.
+
+`StorageStats` now carries two figures, and `disk.Store.EstimateResident` breaks the
+second into its seven terms.
+
+- **`DeltaBytes`** — what the delta's records hold: version cells, records, labels,
+  blobs. The figure the delta counts cannot give, since a hundred records carrying large
+  blobs and a hundred thousand carrying none are four orders of magnitude apart in cost
+  and identical in `DeltaNodes`. Maintained on the write paths, so reading it is free, and
+  recomputed by `VerifyIndexes` so it cannot drift unnoticed. A tombstone costs its cell
+  alone, so deleting lowers it.
+- **`EstimatedResidentBytes`** — record arrays, payload, label postings, adjacency, index,
+  delta and the log ring, summed. `StorageStats.IndexEntries()` totals the indexed triples.
+
+**Reading it costs nothing**, which is a requirement rather than a nicety: `AutoCompact`
+evaluates its policy against these figures on a ticker, so the call is bounded by the
+number of declared keys and distinct labels and not by the store. Measured flat across a
+25× change in store size.
+
+**It is retained heap, not resident set size.** Resident ran 1.19–1.54× live heap across
+three runs of an identical store, so read it as a floor and a ratio; `store stats`,
+`store health` and `debug stats` print the ratio beside the figure. Compared against
+retained heap at three sizes the marginal cost per record agreed to within one percent —
+**78.8 B modelled against 79.4 measured** — and the estimate was a floor at every size.
+
+**Mapped image bytes are reported separately and are not in the total**, because page
+cache the kernel may evict is not memory the process must keep, and a total that included
+them would say mapping the image made the store more expensive.
+
+What the breakdown shows about this engine, on a fixture of 32,000 records with two
+indexed keys each: the property index is **236 bytes** — for 64,000 entries, against the
+6.85 MB it would cost held resident, and the figure does not move between 2,000 records
+and 32,000 because nothing in it is a function of entries. Records are now the largest
+term at 57 B each, and the 256-byte blobs are absent from the heap entirely.
+
+### A property read that yields its ids instead of returning them
+
+`NodesByProperty` answers with a slice, which is right for a lookup and wrong for a
+pass: one key held by half a million nodes is a four-megabyte array allocated so that
+a caller can walk it once and drop it. The array is not incidental — the index builds
+it by merging the image's run of identifiers with the delta's, and it sizes it from the
+sum of the two.
+
+`NodesByPropertyFunc`, `EdgesByPropertyFunc` and `ForEachNodeID` (each with a `Ctx`
+form) are the same questions asked so that the answer need not be held. Over 500,000
+nodes under one value of one key, the property read goes from **4,005,888 B/op and one
+allocation to 128 B/op and three**, and the query form from **8,011,936 B/op and four
+allocations** — it allocates the answer twice, once as candidates and once filtered —
+**to the same 128 B/op**. Sampled halfway through the pass, the process holds **5.6 MiB
+less**. It costs **1.34x to 1.38x the wall clock**: a cursor call and a callback per
+identifier where the slice form had neither.
+
+**The callback may read the store.** That is the difference between these and
+`NodesByPropertyBatch`, which holds the store's read lock for its whole duration. The
+natural use of an identifier is loading what it names, so a pass that held the lock
+across the callback would deadlock any caller that read the store from inside its own
+loop — the same reasoning `Scanner` records. The pass collects a batch of identifiers
+under the lock, filters the dead ones, releases, and only then calls out. The reader is
+pinned for the whole pass, so the answer still comes from one instant, and once a
+compaction has published a new image the pinned one is frozen and the pass stops taking
+the lock at all.
+
+`ForEachNodeID` streams exactly one query shape — a single equality filter, ascending,
+no labels, no identifier list — and runs the ordinary query and walks its result for
+everything else, because an ordering, a window from the end, a conjunction or a label
+union all need the candidate set in hand. Which shapes stream is not part of the
+contract; the answer is, and a test holds `ForEachNodeID` to `QueryNodeIDs` over fifteen
+shapes on both sides of a compaction.
+
+No format change, additive API, and both backends implement it — the memory store has
+no disk-resident side to walk in place, so it materialises and walks, which is what a
+caller gets from the facade's fallback anyway.
+
 ### Adjacency can be built on first use instead of at open
 
 An image carries edge records, each naming its two endpoints. What a traversal needs

@@ -224,6 +224,105 @@ func (g *Graph) EdgesByPropertyBatchCtx(ctx context.Context, key string, values 
 	return nil
 }
 
+// NodesByPropertyFunc calls fn once per live node indexed under key=value,
+// ascending, stopping early if fn returns false.
+//
+// The fallback is NodesByProperty and a range loop, which is the whole answer
+// rather than a degraded one — so this is always callable, and what a backend
+// without store.PropertyStreamer costs is that the ids are materialised before
+// the first one reaches fn.
+func (g *Graph) NodesByPropertyFunc(key string, value []byte,
+	fn func(id store.NodeID) bool,
+) error {
+	return g.NodesByPropertyFuncCtx(context.Background(), key, value, fn)
+}
+
+// NodesByPropertyFuncCtx is NodesByPropertyFunc, cancellable.
+func (g *Graph) NodesByPropertyFuncCtx(ctx context.Context, key string, value []byte,
+	fn func(id store.NodeID) bool,
+) error {
+	if s, ok := g.GraphStore.(store.PropertyStreamer); ok {
+		return s.NodesByPropertyFunc(ctx, key, value, fn)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ids, err := g.NodesByProperty(key, value)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !fn(id) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// EdgesByPropertyFunc is NodesByPropertyFunc for edges.
+func (g *Graph) EdgesByPropertyFunc(key string, value []byte,
+	fn func(id store.EdgeID) bool,
+) error {
+	return g.EdgesByPropertyFuncCtx(context.Background(), key, value, fn)
+}
+
+// EdgesByPropertyFuncCtx is EdgesByPropertyFunc, cancellable.
+func (g *Graph) EdgesByPropertyFuncCtx(ctx context.Context, key string, value []byte,
+	fn func(id store.EdgeID) bool,
+) error {
+	if s, ok := g.GraphStore.(store.PropertyStreamer); ok {
+		return s.EdgesByPropertyFunc(ctx, key, value, fn)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ids, err := g.EdgesByProperty(key, value)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !fn(id) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// ForEachNodeID calls fn once per node id matching query, in the order
+// QueryNodeIDs would have returned them.
+//
+// The fallback runs the query and walks its result, which is what a backend
+// without store.NodeQueryStreamer would do anyway — and what any backend does
+// for a query whose ordering or window needs the candidates in hand.
+func (g *Graph) ForEachNodeID(query store.NodeQuery, fn func(id store.NodeID) bool) error {
+	return g.ForEachNodeIDCtx(context.Background(), query, fn)
+}
+
+// ForEachNodeIDCtx is ForEachNodeID, cancellable.
+func (g *Graph) ForEachNodeIDCtx(ctx context.Context, query store.NodeQuery,
+	fn func(id store.NodeID) bool,
+) error {
+	if s, ok := g.GraphStore.(store.NodeQueryStreamer); ok {
+		return s.ForEachNodeID(ctx, query, fn)
+	}
+	ids, err := g.QueryNodeIDsCtx(ctx, query)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if !fn(id) {
+			return nil
+		}
+	}
+	return nil
+}
+
 // StorageStats reports the backend's storage state, and whether it could.
 //
 // Cheaper than Stats when only the operational figures are wanted: it does not

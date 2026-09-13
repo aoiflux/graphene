@@ -681,6 +681,7 @@ func (g *Graph) NodeCount() (uint64, error)
 func (g *Graph) EdgeCount() (uint64, error)
 func (g *Graph) Stats() (*GraphStats, error) // {NodeCount, EdgeCount}
 func (g *Graph) StorageStats() (store.StorageStats, bool) // operational figures; false if unsupported
+// StorageStats carries EstimatedResidentBytes and DeltaBytes; see §14 for both.
 ```
 
 **A missing ID is not an error.** It is returned in `missing`; `err` is reserved
@@ -1007,6 +1008,9 @@ hits, _ := g.NodesByProperty("sha256", []byte("deadbeef"))
 Property keys are at most 65535 bytes, which is what a property-index record can
 encode a key length into. A longer key is refused rather than truncated.
 
+Two read shapes do not want a slice back and have their own calls: **many values, each
+with a small answer** is §9.1, and **one value with a large answer** is §9.2.
+
 ### 9.1 Resolving many values at once
 
 ```go
@@ -1047,6 +1051,11 @@ of order. Ascending input also allocates nothing for the ordering. Sorting is by
 **A value nothing holds gets no callback at all.** The batch reports matches, not rows.
 Count the callbacks if you need to know how many of your values missed.
 
+**Your callback must not read the graph.** The store’s read lock is held for the whole
+batch, so a `GetNode` or a query from inside the callback deadlocks the pass. Collect
+what you need and read it after the batch returns — or, if the point of the read *is* to
+load what each id names, use §9.2, whose callback is allowed to.
+
 **`ids` is scratch.** It is valid until your callback returns and is overwritten by the
 next value. Copy it if you need to keep it. This is the whole reason the API is a
 callback: returning `[][]store.NodeID` for a million values would be a million slice
@@ -1060,6 +1069,62 @@ The `Ctx` forms cancel between values. Both forms work on every backend: where t
 store implements `store.PropertyBatcher` (the disk and memory stores both do) you get
 the sweep, and otherwise the helper falls back to `NodesByProperty` in a loop, so this
 never fails for a missing capability.
+
+### 9.2 Reading one value without holding its answer
+
+§9.1 is many values with small answers. This is one value with a large one.
+
+```go
+func (g *Graph) NodesByPropertyFunc(key string, value []byte,
+    fn func(id store.NodeID) bool) error
+func (g *Graph) NodesByPropertyFuncCtx(ctx context.Context, key string, value []byte,
+    fn func(id store.NodeID) bool) error
+func (g *Graph) EdgesByPropertyFunc(key string, value []byte,
+    fn func(id store.EdgeID) bool) error
+func (g *Graph) EdgesByPropertyFuncCtx(ctx context.Context, key string, value []byte,
+    fn func(id store.EdgeID) bool) error
+```
+
+`fn` is called once per live matching entity, ascending by id, and returning `false`
+stops the pass without an error.
+
+```go
+err := g.NodesByPropertyFunc("tenant", []byte("t-0"), func(id store.NodeID) bool {
+    n, err := g.GetNode(id)   // reading the store from inside the callback is allowed
+    if err != nil {
+        return false
+    }
+    return handle(n)
+})
+```
+
+**This is the same answer `NodesByProperty` gives, not a cheaper approximation.** What
+differs is that the ids are never all in memory at once. A key half a million nodes hold
+is a four-megabyte slice from `NodesByProperty` and 128 bytes from this: the pass holds
+one batch of 512 ids and a cursor. It costs about **1.35x the wall clock** — a callback
+per id — so reach for it when the answer is large, and keep asking for the slice when it
+is not.
+
+**The callback may read the store.** No lock is held across it. This is the difference
+between these and `NodesByPropertyBatch` (§9.1), which holds the store's read lock for
+its whole duration, so a `GetNode` from *that* callback on the disk backend would
+deadlock. The rule is part of the `store.PropertyStreamer` contract, so it holds whatever
+backend is underneath.
+
+**The answer comes from one instant.** The reader is pinned at the start of the pass, so
+a compaction or a concurrent write landing mid-pass does not change what you see — the
+same guarantee a snapshot gives, for the duration of the pass.
+
+**Writes wait only per batch.** The pass takes the store's read lock to fill each batch
+and releases it before calling out, so a writer queued behind you waits for a batch, not
+for your whole pass. A callback that does slow work per id is therefore not a writer
+stall, which is the other half of why this exists.
+
+The `Ctx` forms cancel at a batch boundary. Both forms work on every backend: where the
+store implements `store.PropertyStreamer` (the disk and memory stores both do) you get
+the streamed pass, and otherwise the helper falls back to `NodesByProperty` and a loop —
+the whole answer rather than a degraded one, so this never fails for a missing
+capability.
 
 ---
 
@@ -1310,6 +1375,39 @@ interval `traversal`'s budget guard uses — so an uncancelled query pays a
 predictable branch and nothing else. Measured interleaved against the same tree
 with the checks stripped out, with `PointLookupNode_Memory` as the control: every
 arm overlaps, control included.
+
+### Walking a query without materialising it
+
+```go
+func (g *Graph) ForEachNodeID(query store.NodeQuery,
+    fn func(id store.NodeID) bool) error
+func (g *Graph) ForEachNodeIDCtx(ctx context.Context, query store.NodeQuery,
+    fn func(id store.NodeID) bool) error
+```
+
+`fn` is called once per matching id, **in the order `QueryNodeIDs` would have returned
+them**, with `Offset` and `Limit` applied as the query asks. Returning `false` stops the
+walk. As with §9.2, the callback may read the store and the reader is pinned for the
+whole walk.
+
+```go
+q := store.NodeQuery{Filters: []store.PropertyFilter{
+    {Key: "tenant", Op: store.PropertyOpEqual, Value: []byte("t-0")}}}
+err := g.ForEachNodeID(q, func(id store.NodeID) bool { return handle(id) })
+```
+
+**What you are promised is the answer, not the route.** For a query the engine can drive
+straight off ascending postings — today: one equality filter, no labels, no id list —
+nothing is materialised, and 500,000 matching ids cost **128 bytes** against
+`QueryNodeIDs`'s 8,011,936 (which allocates the answer twice, once as candidates and once
+filtered). For every other query the engine runs `QueryNodeIDsCtx` and walks the result,
+which is what you would have written; the saving is then only that your own code does not
+hold the slice. Which shapes stream is deliberately not part of the contract — an
+ordering, a window from the end, a conjunction or a label union all need the candidate
+set in hand, and the set that can be driven directly will grow as the planner does.
+
+There is no `ForEachEdgeID`. Edge and relation queries go through `QueryEdgeIDs` as
+before; the streamed property form for edges is `EdgesByPropertyFunc` (§9.2).
 
 ### Query structs
 ```go
@@ -2163,6 +2261,59 @@ A refused `Open` is not a no-op on disk: the directory is created if missing, a
 stranded rebuilt log is adopted, and an empty log is given its container header.
 Nothing is replayed and no ledger is opened. `PreflightOpen` is the only
 genuinely non-mutating way to ask.
+
+### Finding out what an open is costing, now that it is open
+
+The other half of the question above. `PreflightOpen` answers it from a file before
+anything is allocated; this answers it from the structures themselves.
+
+```go
+st, _ := g.StorageStats()
+// st.EstimatedResidentBytes — heap the backend is holding
+// st.DeltaBytes             — what the delta's records hold, exactly
+// st.ImageMappedBytes       — the mapped image: page cache, NOT in the total
+// st.IndexEntries()         — indexed triples across nodes and edges
+
+est := s.EstimateResident() // disk.Store: the same total, term by term
+// est.RecordArrays est.Payload est.LabelPostings est.Adjacency
+// est.Index est.Delta est.WAL est.Total est.Mapped
+```
+
+**It costs nothing to read.** Bounded by the number of declared index keys and
+distinct labels, never by the store's size — which is a requirement rather than an
+observation, because `AutoCompact` evaluates its policy against these figures on a
+ticker.
+
+**It is retained heap, not RSS.** The same caveat as `ImageHeapBytes`, with the same
+number behind it: resident memory ran 1.19–1.54× live heap on the one fixture
+measured for it, varying across runs of an identical store. Read it as a floor and a
+ratio, useful for comparing two configurations of one store or watching one store
+move, and not as a figure to size a machine from directly. `store stats` prints the
+ratio beside it for that reason.
+
+**Mapped image bytes are not in the total.** They are page cache the kernel may
+evict, so a total that included them would invert exactly the comparison
+`ImageMapped` exists to win. `ImageMappedBytes` reports them separately.
+
+**Its counts are exact; three per-item costs are not.** Record arrays, label
+postings, adjacency and the delta's payload are lengths and maintained counters.
+What is modelled is 107 B per *resident* index entry, 32 B for an indexed value
+where a structure scales with distinct values, and a map load factor. Measured
+against retained heap at three sizes the marginal cost agreed to within one percent
+— 78.8 B/record modelled against 79.4 measured — and `MEMORY_MODEL.md` §6.9 carries
+the table and the term-by-term breakdown.
+
+**`DeltaBytes` is the figure the delta counts cannot give.** A hundred records
+carrying large blobs and a hundred thousand carrying none are four orders of
+magnitude apart in cost and are indistinguishable in `DeltaNodes`. It counts the
+records only — the version cells, the records, their labels and blobs — and not the
+maps and postings around them, which are in the estimate instead. A tombstone costs
+its cell alone, so deleting lowers it.
+
+One case where the estimate reads high, and it is bounded: a graph a compaction just
+published reports the payload its records *reference*, which after a compaction over
+a mapped image is page cache counted as heap. The next open corrects it. Over-reporting
+is the direction a figure a budget refuses on should be wrong in.
 
 ---
 
@@ -3083,6 +3234,18 @@ deletes.
 If a workload is memory-bound rather than query-bound, indexing fewer keys is a
 legitimate answer.
 
+#### The answer is a term too, and it is the one you control
+
+The table above is what the *store* holds. What a read hands back is separate and can
+dwarf it: a key half a million nodes share answers in a four-megabyte slice, and the
+query form allocates it twice — once as candidates, once liveness-filtered — for eight.
+`NodesByPropertyFunc` and `ForEachNodeID` (§9.2, §10) deliver the same ids for **128
+bytes**, at about 1.35× the wall clock. Sampled halfway through a 500,000-id pass the
+process held 5.6 MiB less.
+
+Use them when the answer is large, not when it is a lookup: below a few thousand ids the
+slice is simpler and the callback overhead is the larger of the two costs.
+
 ### 19.7 Diagnosing
 
 Do not guess. `ExplainNodeQuery` reports what the planner actually did:
@@ -3110,6 +3273,8 @@ structure, not cost. Measure with the benchmark suite instead.
 
 1. Return IDs, not records, unless you need the records — `QueryNodeIDs`,
    `BFSIDs`.
+1a. And for an answer of more than a few thousand IDs, take them one at a time —
+    `NodesByPropertyFunc`, `ForEachNodeID`. 128 bytes instead of four megabytes.
 2. `Degree(id, nil)` where you can; the typed form is ~488× dearer.
 3. One selective indexed key to drive each query; verify with `ExplainNodeQuery`.
 4. `DeclareOrderedProperty` for any key you range over, with `index/encoding`

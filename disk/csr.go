@@ -186,6 +186,27 @@ type CSRGraph struct {
 	// file", and a rebuilt image is being served from record arrays the
 	// compaction allocated.
 	imgBytes int64
+
+	// payloadBytes is what this graph's record payloads occupy: the label
+	// sequences and the property blobs its records address.
+	//
+	// It cannot be read off a slice header the way every other term of the
+	// resident model can, because the payloads are sub-slices of arenas their
+	// allocator no longer names - which is the whole reason the arenas exist.
+	// So it is recorded at construction, and the two constructors record
+	// different things.
+	//
+	// deserialiseCSRFrom reports the arenas' capacity, which is exact: it
+	// allocated them, and under ImageMapped the property arena does not exist at
+	// all because the blobs address the mapping, so the term is correctly zero
+	// and ImageMappedBytes carries those bytes instead. buildSeq sums what the
+	// records it places reference, which is all a builder can see. For a
+	// compaction that means blobs read out of the image being replaced, so a
+	// graph a compaction published over a mapped image counts page cache as
+	// heap until the store is next opened. That is an over-report in a figure
+	// budgets refuse on, which is the direction to be wrong in, and it is
+	// bounded by one reopen.
+	payloadBytes int64
 }
 
 // MappedBytes is the size of the image file this graph reads its property blobs
@@ -369,6 +390,7 @@ func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge], adj Adjacency
 		}
 		g.nodeRecs[s] = n
 		g.liveNodes++
+		g.payloadBytes += int64(len(n.Properties)) + int64(len(n.Labels))*sizeofLabel
 	}
 	if g.liveNodes != wantNodes {
 		return nil, errUnstableBuild
@@ -383,6 +405,7 @@ func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge], adj Adjacency
 		}
 		g.edgeRecs[s] = e
 		g.liveEdges++
+		g.payloadBytes += int64(len(e.Properties)) + int64(len(e.Labels))*sizeofLabel
 	}
 	if g.liveEdges != wantEdges {
 		return nil, errUnstableBuild

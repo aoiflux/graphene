@@ -164,9 +164,30 @@ func addStorage(r *Result, ss store.StorageStats) {
 	d.Add("deleted nodes", Int(int64(ss.DeletedNodes)))
 	d.Add("deleted edges", Int(int64(ss.DeletedEdges)))
 
+	// Bytes beside the counts, because the counts cannot tell the two cases
+	// apart: a hundred records carrying large blobs and a hundred thousand
+	// carrying none are four orders of magnitude apart in what they cost, and
+	// whichever one an operator has, the other is what the record count suggests.
+	d.AddNote("record bytes", Bytes(ss.DeltaBytes),
+		"(what compaction would move into the image)")
+
 	idx := r.Section("property index")
 	idx.Add("node entries", Int(int64(ss.PropertyNodeEntries)))
 	idx.Add("edge entries", Int(int64(ss.PropertyEdgeEntries)))
+
+	// The estimate, with the caveat attached rather than left in the godoc. An
+	// operator who reads a figure like this and sizes a machine from it will be
+	// wrong by the ratio between retained heap and what the operating system
+	// reports, and here is the only place they are told before they are wrong.
+	if ss.EstimatedResidentBytes > 0 {
+		m := r.Section("memory")
+		m.AddNote("estimated heap", Bytes(ss.EstimatedResidentBytes),
+			"(retained heap, a floor on RSS: measured at 1.19-1.54x this)")
+		if ss.ImageMappedBytes > 0 {
+			m.AddNote("mapped image", Bytes(ss.ImageMappedBytes),
+				"(page cache, evictable, not counted above)")
+		}
+	}
 
 	l := r.Section("log")
 	l.AddNote("size", Bytes(ss.WALBytes), "(the best proxy for how long the next open takes)")

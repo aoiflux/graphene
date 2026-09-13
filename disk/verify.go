@@ -152,6 +152,29 @@ func (s *Store) VerifyIndexesCtx(ctx context.Context) error {
 	// len() on a map, so nothing else would notice them drifting. Recomputing
 	// them is cheap next to the passes above and is the only check that would
 	// catch a mutator forgetting to adjust one.
+	//
+	// The byte total is the same case with more ways to go wrong: four write
+	// paths add to it and one truncation gives bytes back, and the figure it
+	// feeds is one an operator sizes a machine from. Recomputed over every
+	// version of every chain rather than over the heads, because the versions
+	// beneath a head are exactly what a truncation that forgot to report itself
+	// would leave uncounted.
+	var chainBytes int64
+	for _, ver := range d.nodes {
+		for cur := ver; cur != nil; cur = cur.prev {
+			chainBytes += nodeVersionBytes(cur.node)
+		}
+	}
+	for _, ver := range d.edges {
+		for cur := ver; cur != nil; cur = cur.prev {
+			chainBytes += edgeVersionBytes(cur.edge)
+		}
+	}
+	if chainBytes != d.bytes {
+		return fmt.Errorf("delta byte counter drifted: the chains hold %d bytes, recorded %d",
+			chainBytes, d.bytes)
+	}
+
 	live, masked := 0, 0
 	for id, ver := range d.nodes {
 		if ver.node != nil {

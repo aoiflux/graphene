@@ -372,6 +372,12 @@ func (s *Store) StorageStats() store.StorageStats {
 	// next write takes from, and they are what the ceiling binds; the image's
 	// own highest identifier is lower whenever the top of the space has been
 	// deleted, which would report headroom the store does not have.
+	// The delta's own bytes and the whole-store estimate. Both are read under the
+	// lock already held, and neither costs a pass: see estimate.go, which has to
+	// be free because AutoCompact evaluates a policy against this on a ticker.
+	st.DeltaBytes = v.delta.bytes
+	st.EstimatedResidentBytes = s.estimateResidentLocked().Total
+
 	st.HighestNodeID = s.nodeSeq.Load()
 	st.HighestEdgeID = s.edgeSeq.Load()
 	st.IDCeiling = maxCSREntityID

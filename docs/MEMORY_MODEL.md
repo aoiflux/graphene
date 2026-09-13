@@ -864,6 +864,133 @@ and they are the next thing to look at if this direction is worth continuing.
 state. Nothing can defer it; R10(b)'s page table is what bounds it, by making it
 proportional to live edges rather than to the highest identifier ever issued.
 
+### 6.8 An answer nobody holds
+
+§6.5 is about a join — many values, each with a small answer. This is the other shape:
+one value with an enormous answer. A key that discriminates coarsely (a tenant, a type,
+a status flag) has a run as long as the store, and `NodesByProperty` returns it as an
+array sized from the image's run plus the delta's list.
+
+| term | slice form | streamed form |
+|---|---|---|
+| the answer | 8 B × identifiers matched | — |
+| the batch | — | 8 B × 512, reused |
+| the cursor | — | one pending identifier, two indices |
+| the delta's list | 8 B × delta entries for that value | the same |
+
+Measured over 500,000 nodes under one value: **4,005,888 B/op and one allocation becomes
+128 B/op and three**, and the residency sampled halfway through the pass falls from
+69.8–70.1 MiB to **64.18–64.20 MiB** — 5.6 MiB, which is the four megabytes of array
+plus the collector's headroom over it. The streamed arm's spread across three passes is
+0.02 MiB against the slice arm's 0.28, which is what a bounded working set looks like on
+an instrument this noisy.
+
+The query form is worse before it is better: `QueryNodeIDs` on the same shape allocates
+**8,011,936 B** in four allocations, because the candidate set and the liveness-filtered
+result are two arrays. `ForEachNodeID` on the streamable shape holds the same 128 B as
+the property form.
+
+Three consequences for sizing a read against a budget.
+
+**The saving is the base's, not the delta's.** The delta's list for the value is still
+copied, because the alternative is holding a shard lock across caller code. The delta is
+entries since the last compaction and the base is the store, so the term that scales is
+the one removed — but a store that has not been compacted in a long time gets less of
+this than a freshly compacted one.
+
+**It costs 1.34x to 1.38x the wall clock**, which is a cursor call and a callback per
+identifier. Under this program's priority that is a trade worth making and it is not a
+trade worth making blind: a caller that genuinely wants the array should keep asking for
+it.
+
+**What the caller then does with each identifier is not bounded by any of this.** The
+pass holds 128 bytes; a callback that appends every node it loads holds the whole store.
+The API bounds the engine's side of a read, which is the half this document can speak
+for.
+
+### 6.9 The engine's own account of itself
+
+Everything above is measured from outside: a process is built, settled and read through
+`/proc` or `K32GetProcessMemoryInfo`. That is the right instrument for a document and
+the wrong one for a running store, which cannot stop and re-measure itself before
+deciding whether to compact. So `StorageStats` now carries the engine's own answer, and
+this section is where the two are compared.
+
+`EstimatedResidentBytes` totals seven terms. `disk.Store.EstimateResident` returns them
+individually, which is the form worth reading — a total tells an operator their store is
+large, the split tells them which of the four things they can change would change it.
+
+| term | how it is obtained | what it scales with |
+|---|---|---|
+| record arrays | slice lengths — exact | pages of the identifier space that hold a record |
+| payload | arena capacity at load, records referenced at build | labels always, blobs unless mapped |
+| label postings | summed over distinct labels — exact | one identifier per (record, label) |
+| adjacency | slice lengths, zero while deferred — exact | node slots and edges |
+| index | maintained counts × measured bytes/entry, plus the base directory | entries **since the last compaction** |
+| delta | maintained byte counter, plus modelled structure | writes since the last compaction |
+| log | the ring — a constant | nothing |
+
+The counts are exact everywhere. What is modelled is what one item costs, and three
+figures carry that: 107 B per resident index entry (the same number, arrived at the same
+way, as `preflight.go`'s), 32 B for an indexed value where a structure scales with
+distinct values, and a Swiss-table load factor of 7/8 for the structural maps. Mapped
+image bytes are reported beside the total and deliberately not in it: they are page cache
+the kernel may evict, and a total that included them would invert the comparison a
+mapped image exists to win.
+
+**Measured against retained heap**, three sizes, 256 B blobs and two indexed keys per
+record, compacted and reopened:
+
+| records | estimate | retained heap | ratio |
+|---|---|---|---|
+| 2,000 | 356,238 B | 396,824 B | 1.11× |
+| 8,000 | 711,166 B | 756,720 B | 1.06× |
+| 32,000 | 2,720,734 B | 2,780,240 B | 1.02× |
+
+Differenced across the ends: **78.8 B per record modelled against 79.4 measured, a ratio
+of 0.99.** The totals are compared as a slope rather than at one size for the reason
+`TestFootprintGuard_OpenSlope` does — both figures carry a fixed overhead that has
+nothing to do with the data, and differencing cancels it. The estimate is also a floor at
+every size, which it must be: it omits allocator slack, size-class rounding and the
+runtime's own metadata by construction.
+
+Against RSS the ratio is a different and much looser number — 1.19× to 1.54× on the one
+fixture measured for it, varying across runs of an identical store — which is why the
+estimate is compared against retained heap and why the CLI prints the ratio beside the
+figure rather than letting an operator size a machine from it directly.
+
+**What the breakdown says about this engine.** The same fixture, at two sizes:
+
+| term | 2,000 records | 32,000 records |
+|---|---|---|
+| record arrays | 229,396 | 1,835,140 |
+| label postings | 16,094 | 256,094 |
+| adjacency | 65,552 | 524,304 |
+| log ring | 40,960 | 40,960 |
+| payload | 4,000 | 64,000 |
+| **index** | **236** | **236** |
+| total | 356,238 | 2,720,734 |
+| mapped image, evictable | 777,573 | 11,907,573 |
+
+Three things are worth reading off that table.
+
+**The index is 236 bytes for 64,000 entries.** Held resident at the measured 107 B/entry
+it would be 6.85 MB, so this is the whole of R3 stated from inside the engine: a factor
+of about 29,000 on this fixture, and the figure does not move between the two sizes
+because nothing in it is a function of entries. The shipped base is even cheaper than the
+plan's — there is no resident fence over the value table at all, because the table is
+binary-searched in the mapping where it lies, so what is left is the key directory and
+two slice headers.
+
+**Records are now the largest term, and page granularity is visible in it.** 57.3 B per
+record at 32,000 and 114.7 B at 2,000 — the same 56-byte record, paid for a whole
+4,096-slot page at a time. A store far smaller than one page pays for one page, which is
+the floor R10(b) traded the unbounded identifier tax for, and it is a floor rather than a
+slope.
+
+**The blobs are absent.** `payload` is 2 B per record at both sizes, which is the one
+label each, because the 256-byte blobs are in the mapped column instead.
+
 ## 7. Target architecture
 
 The store should hold, per live record and in anonymous memory, only what cannot be

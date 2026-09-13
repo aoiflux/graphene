@@ -89,6 +89,51 @@ func (v *edgeVersion) at(epoch uint64) (e *store.Edge, ok bool) {
 	return nil, false
 }
 
+// Heap cost of one delta cell, for deltaLayer.bytes.
+//
+// Spelled as constants rather than unsafe.Sizeof so that an arithmetic model
+// does not put unsafe in this package's import list, where tests/build_constraints
+// audits every appearance of it. estimate_test.go asserts each figure against
+// unsafe.Sizeof instead, so a struct that grows a field fails a test rather than
+// quietly under-reporting for the rest of its life. Allocator size classes are
+// not modelled: the runtime rounds a 56-byte object up to 64, and every figure
+// here is therefore a floor on what the allocator actually took.
+const (
+	sizeofNodeVersion = 24 // epoch, node pointer, prev pointer
+	sizeofEdgeVersion = 24 // epoch, edge pointer, prev pointer
+	sizeofNode        = 56 // ID, labels header, properties header
+	sizeofEdge        = 80 // ID, Src, Dst, labels header, Weight and its padding, properties header
+	sizeofLabel       = 2  // store.NodeType and store.EdgeType are both uint16
+)
+
+// nodeVersionBytes is what one retained node version costs on the heap: the
+// version cell, the record it points at, and the two slices hanging off that.
+//
+// A tombstone is the cell alone, which is the whole reason a delete is cheap
+// enough to stack rather than apply.
+//
+// One caveat, in the safe direction. Properties is whatever the caller handed
+// in, and a caller that reads a node and writes it back unchanged hands back a
+// slice addressing the image - under ImageMapped that is page cache being
+// counted as heap. Over-reporting is the direction a figure a budget refuses on
+// should be wrong in, and a compaction corrects it.
+func nodeVersionBytes(n *store.Node) int64 {
+	if n == nil {
+		return sizeofNodeVersion
+	}
+	return sizeofNodeVersion + sizeofNode +
+		int64(len(n.Properties)) + int64(len(n.Labels))*sizeofLabel
+}
+
+// edgeVersionBytes is nodeVersionBytes for edges.
+func edgeVersionBytes(e *store.Edge) int64 {
+	if e == nil {
+		return sizeofEdgeVersion
+	}
+	return sizeofEdgeVersion + sizeofEdge +
+		int64(len(e.Properties)) + int64(len(e.Labels))*sizeofLabel
+}
+
 // truncateNodeChain drops versions no reader can still reach.
 //
 // retain is the oldest epoch any reader can still be running at, and ok is
@@ -103,28 +148,42 @@ func (v *edgeVersion) at(epoch uint64) (e *store.Edge, ok bool) {
 // that one). Everything past that is unreachable by definition. A chain under a
 // committing writer therefore settles at two versions rather than one, which is
 // the whole of what the correctness fix costs.
-func truncateNodeChain(head *nodeVersion, retain uint64, ok bool) {
-	if !ok {
-		head.prev = nil
-		return
-	}
+//
+// The return value is what the dropped versions held, so the caller can take it
+// off deltaLayer.bytes. That is the second half of an exactness argument: a
+// version's bytes are added when it is stacked and given back here, once, by the
+// only code that can make one unreachable. Walking the dropped tail to total it
+// costs nothing amortised - each version is walked by the single truncation that
+// drops it - but it is not free in the no-floor case, which previously did no
+// work at all and now walks a chain that is one version long.
+func truncateNodeChain(head *nodeVersion, retain uint64, ok bool) int64 {
 	cur := head
-	for cur.prev != nil && cur.epoch > retain {
-		cur = cur.prev
+	if ok {
+		for cur.prev != nil && cur.epoch > retain {
+			cur = cur.prev
+		}
+	}
+	var dropped int64
+	for v := cur.prev; v != nil; v = v.prev {
+		dropped += nodeVersionBytes(v.node)
 	}
 	cur.prev = nil
+	return dropped
 }
 
-func truncateEdgeChain(head *edgeVersion, retain uint64, ok bool) {
-	if !ok {
-		head.prev = nil
-		return
-	}
+func truncateEdgeChain(head *edgeVersion, retain uint64, ok bool) int64 {
 	cur := head
-	for cur.prev != nil && cur.epoch > retain {
-		cur = cur.prev
+	if ok {
+		for cur.prev != nil && cur.epoch > retain {
+			cur = cur.prev
+		}
+	}
+	var dropped int64
+	for v := cur.prev; v != nil; v = v.prev {
+		dropped += edgeVersionBytes(v.edge)
 	}
 	cur.prev = nil
+	return dropped
 }
 
 // deltaAdj is the delta layer's adjacency for one node.
@@ -168,6 +227,20 @@ type deltaLayer struct {
 	liveEdges   int
 	maskedNodes int
 	maskedEdges int
+
+	// bytes is what every version currently retained in the two maps above
+	// holds: the version cells, the records they point at, and those records'
+	// labels and property blobs. Maintained for the same reason as the counts,
+	// and more sharply - deriving it means walking every chain, and the figure's
+	// consumers are a policy evaluated on a ticker and a budget checked before a
+	// compaction.
+	//
+	// It is the records only. The maps' own buckets, the delta adjacency and the
+	// type postings are structure rather than payload, and they are modelled
+	// where the rest of the resident estimate is; see estimate.go, which adds
+	// them to this. A tombstone contributes its cell, which is why a store that
+	// deletes everything still reports a delta that costs something.
+	bytes int64
 }
 
 func newDeltaLayer() *deltaLayer {
@@ -222,6 +295,7 @@ func (l *deltaLayer) since(epoch uint64, csr *CSRGraph) (*deltaLayer, int64) {
 			continue
 		}
 		out.nodes[id] = &nodeVersion{epoch: ver.epoch, node: ver.node}
+		out.bytes += nodeVersionBytes(ver.node)
 		if hasNode(id) {
 			shadowed++
 		}
@@ -241,6 +315,7 @@ func (l *deltaLayer) since(epoch uint64, csr *CSRGraph) (*deltaLayer, int64) {
 			continue
 		}
 		out.edges[id] = &edgeVersion{epoch: ver.epoch, edge: ver.edge}
+		out.bytes += edgeVersionBytes(ver.edge)
 		inCSR := hasEdge(id)
 		if inCSR {
 			shadowed++

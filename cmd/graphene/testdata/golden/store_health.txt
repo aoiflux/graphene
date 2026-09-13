@@ -24,10 +24,15 @@ delta, written since the last compaction
   edges                                   0
   deleted nodes                           0
   deleted edges                           0
+  record bytes                            0 B (what compaction would move into the image)
                                           
 property index                            
   node entries                            2
   edge entries                            0
+                                          
+memory                                    
+  estimated heap                          608.7 KiB (retained heap, a floor on RSS: measured at 1.19-1.54x this)
+  mapped image                            865 B (page cache, evictable, not counted above)
                                           
 log                                       
   size                                    50 B (the best proxy for how long the next open takes)
