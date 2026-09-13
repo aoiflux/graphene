@@ -75,11 +75,22 @@ const (
 	// smaller.
 	residentBytesPerCompositeEntry = 160
 
-	// residentBytesPerDeclaredKey covers what a key costs merely by being
-	// declared, across the maps that name it: the postings key map, perKey, the
-	// interning table, and an ordered or unique key's own map entry. Multiplied
-	// by declared keys, which is a handful.
+	// residentBytesPerDeclaredKey covers what a key costs merely by carrying an
+	// entry, across the three shard maps that name it: the postings key map, its
+	// value bucket map's header, and perKey. Multiplied by keys with entries,
+	// which is a handful.
+	//
+	// It deliberately does *not* include an ordered or unique declaration's own
+	// map entry. Those are charged by residentBytesPerNamedKey below, because a
+	// key can be declared without being either and charging this figure twice for
+	// one that is both says the shard maps exist twice.
 	residentBytesPerDeclaredKey = 256
+
+	// residentBytesPerNamedKey is one entry in a map that only names a key: a
+	// string header and its control byte. The unique sets are exactly that, and an
+	// ordered key's map entry is that plus the pointer counted by
+	// orderedIndex.residentBytes.
+	residentBytesPerNamedKey = 24
 )
 
 // ResidentBytes models the heap this index holds, in bytes.
@@ -123,7 +134,8 @@ func (sh *propertyShard) residentBytes() int64 {
 	for _, idx := range sh.orderedEdgeKeys {
 		total += idx.residentBytes()
 	}
-	total += int64(len(sh.uniqueNodeKeys)+len(sh.uniqueEdgeKeys)) * residentBytesPerDeclaredKey
+	total += int64(len(sh.uniqueNodeKeys)+len(sh.uniqueEdgeKeys)) * residentBytesPerNamedKey
+	total += int64(len(sh.orderedNodeKeys)+len(sh.orderedEdgeKeys)) * residentBytesPerNamedKey
 	return total
 }
 
