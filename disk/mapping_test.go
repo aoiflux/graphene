@@ -188,7 +188,7 @@ func TestImageMode_SameGraphEitherWay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read image: %v", err)
 	}
-	heapCSR, heapSec, err := deserialiseCSRFrom(data, false)
+	heapCSR, heapSec, err := deserialiseCSRFrom(data, false, AdjacencyEager)
 	if err != nil {
 		t.Fatalf("parse copied: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestImageMode_SameGraphEitherWay(t *testing.T) {
 		t.Skipf("this platform cannot map: %v", err)
 	}
 	defer m.close()
-	mapCSR, mapSec, err := deserialiseCSRFrom(m.data, true)
+	mapCSR, mapSec, err := deserialiseCSRFrom(m.data, true, AdjacencyEager)
 	if err != nil {
 		t.Fatalf("parse mapped: %v", err)
 	}

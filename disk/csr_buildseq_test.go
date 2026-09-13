@@ -63,7 +63,7 @@ func TestBuildSeq_MatchesTheSliceBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	got, err := buildSeq(generated(nodes), generated(edges))
+	got, err := buildSeq(generated(nodes), generated(edges), AdjacencyEager)
 	if err != nil {
 		t.Fatalf("buildSeq: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestBuildSeq_EmptyNodeSequenceNeverWalksTheEdges(t *testing.T) {
 		yield(rawEdge{ID: 1, Src: 1, Dst: 1})
 	}
 
-	g, err := buildSeq(slices.Values([]nodeRecord(nil)), edges)
+	g, err := buildSeq(slices.Values([]nodeRecord(nil)), edges, AdjacencyEager)
 	if err != nil {
 		t.Fatalf("buildSeq: %v", err)
 	}
@@ -177,46 +177,29 @@ func TestBuildSeq_RefusesASequenceThatChangesBetweenPasses(t *testing.T) {
 			edges: unstableEdges(edges, &extraEdge, 2),
 		},
 		{
+			// Pass 3 over edges, and the last one there is. Two further passes
+			// used to follow — a degree count and an adjacency fill, each of
+			// which an unstable sequence could corrupt, the fill dangerously:
+			// its arrays were sized by the degree pass, so an extra edge wrote
+			// past their end.
+			//
+			// Adjacency reads the record arena now (buildAdjacency), so those
+			// passes are gone and with them the four cases that perturbed them.
+			// What replaced them is not a narrower guarantee but a wider one,
+			// asserted in adjacency_mode_test.go: adjacency is the inverse of
+			// the records, so it cannot disagree with them at all — including
+			// for the one instability this refusal was always documented not to
+			// survive, a sequence that yields the same *number* of different
+			// records.
 			name:  "an edge vanishes before the records are placed",
 			nodes: slices.Values(nodes),
 			edges: unstableEdges(edges, nil, 3),
-		},
-		{
-			name:  "an edge vanishes before the degrees are counted",
-			nodes: slices.Values(nodes),
-			edges: unstableEdges(edges, nil, 4),
-		},
-		{
-			// The dangerous one. The adjacency arrays are sized from the count
-			// the degree pass agreed with; an extra edge here writes past their
-			// end.
-			name:  "an edge appears while the adjacency is being filled",
-			nodes: slices.Values(nodes),
-			edges: unstableEdges(edges, &extraEdge, 5),
-		},
-		{
-			// The same pass, one short. Nothing writes out of range, so this is
-			// the check after the loop rather than the one inside it.
-			name:  "an edge vanishes while the adjacency is being filled",
-			nodes: slices.Values(nodes),
-			edges: unstableEdges(edges, nil, 5),
-		},
-		{
-			// And the case the check *inside* that loop is for. The extra edge
-			// above is incident on nodes in the middle of the arena, so its
-			// write lands in another node's range and the count check after the
-			// loop is what notices. This one is incident on the highest node, so
-			// its write is past the end of an array sized before the pass began:
-			// without the check it is an index panic rather than an error.
-			name:  "an edge past the end of the adjacency appears while it is being filled",
-			nodes: slices.Values(nodes),
-			edges: unstableEdges(edges, &rawEdge{ID: 9, Src: 12290, Dst: 12290}, 5),
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			g, err := buildSeq(tc.nodes, tc.edges)
+			g, err := buildSeq(tc.nodes, tc.edges, AdjacencyEager)
 			if !errors.Is(err, errUnstableBuild) {
 				t.Fatalf("buildSeq = (%v, %v), want errUnstableBuild", g, err)
 			}
@@ -230,7 +213,7 @@ func TestBuildSeq_AcceptsARepeatableSequence(t *testing.T) {
 	// The same generator shape the refusal cases use, with the pass number that
 	// never fires: if the harness itself perturbed the records, every case above
 	// would pass for the wrong reason.
-	g, err := buildSeq(unstableNodes(nodes, &nodeRecord{ID: 5}, 0), unstableEdges(edges, nil, 0))
+	g, err := buildSeq(unstableNodes(nodes, &nodeRecord{ID: 5}, 0), unstableEdges(edges, nil, 0), AdjacencyEager)
 	if err != nil {
 		t.Fatalf("buildSeq over a stable sequence: %v", err)
 	}

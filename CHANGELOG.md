@@ -5,6 +5,39 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### Adjacency can be built on first use instead of at open
+
+An image carries edge records, each naming its two endpoints. What a traversal needs
+is the inverse — given a node, the edges incident on it — and that is four arrays the
+loader has always computed while reading the file: sixteen bytes per edge, sixteen per
+node slot, anonymous, for the life of the handle.
+
+`Options.Adjacency` decides when. `AdjacencyEager` is the zero value and builds them at
+open, as every version before this one did. `AdjacencyLazy` defers the build to the
+first thing that needs it: a traversal, a degree query, an edge-of-node read, a delete
+cascade, or a verification. On a 150,000-node, 900,000-edge store, a process that opens
+it and reads every node by an indexed property — never walking the graph — holds **15.5
+MiB less anonymous memory** and opens **11% faster**. A process that does traverse pays
+exactly what it paid before, at a later moment.
+
+It is not offered as a better default, because for a large class of callers it is not
+one. `DeleteNode` cascades to incident edges and finds them through these arrays, so a
+writer that deletes anything builds them on its first delete. The mode is right for a
+read-only aggregate process and worth nothing in a writer, and only the caller knows
+which it is running. `StorageStats.Adjacency` reports `"built"` or `"deferred"` so that
+a caller can check its pass really did avoid them.
+
+The build now reads the record arena rather than the sequence that filled it, which is
+what makes eager and lazy one piece of code called at two moments rather than two that
+have to be kept agreeing. A side effect: `buildSeq` walks its edge sequence three times
+instead of five, and for compaction that sequence is a merge over an image and two
+sorted slices. The compaction clock does not move — it is dominated by writing the
+image — but the passes are gone, and a test asserts there are three of them.
+
+No format change. The default's numbers are unmoved: a hot degree read is 18.25 ns
+against the previous 18.62, anonymous residency is within 0.4 MiB, and a compaction is
+within noise.
+
 ### Residual query planning knows what a probe costs on disk
 
 A query with more than one filter is driven from the most selective one the index can

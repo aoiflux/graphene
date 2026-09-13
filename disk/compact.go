@@ -197,6 +197,12 @@ type compactPlan struct {
 	// metric reports. IndexResident is how an operator asks for v8 back.
 	indexMode IndexMode
 
+	// adjacency is Options.AdjacencyMode, carried so the image this build
+	// produces is held on the same terms the one it replaces was. A compaction
+	// that silently re-eagered a lazily held store would undo the setting at the
+	// one moment the caller is least watching.
+	adjacency AdjacencyMode
+
 	payload csrPayload
 
 	nodeSeqHW   uint64
@@ -499,6 +505,7 @@ func (s *Store) compactPin() (*compactPlan, error) {
 
 		propIdx:   s.propIdx,
 		indexMode: s.indexMode,
+		adjacency: s.adjacency,
 
 		// The image carries the property index so it no longer has to be
 		// reconstructed from the WAL on the next open, and the ordered-key
@@ -773,7 +780,7 @@ func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string,
 	// its dependents were gone would pin the first one for the life of the store
 	// and add one per compaction. So the store maps once at Open and holds it
 	// until Close, and a compaction writes a file. See mapping.go.
-	newCSR, err := buildSeq(p.nodeSeq(), p.edgeSeq())
+	newCSR, err := buildSeq(p.nodeSeq(), p.edgeSeq(), p.adjacency)
 	if err != nil {
 		return nil, "", fmt.Errorf("compact: %w", err)
 	}

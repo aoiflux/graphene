@@ -6,6 +6,8 @@ import (
 	"iter"
 	"slices"
 	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/aoiflux/graphene/store"
 )
@@ -103,13 +105,30 @@ type CSRGraph struct {
 	liveEdges      int
 	highestEdgeID  store.EdgeID
 
-	// Outbound adjacency, indexed by node slot.
+	// Outbound adjacency, indexed by node slot. Derived state, like the label
+	// postings below; nothing in the file carries it. Written once, by
+	// buildAdjacency, at Open or on first use — see AdjacencyMode.
 	outOffset []uint64 // len = len(nodeRecs) + 1
 	outEdges  []store.EdgeID
 
 	// Inbound adjacency.
 	inOffset []uint64
 	inEdges  []store.EdgeID
+
+	// adjBuilt is whether the four arrays above have been filled, and adjMu
+	// serialises the single build that fills them.
+	//
+	// Atomic rather than a plain bool because under AdjacencyLazy the build can
+	// be triggered by any reader, and readers of this image are not serialised
+	// with each other: the fast read path takes no store lock. The Store after
+	// the build pairs with the Load before every use, which is what publishes
+	// the four slice headers to a goroutine that did not do the building.
+	//
+	// sync.Once would say this more briefly and allocate a closure per call to
+	// say it, on a path that is a branch in OutDegree. The pair is the same
+	// double-checked lock without that.
+	adjBuilt atomic.Bool
+	adjMu    sync.Mutex
 
 	// Label postings, built once at construction time. Answering NodesByType /
 	// EdgesByType used to mean scanning every record in the CSR; these give the
@@ -189,7 +208,7 @@ type nodeRecord struct {
 // over the two slices; the contract, and the reason a sequence form exists at
 // all, are stated there.
 func Build(nodes []nodeRecord, edges []rawEdge) (*CSRGraph, error) {
-	return buildSeq(slices.Values(nodes), slices.Values(edges))
+	return buildSeq(slices.Values(nodes), slices.Values(edges), AdjacencyEager)
 }
 
 // errUnstableBuild reports a build sequence that yielded a different number of
@@ -212,12 +231,17 @@ var errUnstableBuild = errors.New("csr: a build sequence yielded a different num
 //
 // # The sequences are walked more than once
 //
-// Three times for nodes and five for edges, and that is inherent rather than
-// lazy: the page directory is sized from the highest identifier, so nothing can
-// be touched until every ID has been seen; the arena is sized from the touched
-// pages, so nothing can be placed until every page has been touched; and
-// adjacency is a degree count followed by a fill. A sequence passed here must
-// therefore be repeatable and must yield the same records every time.
+// Three times each, and that is inherent rather than lazy: the page directory is
+// sized from the highest identifier, so nothing can be touched until every ID has
+// been seen; the arena is sized from the touched pages, so nothing can be placed
+// until every page has been touched; and the placement is a third pass. A
+// sequence passed here must therefore be repeatable and must yield the same
+// records every time.
+//
+// Adjacency used to make it five for edges, because it re-walked the sequence to
+// count degrees and again to fill. It reads the arena instead — see
+// buildAdjacency — which costs the compaction merge two passes less and is what
+// lets the same code build adjacency at Open and on first use.
 //
 // That is checked rather than assumed, to the extent it can be cheaply: each
 // later pass counts what it saw and disagreement with the first pass is refused
@@ -248,7 +272,7 @@ var errUnstableBuild = errors.New("csr: a build sequence yielded a different num
 // one int32 per page of the identifier space up to the highest ID named, plus
 // csrPageSlots records and two csrPageSlots offsets per materialised page. The
 // only transient beyond the result is the directory's own touched-page marks.
-func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge]) (*CSRGraph, error) {
+func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge], adj AdjacencyMode) (*CSRGraph, error) {
 	g := &CSRGraph{}
 
 	// The extent of each directory. The node directory covers the highest node
@@ -274,12 +298,12 @@ func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge]) (*CSRGraph, e
 	if yielded == 0 {
 		g.nodesByLabel = make(map[store.NodeType][]store.NodeID)
 		g.edgesByLabel = make(map[store.EdgeType][]store.EdgeID)
-		// One sentinel each, over zero slots. The offset arrays are one longer
-		// than the arena at every other size, and verifyAdjacency checks exactly
-		// that; leaving them nil here would make the empty image the one shape
-		// the invariant did not hold for.
-		g.outOffset = make([]uint64, 1)
-		g.inOffset = make([]uint64, 1)
+		// buildAdjacency over zero slots produces one sentinel each, which is the
+		// shape verifyAdjacency checks — the offset arrays are one longer than the
+		// arena at every size, and the empty image is not an exception to that.
+		if adj == AdjacencyEager {
+			g.ensureAdjacency()
+		}
 		return g, nil
 	}
 
@@ -374,64 +398,106 @@ func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge]) (*CSRGraph, e
 		g.edgeLiveBefore[p] = g.edgeLiveBefore[p-1] + g.livePageEdges(p-1)
 	}
 
-	// Adjacency: count degrees into offset[slot+1], prefix-sum, then fill. The
-	// fill uses the offset arrays themselves as the running cursors and shifts
-	// them back afterwards, which is what spares the two full-size counter
-	// copies the old layout made. Entries within a slot's range keep the order
-	// the edge sequence yielded them in.
+	g.buildLabelIndex()
+
+	if adj == AdjacencyEager {
+		g.ensureAdjacency()
+	}
+
+	return g, nil
+}
+
+// ensureAdjacency builds the adjacency arrays if they are not built, and is what
+// every read of them goes through.
+//
+// The fast path is one relaxed-looking atomic load and a predicted branch, which
+// is the whole cost AdjacencyLazy imposes on a store that does traverse. The slow
+// path is taken once per image.
+func (g *CSRGraph) ensureAdjacency() {
+	if g.adjBuilt.Load() {
+		return
+	}
+	g.buildAdjacencyOnce()
+}
+
+// buildAdjacencyOnce is ensureAdjacency's slow half, kept separate so the fast
+// half is small enough to inline into the accessors.
+func (g *CSRGraph) buildAdjacencyOnce() {
+	g.adjMu.Lock()
+	defer g.adjMu.Unlock()
+	if g.adjBuilt.Load() {
+		return
+	}
+	g.buildAdjacency()
+	g.adjBuilt.Store(true)
+}
+
+// AdjacencyBuilt reports whether this image's adjacency arrays exist yet. Under
+// AdjacencyEager it is true from the moment the image is loaded; under
+// AdjacencyLazy it is what tells a caller whether its pass avoided the build.
+func (g *CSRGraph) AdjacencyBuilt() bool {
+	return g.adjBuilt.Load()
+}
+
+// buildAdjacency fills the four adjacency arrays: count degrees into
+// offset[slot+1], prefix-sum, then fill. The fill uses the offset arrays
+// themselves as the running cursors and shifts them back afterwards, which is
+// what spares the two full-size counter copies the one-slot-per-ID layout made.
+//
+// It reads the edge arena rather than the sequence that filled it. That is what
+// makes eager and lazy one piece of code called at two moments rather than two
+// pieces that have to be kept agreeing — the failure mode a mode flag invites,
+// where both paths pass their tests and disagree with each other. It also costs
+// the caller two fewer walks of a sequence that, for compaction, is a merge over
+// an image and two sorted slices.
+//
+// The consequence is that entries within a slot's range are in ascending edge-ID
+// order, which is the arena's order, rather than in whatever order the build
+// sequence yielded them. Both callers already sort by ID, so nothing observable
+// moves; what changes is that nothing observable *can* move with the input.
+//
+// Built into locals and published at the end, so a reader that has not yet seen
+// adjBuilt cannot encounter a half-filled array through a stale read of the
+// header.
+func (g *CSRGraph) buildAdjacency() {
 	slots := len(g.nodeRecs)
-	g.outOffset = make([]uint64, slots+1)
-	g.inOffset = make([]uint64, slots+1)
-	seen = 0
-	for e := range edges {
+	outOffset := make([]uint64, slots+1)
+	inOffset := make([]uint64, slots+1)
+	for i := range g.edgeRecs {
+		e := &g.edgeRecs[i]
 		if e.ID == store.InvalidEdgeID {
 			continue
 		}
-		seen++
-		g.outOffset[g.nodeSlotRaw(e.Src)+1]++
-		g.inOffset[g.nodeSlotRaw(e.Dst)+1]++
-	}
-	if seen != wantEdges {
-		return nil, errUnstableBuild
+		outOffset[g.nodeSlotRaw(e.Src)+1]++
+		inOffset[g.nodeSlotRaw(e.Dst)+1]++
 	}
 	for i := 1; i <= slots; i++ {
-		g.outOffset[i] += g.outOffset[i-1]
-		g.inOffset[i] += g.inOffset[i-1]
+		outOffset[i] += outOffset[i-1]
+		inOffset[i] += inOffset[i-1]
 	}
-	g.outEdges = make([]store.EdgeID, g.liveEdges)
-	g.inEdges = make([]store.EdgeID, g.liveEdges)
-	seen = 0
-	for e := range edges {
+	outEdges := make([]store.EdgeID, g.liveEdges)
+	inEdges := make([]store.EdgeID, g.liveEdges)
+	for i := range g.edgeRecs {
+		e := &g.edgeRecs[i]
 		if e.ID == store.InvalidEdgeID {
 			continue
 		}
-		seen++
-		if seen > wantEdges {
-			// The one pass where an extra record would write past the end of an
-			// array sized by the count above, rather than merely disagree with
-			// it.
-			return nil, errUnstableBuild
-		}
 		so := g.nodeSlotRaw(e.Src)
-		g.outEdges[g.outOffset[so]] = e.ID
-		g.outOffset[so]++
+		outEdges[outOffset[so]] = e.ID
+		outOffset[so]++
 		si := g.nodeSlotRaw(e.Dst)
-		g.inEdges[g.inOffset[si]] = e.ID
-		g.inOffset[si]++
-	}
-	if seen != wantEdges {
-		return nil, errUnstableBuild
+		inEdges[inOffset[si]] = e.ID
+		inOffset[si]++
 	}
 	// After the fill offset[s] is the end of slot s, which is the start of
 	// slot s+1; one shift right restores the starts and reinstates offset[0].
-	copy(g.outOffset[1:], g.outOffset[:slots])
-	g.outOffset[0] = 0
-	copy(g.inOffset[1:], g.inOffset[:slots])
-	g.inOffset[0] = 0
+	copy(outOffset[1:], outOffset[:slots])
+	outOffset[0] = 0
+	copy(inOffset[1:], inOffset[:slots])
+	inOffset[0] = 0
 
-	g.buildLabelIndex()
-
-	return g, nil
+	g.outOffset, g.outEdges = outOffset, outEdges
+	g.inOffset, g.inEdges = inOffset, inEdges
 }
 
 // newPageDir returns a directory covering identifiers 0..extent with every
@@ -686,11 +752,13 @@ func (c *edgeIDCursor) next() (store.EdgeID, bool) {
 
 // OutboundEdges returns the raw edges for nodeID in outbound direction.
 func (g *CSRGraph) OutboundEdges(id store.NodeID) ([]rawEdge, error) {
+	g.ensureAdjacency()
 	return g.adjacentEdges(id, g.outOffset, g.outEdges)
 }
 
 // InboundEdges returns the raw edges for nodeID in inbound direction.
 func (g *CSRGraph) InboundEdges(id store.NodeID) ([]rawEdge, error) {
+	g.ensureAdjacency()
 	return g.adjacentEdges(id, g.inOffset, g.inEdges)
 }
 
@@ -788,6 +856,13 @@ func sortedContainsEdgeID(ids []store.EdgeID, target store.EdgeID) bool {
 // absent carries adjacency at a slot no record occupies, and that adjacency is
 // exactly what a dangling edge would show up as.
 func (g *CSRGraph) verifyAdjacency() error {
+	// Checking adjacency is one of the things that needs it. A lazily loaded
+	// image being verified builds it here, which is the honest reading of
+	// "verify the adjacency": there is no state to check until it exists, and
+	// reporting an unbuilt image as sound would make Verify weaker under one
+	// mode than the other.
+	g.ensureAdjacency()
+
 	slots := len(g.nodeRecs)
 	if len(g.outOffset) != slots+1 || len(g.inOffset) != slots+1 {
 		return fmt.Errorf("csr adjacency: offset arrays are %d and %d long for %d slots",
@@ -837,12 +912,14 @@ func (g *CSRGraph) verifyAdjacency() error {
 // result aliases CSR-owned memory: callers must hold the store lock and must not
 // retain or mutate it.
 func (g *CSRGraph) OutboundEdgeIDs(id store.NodeID) []store.EdgeID {
+	g.ensureAdjacency()
 	return g.adjacencySlice(id, g.outOffset, g.outEdges)
 }
 
 // InboundEdgeIDs returns the inbound edge IDs for nodeID. Same aliasing contract
 // as OutboundEdgeIDs.
 func (g *CSRGraph) InboundEdgeIDs(id store.NodeID) []store.EdgeID {
+	g.ensureAdjacency()
 	return g.adjacencySlice(id, g.inOffset, g.inEdges)
 }
 
@@ -850,11 +927,13 @@ func (g *CSRGraph) InboundEdgeIDs(id store.NodeID) []store.EdgeID {
 // from the offset array. It counts edges present in the CSR, so callers must
 // still account for any delete masks held by the store.
 func (g *CSRGraph) OutDegree(id store.NodeID) int {
+	g.ensureAdjacency()
 	return len(g.adjacencySlice(id, g.outOffset, g.outEdges))
 }
 
 // InDegree returns the inbound degree of nodeID in constant time.
 func (g *CSRGraph) InDegree(id store.NodeID) int {
+	g.ensureAdjacency()
 	return len(g.adjacencySlice(id, g.inOffset, g.inEdges))
 }
 

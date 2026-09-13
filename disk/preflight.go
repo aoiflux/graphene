@@ -62,6 +62,14 @@ const (
 	// estLiveEdgeBytes is the adjacency cost of an edge that is actually
 	// present: one EdgeID in outEdges and one in inEdges. Sized by the live
 	// count, not by the identifier space, which is why it is a separate term.
+	//
+	// It assumes AdjacencyEager, and PreflightOpen has no way not to: it reads a
+	// directory and takes no Options, so it cannot know that the store about to
+	// be opened will defer the build. Under AdjacencyLazy the estimate is high by
+	// this term and by the two per-slot uint64s inside estNodeSlotBytes. High is
+	// the direction a budget refusal should be wrong in — it declines a store
+	// that would have fit rather than admitting one that will not — so this is
+	// stated rather than corrected. An Options-aware estimate is N2's.
 	estLiveEdgeBytes = 16
 
 	// estPropertyEntryBytes is one property-index entry. The tree reports this

@@ -2764,6 +2764,89 @@ go test ./disk/ -run '^$' -bench GPIXBaseLookup -benchmem -benchtime 2s
 GRAPHENE_BENCH_NODES=50000 go test -tags=stress ./tests/ -run '^$' -bench RSS_Open -benchtime 1x
 ```
 
+## What adjacency costs a process that never traverses (2026-09-13)
+
+The change: `Options.Adjacency` can defer the four adjacency arrays to the first call
+that reads them, and the build that produces them reads the record arena rather than
+the sequence that filled it. `TECHNICAL_DETAILS.md` §14.23 has the design.
+
+Conditions: Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, go 1.26, NVMe,
+4 KiB pages, `GOGC` default. Interleaved A/B against a copy of `b648126`, alternating
+arms within each pass, with the benchmark file derived into the control tree by script
+so the fixture is identical and only the option differs. Minima, and every pass
+reported.
+
+The fixture (`tests/rss_adjacency_bench_test.go`, `stress`): 150,000 nodes, each
+carrying one indexed property and six outbound edges to nodes a stride ahead — 900,000
+edges, fanning rather than chaining, so no node's adjacency is one contiguous run of
+edge identifiers. Compacted, then reopened read-only, because a store acquires its
+image at open. The workload is the one the option exists for: read every node by its
+indexed property, touch nothing that walks the graph.
+
+### What the default pays, which is the first question
+
+Three arms where the change is supposed to be invisible. If any of these had moved,
+nothing below it would be worth reading.
+
+| | control | change, eager |
+|---|---|---|
+| hot degree read, 5 interleaved passes, minima | 18.62 ns/op | **18.25 ns/op** |
+| — allocations | 0 B/op, 0 allocs/op | 0 B/op, 0 allocs/op |
+| warm open, 3 passes, minima | 161.5 ms | **160.7 ms** |
+| compaction, 150k/900k, 3 passes, minima | 1.099 s | **1.094 s** |
+| anonymous after the property pass | 160.8 MiB | 161.2 MiB |
+
+The degree arm is the one that mattered: every adjacency read now passes an
+`atomic.Bool` before it, on an image where the answer is always yes, and that cost is
+paid by callers who did not ask for the option. It is inside the noise of a benchmark
+whose own spread is 18 to 50 ns across passes.
+
+The compaction arm is a negative result worth keeping. The change removes two of the
+five walks `buildSeq` made over its edge sequence, and for compaction that sequence is
+a merge over an image and two sorted slices rather than a slice — so a saving was
+expected and none appeared. Compaction at this size is dominated by serialising and
+writing the image. The passes are gone whether or not the clock shows it, and
+`TestBuildSeq_WalksEachSequenceThreeTimes` is what asserts it rather than the timer.
+
+### What deferring saves, which is the point
+
+`BenchmarkRSS_AdjacencyPropertyPass_*`, `-benchtime 1x`, one arm per process, three
+interleaved passes. Each opens the compacted store read-only, settles, reads all
+150,000 nodes by property, settles again.
+
+| pass | control anon | change eager anon | change lazy anon | lazy file |
+|---|---|---|---|---|
+| 1 | 161.2 MiB | 160.5 MiB | 147.1 MiB | — |
+| 2 | 160.9 MiB | 161.0 MiB | **144.6 MiB** | 36.14 MiB |
+| 3 | 160.8 MiB | 161.2 MiB | **146.0 MiB** | 35.30 MiB |
+
+**15.5 MiB less anonymous memory held**, against an arithmetic expectation of 16.8 —
+900,000 edges at 16 bytes plus ~151,000 node slots at 16. The file-backed half is
+unmoved at ~36 MiB in every arm, which is the point: adjacency is anonymous, and
+deferring it moves nothing into the page cache, it simply does not allocate.
+
+Warm open drops with it: **142.4 ms against 160.7**, an 11% saving, because the pass
+that built the arrays is the pass that is not run.
+
+**Pass 1 is reported and not used.** Its control arm shows 36 MiB file-backed and its
+change arms zero, which reads as though the two trees mapped the image differently.
+They do not — a probe printing `StorageStats.ImageMode` in both trees reports `mapped`
+either way, and passes 2 and 3 agree to within 1 MiB. It is the working set of a
+process that has just written the fixture, before the image's pages are accounted to
+the mapping. Three passes exist so that a first-pass artefact cannot be mistaken for a
+result, and this is the one time it would have been.
+
+### What did not move, and what is not covered
+
+No format change. `Options.Adjacency` and `StorageStats.Adjacency` are additive. Every
+answer is identical under both modes, asserted per node over the whole fixture rather
+than at a sample.
+
+The saving is the adjacency arrays only. `edgesByLabel` and `nodesByLabel` — the label
+postings, which `NodesByType` and `EdgesByType` read — are still built at open under
+both modes, and a property-only pass does not read those either. Deferring them is a
+separate change with its own risk surface and is not made here.
+
 ## What a residual probe costs on disk (2026-09-13)
 
 The change: `probeIsCheaper` costs a residual probe from the reverse section it would

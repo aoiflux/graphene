@@ -1021,6 +1021,18 @@ type StorageStats struct {
 	// key — so it is here rather than only in a metric a caller has to subscribe
 	// to.
 	IndexMode string
+
+	// Adjacency names whether the backend has built its image's adjacency
+	// arrays: "built", or "deferred" while it has not.
+	//
+	// It is not the option that was asked for. A store opened to defer the build
+	// reports "built" once anything has traversed, deleted, asked a degree or
+	// verified it, because from that point it is holding the arrays like any
+	// other. A caller checking that its read-only pass really did avoid them has
+	// nothing else to look at.
+	//
+	// Empty from a backend with no image.
+	Adjacency string
 }
 
 // DeltaRecords is the total number of records held in memory since the last

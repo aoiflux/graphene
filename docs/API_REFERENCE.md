@@ -161,6 +161,28 @@ defer g.Close()
 err = g.Compact() // the image is now v8
 ```
 
+`disk.Options.Adjacency` is a third choice of the same kind, over derived state rather
+than over the file. An image carries edge records naming their endpoints; what a
+traversal needs is the inverse, and that is four arrays the loader computes — sixteen
+bytes per edge and sixteen per node slot, in anonymous memory, for the life of the
+handle. Nothing in the file changes either way.
+
+| `disk.Options.Adjacency` | The arrays are built | Ask for it when |
+|---|---|---|
+| `AdjacencyEager` (zero value) | while the image loads | anything will traverse, delete, or ask a degree |
+| `AdjacencyLazy` | on the first call that reads them | the process opens, reads properties, and closes |
+
+It is a deferral, not a refusal: a lazily opened store that traverses gets the same
+arrays and pays the same total, at a later moment. The calls that build them are a
+traversal, a degree query, an edge-of-node read, **a delete** — `DeleteNode` cascades
+to incident edges through exactly these arrays, so a writer that deletes cannot skip
+the build — and a verification.
+
+`StorageStats.Adjacency` reports `"built"` or `"deferred"`. It describes the handle,
+not the option: a store opened lazily that has since traversed reports `"built"`,
+because that is what it is holding. A caller checking that its read-only pass really
+avoided the arrays has nothing else to look at.
+
 ```go
 g := graphene.NewInMemory()
 defer g.Close()

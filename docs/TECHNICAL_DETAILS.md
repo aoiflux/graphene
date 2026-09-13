@@ -4947,6 +4947,67 @@ walk means the candidates were probed. Without that, a change reaching one call 
 and not the other leaves every assertion passing, because the answer is identical
 either way.
 
+### 14.23 Taken: adjacency is derived from the arena, and may be derived late
+
+Adjacency is four arrays — `outOffset`, `outEdges`, `inOffset`, `inEdges` — and nothing
+in the file carries them. They are the inverse of the edge records: sixteen bytes per
+live edge and sixteen per node slot, computed while the image loads.
+
+Two things changed, and only one of them is the option.
+
+**The build reads the arena, not the sequence.** `buildSeq` used to count degrees and
+fill the arrays by walking its edge sequence two more times, which made it five passes
+over the edges and three over the nodes. It walks `g.edgeRecs` instead — the records
+it has just placed. That is three passes each, and for compaction, whose edge sequence
+is a merge over an image and two sorted slices rather than a slice, two fewer walks of
+the expensive thing.
+
+The reason to do it is not the two passes. It is that the eager path and the lazy path
+are then the same function called at two moments, rather than two pieces of code that
+have to be kept agreeing — the failure mode a mode flag invites, where each path passes
+its own tests and they disagree with each other. §14.22 paid for that lesson in the
+planner, where a forecast and an executor were two call sites of one comparison.
+
+It also narrowed something and widened something. `buildSeq` refuses a sequence that
+yields a different number of records on a later pass, and four of the cases that
+refusal was tested against perturbed the two adjacency passes — one of them
+dangerously, since the fill's arrays were sized by the degree count and an extra edge
+wrote past their end. Those passes are gone, so those cases are gone. What replaced
+them is wider, not narrower: adjacency is the inverse of the records, so it cannot
+disagree with them at all — including under the one instability the refusal was always
+documented not to survive, a sequence yielding the same *number* of different records.
+
+**And the build may be deferred.** `Options.Adjacency` chooses between `AdjacencyEager`
+(the zero value, and what every earlier version did) and `AdjacencyLazy`, which builds
+on the first call that reads the arrays. The gate is an `atomic.Bool` checked before
+every adjacency read and a mutex around the build — a double-checked lock written out,
+rather than `sync.Once`, whose `Do` would allocate a closure per call on a path that is
+a branch inside `OutDegree`. The atomic is not optional: the fast read path takes no
+store lock, so any reader can be the one that triggers the build, and the Store after
+it is what publishes the four slice headers to a goroutine that did not do the
+building.
+
+**Why it is not the default, which is the finding.** `DeleteNode` cascades to incident
+edges through `incidentEdgeIDsLocked` — through exactly these arrays. A writer that
+deletes anything builds adjacency on its first delete, having also paid the branch on
+every read until then. The mode is worth asking for in a process that opens a store,
+reads properties out of it, and closes — a real and common shape, and the one this
+program's consumer runs for its read-only aggregate — and worth nothing at all in a
+writer. That is a property of the caller, not of the engine, so the engine does not
+guess: `StorageStats.Adjacency` reports `"built"` or `"deferred"`, read off the graph
+rather than off the option, because the option is a request and that is the answer.
+
+**One saving that is not the option's.** `verifyImage` builds a graph to check the
+image's roots and discards it. Roots are trees over records, property entries and
+tombstones — never adjacency — so that graph's arrays were allocated at open, read by
+nothing, and freed. It now builds lazily and never builds them. The premise is stated
+as `rootsAdjacencyMode` rather than as a literal at the call site, and
+`TestRoots_DoNotNeedTheAdjacency` holds it to account: if a root is ever added over
+adjacency the test fails at the place where the answer would have to change, instead of
+the arrays quietly reappearing inside a verification nobody re-measures.
+
+Measured: `docs/benchmarks.md`, "What adjacency costs a process that never traverses".
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.

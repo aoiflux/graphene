@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"iter"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/aoiflux/graphene/index"
@@ -38,7 +39,7 @@ func (s *Store) loadCSR(path string) error {
 // calls it with the same source VerifyOnOpen hashed, which is what keeps an
 // integrity check at one read of the image instead of three.
 func (s *Store) loadImage(src *imageSource) error {
-	csr, section, err := deserialiseCSRFrom(src.data, src.mapped())
+	csr, section, err := deserialiseCSRFrom(src.data, src.mapped(), s.adjacency)
 	if err != nil {
 		src.discard()
 		return err
@@ -294,7 +295,10 @@ func forEachBaseEntry(b index.Base, kind index.EntityKind,
 // 1-byte labels plus inline property blobs; format v4 stores uint16 labels
 // plus inline property blobs.
 func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
-	return deserialiseCSRFrom(data, false)
+	// Eager, because this is the offline entry point — inspect, prove, a test —
+	// and there is no Options in reach to say otherwise. Nothing here is holding
+	// the result for the life of a process.
+	return deserialiseCSRFrom(data, false, AdjacencyEager)
 }
 
 // deserialiseCSRFrom is deserialiseCSR over bytes that may be a mapping.
@@ -314,7 +318,7 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 // Everything else is identical, deliberately: the bounds, the order, the
 // sections, the errors. A file parses to the same graph either way, which is what
 // TestImageMode_SameGraphEitherWay asserts.
-func deserialiseCSRFrom(data []byte, mapped bool) (*CSRGraph, *csrIndexSection, error) {
+func deserialiseCSRFrom(data []byte, mapped bool, adj AdjacencyMode) (*CSRGraph, *csrIndexSection, error) {
 	if len(data) < 22 {
 		return nil, nil, fmt.Errorf("deserialiseCSR: data too short")
 	}
@@ -583,7 +587,7 @@ func deserialiseCSRFrom(data []byte, mapped bool) (*CSRGraph, *csrIndexSection, 
 		return nil, nil, err
 	}
 
-	csr, err := Build(nodes, edges)
+	csr, err := buildSeq(slices.Values(nodes), slices.Values(edges), adj)
 	if err != nil {
 		return nil, nil, err
 	}

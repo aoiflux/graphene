@@ -101,6 +101,10 @@ type Store struct {
 	// the zero value stays the documented default. See mapping.go.
 	imageMode ImageMode
 
+	// adjacency is Options.Adjacency as given: whether the image's adjacency
+	// arrays are built at Open or on first use. See adjacency_mode.go.
+	adjacency AdjacencyMode
+
 	// indexMode is Options.IndexMode as given, on the same terms. See
 	// index_mode.go.
 	indexMode IndexMode
@@ -361,6 +365,7 @@ func (s *Store) StorageStats() store.StorageStats {
 	}
 	st.ImageMode, st.ImageMappedBytes = s.imageHolding()
 	st.IndexMode = s.indexHolding()
+	st.Adjacency = s.adjacencyHolding()
 	st.PropertyNodeEntries, st.PropertyEdgeEntries = s.index().EntryCounts()
 
 	// Identifiers issued, not identifiers present. The counters are what the
@@ -802,6 +807,21 @@ type Options struct {
 	// See index_mode.go for the whole argument, including why a store that could
 	// not map its image still writes the format it was asked for.
 	IndexMode IndexMode
+
+	// Adjacency decides whether the image's adjacency arrays — the inverse of
+	// the edge records, which is what a traversal, a degree query and a delete
+	// cascade all read — are built while the image loads or the first time one
+	// of those asks for them.
+	//
+	// The zero value, AdjacencyEager, builds them at Open, which is what every
+	// version before this one did. AdjacencyLazy is for a process that opens a
+	// store to read properties out of it and never walks it: 16 bytes per edge
+	// and 16 per node slot that are then never allocated. A process that does
+	// walk it pays the same total either way, at a different moment.
+	//
+	// Nothing in the file changes and nothing about an answer changes.
+	// StorageStats.Adjacency reports which side of the build a handle is on.
+	Adjacency AdjacencyMode
 }
 
 // ErrReplayBudget reports an Open refused because the log exceeds
@@ -914,7 +934,7 @@ func verifyImage(src *imageSource, opts Options) error {
 		return nil
 	}
 
-	csr, section, err := deserialiseCSRFrom(data, src.mapped())
+	csr, section, err := deserialiseCSRFrom(data, src.mapped(), rootsAdjacencyMode())
 	if err != nil {
 		return fmt.Errorf("verify image: verify roots: %w", err)
 	}
@@ -1065,6 +1085,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		idHeadroomWarn: opts.IDHeadroomWarn,
 		imageMode:      opts.ImageMode,
 		indexMode:      opts.IndexMode,
+		adjacency:      opts.Adjacency,
 		syncOnCommit:   true,
 		metrics:        opts.Metrics,
 		signer:         opts.Signer,

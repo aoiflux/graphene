@@ -827,6 +827,43 @@ ceiling that is the difference between reclaiming and swapping. `ExplainNodeQuer
 names the route per residual step, which is the only way to know which of these two
 rows a given query is paying for.
 
+### 6.7 Adjacency, and the process that never asks for it
+
+Adjacency is not in the file. It is four arrays derived from the edge records while
+the image loads, and its cost is arithmetic rather than measured:
+
+| array | size | at 900k edges / 150k nodes |
+|---|---|---|
+| `outEdges` + `inEdges` | 8 B — live edge, each direction | 14.4 MiB |
+| `outOffset` + `inOffset` | 8 B — node slot, each direction | 2.4 MiB |
+
+All of it anonymous. Measured at 15.5 MiB against the 16.8 the table predicts, which
+is the closest agreement between arithmetic and instrument anywhere in this document
+and is what a derived array should look like.
+
+**Who pays it.** Everyone, until now — including a process that opens a store to read
+properties out of it and never touches an edge. `Options.Adjacency` is how that
+process says so, and `AdjacencyLazy` then builds nothing: 15.5 MiB not held and 11%
+off the open.
+
+**Who cannot avoid it, which is the finding that keeps this from being a default.**
+Any writer that deletes. `DeleteNode` cascades to incident edges and finds them
+through these arrays, so a lazily opened writer builds them on its first delete. The
+consumer this program is aimed at runs two processes — a rebuild that deletes 1.5M
+nodes per cycle, and a read-only aggregate that opens and reads ten rows — and the
+option is worth exactly nothing to the first and its full value to the second. That
+asymmetry is why the engine does not choose: it cannot see which process it is in.
+
+**What it does not cover.** The label postings (`nodesByLabel`, `edgesByLabel`) are
+also derived, also anonymous, also built at open, and also unread by a property-only
+pass. They are not deferred here. At 2M edges they are the larger term of the two,
+and they are the next thing to look at if this direction is worth continuing.
+
+**Where the rest of the edge cost is.** `[]rawEdge` is 80 bytes per edge — 160 MiB at
+2M edges, an order above the adjacency arrays — and it is a record array, not derived
+state. Nothing can defer it; R10(b)'s page table is what bounds it, by making it
+proportional to live edges rather than to the highest identifier ever issued.
+
 ## 7. Target architecture
 
 The store should hold, per live record and in anonymous memory, only what cannot be
