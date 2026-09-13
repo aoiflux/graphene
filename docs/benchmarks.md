@@ -2598,6 +2598,98 @@ includes a compaction — so 300,000 of its allocations were the payload. The
 bytes-per-node and bytes-per-edge figures it exists to report are unchanged to
 four significant figures.
 
+## What a migration costs, in both directions (2026-09-13)
+
+The change: `graphene store migrate -to 8|9` writes either format. It opens the
+store under the `IndexMode` that version implies and compacts once, so there is no
+new code path to measure — which is what makes this an interleaved A/B rather than
+a report on something with no before. Both arms exist in both trees as the library
+route (`Options.IndexMode` plus `Compact`), and the question is whether either
+moved.
+
+Conditions: Windows 11 Pro 26200, AMD Ryzen 9 5980HS, 16 logical CPUs, go 1.26,
+NVMe, 4 KiB pages. 50,000 nodes at the consumer's declared shape — eight unique
+keys including a 32-byte all-distinct digest, five low-cardinality ordered keys,
+two composites, **13 index entries per node, 650,000 in total** — reopened from
+disk. Residency is sampled on a 1 ms ticker across the open-compact-close window,
+with the fixture closed first so the peak is the migration's own. Three interleaved
+passes; every pass reported.
+
+### Neither arm moved
+
+| | before | after |
+|---|---|---|
+| `-to 9`, ms | 1014 / 804 / 843 | 856 / 720 / 726 |
+| `-to 9`, peak MiB | 127.9 / 128.1 / 127.3 | 128.1 / 126.7 / 127.3 |
+| `-to 9`, over idle MiB | 75.7 / 75.3 / 75.4 | 75.9 / 74.9 / 75.2 |
+| `-to 8`, ms | 2559 / 1410 / 1116 | 1292 / 1110 / 1011 |
+| `-to 8`, peak MiB | 220.0 / 213.0 / 209.2 | 216.4 / 222.2 / 221.2 |
+| `-to 8`, over idle MiB | 167.4 / 159.7 / 156.8 | 163.4 / 169.4 / 168.7 |
+
+The control arm ran first in every pass and paid the cold page cache for it, which
+is the whole of why its first `-to 8` reads 2559 ms against a 1011–1410 ms spread
+afterwards. Residency is flat to within a megabyte in both arms, which is the
+assertion that matters: nothing on a compaction path changed.
+
+`BenchmarkGPIXBaseLookup`, three interleaved passes, ns/op: AllDistinct
+123.9 / 129.7 / 121.5 → 119.5 / 124.2 / 113.6; LowCardinality 108.8 / 107.8 / 100.4
+→ 112.7 / 100.1 / 97.06. Zero allocations in both arms. `BenchmarkRSS_Open` at
+50,000 nodes: heap 17.36 MiB in every arm of every pass, image 60.46 MiB, resident
+per disk 1.922 / 1.924 against 1.925 — the one 1.619 reading in the first control
+pass is that pass's cold start and did not recur.
+
+### What the downgrade costs, which is the number an operator wants
+
+Reading across the arms rather than between them:
+
+| one migration, 650,000 index entries | `-to 9` | `-to 8` |
+|---|---|---|
+| wall clock | 0.72–1.01 s | 1.01–1.41 s |
+| peak RSS | ~127 MiB | ~215 MiB |
+| anonymous, over idle | ~75 MiB | ~165 MiB |
+| image it leaves | 60.46 MiB | 44.01 MiB |
+
+**The downgrade costs 2.2× the anonymous memory**, and that is the point rather
+than a defect: a store holding GIDX has to build the whole index in the heap, and
+the ~90 MiB of difference over 650,000 entries is the ~107 B/entry this whole
+programme exists to stop paying. An operator downgrading a store near a memory
+ceiling should expect the migration itself to be the expensive moment, and
+`-to 8` on a 1.2 GiB store is the shape R5's pre-flight refusal is for.
+
+### The v8 image is 27% smaller, and the missing bytes are the point
+
+Same content, same records, same blobs: **60.46 MiB as v9 against 44.01 MiB as
+v8.** Every difference is in the index sections, and it is accounted for exactly
+by the two formats' own field widths:
+
+| | per entry | per distinct value | at this shape |
+|---|---|---|---|
+| GIDX | `id 8 + keyLen 2 + key + valLen 4 + value` | — | 18.88 MiB |
+| GPIX | value bytes once, `valLen 4 + idCount 4 + ids 8n` | + `vtab 16` | 21.45 MB |
+| GPIR | `24` | — | 15.60 MB |
+| GPIX + GPIR | | | 35.33 MiB |
+| predicted difference | | | **16.45 MiB** |
+| measured difference | | | **16.45 MiB** |
+
+So v9 costs about 26 bytes an entry more on disk, and the two terms that make it
+up are GPIR's 24 bytes per entry and the value table's 16 bytes per distinct
+value. Those are the reverse direction and the search structure — precisely the
+two things v8 rebuilds in the heap at every open, at 5.2× the bytes (§"The memory
+architecture review"). **The image grew by exactly what stopped being built in
+RAM**, which is the trade this format change is, stated in bytes rather than in
+prose. Disk is unconstrained for this programme and memory is the budget; a
+reader for whom that is the other way round has `-to 8`.
+
+### Reproducing
+
+The arms are the library route, so this needs no CLI:
+
+```
+GRAPHENE_RSS_NODES=50000 go test -tags=stress ./tests/ -run '^$' -bench RSS_Open -benchtime 1x
+go test ./disk/ -run '^$' -bench GPIXBaseLookup -benchmem -benchtime 2s
+graphene store migrate -check -to 8 <dir>   # what it would do, and to what
+```
+
 ## The mapped index is verified, boundedly (2026-09-13)
 
 The change: `Store.VerifyIndexes` also checks the image's GPIX and GPIR sections

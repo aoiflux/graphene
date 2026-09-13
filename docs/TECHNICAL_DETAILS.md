@@ -3123,11 +3123,41 @@ image in place because the new one is renamed in only once complete and fsynced.
 It reads the version back and re-verifies the indexes afterwards, because a
 migration reporting success without reading back what it wrote fails silently.
 
-`migrate -check` reads the image header without opening the store, so surveying
-a fleet does not mean taking the exclusive lock on every one of them. It
-distinguishes "there is no image" — an ordinary state for a store that has never
-compacted — from "the image will not parse", because collapsing the two sends an
-operator looking for corruption that is not there.
+`migrate -to` names the version to write, in either direction. It is not a
+second code path and could not be one: which version a compaction produces is
+`Options.IndexMode`'s decision — v9 carries the property index as GPIX and GPIR,
+v8 carries GIDX — so `-to` opens the store under the mode that version implies
+and then compacts once. A downgrade is therefore exactly as crash-safe as any
+other compaction, costs the same single pass, and shares every guarantee above
+including the read-back. Only v8 and v9 are writable, and `-to 7` is refused by
+the flag parser rather than by the handler, so a typo does not acquire the
+exclusive lock on the way to being rejected. The accepted versions come from
+`disk.CSRVersionsWritable`, so the tool cannot come to name a set the engine does
+not write.
+
+That `-to` reaches an Option at all is a small framework addition worth naming:
+the CLI opens what a command declared *before* the handler runs, so a flag that
+decides how the store must be opened cannot be acted on by the handler. An
+options struct may therefore implement `tuneOpen(*disk.Options)`, which runs
+after the ledger detection and the `-metrics` bind and before the open. It may
+set fields and nothing else — it cannot refuse the open, and `ReadOnly` is
+applied after it, so a tuner cannot undo `-dry-run`'s downgrade.
+
+`migrate -check` reads the image header before the graph is touched, so the
+report describes the image on disk rather than what the open made of it, and a
+store this build could not open still gets an account of why it needs migrating.
+It distinguishes "there is no image" — an ordinary state for a store that has
+never compacted — from "the image will not parse", because collapsing the two
+sends an operator looking for corruption that is not there. `-dry-run` asks the
+same question and gets the same answer.
+
+What `-check` does *not* do is avoid the lock, and an earlier version of this
+paragraph claimed it did. The framework opens what the command declared before
+any handler runs, so `-check` on a store another process holds fails like every
+other subcommand; `info`, `csr` and `wal` are the ones that read the files
+directly. Making `-check` one of them means letting a flag downgrade the open
+mode rather than adjust its options, which is a larger change than the one above
+and has not been made.
 
 #### The register, extended
 

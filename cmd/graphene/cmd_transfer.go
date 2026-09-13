@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/aoiflux/graphene"
@@ -337,36 +338,157 @@ func openDump(path string) (io.Reader, func(), bool, error) {
 
 // --- store migrate ---
 
-type migrateOpts struct{ check bool }
+// csrTarget is `store migrate -to`: a container version this build can write.
+//
+// A flag.Value rather than a plain integer, so a number this build cannot write
+// is refused by the flag parser — before the store is opened and before the
+// exclusive lock is taken. A handler checking it afterwards would have acquired
+// the lock in order to reject a typo, and the check would have had to come
+// before its first read to avoid reporting on a migration it was about to
+// refuse.
+type csrTarget struct{ v uint16 }
+
+// String is what -h prints as the default: empty when unset, because 0 is not a
+// version and the flag's own help says what unset means.
+func (t *csrTarget) String() string {
+	if t == nil || t.v == 0 {
+		return ""
+	}
+	return fmt.Sprintf("v%d", t.v)
+}
+
+// Set accepts "8" and "v8" alike. The report prints versions with the v, so
+// pasting one back in has to work.
+func (t *csrTarget) Set(s string) error {
+	n, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(s), "v"), 10, 16)
+	if err != nil {
+		return fmt.Errorf("%q is not a format version", s)
+	}
+	if _, ok := disk.IndexModeForCSRVersion(uint16(n)); !ok {
+		return fmt.Errorf("this build writes %s, not v%d", writableVersions(), n)
+	}
+	t.v = uint16(n)
+	return nil
+}
+
+// writableVersions spells disk.CSRVersionsWritable for a message: "v8 or v9".
+//
+// Read from the engine rather than written out here, because a tool naming the
+// formats it can produce from its own copy of the list is a tool that will one
+// day name the wrong ones.
+func writableVersions() string {
+	vs := disk.CSRVersionsWritable()
+	parts := make([]string, len(vs))
+	for i, v := range vs {
+		parts[i] = fmt.Sprintf("v%d", v)
+	}
+	if len(parts) < 2 {
+		return strings.Join(parts, "")
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + " or " + parts[len(parts)-1]
+}
+
+// indexEncodingOf describes what version v does with the property index.
+//
+// The report says it in words because it is the whole of what -to chooses. An
+// operator downgrading is trading a store that reads its index off the disk for
+// one that holds it in memory, and that is a sentence, not a version number.
+func indexEncodingOf(v uint16) string {
+	mode, ok := disk.IndexModeForCSRVersion(v)
+	switch {
+	case !ok:
+		return "unknown to this build"
+	case mode == disk.IndexMapped:
+		return "GPIX and GPIR, which a store can read in place"
+	default:
+		return "GIDX, which every open rebuilds in the heap"
+	}
+}
+
+type migrateOpts struct {
+	check bool
+	to    csrTarget
+}
+
+// want is the version this invocation is aiming at.
+func (o *migrateOpts) want() uint16 {
+	if o.to.v == 0 {
+		return disk.CSRVersionCurrent
+	}
+	return o.to.v
+}
+
+// tuneOpen asks for the index encoding the target version implies — see
+// openTuner for why this cannot be the handler's job.
+//
+// Total by construction: csrTarget.Set has already refused every version this
+// build cannot write, so the lookup here cannot fail, and an unset -to resolves
+// to the current version rather than to no decision at all. The default case is
+// therefore the option's zero value being set to itself, which is what makes
+// adding the flag no change at all to an invocation that does not use it.
+func (o *migrateOpts) tuneOpen(opts *disk.Options) {
+	if mode, ok := disk.IndexModeForCSRVersion(o.want()); ok {
+		opts.IndexMode = mode
+	}
+}
 
 var storeMigrate = cmd(Command{
 	Group: "store", Name: "migrate", Aliases: []string{"migrate"},
-	Usage: "<dir>", Short: "bring the image up to the current format",
+	Usage: "<dir>", Short: "rewrite the image in a given format version",
 	Long: "Open, Compact, verify — which is what the library does on its own\n" +
 		"schedule. A compaction that fails leaves the old image in place: the new\n" +
-		"one is renamed in only once it is complete and fsynced.",
+		"one is renamed in only once it is complete and fsynced.\n" +
+		"\n" +
+		"-to picks the format the new image is written in, in either direction. It\n" +
+		"is not a second code path: the store is opened with the index mode that\n" +
+		"version implies and then compacted once, so a downgrade is exactly as\n" +
+		"crash-safe as any other compaction and costs the same one pass. v9 carries\n" +
+		"the property index as GPIX and GPIR, which is what lets a store read it\n" +
+		"off the disk instead of holding it in memory; v8 carries GIDX and is read\n" +
+		"by every build since v8, at that memory. Downgrade to hand a store to an\n" +
+		"older build, or to trade the memory back for the lookup latency.",
 	Notice: "migrate opens the store for writing and takes the exclusive lock",
 	Open:   OpenGraphRW, Tier: CtxExact,
 },
 	func(fs *flag.FlagSet, o *migrateOpts) {
 		fs.BoolVar(&o.check, "check", false, "report what would happen and change nothing")
+		fs.Var(&o.to, "to", "format version to write: "+writableVersions()+
+			" (default: what this build writes)")
 	},
 	runStoreMigrate)
 
 func runStoreMigrate(cx *Context, o *migrateOpts) (Result, error) {
 	var r Result
 	dir := cx.Target
+	want := o.want()
 
-	// -check reads the header rather than opening the store: an operator
-	// surveying a fleet should not have to take the exclusive lock on every one
-	// of them to find out which need anything.
+	// -dry-run asks the same question -check does, so it gets the same answer.
+	// What it used to get was the engine's: the framework downgrades the open to
+	// read-only under -dry-run, the handler compacted anyway, and the operator
+	// was told "store is open read-only" by a store they had asked it not to
+	// write to. A global flag the tool advertises, failing on the one command
+	// that had a perfectly good account of what it would have done.
+	plan := o.check || (cx.Globals != nil && cx.Globals.DryRun)
+
+	// The header, before the graph is touched: the report describes the image on
+	// disk rather than what the open made of it, and a store this build could not
+	// open still gets an account of why it needs migrating.
+	//
+	// It does not avoid the lock, whatever this used to claim. The framework opens
+	// what the command declared before any handler runs, so -check on a store
+	// another process holds fails like every other subcommand — `info`, `csr` and
+	// `wal` are the ones that read the files directly. Making -check one of them
+	// means letting a flag downgrade the open mode, which is a framework change
+	// and not a line in this function.
 	info, err := disk.InspectCSR(filepath.Join(dir, "graphene.csr"))
 	s := r.Section("")
 	switch {
 	case err == nil:
 		s.Addf("image format", "v%d", info.Version)
 		s.Addf("this build writes", "v%d", disk.CSRVersionCurrent)
-		if info.Version == disk.CSRVersionCurrent && o.check {
+		s.Addf("target format", "v%d", want)
+		s.Add("property index", Str(indexEncodingOf(want)))
+		if info.Version == want && plan {
 			s.Add("action", Str("nothing to do"))
 			return r, nil
 		}
@@ -378,12 +500,14 @@ func runStoreMigrate(cx *Context, o *migrateOpts) (Result, error) {
 		// would send an operator looking for corruption in a store that has
 		// simply never been compacted.
 		s.Add("image", Str("none yet; this store has never been compacted"))
+		s.Addf("target format", "v%d", want)
+		s.Add("property index", Str(indexEncodingOf(want)))
 	default:
 		return r, fmt.Errorf("read image: %w", err)
 	}
 
-	if o.check {
-		s.Add("action", Str("would open the store, compact it, and verify the result"))
+	if plan {
+		s.Addf("action", "would open the store, compact it as v%d, and verify the result", want)
 		return r, nil
 	}
 
@@ -404,9 +528,9 @@ func runStoreMigrate(cx *Context, o *migrateOpts) (Result, error) {
 	if err != nil {
 		return r, fmt.Errorf("read migrated image: %w", err)
 	}
-	if after.Version != disk.CSRVersionCurrent {
-		return r, fmt.Errorf("image is still v%d after compaction; expected v%d",
-			after.Version, disk.CSRVersionCurrent)
+	if after.Version != want {
+		return r, fmt.Errorf("image is v%d after compaction; expected v%d",
+			after.Version, want)
 	}
 	if err := g.VerifyIndexesCtx(cx.Ctx); err != nil {
 		return r, fmt.Errorf("indexes do not verify after migration: %w", err)

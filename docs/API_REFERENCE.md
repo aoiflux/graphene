@@ -124,15 +124,42 @@ that does many of them wants `NodesByPropertyBatch`.
 It does not change what a read hands back: property values are copied out of the
 index at every public boundary either way.
 
+The v9 image is **larger on disk** — about 26 bytes per indexed entry, measured at
+16.45 MiB over 650,000 entries — because the reverse direction and the value table
+are written down instead of being rebuilt in the heap at every open. That is the
+same structure either way; the choice is only where it lives. Disk for it, or
+memory for it at 5.2× the bytes.
+
 Two things to know before taking the default. The image it writes is **v9, which
 no earlier build opens** — `IndexResident` plus one `Compact()` writes v8 again
-and is the supported way back. And reading in place needs a mapped image: under
+and is the supported way back, and `graphene store migrate -to 8` is that same
+compaction from a command line. And reading in place needs a mapped image: under
 `ImageHeap` a base pointing into the heap buffer would pin the whole file to save a
 fraction of it, so the store rebuilds the index instead. It still writes the format
 it was asked for, because an image is portable and its digest is an identity for its
 contents — the encoding follows the option, not the machine.
 `StorageStats.IndexMode` reports what is in force and `store.MetricIndexFallback`
 names any request that could not be honoured.
+
+Two functions exist for tools that have to talk about the versions rather than the
+modes. `disk.CSRVersionsWritable()` lists what this build can produce — two
+versions, for the first time in the format's history, because v8 and v9 differ only
+in how the index is encoded. `disk.IndexModeForCSRVersion(v)` is the inverse of
+that choice: the mode a store must be opened under for its next compaction to write
+`v`, and whether this build writes `v` at all. Everything from v2 is *readable* and
+unwritable, so the second return is how a tool tells "unknown version" from "a
+version I understand and cannot produce" — which is the difference between a typo
+and a request to do something impossible. `disk.CSRVersionCurrent` remains what a
+store writes when nobody chooses.
+
+```go
+mode, ok := disk.IndexModeForCSRVersion(8)
+if !ok { /* this build cannot write v8 */ }
+g, err := graphene.OpenWithOptions(dir, disk.Options{IndexMode: mode})
+if err != nil { /* ... */ }
+defer g.Close()
+err = g.Compact() // the image is now v8
+```
 
 ```go
 g := graphene.NewInMemory()

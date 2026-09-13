@@ -89,6 +89,42 @@ func (m IndexMode) String() string {
 	return fmt.Sprintf("IndexMode(%d)", uint8(m))
 }
 
+// CSRVersionsWritable lists the container versions this build can produce, in
+// ascending order.
+//
+// Two, for the first time in the format's history: v8 and v9 differ in how the
+// property index is encoded and in nothing else, and which one a compaction
+// writes is IndexMode's decision. Everything older is readable and not writable
+// — those versions differ in the record layout, and reproducing one would mean
+// carrying a second writer for a format nothing gains from.
+//
+// Exported for `graphene store migrate -to`, which has to tell an operator which
+// numbers it accepts. A fresh slice per call, so a caller cannot edit the answer.
+func CSRVersionsWritable() []uint16 {
+	return []uint16{csrVersionSectioned, csrVersionMappedIndex}
+}
+
+// IndexModeForCSRVersion is the mode a store must be opened under for its next
+// compaction to write version v, and whether this build writes v at all.
+//
+// The inverse of csrPayload.imageVersion, and the reason to have it is that the
+// rule has one owner. A downgrade is not a separate code path: it is an ordinary
+// compaction by a store that was opened under IndexResident, which is what makes
+// it as crash-safe as any other. A caller wanting the number back out of a mode
+// asks imageVersion, or CSRVersionCurrent for the default.
+//
+// v is a uint16 because that is what CSRInfo.Version is, so an operator's number
+// and a file's are compared without a conversion in between that could narrow.
+func IndexModeForCSRVersion(v uint16) (IndexMode, bool) {
+	switch v {
+	case csrVersionMappedIndex:
+		return IndexMapped, true
+	case csrVersionSectioned:
+		return IndexResident, true
+	}
+	return 0, false
+}
+
 // indexBaseAllowed reports why this store will not read the image's index in
 // place, or nil.
 //

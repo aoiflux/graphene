@@ -343,6 +343,20 @@ Two further readings.
 becomes 2,748 MiB of maps. A design that reads it in place rather than decoding it
 is not a marginal improvement on that ratio; it removes it.
 
+**And it costs more on disk to read it in place — by exactly what stops being
+built.** Measured on the same declared shape at 50,000 nodes and 650,000 entries,
+the image is 60.46 MiB as v9 against 44.01 MiB as v8: **about 26 bytes an entry
+more**, all of it in the index sections. The two terms are GPIR's 24 bytes per
+entry and the value table's 16 bytes per distinct value, and predicting the
+difference from those field widths gives 16.45 MiB against 16.45 MiB measured.
+Those two structures are the reverse direction and the search structure — which
+is to say the *whole* of what a v8 open reconstructs in the heap, at 5.2× the
+bytes. The image grew by what stopped being built in RAM. Disk is unconstrained
+here and memory is the budget, so this is the trade being made rather than a cost
+being discovered; `graphene store migrate -to 8` is the way back for a reader for
+whom it runs the other way round. See `docs/benchmarks.md`, "What a migration
+costs, in both directions".
+
 **155.9 B per entry at 1.4M**, against 135.87 measured at 200k (§1.2) — 14.7%
 higher for the same declared shape, at a larger size. That is the map sawtooth
 (§1.4) and it is the reason this document reports a range wherever it reports a

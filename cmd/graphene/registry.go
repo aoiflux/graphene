@@ -12,6 +12,8 @@ package main
 import (
 	"flag"
 	"sort"
+
+	"github.com/aoiflux/graphene/disk"
 )
 
 // Handler runs a command and returns the document it produced.
@@ -56,9 +58,30 @@ type Command struct {
 	Before func(*Context) error
 
 	// newFlags registers this command's flags on fs and returns the handler
-	// closed over them. Written by cmd(), never by hand.
-	newFlags func(*flag.FlagSet) Handler
+	// closed over them, plus the tuner if the options type has one. Written by
+	// cmd(), never by hand.
+	newFlags func(*flag.FlagSet) (Handler, openTune)
 }
+
+// openTune adjusts the Options the framework opens the store with. Nil unless
+// the command's options type implements openTuner.
+type openTune func(*disk.Options)
+
+// openTuner is implemented by an options struct one of whose flags changes how
+// the store has to be opened, rather than what the handler does once it is open.
+//
+// It exists because Before cannot serve: the framework opens before the handler
+// runs, so a flag that decides an Option has to be read in between, and Before
+// is a func(*Context) with no access to the flags. `store migrate -to 8` is the
+// case — which version the next compaction writes is Options.IndexMode's
+// decision, made at open, so by the time a handler could act on -to the store
+// is already open under the wrong one.
+//
+// Deliberately narrow. A tuner may set fields on the Options and nothing else:
+// it cannot refuse the open (that is Before), cannot change the open mode (that
+// is Command.Open and -dry-run), and runs after -metrics and the ledger
+// detection, so it cannot quietly undo either.
+type openTuner interface{ tuneOpen(*disk.Options) }
 
 // Path is how the command is spelled: "node custody", or "info".
 func (c *Command) Path() string {
@@ -79,12 +102,19 @@ func cmd[O any](
 	bind func(*flag.FlagSet, *O),
 	run func(*Context, *O) (Result, error),
 ) *Command {
-	c.newFlags = func(fs *flag.FlagSet) Handler {
+	c.newFlags = func(fs *flag.FlagSet) (Handler, openTune) {
 		var o O
 		if bind != nil {
 			bind(fs, &o)
 		}
-		return func(cx *Context) (Result, error) { return run(cx, &o) }
+		var tune openTune
+		// The assertion is on the pointer, so a tuner is declared on *O and
+		// reads the same flags the handler does — one struct, filled by the
+		// flag set, seen by both.
+		if t, ok := any(&o).(openTuner); ok {
+			tune = t.tuneOpen
+		}
+		return func(cx *Context) (Result, error) { return run(cx, &o) }, tune
 	}
 	return &c
 }

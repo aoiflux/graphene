@@ -384,3 +384,90 @@ func TestIndexMapped_RecompactingOverABaseKeepsTheWholeIndex(t *testing.T) {
 	}
 	requireSameAnswers(t, "recompacted over a base", askIndex(t, resident), askIndex(t, mapped))
 }
+
+// TestIndexModeForCSRVersion_AgreesWithTheWriter ties the exported mapping to
+// what a compaction actually produces.
+//
+// A table checked against another table passes with its two arms swapped, and
+// the whole value of the mapping is that `store migrate -to 8` opens the store
+// under the mode that really does write v8. So for every version
+// CSRVersionsWritable offers, a store is opened under the mode the mapping names,
+// compacted, and the version read back out of the bytes.
+func TestIndexModeForCSRVersion_AgreesWithTheWriter(t *testing.T) {
+	writable := CSRVersionsWritable()
+	if len(writable) == 0 {
+		t.Fatal("a build that writes no version writes no store")
+	}
+	if !slices.IsSorted(writable) {
+		t.Errorf("CSRVersionsWritable is %v, which is not ascending as documented", writable)
+	}
+	if !slices.Contains(writable, uint16(CSRVersionCurrent)) {
+		t.Errorf("CSRVersionsWritable is %v and omits the version this build writes by "+
+			"default, v%d", writable, CSRVersionCurrent)
+	}
+
+	for _, want := range writable {
+		mode, ok := IndexModeForCSRVersion(want)
+		if !ok {
+			t.Errorf("v%d is offered as writable and has no mode", want)
+			continue
+		}
+		dir := t.TempDir()
+		s, err := OpenWithOptions(dir, Options{IndexMode: mode})
+		if err != nil {
+			t.Fatalf("open under %s: %v", mode, err)
+		}
+		id := addNodeD(t, s, store.NodeTypeEvidenceFile)
+		if err := s.IndexNodeProperty(id, "k", []byte("v")); err != nil {
+			t.Fatalf("index: %v", err)
+		}
+		if err := s.Compact(); err != nil {
+			t.Fatalf("compact under %s: %v", mode, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if got := versionOf(readCSR(t, dir)); got != want {
+			t.Errorf("a compaction under %s wrote v%d; the mapping named it for v%d",
+				mode, got, want)
+		}
+	}
+}
+
+// TestIndexModeForCSRVersion_RefusesWhatItCannotWrite.
+//
+// The interesting class is v2 to v7: readable by this build and not writable by
+// it, because those versions differ in the record layout rather than in how the
+// index is encoded. A mapping that answered for them would have `migrate -to 7`
+// open a store, compact it, and then discover the image came out v9 — a refusal
+// after the exclusive lock rather than at the flag.
+func TestIndexModeForCSRVersion_RefusesWhatItCannotWrite(t *testing.T) {
+	for _, v := range []uint16{csrVersionV2, csrVersionV3, csrVersionWithU16Labels,
+		csrVersionWithSeqHW, csrVersionWithPropIndex, csrVersionNoAdjacency} {
+		if _, ok := IndexModeForCSRVersion(v); ok {
+			t.Errorf("v%d is readable and not writable, and the mapping claims a mode "+
+				"for it", v)
+		}
+	}
+	// Nothing outside the list, in either direction — including 0, which is what
+	// an unset flag would carry if it reached this far.
+	for v := uint16(0); v < 64; v++ {
+		_, ok := IndexModeForCSRVersion(v)
+		if want := slices.Contains(CSRVersionsWritable(), v); ok != want {
+			t.Errorf("IndexModeForCSRVersion(%d) = %v; CSRVersionsWritable says %v",
+				v, ok, want)
+		}
+	}
+}
+
+// TestCSRVersionsWritable_CannotBeEdited: it hands back the answer, not the list.
+func TestCSRVersionsWritable_CannotBeEdited(t *testing.T) {
+	first := CSRVersionsWritable()
+	if len(first) == 0 {
+		t.Fatal("nothing to edit")
+	}
+	first[0] = 999
+	if second := CSRVersionsWritable(); second[0] == 999 {
+		t.Errorf("editing the returned slice changed the answer: %v", second)
+	}
+}

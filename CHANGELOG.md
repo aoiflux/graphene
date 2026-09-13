@@ -5,6 +5,62 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### `store migrate -to` writes either format, in either direction
+
+The compatibility statement for v9 said `Options.IndexMode: IndexResident` plus one
+`Compact()` is the way back to v8 and that the convenient form would follow. This
+is it: `graphene store migrate -to 8` downgrades an image, `-to 9` upgrades one, and
+a bare `migrate` writes what the build writes, as before.
+
+It is not a second code path, and the reason matters more than the flag. Which
+version a compaction produces is `Options.IndexMode`'s decision — v9 carries the
+property index as GPIX and GPIR, v8 carries GIDX, and the container is otherwise
+identical — so `-to` opens the store under the mode that version implies and
+compacts once. A downgrade is therefore exactly as crash-safe as any other
+compaction: the new image is renamed in only once it is complete and fsynced, the
+version is read back, and the indexes are re-verified. There is no conversion
+routine to get wrong, because there is no conversion.
+
+Only v8 and v9 are writable, and the refusal happens at the flag rather than in the
+handler, so `-to 7` — a version this build reads perfectly well and cannot write —
+does not acquire the exclusive lock on its way to being rejected. The accepted set
+comes from the new `disk.CSRVersionsWritable`, and `disk.IndexModeForCSRVersion`
+is the mapping the tool opens by, so neither can come to disagree with the writer.
+A test compacts under each mode the mapping names and reads the version back out of
+the bytes, rather than checking one table against another.
+
+**What the round trip preserves.** v9 → v8 → v9 over a store with an all-distinct
+key, a low-cardinality key, a declared ordered key, a composite tuple and an edge
+key: every entry in the index, every distinct value and its count, exact-match,
+prefix, range and composite queries, all identical at each step. The index is
+re-encoded rather than copied, so that is the assertion worth making; the version
+number is checked as well, because a migration that quietly did nothing would pass
+an answers-only test.
+
+**Two fixes that came with it.** `-dry-run migrate` used to fail: the framework
+downgrades the open to read-only under it, the handler compacted anyway, and the
+operator was handed the engine's "store is open read-only" by a store they had
+asked it not to write to. It now reports what it would do, exactly as `-check`
+does. And `-check`'s own documentation claimed it read the header *without opening
+the store*, so that surveying a fleet took no exclusive lock. That was never true —
+the framework opens what a command declared before any handler runs — and the claim
+is now corrected in both the code and `TECHNICAL_DETAILS.md` rather than quietly
+dropped. Making it true means letting a flag downgrade the open mode, which is a
+larger change and has not been made; `info`, `csr` and `wal` read the files
+directly today.
+
+**Framework, for the curious.** A command's options struct may now implement
+`tuneOpen(*disk.Options)`, which the CLI calls after the ledger detection and the
+`-metrics` bind and before it opens anything. It exists because the framework opens
+what a command declared *before* the handler runs, so a flag that decides an Option
+cannot be acted on by the handler that reads it. It may set fields and nothing
+else: it cannot refuse an open, and `ReadOnly` is applied after it, so a tuner
+cannot turn `-dry-run`'s downgrade back into a suggestion. `store migrate` is the
+only command with one, and a test names it so that a second is a decision somebody
+makes on purpose.
+
+No format change, no API removed, no read or write path touched.
+
 ### `VerifyIndexes` now checks the image's own property index
 
 A v9 image carries its property index as two sections read in place, and until now
@@ -80,8 +136,8 @@ says so by doing nothing.
 writes v9, and no earlier build opens a v9 image — GPIX and GPIR are critical
 sections, so an older reader refuses the file rather than answering property
 queries out of an index it cannot read. `Options.IndexMode: IndexResident` plus one
-`Compact()` writes v8 again and is the supported way back; `store migrate --to 8`
-is the convenient form of the same thing and lands next.
+`Compact()` writes v8 again and is the supported way back; `store migrate -to 8`
+is the convenient form of the same thing — see the entry above.
 
 Everything before this change made the mapped index *possible*. This is the one
 that measures it against the alternative and moves the default, which is the only

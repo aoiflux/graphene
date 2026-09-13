@@ -68,7 +68,7 @@ func invoke(c *Command, args []string, g *Globals, cfg *Config, stdout, stderr i
 	fs.SetOutput(stderr)
 	fs.Usage = func() { writeCommandHelp(stderr, c, fs) }
 
-	handler := c.newFlags(fs)
+	handler, tuneOpen := c.newFlags(fs)
 	bindGlobals(fs, g)
 
 	var confirm bool
@@ -119,6 +119,8 @@ func invoke(c *Command, args []string, g *Globals, cfg *Config, stdout, stderr i
 		Args:    fs.Args(),
 		Out:     stdout,
 		Err:     stderr,
+
+		tuneOpen: tuneOpen,
 	}
 
 	if g.CPUProfile != "" {

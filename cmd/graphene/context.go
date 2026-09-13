@@ -107,6 +107,10 @@ type Context struct {
 	// sites cost nothing.
 	metrics *collector
 
+	// tuneOpen is the command's openTuner, if its options type has one. Set by
+	// invoke once the flags are parsed and read by open.
+	tuneOpen openTune
+
 	Out io.Writer // stdout; only a streaming command writes here
 	Err io.Writer // stderr; notices
 }
@@ -149,6 +153,13 @@ func (c *Context) open(mode OpenMode) (func(), error) {
 	if c.Globals != nil && c.Globals.Metrics {
 		c.metrics = newCollector()
 		opts.Metrics = c.metrics
+	}
+	// Last, so a command's own flags see the finished Options and cannot be
+	// overwritten by the framework's. ReadOnly is set after it for the one
+	// field a tuner is not allowed to reach: -dry-run's downgrade is the
+	// framework's guarantee, not a command's suggestion.
+	if c.tuneOpen != nil {
+		c.tuneOpen(&opts)
 	}
 	opts.ReadOnly = !mode.writes()
 
