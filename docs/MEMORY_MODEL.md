@@ -511,6 +511,48 @@ compacted accumulates an unbounded delta, and the compaction that finally runs p
 all of it at once — which is why `CompactionPolicy.MaxDeltaBytes` (Phase 6) is a memory
 control and not only a disk one.
 
+### 4.2a The fourth term: a constant, and the only one an operator sets directly
+
+The model above has three terms and every one of them follows the store. A
+mapped-index compaction has a fourth that does not: the intermediates it holds
+while it streams.
+
+| intermediate | default | what it bounds |
+|---|---:|---|
+| GPIX value table (`gpixVtabMemCap`) | 1,048,576 B | distinct values held before the table opens a file |
+| GPIR sort chunk (`gpirSortChunkEntries`) | 32,768 entries | entries sorted in memory at once, held twice — as entries and as the buffer that writes them out — in each of two sorters |
+| GPIR merge budget (`gpirMergeReadBudget`) | 2,097,152 B | every run reader's buffer together |
+| GPIR run buffer (`gpirMaxRunBuffer`) | 65,536 B | one run reader's |
+| **peak, the four together** | **4,325,376 B** | **4.125 MiB, whatever the store holds** |
+
+The peak is during the fill rather than the merge, because both sorters are
+filled together and live for the whole GPIX write while the merge runs after the
+value table is closed and after the sorter being drained has released its chunk.
+
+Four megabytes is nothing beside the 181 MiB §4.2 predicts, which is exactly why
+it was missed twice: it is absent from §4.1's decomposition, which was measured
+on the v8 path, and it was absent from `compactWorkingSet` until `CompactOptions`
+gave it a figure to be named by. On a small store it is most of the transient,
+and a small store under a tight budget is the case a budget exists for.
+
+`Options.Compact.MaxWorkingBytes` sets it, floor 524,288 B. Measured at 50,500
+records over three interleaved rounds:
+
+| setting | compaction allocation | vs default | wall clock vs default |
+|---|---:|---:|---|
+| default (4,325,376 B) | 10.19 MiB | — | — |
+| floor (524,288 B) | 6.87 MiB | **−3.32 MiB** | +12%, +16%, +42% |
+| 64 MiB | 48.23 MiB | +38.04 MiB | +18%, 0%, −12% |
+
+**Fifteen times the memory buys nothing measurable.** The spill and the merge are
+already cheap — sequential, page-cache backed, written once and read once — so
+the direction that was expected to pay does not. Lowering it is a real 3.3 MiB
+for a real third of a second. Both figures are small, and this table exists so
+that nobody has to rediscover that they are.
+
+Not covered: that fixture sorts in about twenty runs, and the 28 million entries
+§1.2 projects would sort in around 850. A merge forty times wider was not timed.
+
 ### 4.3 A never-compacted store also opens expensively
 
 `RSS_Open_UncompactedWAL` at 200,000 nodes replays the whole history from the WAL with

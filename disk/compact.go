@@ -210,6 +210,12 @@ type compactPlan struct {
 	// one moment the caller is least watching.
 	adjacency AdjacencyMode
 
+	// buffers is the store's compactBufs, copied at the pin with everything else
+	// the build reads, so a build shares nothing mutable with the store it came
+	// from. It sizes the mapped index's intermediates and is what
+	// compactWorkingSet charges the build for.
+	buffers compactBuffers
+
 	payload csrPayload
 
 	nodeSeqHW   uint64
@@ -544,6 +550,7 @@ func (s *Store) compactPin() (*compactPlan, error) {
 		propIdx:   s.propIdx,
 		indexMode: s.indexMode,
 		adjacency: s.adjacency,
+		buffers:   s.compactBufs,
 
 		// The image carries the property index so it no longer has to be
 		// reconstructed from the WAL on the next open, and the ordered-key
@@ -782,6 +789,7 @@ func (p *compactPlan) mappedIndexSource(csr *CSRGraph, dir string) *gpixSource {
 		// spills onto the filesystem whose free space was sized for the image it
 		// is being written beside — not onto whatever /tmp happens to be.
 		ScratchDir: dir,
+		buffers:    p.buffers,
 	}
 }
 

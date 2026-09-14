@@ -2415,6 +2415,37 @@ follows records and identifiers rather than bytes written. Measured against the
 image its own build produced, the model runs 1.00× on a dense identifier space, on
 a blob-carrying store and on a heap image, and up to 1.62× on a sparsified one.
 
+### Sizing what a compaction holds
+
+```go
+s, err := disk.OpenWithOptions(dir, disk.Options{
+    Compact: disk.CompactOptions{MaxWorkingBytes: 1 << 20},  // zero is the default
+})
+```
+
+One figure for the four intermediates a mapped-index compaction holds while it
+streams: the GPIX value table's in-memory cap, the GPIR sort chunk, and the two
+bounds on the merge that drains it. They come to **4,325,376 bytes** at the
+default — a constant, not a function of the store — and this divides them in the
+proportions they already stood in. Zero reproduces those four numbers exactly.
+
+- **The floor is 524,288.** Below it the sort chunk falls under the flush buffer
+  of the spill that writes it and the figure stops naming what it bounds, so a
+  smaller value is refused at `Open` with `ErrCompactWorkingBytes` rather than
+  rounded up. A bound silently larger than the one asked for is the failure this
+  option exists to prevent.
+- **The image is byte-identical at every setting.** Each of the four decides
+  whether something is held or written to a file and read back; where bytes live
+  while they are sorted is not what is written.
+- **It governs a v9 compaction only.** Under `IndexResident` the image carries
+  GIDX, built by a path that holds none of these four.
+
+It is a small lever and the figures say so. At 50,500 records, three interleaved
+rounds: the floor saved **3.32 MiB** of allocation and cost **12–42%** of the
+compaction's wall clock, while 64 MiB cost **38.04 MiB** and moved the wall clock
+by −12% to +18%, which is noise. Set it when four megabytes is worth a third of a
+second on a tight machine; do not set it expecting a faster compaction.
+
 ### Finding out what an open is costing, now that it is open
 
 The other half of the question above. `PreflightOpen` answers it from a file before
@@ -3534,6 +3565,7 @@ if s, ok := g.Forensics(); ok {
 | `Options.Redaction` / `.RedactionPolicy` | Enable the redaction ledger; bound a single cascade |
 | `Options.MaxReplayBytes` / `.MaxReplayRecords` | Refuse an `Open` whose WAL replay exceeds the budget, with `ErrReplayBudget`, rather than replaying into an OOM (§14) |
 | `Options.MemoryBudget` | Refuse an `Open` or a `Compact` whose modelled heap exceeds the budget, with `ErrMemoryBudget` naming the arithmetic — a pre-flight refusal, never a runtime degradation |
+| `Options.Compact.MaxWorkingBytes` | Size the four intermediates a mapped-index compaction holds, as one figure; default 4,325,376 B, floor 524,288 B, and the image is byte-identical at every setting |
 
 ### Snapshot roots, attestations, proofs
 

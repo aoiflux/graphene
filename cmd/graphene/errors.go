@@ -182,6 +182,15 @@ func classify(err error) (FaultKind, string) {
 			"this was refused by a configured memory budget. The message names " +
 			"what the operation needed against what was budgeted, so the choice " +
 			"is to raise Options.MemoryBudget or to open with cheaper Options."
+	case errors.Is(err, disk.ErrCompactWorkingBytes):
+		// A configuration error rather than a refusal about a store, and it
+		// cannot be reached from any flag this tool has: nothing here sets
+		// Options.Compact. It is classified anyway, on the rule at the top of
+		// this switch, which is categorical about disk sentinels precisely so
+		// that it does not become a list of the ones somebody remembered.
+		return FaultRefused, "nothing was opened; the configured compaction " +
+			"working set is below the floor a compaction can be built within. " +
+			"The message names both figures."
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return FaultTimeout, hintFor(FaultTimeout)
 	case os.IsNotExist(underlying(err)):

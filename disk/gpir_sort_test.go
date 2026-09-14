@@ -47,7 +47,7 @@ func TestGPIRSorter_OrdersTheSameWhateverTheChunk(t *testing.T) {
 	want := sortedGPIRCopy(in)
 
 	for _, chunk := range []int{1, 2, 7, 64, 499, 1_999, 2_000, 4_000} {
-		s := newGPIRSorter(t.TempDir(), chunk)
+		s := newGPIRSorter(t.TempDir(), compactBuffers{revChunk: chunk})
 		for _, e := range in {
 			s.add(e)
 		}
@@ -76,7 +76,7 @@ func TestGPIRSorter_OrdersTheSameWhateverTheChunk(t *testing.T) {
 func TestGPIRSorter_EmptyAndSingle(t *testing.T) {
 	for _, n := range []int{0, 1} {
 		for _, chunk := range []int{1, 1024} {
-			s := newGPIRSorter(t.TempDir(), chunk)
+			s := newGPIRSorter(t.TempDir(), compactBuffers{revChunk: chunk})
 			for i := 0; i < n; i++ {
 				s.add(gpirEntry{ID: 5, KeyID: 1, ValLen: 2, ValueOff: 8})
 			}
@@ -96,7 +96,7 @@ func TestGPIRSorter_EmptyAndSingle(t *testing.T) {
 // consumes its readers, so a second emit would silently produce a short section
 // rather than the same one.
 func TestGPIRSorter_RefusesASecondDrain(t *testing.T) {
-	s := newGPIRSorter(t.TempDir(), 4)
+	s := newGPIRSorter(t.TempDir(), compactBuffers{revChunk: 4})
 	defer s.close()
 	for i := 0; i < 10; i++ {
 		s.add(gpirEntry{ID: uint64(i)})
@@ -116,7 +116,7 @@ func TestGPIRSorter_RefusesASecondDrain(t *testing.T) {
 // Emitting a subset is the failure that matters: the section's header carries the
 // count, so a short body is an image whose directory and contents disagree.
 func TestGPIRSorter_SurvivesAFailureToSpill(t *testing.T) {
-	s := newGPIRSorter(filepath.Join(t.TempDir(), "no-such-directory"), 2)
+	s := newGPIRSorter(filepath.Join(t.TempDir(), "no-such-directory"), compactBuffers{revChunk: 2})
 	defer s.close()
 	for i := 0; i < 20; i++ {
 		s.add(gpirEntry{ID: uint64(i), ValueOff: uint64(i) * 8})
@@ -147,7 +147,7 @@ func TestGPIRSorter_MemoryIsBoundedByTheChunk(t *testing.T) {
 		var before, after runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&before)
-		s := newGPIRSorter(dir, 16)
+		s := newGPIRSorter(dir, compactBuffers{revChunk: 16})
 		for i := 0; i < n; i++ {
 			s.add(gpirEntry{ID: uint64(i * 7919 % n), KeyID: uint16(i % 3), ValueOff: uint64(i) * 8})
 		}
@@ -172,7 +172,7 @@ func TestGPIRSorter_MemoryIsBoundedByTheChunk(t *testing.T) {
 // must not leave a second file behind.
 func TestGPIRSorter_CleansUpItsFile(t *testing.T) {
 	dir := t.TempDir()
-	s := newGPIRSorter(dir, 4)
+	s := newGPIRSorter(dir, compactBuffers{revChunk: 4})
 	for i := 0; i < 100; i++ {
 		s.add(gpirEntry{ID: uint64(i), ValueOff: uint64(i) * 8})
 	}

@@ -164,6 +164,12 @@ type Store struct {
 	// budget.go.
 	memBudget int64
 
+	// compactBufs is Options.Compact divided into the four sizes a mapped-index
+	// compaction is built with. Resolved once at Open, for the reason memBudget
+	// is kept: the store compacts on a timer and has to know months later. A
+	// zero value means every consumer takes its own default.
+	compactBufs compactBuffers
+
 	// deltaOverBudget is whether the delta is currently above that limit, and
 	// deltaBudgetReported whether the crossing has been announced to a metrics
 	// sink. Both are maintained by noteDeltaBytesLocked under the store lock and
@@ -890,6 +896,16 @@ type Options struct {
 	// store.
 	MemoryBudget int64
 
+	// Compact sizes the intermediates a compaction holds while it builds. The
+	// zero value is every prior version's behaviour; see CompactOptions, which
+	// says what the one figure covers and what it deliberately does not.
+	//
+	// It is the other half of MemoryBudget rather than a duplicate of it: that
+	// one refuses a compaction whose working set does not fit, this one sets how
+	// large a part of that working set is. A figure below the floor is refused by
+	// Open with ErrCompactWorkingBytes.
+	Compact CompactOptions
+
 	// IDHeadroomWarn is the fraction of the identifier space remaining below
 	// which a completed compaction emits MetricIDHeadroomLow and writes an
 	// AuditIDHeadroomLow entry. Zero takes the default of 0.10; a negative value
@@ -1142,6 +1158,18 @@ func OpenReadOnly(dir string) (*Store, error) {
 // checked separately: the log is replayed on every open regardless, so checking
 // signatures there costs only the verification itself.
 func OpenWithOptions(dir string, opts Options) (*Store, error) {
+	// A setting that can never be honoured is refused before the directory is
+	// touched. This is not the memory budget's kind of refusal -- there is no
+	// store to measure and nothing to compare -- it is arithmetic on the Options
+	// alone, so it costs nothing and it is the one refusal that can come first.
+	//
+	// It stops the Open rather than the first compaction because under
+	// AutoCompact the first compaction is a background tick, and a configuration
+	// error that surfaces only there surfaces to nobody.
+	if err := opts.Compact.validate(); err != nil {
+		return nil, fmt.Errorf("disk.Open: %w", err)
+	}
+
 	// Creating the directory is a write, so a read-only open does not do it. A
 	// missing directory is then a real error rather than an empty store, which
 	// is the honest answer: there is nothing there to read.
@@ -1247,6 +1275,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		idHeadroomWarn: opts.IDHeadroomWarn,
 		deltaSoftLimit: opts.DeltaSoftLimit,
 		memBudget:      opts.MemoryBudget,
+		compactBufs:    compactBuffersFor(opts.Compact.MaxWorkingBytes),
 		imageMode:      opts.ImageMode,
 		indexMode:      opts.IndexMode,
 		adjacency:      opts.Adjacency,

@@ -127,6 +127,12 @@ type gpirSorter struct {
 	spill *spillBuffer
 	chunk int
 
+	// mergeBudget and maxRunBuffer are emit's, held here because that is where
+	// the sizes a caller chose have to arrive: the merge happens once, at the
+	// end, and there is nowhere else to pass them in.
+	mergeBudget  int
+	maxRunBuffer int
+
 	buf     []gpirEntry
 	scratch []byte
 	runs    []gpirRun
@@ -134,15 +140,18 @@ type gpirSorter struct {
 	drained bool
 }
 
-// newGPIRSorter returns a sorter spilling into dir, holding chunk entries in
-// memory at a time. A zero chunk takes the default.
-func newGPIRSorter(dir string, chunk int) *gpirSorter {
-	if chunk <= 0 {
-		chunk = gpirSortChunkEntries
-	}
+// newGPIRSorter returns a sorter spilling into dir and sized by b. Every zero
+// field of b takes that threshold's default.
+func newGPIRSorter(dir string, b compactBuffers) *gpirSorter {
+	b = b.resolved()
 	// One chunk's worth of spill in memory, so that a sort producing a single run
 	// touches no file and one producing two does.
-	return &gpirSorter{spill: newSpill(dir, chunk*gpirEntrySize), chunk: chunk}
+	return &gpirSorter{
+		spill:        newSpill(dir, b.revChunk*gpirEntrySize),
+		chunk:        b.revChunk,
+		mergeBudget:  b.mergeBudget,
+		maxRunBuffer: b.maxRunBuffer,
+	}
 }
 
 // add records one entry.
@@ -214,7 +223,7 @@ func (s *gpirSorter) emit(fn func(gpirEntry)) error {
 		return s.spill.err
 	}
 
-	bufSize := min(gpirMergeReadBudget/len(s.runs), gpirMaxRunBuffer)
+	bufSize := min(s.mergeBudget/len(s.runs), s.maxRunBuffer)
 	bufSize -= bufSize % gpirEntrySize
 	if bufSize < gpirMinRunBuffer {
 		bufSize = gpirMinRunBuffer

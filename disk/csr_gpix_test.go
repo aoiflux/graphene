@@ -94,8 +94,7 @@ func (f *gpixFixture) source(dir string, vtabCap, revChunk int) gpixSource {
 		NodeValues: f.walker(gpixKindNode),
 		EdgeValues: f.walker(gpixKindEdge),
 		ScratchDir: dir,
-		vtabMemCap: vtabCap,
-		revChunk:   revChunk,
+		buffers:    compactBuffers{vtabMemCap: vtabCap, revChunk: revChunk},
 	}
 }
 
@@ -111,9 +110,9 @@ func encodeGPIXFrom(src gpixSource) ([]byte, error) {
 func encodeMappedIndexFrom(src gpixSource) (gpix, gpir []byte, dirs []gpixKeyDir, err error) {
 	var fwd, rev bytes.Buffer
 	iw := newImageWriter(&fwd, make([]byte, 0, 4096))
-	nodeRev := newGPIRSorter(src.ScratchDir, src.revChunk)
+	nodeRev := newGPIRSorter(src.ScratchDir, src.buffers)
 	defer nodeRev.close()
-	edgeRev := newGPIRSorter(src.ScratchDir, src.revChunk)
+	edgeRev := newGPIRSorter(src.ScratchDir, src.buffers)
 	defer edgeRev.close()
 	if dirs, err = writeGPIX(iw, 0, src, nodeRev, edgeRev, nil); err != nil {
 		return nil, nil, nil, err
@@ -442,7 +441,7 @@ func TestGPIX_RefusesAWriterThatRunsOut(t *testing.T) {
 		f.add(gpixKindNode, "digest", fmt.Sprintf("v%04d", i), uint64(i))
 	}
 	src := f.source(t.TempDir(), 0, 0)
-	rev := newGPIRSorter(src.ScratchDir, 0)
+	rev := newGPIRSorter(src.ScratchDir, compactBuffers{})
 	defer rev.close()
 	iw := newImageWriter(&shortWriter{limit: 24}, make([]byte, 0, 8))
 	_, err := writeGPIX(iw, 0, src, rev, rev, nil)
@@ -1221,10 +1220,11 @@ func TestGPIX_WriteAllocationIsFlatInEntries(t *testing.T) {
 				runtime.GC()
 				runtime.ReadMemStats(&before)
 				iw := newImageWriter(io.Discard, make([]byte, 0, 4096))
-				rev := newGPIRSorter(dir, tc.revLen)
+				rev := newGPIRSorter(dir, compactBuffers{revChunk: tc.revLen})
 				defer rev.close()
 				gsrc := gpixSource{NodeKeys: []string{"k"}, NodeValues: src.walk,
-					ScratchDir: dir, vtabMemCap: tc.vtabCap, revChunk: tc.revLen}
+					ScratchDir: dir,
+					buffers:    compactBuffers{vtabMemCap: tc.vtabCap, revChunk: tc.revLen}}
 				if _, err := writeGPIX(iw, 0, gsrc, rev, rev, nil); err != nil {
 					t.Fatalf("writeGPIX: %v", err)
 				}
@@ -1274,7 +1274,7 @@ func BenchmarkGPIXWrite(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				iw := newImageWriter(io.Discard, make([]byte, 0, 64<<10))
-				rev := newGPIRSorter(dir, 0)
+				rev := newGPIRSorter(dir, compactBuffers{})
 				if _, err := writeGPIX(iw, 0, gsrc, rev, nil, nil); err != nil {
 					b.Fatal(err)
 				}

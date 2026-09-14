@@ -5394,7 +5394,15 @@ Any change must preserve these. Each is enforced by tests.
     refusing with `disk.ErrMemoryBudget` and the arithmetic attached. It is a
     pre-flight refusal for the same reason and under the same limitation — no
     runtime degradation of any kind, because there is nothing to degrade once the
-    allocation has begun.
+    allocation has begun. The one part of that working set an operator sets
+    directly is `Options.Compact.MaxWorkingBytes`: the four intermediates a
+    mapped-index compaction holds while it streams come to 4,325,376 B whatever
+    the store holds, and that figure divides them. Floor 524,288 B, refused at
+    `Open` with `disk.ErrCompactWorkingBytes` below it, and the image is
+    byte-identical at every setting — a spill decides where bytes are held and
+    never what they are. Worth 3.32 MiB for 12–42% of the compaction's wall clock
+    at the floor, and nothing at all in the other direction (docs/MEMORY_MODEL.md
+    §4.2a).
 14. **A compaction still stalls writers for its pin and its commit** — ~17–20 ms
     on a 100 000-record store, down from the whole rebuild (§9.4). The remainder
     is the record scan, which is under the lock because the delta layer is

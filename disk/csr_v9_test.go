@@ -208,8 +208,8 @@ func TestSerialiseTo_MappedIndexIsByteDeterministic(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			build := func() []byte {
 				g, _, v9 := v9Fixture(t, 40)
-				v9.MappedIndex.vtabMemCap = tc.vtabCap
-				v9.MappedIndex.revChunk = tc.revLen
+				v9.MappedIndex.buffers = compactBuffers{
+					vtabMemCap: tc.vtabCap, revChunk: tc.revLen}
 				data, err := g.SerialiseWithPayload(v9)
 				if err != nil {
 					t.Fatalf("serialise: %v", err)
@@ -295,8 +295,7 @@ func TestSerialiseTo_MappedIndexLeavesNoSpillBehind(t *testing.T) {
 	g, _, v9 := v9Fixture(t, 40)
 	scratch := t.TempDir()
 	v9.MappedIndex.ScratchDir = scratch
-	v9.MappedIndex.vtabMemCap = 16
-	v9.MappedIndex.revChunk = 4
+	v9.MappedIndex.buffers = compactBuffers{vtabMemCap: 16, revChunk: 4}
 	if _, err := g.SerialiseWithPayload(v9); err != nil {
 		t.Fatalf("serialise: %v", err)
 	}
@@ -308,8 +307,7 @@ func TestSerialiseTo_MappedIndexLeavesNoSpillBehind(t *testing.T) {
 	iw := &shortWriter{limit: 4096}
 	g2, _, v9b := v9Fixture(t, 40)
 	v9b.MappedIndex.ScratchDir = scratch
-	v9b.MappedIndex.vtabMemCap = 16
-	v9b.MappedIndex.revChunk = 4
+	v9b.MappedIndex.buffers = compactBuffers{vtabMemCap: 16, revChunk: 4}
 	if err := g2.SerialiseTo(&writeOnlySeeker{w: iw}, v9b); err == nil {
 		t.Fatal("serialising into a writer that runs out reported success")
 	}

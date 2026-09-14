@@ -187,12 +187,21 @@ func checkOpenBudget(dir string, opts Options) error {
 // carrying three labels is in three postings, and a model that said one would
 // under-report exactly the store that has the most of them.
 //
-// The index is absent, and that is a finding rather than an omission. Both
-// payload forms stream: mappedIndexSource walks the live index a value at a time
-// reusing one id buffer, and nodePropSeq does the same for the v8 encoding.
-// Neither materialises the index, and serialisation streams into the temp file
-// rather than through an image-sized buffer, so there is no term here for either.
-// The GPIR sort spends a temp file, not heap.
+// The index's *entries* are absent, and that is a finding rather than an
+// omission. Both payload forms stream: mappedIndexSource walks the live index a
+// value at a time reusing one id buffer, and nodePropSeq does the same for the
+// v8 encoding. Neither materialises the index, and serialisation streams into
+// the temp file rather than through an image-sized buffer, so neither has a term
+// here that follows the number of entries.
+//
+// What the mapped form does hold while it streams is the machinery: the value
+// table's in-memory cap, the reverse sort's chunk, and the merge that drains it.
+// Those are a constant -- 4,325,376 bytes at the default, and whatever
+// CompactOptions.MaxWorkingBytes asked for otherwise -- and they are the last
+// term below. Constant is not free: on a store small enough that the structure
+// terms are a few hundred kilobytes it is most of the total, which is precisely
+// the store whose budget is set low enough for the difference to decide
+// something. The v8 encoding holds none of it.
 func (p *compactPlan) compactWorkingSet() int64 {
 	// The plan. Already allocated by the time this is asked -- compactPin has
 	// returned -- but not counted by EstimateResident, which describes the
@@ -223,6 +232,13 @@ func (p *compactPlan) compactWorkingSet() int64 {
 			liveEdges += int64(p.csr.EdgeCount())
 		}
 		total += (nodeSlots+1)*2*sizeofOffset + liveEdges*2*sizeofEdgeID
+	}
+
+	// The mapped index's intermediates, which are a setting rather than a
+	// consequence of the store. Only the v9 build has them: under IndexResident
+	// the image carries GIDX, which is written by a path that spills nothing.
+	if p.indexMode == IndexMapped {
+		total += p.buffers.workingBytes()
 	}
 	return total
 }

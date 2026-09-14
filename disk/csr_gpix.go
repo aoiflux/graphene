@@ -228,14 +228,17 @@ type gpixSource struct {
 	// the image beside it.
 	ScratchDir string
 
-	// vtabMemCap and revChunk override the two thresholds that decide whether an
-	// intermediate is held in memory or spilled. Zero takes the defaults.
+	// buffers sizes the intermediates: what is held before the value table
+	// spills, how many entries the reverse sort holds at once, and the two
+	// bounds on the merge that drains it. A zero field takes that consumer's
+	// default, so a caller setting one states one.
 	//
-	// They exist because the spilled and merged paths are the ones the store
-	// this program is aimed at takes, and a threshold only a multi-gigabyte
-	// fixture crosses is a threshold nothing tests.
-	vtabMemCap int
-	revChunk   int
+	// Overridable for two reasons. The spilled and merged paths are the ones the
+	// store this program is aimed at takes, and a threshold only a multi-gigabyte
+	// fixture crosses is a threshold nothing tests; and a caller with memory to
+	// spare should be able to buy some of the compaction's wall clock back with
+	// it. See compact_buffers.go, which turns one figure into these four.
+	buffers compactBuffers
 }
 
 // writeGPIX writes the GPIX body and returns the kdir it wrote, which the caller
@@ -254,7 +257,7 @@ func writeGPIX(iw *imageWriter, base uint64, src gpixSource,
 	iw.u32(uint32(len(src.NodeKeys)))
 	iw.u32(uint32(len(src.EdgeKeys)))
 
-	memCap := src.vtabMemCap
+	memCap := src.buffers.vtabMemCap
 	if memCap <= 0 {
 		memCap = gpixVtabMemCap
 	}
@@ -459,9 +462,9 @@ func emptyValueWalk(string, func([]byte, []uint64) bool) error { return nil }
 func writeMappedIndexSections(iw *imageWriter, sections []csrSection, src gpixSource,
 	roots *snapshotRootStream) ([]csrSection, error) {
 
-	nodeRev := newGPIRSorter(src.ScratchDir, src.revChunk)
+	nodeRev := newGPIRSorter(src.ScratchDir, src.buffers)
 	defer nodeRev.close()
-	edgeRev := newGPIRSorter(src.ScratchDir, src.revChunk)
+	edgeRev := newGPIRSorter(src.ScratchDir, src.buffers)
 	defer edgeRev.close()
 
 	gpixOff := iw.at()

@@ -5,6 +5,50 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### One figure for what a compaction holds while it builds
+
+- **`CompactOptions{MaxWorkingBytes}`**, set through `Options.Compact`, sizes the
+  four intermediates a mapped-index compaction holds by choice rather than by the
+  store: the GPIX value table's in-memory cap, the GPIR sort chunk, and the two
+  bounds on the merge that drains it. One figure rather than four, divided in the
+  proportions the constants already stood in. Zero is the default and reproduces
+  today's four numbers exactly, which is asserted rather than intended.
+
+  The floor is 524,288 bytes, below which the sort chunk falls under the flush
+  buffer of the spill that writes it and the figure would stop naming what it
+  bounds. A smaller value is refused by `Open` with **`ErrCompactWorkingBytes`**,
+  before the directory is created — rounding it up silently would be the failure
+  the option exists to prevent, in miniature.
+
+- **The image is byte-identical at every setting.** Each of the four decides
+  whether something is held or written to a file and read back, and a spill may
+  change where bytes live and never what they are or what order they come in.
+  Asserted directly by compacting the same fixture at three settings and
+  comparing the images, which is also what caught that the claim rests on the
+  *merge's* comparator rather than the sort's: a tie spanning two runs is broken
+  by the merge, and a merge that broke it by run would make the chunk size decide
+  the bytes.
+
+- **What it is worth, measured rather than assumed.** The plan that scheduled
+  this assumed the spill and the merge were a meaningful part of the 15–24% a
+  mapped index costs a compaction. Three interleaved rounds at 50,500 records say
+  they are not. Lowering the figure to the floor saved **3.32 MiB** of allocation
+  against a modelled 3.62 MiB and cost **12%, 16% and 42%** of the compaction's
+  wall clock; raising it to 64 MiB cost **38.04 MiB** and moved the wall clock by
+  **+18%, 0% and −12%**, which is noise. Fifteen times the memory bought nothing
+  measurable. This is a small lever, and it is now labelled as one — for a
+  machine whose limit is tight enough that four megabytes is worth three tenths
+  of a second, and not for a slow compaction. `BenchmarkRSS_CompactWorkingBytes`
+  is the instrument, one setting per process.
+
+- **It also closed an under-report in the memory budget that shipped a commit
+  ago.** `compactWorkingSet` charged a compaction nothing for the mapped index,
+  on the finding that both payload encodings stream. True of the entries and
+  false of the machinery: the four intermediates are 4,325,376 bytes that the
+  build genuinely holds, and they are now the last term. The reason they could
+  not have been charged before is the reason the option is worth having — there
+  was no figure to charge, only four constants in two files with no owner.
+
 ### A memory budget, which is a refusal and never a degradation
 
 Go cannot catch an out-of-memory condition. There is no allocation failure to

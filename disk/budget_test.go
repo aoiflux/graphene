@@ -245,14 +245,26 @@ func TestBudget_CompactModelBoundsTheBuild(t *testing.T) {
 			}
 			// And not uselessly high. A model returning MaxInt64 satisfies the
 			// line above and would refuse every compaction ever attempted.
-			const band = 3
-			if model > actual*band {
-				t.Errorf("model %d B is %.2fx the %d B produced, past the %dx band: "+
-					"a gate this loose refuses compactions that would have fit",
-					model, float64(model)/float64(actual), actual, band)
+			//
+			// The band is on the part of the model that follows the store. The
+			// mapped index's intermediates are a constant the build genuinely
+			// holds -- 4.125 MiB at the default -- and on a fixture this size
+			// they are most of the total, so a ratio taken over them would say
+			// six times and mean "the fixture is small". Charged as a constant on
+			// both sides, and the constant itself is tested where it is divided.
+			var buffers int64
+			if plan.indexMode == IndexMapped {
+				buffers = plan.buffers.workingBytes()
 			}
-			t.Logf("model %d B, produced %d B, ratio %.2fx", model, actual,
-				float64(model)/float64(actual))
+			const band = 3
+			if model > actual*band+buffers {
+				t.Errorf("model %d B is %.2fx the %d B produced with %d B of "+
+					"intermediates allowed, past the %dx band: a gate this loose "+
+					"refuses compactions that would have fit",
+					model, float64(model-buffers)/float64(actual), actual, buffers, band)
+			}
+			t.Logf("model %d B (%d B of it intermediates), produced %d B, ratio %.2fx",
+				model, buffers, actual, float64(model-buffers)/float64(actual))
 		})
 	}
 }
