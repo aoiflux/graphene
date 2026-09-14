@@ -5,6 +5,145 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### A composite index stops holding a second copy of its members' values
+
+- **The largest thing a default configuration held was a Go map of per-entity
+  structs.** `MEMORY_MODEL.md` §8.4 named the composites as the one term no
+  residency option moves — 61.04 MiB of the 90.9 a fully mapped store holds, two
+  thirds of it, and 427.2 MiB of the 537 at the consumer's shape — and §8.6 said
+  the 160 B per entry was the coefficient anything replacing it would have to
+  beat. Measuring the two halves separately says where that coefficient lives:
+  over 200,000 entities of a width-2 composite, the postings cost 11.02 B per
+  entry and the member values **135.65**, and the member figure does not move
+  with the tuple shape. It is about 85% of the term, and what it holds is values
+  the index already has — one `*memberState` per entity, being a struct, a
+  backing array of width string headers, and a freshly converted copy of every
+  value's bytes, reached through a pointer in a map.
+
+- **An entity's values are now a row of int32 references.** `slots` holds width
+  of them per row, laid out row-major, into a value table that interns each
+  distinct value once and counts its holders. Rows and value slots each have a
+  free list, so a store that deletes its derived layer and writes a new one reuses
+  both instead of growing either. Measured interleaved against HEAD over twelve
+  samples, per (id, tuple) entry: **146.60 → 43.87 B, −70.08%** at the thousand
+  distinct tuples the program's own fixture declares, and 262.6 → 257.4 B,
+  −1.98%, at the degenerate shape of one distinct tuple per entity.
+
+- **On a real process it is 35 MiB off a 241 MiB store.** Seven interleaved
+  rounds, one process per measurement, 200,000 nodes with eight unique keys, five
+  ordered and two composites, each arm opening the same fixture from disk:
+  anonymous memory **124.40 → 89.08 MiB (−28.39%)**, Go heap **66.31 → 33.09 MiB
+  (−50.10%)**, process peak 197.9 → 168.2 MiB (−15.01%), and resident bytes per
+  byte of store **0.795× → 0.650×**. File-backed residency is 67.50 → 68.15 MiB,
+  which is noise on an unchanged number (p=0.097) and is the right answer: no
+  byte of the image moved.
+
+- **The reverse direction is not a map, because the first version's was and it
+  cost more than the rows saved.** Interning needs a value-to-reference lookup,
+  and `map[string]int32` measures at ~96 B per distinct value — so on exactly the
+  composite `postings.canonical` warns about, a member key whose values rarely
+  repeat, the first attempt came out **16.6% worse per entry than the form it
+  replaced**. `canonical`'s own answer is to intern only a value's second entry,
+  which needs a count this side has no way to get before the lookup that would
+  establish it. So the reverse direction is an open-addressed set of references,
+  probed by hashing the value: 4 bytes per bucket at a load factor of one half,
+  8 B per distinct value against 96, which turns that arm from +16.6% into
+  −1.98% while the shape composites are actually for stays at a third.
+
+- **What it costs is build time on the shape nobody should declare.** Registering
+  200,000 entities into a composite whose every tuple is distinct is **+39.18%**
+  (p=0.000, twelve samples); at the fixture's shape it is unchanged (p=0.932).
+  The regression is the rehash, which re-hashes every live value on each
+  doubling. Caching each value's hash beside it was built and measured: it bought
+  8% of that time and cost 3.3% of that shape's bytes, which is the wrong
+  direction under this programme's priority, so it was taken out again.
+
+- **`EstimatedResidentBytes` moves with it, and the composites are still
+  resident.** `residentBytesPerCompositeEntry` goes from 160 to 48 — the old
+  figure scaled by the measured ratio at the shape it was chosen against —
+  and `TestEstimatedResident_WithinBand` holds. Nothing here puts a composite on
+  disk: it is still rebuilt from the base's member keys at open and still held
+  under every one of §8's twelve specifications. What changed is the coefficient,
+  so the follow-up §8.6 asks for now has 48 B per entry to beat rather than 160.
+
+- **No format change and no API change.** `DeclareCompositeProperties`,
+  `NodesByProperty` and the planner's composite driver are untouched; the whole
+  change is behind `compositeIndex`. Four tests cover the parts that were not
+  reachable before — the value table's free list, the row free list, an overflow
+  list outliving its row, and the tombstone an open-addressed probe needs —
+  and three mutations (a removal that empties its bucket instead of tombstoning
+  it, a released row that keeps its overflow lists, and one that keeps its
+  values) are each caught by the test written for it.
+### A property walk no longer holds the lock its callback needs
+
+- **`ForEachNodeProperty` ran the caller's function under a shard read lock, and
+  that was half of a deadlock.** Every store write path takes `s.mu` first and an
+  index shard lock second — `IndexNodeProperty` → `indexNodePropertyLocked` →
+  `IndexNodeUnique` — so a walk holding a shard lock while the callback reads the
+  store closed an AB-BA cycle. It took about a second to reproduce against a plain
+  `IndexNodeProperty` write with no compaction involved, which is also how it was
+  established that this predates the change above rather than being caused by it:
+  that change widened the window, because a compaction now takes all sixteen shard
+  locks under `s.mu`, but the inversion was already there. Everything built on the
+  walk was exposed and all of it was doing the obvious thing with the id it had been
+  handed: `bulk`'s export checks each entry's node exists before writing it,
+  `graphene export graph` and `Graph.ForEachNodeProperty` go through the same code,
+  `VerifyIndexes` enumerates against the store, and the memory backend's snapshot
+  walk has the identical shape.
+
+- **The fix is the shape the codebase already had, and its own comment had already
+  named this.** `IDStream` copies a key's delta side out from under the shard lock
+  rather than holding it across the consumer, and `index/stream.go`'s header says
+  why in as many words: "a shard lock held across caller code is the deadlock
+  `disk/scan.go`'s header describes". The entry walks now do the same — copy one
+  key, release the lock, merge the immutable base and yield with no index lock held.
+  Rejected on the way: holding `s.mu.RLock` across the walk (turns the cycle into a
+  writer stall for the length of caller code), inverting to a per-node
+  `NodeEntriesOf` (quadratic on the export path), and a fully resumable entry
+  stream (the same result for several hundred more lines).
+
+- **The base is loaded after the delta copy, and that order is load-bearing.**
+  `SwapBase` installs the new base and then empties the shards, so a copy taken
+  before the clear pairs with either base and is a superset either way, while a base
+  read before the copy pairs a pre-swap base with a delta that has since been
+  emptied — neither half, and no error. The window between the two is two
+  instructions wide, so the concurrent test could not see the mutation that swapped
+  them; it survived ten runs under `-race`.
+  `TestForEachNodeEntry_LoadsTheBaseAfterCopyingTheDelta` performs `SwapBase`'s two
+  halves by hand between the copy and the load instead, and reports "the walk
+  answered [1], want [1 2]" three times out of three.
+
+- **The copy costs 28 bytes per entry of the largest key, and nothing on a
+  compacted store.** No value bytes are copied at all: the copied slice holds string
+  headers into the shard's interned values, which is why the figure is 28 and not 28
+  plus the value. The buffers are reused across a walk's keys, so what is retained
+  is one key's worth and not the index's — at the 50,000-node never-compacted arm
+  that is 1.34 MiB, released when the walk returns. Measured per-op bytes over four
+  counts in each of three interleaved rounds: a store whose index is entirely in the
+  base pays **+0.02%** (798.4 → 798.5 KiB) and one in the ordinary mixed state
+  **+21%** (894.4 → 1,083.3 KiB), while one that has never compacted pays **+348%**
+  (800.2 → 3,582.4 KiB), which is the case where the delta *is* the index.
+  Allocations follow: 10 to 53 per op on the never-compacted arm, +0.01–0.23%
+  everywhere else. The walks that keep the shard lock — `ForEachNodeValue`,
+  `ForEachEdgeValue` and the value walkers a v9 compaction writes its index
+  through — keep it deliberately, because their callbacks are the engine's own
+  scans holding `s.mu.RLock` already, and charging the streaming query path for a
+  copy is the opposite of what it exists for.
+
+- **The wall-clock half is not reported, because it was not resolved.** Two
+  interleaved A/Bs against a HEAD worktree, twelve samples per arm, the second with
+  fixed iteration counts to remove `b.N` scaling as a variance source: not one of
+  twelve per-arm comparisons reached significance (p from 0.091 to 0.843), spreads
+  ran to ±260%, and the two geomeans came out **+7.06% and −18.38%** — opposite
+  signs. Two runs disagreeing about direction is the instrument failing on this
+  machine, not a result, so there is no timing figure here. The per-op byte figures
+  above reproduced byte-identically across both runs, which is the reason to trust
+  them and not the other column.
+
+- **No format change and no API change.** `index.PropertyIndex` keeps every method
+  signature; the new `deltaCopy` is unexported and threaded through the walks that
+  need it. Invariant §15.15 states the rule the fix restores, so the next walk added
+  here has something to be checked against.
 ### A compaction gives its own index back, without being reopened
 
 - **The index a compaction writes is now the index it reads from.** A base was

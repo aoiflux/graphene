@@ -1184,6 +1184,22 @@ configuration holds — two thirds of it — they are resident under every one o
 specifications, and they are the largest remaining item in this document. §6.4 named them
 as the next thing to look at; this is the figure that says how much is in it.
 
+**Since measured: the coefficient is 48, not 160.** What that 160 B per entry mostly was
+is a second copy of the member values — one `*memberState` per entity, a struct and a
+backing array of string headers and a copy of every value's bytes, behind a pointer in a
+map. Splitting the composite index in two says how much: over 200,000 entities of a
+width-2 composite the postings cost 11.02 B per entry and the member values **135.65**,
+flat across tuple shapes, so about 85% of the term was the copy. Replacing it with a row
+of int32 references into an interned value table measures **146.60 → 43.87 B per entry**
+(twelve interleaved samples) and, on a 200,000-node store reopened from disk, **124.40 →
+89.08 MiB of anonymous memory** and 66.31 → 33.09 MiB of Go heap.
+
+The table above is left as the record of the tree it was taken on and has not been re-run
+at this scale. Scaled by the measured ratio the 61.04 MiB row is about 18.3 MiB, which
+would stop the composites being the largest thing a fully mapped configuration holds. The
+follow-up §8.6 asks for — the composites on disk — is unchanged and unstarted; what moved
+is the coefficient it has to beat.
+
 ### 8.5 The live reader takes the defaults and pays 3.8×
 
 The one configuration in the sweep that nobody would choose deliberately, and the one a
@@ -1243,6 +1259,12 @@ question: *which term to attack*.
 **The composite term is now the largest thing a default configuration holds**, at 427 MiB
 of the 537. Nothing in the shipped program moves it; it is the R3 follow-up, and §8.4's
 160 B per entry is the coefficient it would have to beat.
+
+*Since measured*, and see §8.4: 160 B per entry was mostly a second copy of the member
+values, and the columnar rows that replaced it measure 43.87. This row has not been taken
+again at 1.4M nodes — scaled by that ratio the 427.2 MiB would be about 128, which is no
+longer the largest term in the column. The item itself, composites read from the image
+rather than rebuilt into the heap at open, is unchanged and unstarted.
 
 ## 9. Under a ceiling
 

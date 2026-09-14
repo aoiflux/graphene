@@ -5164,6 +5164,78 @@ kind of arithmetic should not have to make. The literals live in production and 
 `unsafe.Sizeof` comparison lives in a test, so a struct that grows a field fails at the
 line naming the number that needs revisiting.
 
+### 14.26 Taken: a composite's member values are a row, not a struct per entity
+
+A composite index answers a conjunction of equalities in one lookup, and to do that it
+holds, per entity, the values that entity carries at each of the tuple's positions. It
+has to: forming the tuples a new value makes reachable needs the other positions, and
+those live behind shard locks a composite must never take (see `composite_index.go`'s
+header for why that is structural and not a preference).
+
+What it held them in was a `*memberState` per entity, in a `map[T]*memberState`. Per
+entry that is a map slot, a 48-byte struct, a separately allocated backing array of
+width string headers, and — because every registration arrives as a freshly converted
+string — one copy of the value's bytes for every entity carrying it.
+
+`MEMORY_MODEL.md` §8.4 had already named the composites as the term no residency option
+moves: 61.04 MiB of the 90.9 a fully mapped store holds, and 427.2 MiB of the 537 a
+default configuration holds at the consumer's shape. What it had not done is say which
+half of a composite that was. Measuring the two separately over 200,000 entities of a
+width-2 composite:
+
+| part | 1,000 distinct tuples | 200,000 distinct tuples |
+|---|---:|---:|
+| postings | 11.02 B/entry | 127.02 B/entry |
+| member values | **135.65** | **135.65** |
+
+The member figure does not move with the tuple shape, which is what identifies it as the
+copy rather than as the index: about 85% of the term, holding values the index already
+has.
+
+**Taken:** a row of `int32` references, width of them per entity, laid out row-major in
+one array, into a value table that interns each distinct value once and counts its
+holders. Rows and value slots each carry a free list, so a store that deletes its derived
+layer and writes a new one reuses both rather than growing either. Measured interleaved
+against the previous form over twelve samples: **146.60 → 43.87 B per entry** at the
+thousand distinct tuples the program's own fixture declares. On a 200,000-node store
+reopened from disk, seven interleaved rounds with one process per measurement: anonymous
+memory **124.40 → 89.08 MiB**, Go heap **66.31 → 33.09 MiB**, process peak 197.9 → 168.2
+MiB, and file-backed residency unchanged, which is the right answer because no byte of
+the image moved.
+
+Two things fell out of the measurements rather than out of the design.
+
+**Rejected: a map for the reverse direction.** Interning needs a value-to-reference
+lookup, and the obvious one is `map[string]int32`. It measures at ~96 B per distinct
+value, so on exactly the composite `postings.canonical` warns about — a member key whose
+values rarely repeat — the first version came out **16.6% worse per entry than the form
+it replaced**, which is the whole item inverted. `canonical`'s own answer, interning only
+a value's second entry, needs a count this side cannot have before the lookup that would
+establish it. So the reverse direction is an open-addressed set of references instead,
+probed by hashing the value and comparing against the table: 4 bytes per bucket at a load
+factor of one half, 8 B per distinct value against 96. That arm then reads −1.98% rather
+than +16.6%.
+
+**Rejected: caching each value's hash beside it.** The remaining cost of the set is the
+rehash, which re-hashes every live value at each doubling, and it shows up as **+39.18%**
+on the build path of the high-cardinality composite (unchanged, p=0.932, at the fixture's
+shape). A `[]uint32` of hashes parallel to the values removes the hashing from the rehash
+and lets a colliding probe compare four bytes before any string. Built and measured: it
+bought 8% of that time and cost 3.3% of that shape's bytes. Memory is this programme's
+P0, so it was taken out again and the rehash hashes strings.
+
+Left standing, and deliberately: **nothing here puts a composite on disk.** It is still
+filled from the base's member keys at open (`fillCompositeFromBase`) and still resident
+under every one of §8's twelve specifications, because a composite cannot be answered in
+place — it is an index over a tuple the forward direction holds separately. What this
+changes is the coefficient that follow-up has to beat, from 160 B per entry to 48.
+
+`index/resident.go`'s `residentBytesPerCompositeEntry` moves with it, and is the one
+per-item cost in that file that is not the up-direction choice its header describes: the
+160 it replaces was chosen against the low-cardinality shape too, because a composite
+whose tuples are nearly all distinct returns one entity per lookup and is not a composite
+anyone would declare. `TestEstimatedResident_WithinBand` is what holds it honest.
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.
@@ -5290,6 +5362,52 @@ Any change must preserve these. Each is enforced by tests.
     that is precisely why a live reader is **not** mapped by default and
     `ImageMappedUnlocked` is a separate, documented opt-in rather than a
     platform detail of `ImageMapped`.
+
+15. **No engine lock is held while caller code runs.** A read that yields to a
+    function the caller supplied — `ForEachNodeProperty`, `ForEachEdgeProperty`,
+    `ForEachNodeEntry`, and `bulk`'s export walk built on them — must own no
+    shard lock, no `s.mu` and no other engine lock at the moment it calls out.
+    The reason is an ordering the engine cannot escape: every write path takes
+    the store lock first and an index shard lock second (`IndexNodeProperty` →
+    `indexNodePropertyLocked` → `IndexNodeUnique` → `sh.mu.Lock`), so a walk
+    holding a shard lock while its callback reads the store is the other half of
+    an AB-BA cycle. That is not a hypothesis about a rare interleaving: it hangs
+    both goroutines within a second, against a plain `IndexNodeProperty` write,
+    with no compaction anywhere near it. The callers that closed it — `bulk`'s
+    export, `graphene export graph`, `Graph.ForEachNodeProperty`,
+    `VerifyIndexes`, the memory backend's snapshot walk — were all doing the
+    obvious thing with the id they had been handed.
+
+    The shape that satisfies it is §14.24's, applied to entries instead of ids:
+    copy one key's delta side out from under the shard lock, release the lock,
+    then merge the immutable base and yield with nothing held. Ordering inside
+    that is load-bearing in one direction only — the base must be read *after*
+    the delta copy, because `SwapBase` installs the new base and then empties the
+    shards, so a copy taken before the clear pairs with either base and is a
+    superset either way, while a base read before the copy pairs a pre-swap base
+    with a delta that has since been emptied and loses the difference in
+    silence. The window is two instructions wide, so a race detector will not
+    find it; `TestForEachNodeEntry_LoadsTheBaseAfterCopyingTheDelta` performs
+    `SwapBase`'s two halves by hand between them instead.
+
+    The copy is the price, and it is charged only where it is owed. A walk
+    retains one key's worth at a time — the largest key's, 28 bytes per entry of
+    it, released when the walk returns — and no value bytes at all, because the
+    copied slice holds headers into the shard's interned strings. A store that
+    has compacted pays +0.02%, the ordinary mixed state +20%, and only one that
+    has never compacted pays for its whole index, which is the case where the
+    delta *is* the index. The walks that keep the shard lock — `ForEachNodeValue`,
+    `ForEachEdgeValue`, `NodeValueWalker`, `EdgeValueWalker`, and so the v9
+    compaction's own payload — are not exceptions to this invariant but outside
+    it: their callbacks are the engine's filter, aggregate and image-writing
+    scans, which either hold `s.mu.RLock` already or touch nothing but the image
+    being built, and so cannot invert. Their doc comments state that contract,
+    and charging the streaming query path for a copy is the opposite of what it
+    exists for.
+
+    `TestForEachNodeProperty_CallbackMayWriteTheIndex` and its edge and entry
+    forms are the guards, each under a deadline, because the failure this
+    invariant describes is a hang and not an error.
 
 ---
 

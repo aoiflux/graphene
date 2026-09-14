@@ -222,38 +222,53 @@ func TestCompositeVerify_CatchesADroppedTupleFromTheCrossProduct(t *testing.T) {
 // damage is what verify is for.
 func TestCompositeVerify_CatchesARepeatedValueAtOnePosition(t *testing.T) {
 	p, idx := wideCompositeUnderTest(t)
-	m := idx.members[store.NodeID(1)]
-	if m == nil {
-		t.Fatal("the fixture entity has no member state")
+	row, ok := idx.members[store.NodeID(1)]
+	if !ok {
+		t.Fatal("the fixture entity has no member row")
 	}
-	m.more[1] = append(m.more[1], m.one[1])
+	// A second reference to the value the position already holds. Interning
+	// makes that literally the same reference, which is what verifyRow compares.
+	if idx.extra == nil {
+		idx.extra = make(map[int64][]int32)
+	}
+	k := idx.extraKey(row, 1)
+	idx.extra[k] = append(idx.extra[k], idx.slotAt(row, 1))
+	idx.markExtras(row)
 
 	err := p.Verify()
 	if err == nil {
-		t.Fatal("verify accepted a member state holding the same value twice at one position")
+		t.Fatal("verify accepted a member row holding the same value twice at one position")
 	}
 	if !strings.Contains(err.Error(), "same value twice") {
 		t.Errorf("the error does not say what is wrong with the member state: %v", err)
 	}
 }
 
-// TestCompositeVerify_CatchesAValueBeyondTheDeclaredWidth covers the other
-// masked corruption: forEachTuple only ever walks positions below the width, so
-// a value stored past it is never enumerated and never contradicts anything.
-func TestCompositeVerify_CatchesAValueBeyondTheDeclaredWidth(t *testing.T) {
+// TestCompositeVerify_CatchesAnOverflowListNoEntityOwns covers what a value
+// stored outside the declared width became.
+//
+// A row is exactly width slots, so that value can no longer be *stored* out of
+// range — but the overflow lists are addressed by row*width+pos, so writing one
+// past the width lands on another row instead of outside the array. When that
+// row is live the cross-product walk catches it, by reporting a tuple the other
+// entity is not filed under. When it is not, nothing reads it at all, and this
+// is the check that says so.
+func TestCompositeVerify_CatchesAnOverflowListNoEntityOwns(t *testing.T) {
 	p, idx := wideCompositeUnderTest(t)
-	m := idx.members[store.NodeID(1)]
-	if m == nil {
-		t.Fatal("the fixture entity has no member state")
+	if idx.extra == nil {
+		idx.extra = make(map[int64][]int32)
 	}
-	m.more[7] = []string{"unreachable"}
+	// A row beyond every row the fixture allocated: in range of nothing, named
+	// by nobody.
+	orphan := int64(len(idx.slots)/len(idx.keys)) * int64(len(idx.keys))
+	idx.extra[orphan] = []int32{0}
 
 	err := p.Verify()
 	if err == nil {
-		t.Fatal("verify accepted a member value stored outside the declared width")
+		t.Fatal("verify accepted an overflow list held for a row no entity names")
 	}
-	if !strings.Contains(err.Error(), "outside the declared width") {
-		t.Errorf("the error does not identify the out-of-range position: %v", err)
+	if !strings.Contains(err.Error(), "outside the") && !strings.Contains(err.Error(), "no entity names") {
+		t.Errorf("the error does not identify the orphaned overflow list: %v", err)
 	}
 }
 

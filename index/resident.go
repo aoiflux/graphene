@@ -68,12 +68,24 @@ const (
 	residentBytesPerID = 8
 
 	// residentBytesPerCompositeEntry is one (id, tuple) pair in a composite: the
-	// id in its posting slice, the id's memberState entry, and that entity's
-	// share of the encoded tuple its posting is keyed by. Composites are declared
-	// rather than incidental and their tuples are the concatenation of several
-	// values, which is why this is larger than a single-key entry rather than
-	// smaller.
-	residentBytesPerCompositeEntry = 160
+	// id in its posting slice, the entity's row in the member store, and that
+	// entity's share of the encoded tuple its posting is keyed by.
+	//
+	// It was 160 while an entity's member values were a *memberState — a struct,
+	// a backing array of width string headers, and one copy of every value's
+	// bytes, behind a pointer in a map. Measured over 200,000 entities of a
+	// width-2 composite, that form held 146.60 B per entry at the low tuple
+	// cardinality a composite is declared for and 262.6 B at one distinct tuple
+	// per entity; the columnar rows that replaced it hold 43.87 and 257.4. This
+	// figure is the old one scaled by the first of those ratios, 160 ×
+	// 43.87/146.60, because 160 was itself chosen against that shape rather than
+	// against the worst case — a composite whose tuples are nearly all distinct
+	// returns one entity per lookup and is not a composite anyone would declare.
+	//
+	// So it is the one per-item cost here that is not the up-direction choice the
+	// header describes, and it was not before either. What keeps it honest is the
+	// same thing as the rest: TestEstimatedResident_WithinBand.
+	residentBytesPerCompositeEntry = 48
 
 	// residentBytesPerDeclaredKey covers what a key costs merely by carrying an
 	// entry, across the three shard maps that name it: the postings key map, its

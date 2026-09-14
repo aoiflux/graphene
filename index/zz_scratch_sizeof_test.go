@@ -18,7 +18,7 @@ func TestScratchSizes(t *testing.T) {
 	fmt.Printf("sync.RWMutex           = %d\n", unsafe.Sizeof(sync.RWMutex{}))
 	fmt.Printf("orderedValue[NodeID]   = %d\n", unsafe.Sizeof(orderedValue[store.NodeID]{}))
 	fmt.Printf("orderedIndex[NodeID]   = %d\n", unsafe.Sizeof(orderedIndex[store.NodeID]{}))
-	fmt.Printf("memberState            = %d\n", unsafe.Sizeof(memberState{}))
+	fmt.Printf("valueTable             = %d\n", unsafe.Sizeof(valueTable{}))
 	fmt.Printf("compositeIndex[NodeID] = %d\n", unsafe.Sizeof(compositeIndex[store.NodeID]{}))
 	fmt.Printf("compositeSet[NodeID]   = %d\n", unsafe.Sizeof(compositeSet[store.NodeID]{}))
 	fmt.Printf("compositeMember[NodeID]= %d\n", unsafe.Sizeof(compositeMember[store.NodeID]{}))
@@ -54,10 +54,10 @@ func TestScratchMapCost(t *testing.T) {
 			}
 			return m
 		}},
-		{"map[uint64]*memberState", func() any {
-			m := make(map[uint64]*memberState)
+		{"map[uint64]int32 (composite members)", func() any {
+			m := make(map[uint64]int32)
 			for i := 0; i < n; i++ {
-				m[uint64(i)] = nil
+				m[uint64(i)] = int32(i)
 			}
 			return m
 		}},

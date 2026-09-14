@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/bits"
+	"hash/maphash"
 	"sort"
 	"strings"
 	"sync"
@@ -72,12 +72,53 @@ type compositeIndex[T entityID] struct {
 	// single-key postings, so a composite-driven query needs no sort.
 	postings map[string][]T
 
-	// members holds, per entity, the values it carries at each position.
+	// members maps an entity to its row in slots.
 	//
 	// This is what makes registration a single-lock operation: a new value at
 	// one position needs the other positions' values to form a tuple, and they
 	// are here rather than behind a shard lock this must not take.
-	members map[T]*memberState
+	//
+	// A row index rather than a pointer to a per-entity struct, because that
+	// struct was the largest thing this index held. See slots.
+	members map[T]int32
+
+	// slots holds one value reference per position, width of them per row, laid
+	// out row-major. noValue marks a position with no value.
+	//
+	// This is the columnar form of what used to be a *memberState per entity: a
+	// 48-byte struct, a separately allocated backing array of width string
+	// headers, and one freshly converted copy of every value's bytes, reached
+	// through a pointer in the map. Measured over 200,000 entities of a width-2
+	// composite, that arrangement cost 135.65 B per entry and was 85% of what a
+	// composite index holds — the largest single term in a default configuration
+	// at the shape this engine is sized for. A row is width int32s and the values
+	// are interned once in vtab.
+	//
+	// A row index is int32 and cannot overflow before this array could not be
+	// allocated: 2^31 rows of a width-2 composite is 17 GB of slots alone.
+	slots []int32
+
+	// freeRow lists the rows of removed entities, for reuse. The array itself is
+	// never shrunk — Go's maps do not shrink either, and a store that deleted
+	// everything is about to be compacted.
+	freeRow []int32
+
+	// extra carries the second and later values at a position that went
+	// multi-valued, keyed by row*width+pos. nil for every index whose entities
+	// each hold one value per key, which is almost all of them.
+	extra map[int64][]int32
+
+	// extraRows marks, one bit per row, the rows with any overflow list, so the
+	// registration path costs no map lookup in an index where some single entity
+	// once held two values at one key. See hasExtras.
+	extraRows []uint64
+
+	// vtab interns the values the rows refer to.
+	vtab valueTable
+
+	// scratch assembles one tuple's values during register and remove, both of
+	// which hold mu exclusively. The read paths bring their own: see verify.
+	scratch []string
 
 	// entries is the number of (id, tuple) pairs, maintained rather than
 	// recomputed for the same reason orderedIndex.totalIDs is: the planner reads
@@ -85,19 +126,248 @@ type compositeIndex[T entityID] struct {
 	entries int
 }
 
-// memberState is one entity's values across a composite's key positions.
-type memberState struct {
-	// one holds the single value at each position — true for essentially every
-	// entity, since a key normally carries one value per entity.
-	one []string
+// noValue marks a position in slots that holds no value. Distinct from any
+// reference because references index vtab and are therefore non-negative.
+const noValue = int32(-1)
 
-	// filled marks the positions that have a value. A separate bitmask because
-	// "" is a legal property value and so cannot stand in for absent.
-	filled uint64
+// valueTable interns the values a composite's rows carry.
+//
+// A row stores an int32 reference rather than a string, and that is the whole of
+// the saving. Every registration arrives as a freshly converted string, so the
+// form this replaces held one copy of a value's bytes per entity carrying it —
+// for a key with a thousand distinct values over a million entities, a thousand
+// copies would have done.
+//
+// Refcounted rather than grow-only, and that is not a refinement: a composite
+// over a high-cardinality key would otherwise gain one permanent slot per value
+// ever registered, so a store that rewrites its derived layer would accumulate a
+// table nothing reads and nothing frees — a leak this index does not have today
+// and must not acquire in exchange for the bytes above. postings.shared achieves
+// the same by deleting its entry when the bucket empties; here the holders are
+// rows rather than a bucket, so the count is explicit.
+//
+// # Why the reverse direction is not a map
+//
+// It was, and it cost more than the rows saved on exactly the composite
+// postings.canonical warns about: a member key whose values rarely repeat. A
+// map[string]int32 measures at ~96 B per distinct value, so a width-2 composite
+// with one distinct value per entity per position paid it 400,000 times and came
+// out 16.6% worse per entry than the per-entity form it replaced — measured, not
+// reasoned about. canonical's own answer is to intern only a value's second
+// entry, which needs a count this side does not have before the lookup that
+// would establish it.
+//
+// So the reverse direction is an open-addressed set of references instead,
+// probed by hashing the value and comparing against vals. It holds 4 bytes per
+// bucket at a load factor of one half — 8 B per distinct value against 96 — and
+// that shape then comes out slightly better than what it replaced, while the
+// shape composites are actually for holds under a third.
+//
+// Caching each value's hash beside it was tried, to spare the rehash its string
+// hashing. It bought 8% of the build time on the high-cardinality shape and cost
+// 3.3% of that shape's bytes, which is the wrong direction under this
+// programme's priority, so the rehash hashes strings.
+//
+// The seed is per-table and random. Nothing here is persisted or enumerated in
+// bucket order, so there is no determinism to preserve, and property values are
+// caller-supplied: a fixed seed would let a caller choose values that collide.
+type valueTable struct {
+	// vals is the interned strings, addressed by reference. A freed slot holds
+	// "" and is listed in free.
+	vals []string
 
-	// more carries the extra values for a position that went multi-valued. nil
-	// for every entity that never did, which is almost all of them.
-	more map[int][]string
+	// count is the number of rows referring to each slot.
+	count []int32
+
+	// free lists slots whose count reached zero, for reuse — so a store that
+	// churns values reuses slots instead of growing vals forever.
+	free []int32
+
+	// buckets holds a reference, bucketEmpty or bucketDead. A power of two, so
+	// the probe masks rather than divides.
+	buckets []int32
+
+	// live is the number of buckets holding a reference, and tombs the number
+	// holding a tombstone. Both drive the rehash, and live is what verify checks
+	// the free list against.
+	live  int
+	tombs int
+
+	seed maphash.Seed
+}
+
+const (
+	// bucketEmpty ends a probe: nothing was ever stored here.
+	bucketEmpty = int32(-1)
+
+	// bucketDead continues a probe but may be claimed by an insertion. Linear
+	// probing cannot simply empty a slot — doing so cuts the chain that reached
+	// whatever was placed after it.
+	bucketDead = int32(-2)
+)
+
+func newValueTable() valueTable { return valueTable{seed: maphash.MakeSeed()} }
+
+// find locates value, returning its reference, the bucket it occupies, and
+// whether it was there. When it was not, the bucket returned is the one an
+// insertion should claim — the first tombstone passed, or the empty slot that
+// ended the probe.
+func (t *valueTable) find(value string) (int32, int, bool) {
+	mask := len(t.buckets) - 1
+	i := int(maphash.String(t.seed, value)) & mask
+	dead := -1
+	for {
+		switch b := t.buckets[i]; {
+		case b == bucketEmpty:
+			if dead >= 0 {
+				return 0, dead, false
+			}
+			return 0, i, false
+		case b == bucketDead:
+			if dead < 0 {
+				dead = i
+			}
+		case t.vals[b] == value:
+			return b, i, true
+		}
+		i = (i + 1) & mask
+	}
+}
+
+// ref returns the reference for value, taking one count on it.
+func (t *valueTable) ref(value string) int32 {
+	if len(t.buckets) == 0 {
+		t.rehash(8)
+	}
+	r, slot, ok := t.find(value)
+	if ok {
+		t.count[r]++
+		return r
+	}
+	if n := len(t.free); n > 0 {
+		r = t.free[n-1]
+		t.free = t.free[:n-1]
+		t.vals[r] = value
+		t.count[r] = 1
+	} else {
+		r = int32(len(t.vals))
+		t.vals = append(t.vals, value)
+		t.count = append(t.count, 1)
+	}
+	// The bucket the probe above ended on, not a second probe: it is empty or a
+	// tombstone either way, and storing value in vals does not move it.
+	if t.buckets[slot] == bucketDead {
+		t.tombs--
+	}
+	t.buckets[slot] = r
+	t.live++
+	if (t.live+t.tombs)*2 >= len(t.buckets) {
+		t.rehash(0)
+	}
+	return r
+}
+
+// unref drops one count, freeing the slot at zero. noValue is ignored, so a
+// caller releasing a row need not check each position first.
+func (t *valueTable) unref(r int32) {
+	if r == noValue {
+		return
+	}
+	t.count[r]--
+	if t.count[r] > 0 {
+		return
+	}
+	// Before vals[r] is cleared: the probe compares against it.
+	if _, slot, ok := t.find(t.vals[r]); ok {
+		t.buckets[slot] = bucketDead
+		t.live--
+		t.tombs++
+	}
+	t.vals[r] = ""
+	t.free = append(t.free, r)
+}
+
+// rehash rebuilds the bucket array, dropping every tombstone. size fixes the new
+// length; zero picks the smallest power of two that keeps the load under a half.
+func (t *valueTable) rehash(size int) {
+	n := size
+	if n == 0 {
+		n = 8
+		for n < (t.live+1)*2 {
+			n *= 2
+		}
+	}
+	t.buckets = make([]int32, n)
+	for i := range t.buckets {
+		t.buckets[i] = bucketEmpty
+	}
+	t.tombs = 0
+	t.live = 0
+	for r := range t.vals {
+		if t.count[r] <= 0 {
+			continue
+		}
+		// find rather than a bare scan for an empty bucket: it is the same probe
+		// the lookups will make, and a disagreement between the two would
+		// otherwise be silent.
+		_, slot, _ := t.find(t.vals[r])
+		t.buckets[slot] = int32(r)
+		t.live++
+	}
+}
+
+// at returns the value a reference names. noValue has none and must not reach
+// here; every caller establishes the position is filled first.
+func (t *valueTable) at(r int32) string { return t.vals[r] }
+
+// verifyRef checks that a reference names a live interned value.
+func (t *valueTable) verifyRef(ref int32) error {
+	if ref < 0 || int(ref) >= len(t.vals) {
+		return fmt.Errorf("names value %d, outside the %d interned", ref, len(t.vals))
+	}
+	if t.count[ref] <= 0 {
+		return fmt.Errorf("names value %d, which is free", ref)
+	}
+	return nil
+}
+
+// verify checks the intern table against itself: that the two directions agree,
+// that no count went negative, and that the free list holds exactly the slots no
+// row refers to.
+//
+// The last of those is the one worth having. A slot freed twice appears once in
+// the counts and twice in the free list, and the next two registrations then
+// share a slot — two distinct values collapsing into one, which is a composite
+// answering a query with entities that do not match it. Nothing else here would
+// notice, because every individual reference would still resolve.
+func (t *valueTable) verify() error {
+	if len(t.vals) != len(t.count) {
+		return fmt.Errorf("%d values against %d reference counts", len(t.vals), len(t.count))
+	}
+	if n := len(t.buckets); n != 0 && n&(n-1) != 0 {
+		return fmt.Errorf("the bucket array is %d long, which is not a power of two", n)
+	}
+	live := 0
+	for ref, v := range t.vals {
+		if t.count[ref] < 0 {
+			return fmt.Errorf("value %d has a reference count of %d", ref, t.count[ref])
+		}
+		if t.count[ref] == 0 {
+			continue
+		}
+		live++
+		if got, _, ok := t.find(v); !ok || got != int32(ref) {
+			return fmt.Errorf("value %d is referred to but the probe does not find it", ref)
+		}
+	}
+	if live != t.live {
+		return fmt.Errorf("%d values are referred to but %d buckets are occupied", live, t.live)
+	}
+	if live != len(t.vals)-len(t.free) {
+		return fmt.Errorf("%d values are referred to but the free list implies %d",
+			live, len(t.vals)-len(t.free))
+	}
+	return nil
 }
 
 func newCompositeIndex[T entityID](keys []string) *compositeIndex[T] {
@@ -106,7 +376,8 @@ func newCompositeIndex[T entityID](keys []string) *compositeIndex[T] {
 	return &compositeIndex[T]{
 		keys:     own,
 		postings: make(map[string][]T),
-		members:  make(map[T]*memberState),
+		members:  make(map[T]int32),
+		vtab:     newValueTable(),
 	}
 }
 
@@ -161,68 +432,148 @@ func encodeTuple(values []string) string {
 	return string(b)
 }
 
-// valuesAt returns every value the entity carries at position pos.
-func (m *memberState) valuesAt(pos int) []string {
-	if m.filled&(1<<uint(pos)) == 0 {
-		return nil
-	}
-	if extra := m.more[pos]; len(extra) > 0 {
-		out := make([]string, 0, 1+len(extra))
-		return append(append(out, m.one[pos]), extra...)
-	}
-	return m.one[pos : pos+1]
+// slotAt returns the reference at one position of a row, or noValue.
+func (c *compositeIndex[T]) slotAt(row int32, pos int) int32 {
+	return c.slots[int(row)*len(c.keys)+pos]
 }
 
-// add records value at pos, reporting whether it was new.
-func (m *memberState) add(pos int, value string) bool {
-	bit := uint64(1) << uint(pos)
-	if m.filled&bit == 0 {
-		m.one[pos] = value
-		m.filled |= bit
+func (c *compositeIndex[T]) setSlot(row int32, pos int, ref int32) {
+	c.slots[int(row)*len(c.keys)+pos] = ref
+}
+
+// extraKey addresses one position's overflow list.
+func (c *compositeIndex[T]) extraKey(row int32, pos int) int64 {
+	return int64(row)*int64(len(c.keys)) + int64(pos)
+}
+
+func (c *compositeIndex[T]) extraAt(row int32, pos int) []int32 {
+	if c.extra == nil {
+		return nil
+	}
+	return c.extra[c.extraKey(row, pos)]
+}
+
+// hasExtras reports whether any position of the row went multi-valued.
+//
+// A bitset rather than a probe into extra, because this is read on every
+// registration and the alternative costs one map lookup per position for every
+// entity in an index where any single entity ever held two values at one key.
+// One bit per row is 0.125 B per entry against that.
+func (c *compositeIndex[T]) hasExtras(row int32) bool {
+	i := int(row) >> 6
+	return i < len(c.extraRows) && c.extraRows[i]&(uint64(1)<<(uint(row)&63)) != 0
+}
+
+func (c *compositeIndex[T]) markExtras(row int32) {
+	i := int(row) >> 6
+	for len(c.extraRows) <= i {
+		c.extraRows = append(c.extraRows, 0)
+	}
+	c.extraRows[i] |= uint64(1) << (uint(row) & 63)
+}
+
+func (c *compositeIndex[T]) clearExtras(row int32) {
+	if i := int(row) >> 6; i < len(c.extraRows) {
+		c.extraRows[i] &^= uint64(1) << (uint(row) & 63)
+	}
+}
+
+// newRow returns a row with every position empty, reusing a released one where
+// there is one.
+func (c *compositeIndex[T]) newRow() int32 {
+	if n := len(c.freeRow); n > 0 {
+		row := c.freeRow[n-1]
+		c.freeRow = c.freeRow[:n-1]
+		return row
+	}
+	row := int32(len(c.slots) / len(c.keys))
+	for range c.keys {
+		c.slots = append(c.slots, noValue)
+	}
+	return row
+}
+
+// releaseRow drops every value the row holds and lists it for reuse.
+//
+// Called only after the row's tuples have been unfiled, because unfiling reads
+// the values this releases.
+func (c *compositeIndex[T]) releaseRow(row int32) {
+	for pos := range c.keys {
+		c.vtab.unref(c.slotAt(row, pos))
+		c.setSlot(row, pos, noValue)
+		if c.extra == nil {
+			continue
+		}
+		k := c.extraKey(row, pos)
+		for _, ref := range c.extra[k] {
+			c.vtab.unref(ref)
+		}
+		delete(c.extra, k)
+	}
+	c.clearExtras(row)
+	c.freeRow = append(c.freeRow, row)
+}
+
+// addValue records value at pos of row, reporting whether it was new.
+func (c *compositeIndex[T]) addValue(row int32, pos int, value string) bool {
+	if c.slotAt(row, pos) == noValue {
+		c.setSlot(row, pos, c.vtab.ref(value))
 		return true
 	}
-	if m.one[pos] == value {
+	if c.vtab.at(c.slotAt(row, pos)) == value {
 		return false
 	}
-	for _, v := range m.more[pos] {
-		if v == value {
+	k := c.extraKey(row, pos)
+	for _, ref := range c.extra[k] {
+		if c.vtab.at(ref) == value {
 			return false
 		}
 	}
-	if m.more == nil {
-		m.more = make(map[int][]string)
+	if c.extra == nil {
+		c.extra = make(map[int64][]int32)
 	}
-	m.more[pos] = append(m.more[pos], value)
+	c.extra[k] = append(c.extra[k], c.vtab.ref(value))
+	c.markExtras(row)
 	return true
 }
 
 // complete reports whether every position has a value, which is what it takes
 // for the entity to appear under any tuple at all.
-func (m *memberState) complete(width int) bool {
-	return bits.OnesCount64(m.filled) == width
+func (c *compositeIndex[T]) complete(row int32) bool {
+	for pos := range c.keys {
+		if c.slotAt(row, pos) == noValue {
+			return false
+		}
+	}
+	return true
 }
 
-// forEachTuple calls fn for every tuple in the cross product of the entity's
+// forEachTuple calls fn for every tuple in the cross product of the row's
 // values, with position pos pinned to pinned when pin is true.
 //
 // Pinning is what makes registration cheap: when a value arrives at pos, the
 // tuples that become reachable are exactly those carrying it there, and the rest
 // were filed when their own values arrived.
-func (m *memberState) forEachTuple(width, pos int, pinned string, pin bool, fn func(string)) {
-	if m.more == nil {
+//
+// buf belongs to the caller and must hold width entries. It is a parameter
+// rather than a field because the read paths run under a shared lock and two of
+// them may be walking at once; register and remove hold mu exclusively and pass
+// the index's own scratch.
+func (c *compositeIndex[T]) forEachTuple(row int32, pos int, pinned string, pin bool, buf []string, fn func(string)) {
+	if !c.hasExtras(row) {
 		// Every position holds exactly one value, which is the case for
-		// essentially every entity — more is allocated only when a second value
-		// arrives at some position. The cross product is then the single tuple
-		// already assembled in one, and pinning cannot change it, because a
-		// value that reached this path is the one add just stored there.
-		//
-		// Worth its own branch rather than falling through: this runs on every
-		// registration, and the walk below allocates a buffer to rediscover a
-		// tuple that is sitting in front of it.
-		fn(encodeTuple(m.one))
+		// essentially every entity — a position gains an overflow list only when
+		// a second value arrives at it. The cross product is then the single
+		// tuple the row already spells out, and pinning cannot change it,
+		// because a value that reached this path is the one addValue just stored
+		// there.
+		for i := range c.keys {
+			buf[i] = c.vtab.at(c.slotAt(row, i))
+		}
+		fn(encodeTuple(buf))
 		return
 	}
-	buf := make([]string, width)
+	width := len(c.keys)
 	var walk func(i int)
 	walk = func(i int) {
 		if i == width {
@@ -234,12 +585,23 @@ func (m *memberState) forEachTuple(width, pos int, pinned string, pin bool, fn f
 			walk(i + 1)
 			return
 		}
-		for _, v := range m.valuesAt(i) {
-			buf[i] = v
+		buf[i] = c.vtab.at(c.slotAt(row, i))
+		walk(i + 1)
+		for _, ref := range c.extraAt(row, i) {
+			buf[i] = c.vtab.at(ref)
 			walk(i + 1)
 		}
 	}
 	walk(0)
+}
+
+// tupleBuf returns the index's own width-sized assembly buffer. Callers hold mu
+// exclusively; the read paths bring their own.
+func (c *compositeIndex[T]) tupleBuf() []string {
+	if cap(c.scratch) < len(c.keys) {
+		c.scratch = make([]string, len(c.keys))
+	}
+	return c.scratch[:len(c.keys)]
 }
 
 // register records that id carries value at position pos.
@@ -252,24 +614,24 @@ func (c *compositeIndex[T]) register(id T, pos int, value string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	m := c.members[id]
-	if m == nil {
-		m = &memberState{one: make([]string, len(c.keys))}
-		c.members[id] = m
+	row, ok := c.members[id]
+	if !ok {
+		row = c.newRow()
+		c.members[id] = row
 	}
-	if !m.add(pos, value) {
+	if !c.addValue(row, pos, value) {
 		return
 	}
-	if !m.complete(len(c.keys)) {
+	if !c.complete(row) {
 		// An early exit, not the thing that prevents a partial filing: the cross
-		// product of a position with no values is empty, so an incomplete state
+		// product of a position with no values is empty, so an incomplete row
 		// produces no tuples whether this returns or not. What it buys is the
 		// ingest path, where every entity is incomplete until its last member
-		// key arrives — without it each of those registrations allocates a walk
-		// buffer to discover there is nothing to walk.
+		// key arrives — without it each of those registrations walks and encodes
+		// a tuple to discover it has nothing to file.
 		return
 	}
-	m.forEachTuple(len(c.keys), pos, value, true, func(tuple string) {
+	c.forEachTuple(row, pos, value, true, c.tupleBuf(), func(tuple string) {
 		ids, inserted := insertSorted(c.postings[tuple], id)
 		if inserted {
 			c.postings[tuple] = ids
@@ -280,33 +642,35 @@ func (c *compositeIndex[T]) register(id T, pos int, value string) {
 
 // remove drops every trace of id.
 //
-// The tuples to unfile are recomputed from the entity's own member values rather
-// than found by searching the postings, which is what keeps removal proportional
-// to that entity instead of to the index.
+// The tuples to unfile are recomputed from the entity's own row rather than
+// found by searching the postings, which is what keeps removal proportional to
+// that entity instead of to the index.
 func (c *compositeIndex[T]) remove(id T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	m := c.members[id]
-	if m == nil {
+	row, ok := c.members[id]
+	if !ok {
 		return
 	}
 	delete(c.members, id)
-	if !m.complete(len(c.keys)) {
-		return
+	if c.complete(row) {
+		c.forEachTuple(row, 0, "", false, c.tupleBuf(), func(tuple string) {
+			ids, removed := deleteSorted(c.postings[tuple], id)
+			if !removed {
+				return
+			}
+			c.entries--
+			if len(ids) == 0 {
+				delete(c.postings, tuple)
+				return
+			}
+			c.postings[tuple] = ids
+		})
 	}
-	m.forEachTuple(len(c.keys), 0, "", false, func(tuple string) {
-		ids, removed := deleteSorted(c.postings[tuple], id)
-		if !removed {
-			return
-		}
-		c.entries--
-		if len(ids) == 0 {
-			delete(c.postings, tuple)
-			return
-		}
-		c.postings[tuple] = ids
-	})
+	// After the unfiling and never before it: releasing the row drops the
+	// references the walk above reads the values through.
+	c.releaseRow(row)
 }
 
 // lookup returns a copy of the ascending ids filed under the given values.
@@ -391,23 +755,41 @@ func (c *compositeIndex[T]) verify(kind string, cc *store.CancelCheck) error {
 		filed += len(ids)
 	}
 
+	// The intern table before any row is read through it: every check below
+	// resolves references against it, so a table that disagrees with itself
+	// would have them all reporting values no row holds.
+	if err := c.vtab.verify(); err != nil {
+		return errIndexf("%s composite index (%s): %s", kind, name, err.Error())
+	}
+
 	counted := 0
+	buf := make([]string, width)
+	// seenRow marks the rows an entity names, so the overflow lists can be
+	// checked against them afterwards. One bit per row, the same bound the
+	// extras bitset already costs.
+	seenRow := make([]uint64, (len(c.slots)/width)/64+1)
 	var verr error
-	for id, m := range c.members {
+	for id, row := range c.members {
 		if err := cc.Step(); err != nil {
 			return err
 		}
-		if len(m.one) != width {
-			return errIndexf("%s composite index (%s): entity %v holds %d positions, want %d",
-				kind, name, id, len(m.one), width)
+		if row < 0 || int(row)*width+width > len(c.slots) {
+			return errIndexf("%s composite index (%s): entity %v names row %d, outside the %d slots held",
+				kind, name, id, row, len(c.slots))
 		}
-		if err := m.verifyShape(width); err != nil {
+		if err := c.verifyRow(row); err != nil {
 			return errIndexf("%s composite index (%s): entity %v %s", kind, name, id, err.Error())
 		}
-		if !m.complete(width) {
+		if w := int(row) >> 6; seenRow[w]&(uint64(1)<<(uint(row)&63)) != 0 {
+			return errIndexf("%s composite index (%s): entity %v shares row %d with another entity",
+				kind, name, id, row)
+		} else {
+			seenRow[w] |= uint64(1) << (uint(row) & 63)
+		}
+		if !c.complete(row) {
 			continue
 		}
-		m.forEachTuple(width, 0, "", false, func(tuple string) {
+		c.forEachTuple(row, 0, "", false, buf, func(tuple string) {
 			if verr != nil {
 				return
 			}
@@ -420,6 +802,29 @@ func (c *compositeIndex[T]) verify(kind string, cc *store.CancelCheck) error {
 		})
 		if verr != nil {
 			return verr
+		}
+	}
+
+	// Every overflow list belongs to a position of a row some entity names.
+	//
+	// The list is addressed by row*width+pos, so a value written at a position
+	// outside the declared width does not land outside the array — it lands on a
+	// different row, and is read back as that entity's value. The walk above
+	// catches the consequence when that row is live, by reporting a tuple the
+	// other entity is not filed under; this catches it when the row is not, and
+	// catches an orphan releaseRow failed to delete, which nothing else would.
+	for k := range c.extra {
+		if err := cc.Step(); err != nil {
+			return err
+		}
+		row := k / int64(width)
+		if row < 0 || int(row)*width+width > len(c.slots) {
+			return errIndexf("%s composite index (%s): an overflow list is held for row %d, outside the %d slots",
+				kind, name, row, len(c.slots))
+		}
+		if seenRow[int(row)>>6]&(uint64(1)<<(uint(row)&63)) == 0 {
+			return errIndexf("%s composite index (%s): an overflow list is held for row %d, which no entity names",
+				kind, name, row)
 		}
 	}
 
@@ -440,22 +845,23 @@ func (c *compositeIndex[T]) verify(kind string, cc *store.CancelCheck) error {
 // gave for free. Bounded like the rest: one member's cross product at a time,
 // nothing accumulated. Caller holds c.mu.
 func (c *compositeIndex[T]) unimpliedEntry(kind, name string, width, counted, filed int, cc *store.CancelCheck) error {
+	buf := make([]string, width)
 	for tuple, ids := range c.postings {
 		if err := cc.Step(); err != nil {
 			return err
 		}
 		for _, id := range ids {
-			m := c.members[id]
-			if m == nil {
+			row, ok := c.members[id]
+			if !ok {
 				return errIndexf("%s composite index (%s): entity %v is filed but holds no member values",
 					kind, name, id)
 			}
-			if len(m.one) != width || !m.complete(width) {
+			if !c.complete(row) {
 				return errIndexf("%s composite index (%s): entity %v is filed but does not hold a value at every position",
 					kind, name, id)
 			}
 			found := false
-			m.forEachTuple(width, 0, "", false, func(t string) {
+			c.forEachTuple(row, 0, "", false, buf, func(t string) {
 				if t == tuple {
 					found = true
 				}
@@ -473,32 +879,48 @@ func (c *compositeIndex[T]) unimpliedEntry(kind, name string, width, counted, fi
 		kind, name, filed, counted)
 }
 
-// verifyShape checks the parts of a member state that forEachTuple trusts:
-// every position it can reach is within the declared width, and no position
-// holds the same value twice.
+// verifyRow checks the parts of a row that forEachTuple trusts: every reference
+// it can reach names a live value, no position holds the same value twice, an
+// overflow list exists only at a position that is itself filled, and the extras
+// bitset agrees with the overflow lists it is a summary of.
 //
-// Both were previously masked. The cross product is enumerated with no memory
-// of what it has produced, so a repeated value repeats a tuple; the old verify
-// deduplicated those into a set and so could not see it. A value stored beyond
-// the declared width is never enumerated at all, and drifts unnoticed.
-func (m *memberState) verifyShape(width int) error {
-	if m.filled>>uint(width) != 0 {
-		return fmt.Errorf("has a value beyond position %d", width-1)
-	}
-	for pos, extra := range m.more {
-		if pos < 0 || pos >= width {
-			return fmt.Errorf("holds extra values at position %d, outside the declared width %d", pos, width)
+// A value stored beyond the declared width — which the per-entity form this
+// replaced could hold and drift on unnoticed, because it was never enumerated —
+// is not a state a row can represent: a row is exactly width slots. That check
+// is therefore absent rather than missing.
+func (c *compositeIndex[T]) verifyRow(row int32) error {
+	marked := false
+	for pos := range c.keys {
+		slot := c.slotAt(row, pos)
+		if slot != noValue {
+			if err := c.vtab.verifyRef(slot); err != nil {
+				return fmt.Errorf("at position %d %s", pos, err.Error())
+			}
 		}
-		for i, v := range extra {
-			if m.filled&(1<<uint(pos)) != 0 && m.one[pos] == v {
+		extra := c.extraAt(row, pos)
+		if len(extra) == 0 {
+			continue
+		}
+		marked = true
+		if slot == noValue {
+			return fmt.Errorf("holds extra values at position %d but no value there", pos)
+		}
+		for i, ref := range extra {
+			if err := c.vtab.verifyRef(ref); err != nil {
+				return fmt.Errorf("at position %d %s", pos, err.Error())
+			}
+			if ref == slot {
 				return fmt.Errorf("holds the same value twice at position %d", pos)
 			}
-			for _, w := range extra[i+1:] {
-				if v == w {
+			for _, other := range extra[i+1:] {
+				if ref == other {
 					return fmt.Errorf("holds the same value twice at position %d", pos)
 				}
 			}
 		}
+	}
+	if marked != c.hasExtras(row) {
+		return fmt.Errorf("carries overflow values the extras bitset disagrees with")
 	}
 	return nil
 }

@@ -182,6 +182,22 @@ func TestCeiling_TheAppliedCeilingBinds(t *testing.T) {
 			"TestCeiling_ConsumerSequenceFitsUnderTheLimit is already independent of this process")
 	}
 
+	if raceEnabled {
+		// The child is this same binary, so under the race detector it starts
+		// ThreadSanitizer inside the 128 MiB ceiling, and tsan needs more than
+		// that for its shadow memory before any test code runs. It aborts, and
+		// the abort is indistinguishable here from a child that could not report
+		// a verdict -- even though the verdict is already in its output, because
+		// the probe answers long before tsan runs out.
+		//
+		// Raising the ceiling is not the fix: the probe commits four times it, so
+		// a ceiling large enough for tsan makes the probe's allocation larger than
+		// the machines this is meant to run on. What the test establishes -- that
+		// a self-applied Job Object limit binds -- is a property of the kernel and
+		// not of the code under test, so the untagged run establishes it.
+		t.Skip("the child cannot start the race detector inside the ceiling it is here to prove binds")
+	}
+
 	// A separate process because the ceiling has to be small enough that four
 	// times it is an ordinary allocation, and a process gets one ceiling: applying
 	// a small one here would leave the acceptance test running under it.
