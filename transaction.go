@@ -187,7 +187,7 @@ func (tx *Tx) Attributed() bool {
 // fails, the ID is never used by anything.
 //
 // The node is copied, so the caller may reuse its slices as soon as this
-// returns — the same contract as AddNode.
+// returns.
 func (tx *Tx) AddNode(n *store.Node) store.NodeID {
 	if tx.done {
 		tx.setErr(ErrTxDone)
@@ -248,6 +248,10 @@ func (tx *Tx) AddNode(n *store.Node) store.NodeID {
 //
 // Upserting one key twice in a transaction returns the same ID both times, and
 // the later call wins.
+//
+// The node is copied, so the caller may reuse its slices as soon as this
+// returns. UpsertNodeOwned skips that copy for callers that can hand the node
+// over instead.
 func (tx *Tx) UpsertNode(key string, value []byte, n *store.Node, props map[string][]byte) (store.NodeID, bool) {
 	if tx.done {
 		tx.setErr(ErrTxDone)
@@ -257,20 +261,93 @@ func (tx *Tx) UpsertNode(key string, value []byte, n *store.Node, props map[stri
 		tx.setErr(errors.New("Tx.UpsertNode: nil node"))
 		return store.InvalidNodeID, false
 	}
+	id, created, ok := tx.claimNodeKey("Tx.UpsertNode", key, value)
+	if !ok {
+		return store.InvalidNodeID, false
+	}
 
+	stored := copyNode(n)
+	stored.ID = id
+	tx.bufferUpsertNode(stored, id, created, key, value, props)
+	return id, created
+}
+
+// UpsertNodeOwned is UpsertNode, except that it takes ownership of n instead of
+// copying it.
+//
+// UpsertNode copies because a transaction buffers: the record it will commit has
+// to survive from the call until Commit, and a caller is otherwise free to refill
+// the *store.Node it just handed over. That copy is the per-node cost of the root
+// package's write path — a struct, a labels slice and a properties slice per
+// entity, and the properties slice is the blob.
+//
+// This method gives the copy up in exchange for a promise:
+//
+//	once this returns, n and the memory it points at belong to the store.
+//	Do not read it, write it, or reuse its backing arrays.
+//
+// The promise runs to the end of the store's use of the record, not to Commit.
+// Both bundled backends retain the pointer as the live record rather than copying
+// it — disk's putNode hangs it off the delta version chain, memory's
+// upsertNodeLocked puts it straight in the map — so a caller that writes to the
+// slice afterwards changes what the store answers with, with no error anywhere to
+// say so. disk.Store's own transaction path has always worked this way; this
+// aligns the root package with it for callers that can make the promise.
+//
+// n.ID is set to the resolved ID. That is the one visible effect on the caller's
+// struct, and is usually wanted anyway.
+//
+// value and props are copied here exactly as UpsertNode copies them, and
+// deliberately: a reused key buffer and a refilled entry map are both ordinary
+// caller patterns, and both are small beside the blob. What is owned is the node.
+//
+// Use UpsertNode unless a measurement says this copy matters. A caller that
+// cannot keep the promise on every path — including an error path that returns a
+// buffer to a pool — should not use this.
+func (tx *Tx) UpsertNodeOwned(key string, value []byte, n *store.Node, props map[string][]byte) (store.NodeID, bool) {
+	if tx.done {
+		tx.setErr(ErrTxDone)
+		return store.InvalidNodeID, false
+	}
+	if n == nil {
+		tx.setErr(errors.New("Tx.UpsertNodeOwned: nil node"))
+		return store.InvalidNodeID, false
+	}
+	id, created, ok := tx.claimNodeKey("Tx.UpsertNodeOwned", key, value)
+	if !ok {
+		return store.InvalidNodeID, false
+	}
+
+	n.ID = id
+	tx.bufferUpsertNode(n, id, created, key, value, props)
+	return id, created
+}
+
+// claimNodeKey resolves a declared-unique key to the ID the entity will have,
+// reserving a new one if nothing holds the key yet. ok is false if the
+// transaction has already failed, and the reason has been recorded on it.
+//
+// This is the half of an upsert the two methods share. The other half — the four
+// lines that decide whether the buffered record is the caller's node or a copy of
+// it — is deliberately written out twice, because sharing it does real damage:
+// a single body that can store n makes n a leaking parameter, and UpsertNode's
+// callers then heap-allocate a *store.Node the escape analysis used to keep on
+// the stack. Measured at two allocations per node, which is more than
+// UpsertNodeOwned saves. See TECHNICAL_DETAILS.md §14.27.
+func (tx *Tx) claimNodeKey(name, key string, value []byte) (store.NodeID, bool, bool) {
 	claim := txClaim{kind: "node", key: key, value: string(value)}
 	existing, resolved := tx.claimed[claim]
 	created := false
 	if !resolved {
 		d, ok := tx.g.GraphStore.(store.UniqueIndexDeclarer)
 		if !ok {
-			tx.setErr(fmt.Errorf("Tx.UpsertNode: %T cannot enforce unique properties", tx.g.GraphStore))
-			return store.InvalidNodeID, false
+			tx.setErr(fmt.Errorf("%s: %T cannot enforce unique properties", name, tx.g.GraphStore))
+			return store.InvalidNodeID, false, false
 		}
 		owner, found, err := d.UniqueNodeOwner(key, value)
 		if err != nil {
-			tx.setErr(fmt.Errorf("Tx.UpsertNode: %w", err))
-			return store.InvalidNodeID, false
+			tx.setErr(fmt.Errorf("%s: %w", name, err))
+			return store.InvalidNodeID, false, false
 		}
 		if found {
 			existing = uint64(owner)
@@ -281,14 +358,15 @@ func (tx *Tx) UpsertNode(key string, value []byte, n *store.Node, props map[stri
 		}
 		tx.claimed[claim] = existing
 	}
-	id := store.NodeID(existing)
+	return store.NodeID(existing), created, true
+}
 
-	stored := copyNode(n)
-	stored.ID = id
-
+// bufferUpsertNode appends the op. stored is retained, so a caller that must not
+// hand over the caller's node passes a copy.
+func (tx *Tx) bufferUpsertNode(stored *store.Node, id store.NodeID, created bool, key string, value []byte, props map[string][]byte) {
 	expect := uint64(store.InvalidNodeID)
 	if !created {
-		expect = existing
+		expect = uint64(id)
 	}
 	tx.ops = append(tx.ops, store.TxOp{
 		Kind:   store.TxOpUpsertNode,
@@ -299,7 +377,6 @@ func (tx *Tx) UpsertNode(key string, value []byte, n *store.Node, props map[stri
 		Expect: expect,
 		Props:  copyProps(props),
 	})
-	return id, created
 }
 
 // UpsertEdge is UpsertNode for edges, keyed on a declared-unique edge property.
