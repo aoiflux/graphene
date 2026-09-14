@@ -156,6 +156,15 @@ func rssBlobSize(i, blob int) int {
 	}
 }
 
+// The fixture helpers below take testing.TB rather than *testing.B.
+//
+// They only ever call Helper, Fatal* and Cleanup, so the narrower type bought
+// nothing and excluded the one caller that is not a benchmark: the ceiling run
+// in ceiling_test.go, which is a test because its result is pass or fail rather
+// than a figure. Sharing the builders matters more than the type -- a second
+// copy of rssProps would let the fixture the ceiling run measures drift away
+// from the fixture every other figure in this program was taken on.
+
 // rssWriteEdges connects the fixture's nodes, and returns how many edges it
 // wrote.
 //
@@ -163,7 +172,7 @@ func rssBlobSize(i, blob int) int {
 // The distance matters: a fixture whose edges all point at the next slot would
 // lay the adjacency arrays out as one sequential run, which is neither what a
 // real graph looks like nor what its residency costs to walk.
-func rssWriteEdges(b *testing.B, g *graphene.Graph, ids []store.NodeID, stride int) int {
+func rssWriteEdges(b testing.TB, g *graphene.Graph, ids []store.NodeID, stride int) int {
 	b.Helper()
 
 	if stride <= 0 || len(ids) < 2 {
@@ -226,7 +235,7 @@ func rssDeclare(g *graphene.Graph) error {
 
 // rssWriteNodes adds n nodes with blob-sized properties and indexes each one.
 // It returns the ids in insertion order so callers can delete a contiguous band.
-func rssWriteNodes(b *testing.B, g *graphene.Graph, from, n, blob int) []store.NodeID {
+func rssWriteNodes(b testing.TB, g *graphene.Graph, from, n, blob int) []store.NodeID {
 	b.Helper()
 
 	const chunk = 10_000
@@ -277,7 +286,7 @@ func rssShape(nodes, blob int) string {
 }
 
 // rssBuildFixture writes the fixture into dir and compacts it.
-func rssBuildFixture(b *testing.B, dir string, nodes, blob int) {
+func rssBuildFixture(b testing.TB, dir string, nodes, blob int) {
 	b.Helper()
 
 	g, err := graphene.Open(dir)
@@ -307,7 +316,7 @@ func rssBuildFixture(b *testing.B, dir string, nodes, blob int) {
 // for why that distinction decides whether peakMiB means anything.
 //
 // A benchmark that writes to the store wants rssMutableFixtureDir instead.
-func rssFixtureDir(b *testing.B, nodes, blob int) string {
+func rssFixtureDir(b testing.TB, nodes, blob int) string {
 	b.Helper()
 
 	if rssDir == "" {
@@ -368,7 +377,7 @@ func rssFixtureDir(b *testing.B, nodes, blob int) string {
 // store that is larger and freshly compacted -- so the second run of the same
 // benchmark would measure a different store from the first, and the shape marker
 // would still say they matched.
-func rssMutableFixtureDir(b *testing.B, nodes, blob int) string {
+func rssMutableFixtureDir(b testing.TB, nodes, blob int) string {
 	b.Helper()
 
 	master := rssFixtureDir(b, nodes, blob)
@@ -387,7 +396,7 @@ func rssMutableFixtureDir(b *testing.B, nodes, blob int) string {
 
 // rssCopyDir copies a fixture's files. Flat by construction: a store directory
 // holds no subdirectories, and failing on one is better than skipping it.
-func rssCopyDir(b *testing.B, src, dst string) {
+func rssCopyDir(b testing.TB, src, dst string) {
 	b.Helper()
 
 	entries, err := os.ReadDir(src)
@@ -536,6 +545,17 @@ func BenchmarkRSS_BulkWrite(b *testing.B) {
 // compaction, the sample count is reported, and the result is a floor on the
 // true peak rather than the peak itself.
 func samplePeakDuring(fn func()) (peak rssSample, samples int) {
+	return samplePeakEvery(time.Millisecond, fn)
+}
+
+// samplePeakEvery is samplePeakDuring with the interval named.
+//
+// One millisecond is right for a compaction measured in seconds and wrong for a
+// rebuild measured in minutes, where it costs hundreds of thousands of readings
+// of the very counters being read. The interval is the floor on the true peak
+// this returns, so a caller that widens it is trading resolution for overhead
+// deliberately rather than inheriting a constant chosen for another operation.
+func samplePeakEvery(interval time.Duration, fn func()) (peak rssSample, samples int) {
 	type reading struct {
 		s rssSample
 		n int
@@ -544,7 +564,7 @@ func samplePeakDuring(fn func()) (peak rssSample, samples int) {
 	result := make(chan reading, 1)
 
 	go func() {
-		ticker := time.NewTicker(time.Millisecond)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		var best rssSample
 		n := 0

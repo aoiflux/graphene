@@ -760,7 +760,11 @@ arm64, static and reproducible:
   configuration can change: [MEMORY_MODEL.md](docs/MEMORY_MODEL.md) — read this
   before sizing a machine for a store. §8 is the worked table: what `ImageMode`,
   `IndexMode` and `Adjacency` each cost, measured term by term, and which of
-  their combinations are configurations at all.
+  their combinations are configurations at all. §9 is the verdict under an
+  actual RAM ceiling: a 1,400,000-node store opens and is read in **561 MiB**
+  of anonymous memory under a 2 GiB cgroup, and a whole-layer rebuild in the
+  same process needs 3,853 MiB because a compaction holds its own output until
+  the store is reopened.
 - Engine comparison notes: [comparison.md](docs/comparison.md)
 - Where we stand against a native graph database, and what would close the
   gap: [RESEARCH_NATIVE_GRAPH.md](docs/RESEARCH_NATIVE_GRAPH.md)

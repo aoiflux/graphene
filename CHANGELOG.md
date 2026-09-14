@@ -5,6 +5,55 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### Measured under an actual RAM ceiling, not projected
+
+- **`tests/ceiling_test.go` runs the consumer's own sequence under a real memory
+  limit** — open, scan ten rows through the index, enumerate the live set, rebuild
+  the derived layer, compact, reopen and check the result is still there. cgroup v2
+  `memory.max` on linux, a Job Object `JOB_OBJECT_LIMIT_JOB_MEMORY` on windows, and
+  two nightly CI jobs. `RLIMIT_AS` is deliberately not used: it counts the mapped
+  image's address space, which is the term this whole programme moved *out* of the
+  constrained class, so a run under `ulimit -v` would refuse a store that fits.
+
+- **The run refuses to report unless a ceiling is in force.** It reads the limit back
+  from the kernel and fails when there is none, or when the one in force is looser
+  than the figure the run claims. A CI step whose limit silently failed to apply
+  would otherwise run the workload unconstrained and go green — the same failure as
+  an option asked for and not held, which is why `StorageStats` reports what is
+  *held*. The peak is reported and never asserted: a process that exceeded its
+  ceiling is already dead, so the assertion could only ever run once it had passed.
+
+- **The read path reaches the target, measured at the target shape.** 1,400,000
+  nodes in a 1,689 MiB v9 image with 18,200,000 index entries open and are read in
+  **560.8 MiB of anonymous memory**, charging 613.9 MiB against a real 2 GiB cgroup
+  and finishing with **70% headroom** — while holding a 1,354 MiB working set, the
+  difference being the mapped image the ceiling does not count. `MEMORY_MODEL.md`
+  §8.6 projected 537 MiB for this configuration and `EstimatedResidentBytes` reports
+  537.1, so the model is confirmed by direct measurement rather than by scaling. The
+  §6.4 estimate of ~1,113 MiB came from multiplying a 200,000-node arm by seven and
+  **over-predicts by 1.98×**, because the fixed part of an anonymous reading does not
+  scale.
+
+- **A whole-layer rebuild does not reach it, and the delta is not the reason.**
+  Rebuilding all 1,400,000 nodes in one process holds **3,853 MiB** and peaks at
+  6,644 MiB. Bounding the delta with `CompactionPolicy.MaxDeltaBytes` works — nine
+  interim compactions, the delta held at 56.6 MiB — and buys almost nothing. The
+  cause is that **a compaction leaves its own output resident until the store is
+  reopened**: the graph it publishes was built in the heap, and `AttachBase` is
+  called only on the load path, so the 18,200,000 entries it just wrote stay in the
+  shards. Anonymous memory is 3,838 MiB after compacting and **1,078 MiB after
+  reopening the same directory**. The arrangement §8 measures is therefore one a
+  process is in after Open and until its first compaction; a long-running writer
+  leaves it and does not return. `MEMORY_MODEL.md` §9 has the full accounting, and
+  the remedy — re-attaching the image and index base after a compaction — is not a
+  shipped knob.
+
+- **The nightly runs both arms and neither hides the other.** Read-only at 1,400,000
+  nodes under 2 GiB, the whole sequence at 200,000 nodes under the same 2 GiB where
+  it finishes with 53% headroom. Fixtures are built first and outside the limit,
+  because a 1.4M-node build peaks at several times what the finished store costs to
+  open.
+
 ### What each residency option costs, measured together rather than one at a time
 
 - **`docs/MEMORY_MODEL.md` §8 is the per-configuration table.** `ImageMode`,

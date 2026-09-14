@@ -27,7 +27,9 @@ store built with no index declared holds 161 MiB and peaks at 980 MiB.
 | What is the compaction peak made of? | 512 B × delta records + 118 B × live records + 16 B × live records, predicting a 7× larger store to 2.3% | §4 |
 | What does a rebuild cost, permanently? | 10.83 B per burned identifier, against 72 B before R10(b); ~83 MiB per forty rebuilds | §5 |
 | Does the program reach 2 GiB? | not today — 2,909 MiB is 42% over. With R3, ~607 MiB. Only R3 closes it | §6 |
+| Does it reach 2 GiB *measured*? | for the read path, yes: 561 MiB anonymous at 1.4M nodes, 70% headroom under a real 2 GiB cgroup. For a whole-layer rebuild in the same process, no — 3,853 MiB | §9 |
 | What does each option cost? | index 273 MiB, image 149 MiB of heap, adjacency 6 MiB — independent and additive | §8 |
+| What does a compaction leave behind? | its own output, resident: 3,838 MiB after compacting against 1,078 MiB after reopening the same store | §9.4 |
 
 Four things a reader should take away before the detail.
 
@@ -776,7 +778,9 @@ document is otherwise about, and that scaling is checkable rather than asserted:
 control arm's 441 MiB of anonymous memory scaled by seven is **3,087 MiB against the
 2,909 this document measured directly**, a 6% disagreement between two harnesses and
 two fixture builds. The mapped arm's 159 MiB scales to **~1,113 MiB**, which is the
-row in §6.3.
+row in §6.3. That scaling has since been checked against a direct run at 1,400,000
+nodes and over-predicts by almost exactly two: the measured figure is **560.8 MiB**, and
+§9.3 says which part of an anonymous reading does not scale.
 
 **Why that is 1,113 and not the 607 projected.** The projection summed live
 structures: 161 measured with no index, + 402 for the composites, + ~44 for R3's own
@@ -1240,6 +1244,191 @@ question: *which term to attack*.
 of the 537. Nothing in the shipped program moves it; it is the R3 follow-up, and §8.4's
 160 B per entry is the coefficient it would have to beat.
 
+## 9. Under a ceiling
+
+Every section above reports a figure. This one reports a verdict, because the question
+the program was started to answer is not "how many bytes" but "does it fit on the
+machine" — a 2 GiB box, where slower is acceptable and OOM-killed is not.
+
+The instrument is `tests/ceiling_test.go` behind the `stress` tag, and the sequence it
+runs is the consumer's own: open, resolve ten rows through the index, enumerate the live
+set, rebuild the derived layer, compact, reopen and check the result is still there.
+
+### 9.1 What a ceiling is, and why the harness reads it back
+
+A ceiling is only worth measuring under if the kernel is enforcing one, so the harness
+refuses to produce a result until it has read back a limit at least as tight as the
+figure the run claims. A CI step whose limit silently failed to apply would run this
+workload unconstrained and go green, and nothing in the output would say so — the same
+failure as an option asked for and not held, which is why `StorageStats` reports what is
+*held* and why §8 prints both.
+
+| | linux | windows |
+|---|---|---|
+| instrument | cgroup v2 `memory.max` | Job Object `JOB_OBJECT_LIMIT_JOB_MEMORY` |
+| what it counts | resident bytes, page cache included but reclaimable | commit charge; a read-only file mapping counts for nothing |
+| applied by | the caller, `systemd-run --scope` | the harness, on itself |
+| read back from | the tightest `memory.max` from this cgroup up to the mount | `QueryInformationJobObject(NULL, …)` |
+| exceeding it | the OOM killer | `VirtualAlloc` fails with `ERROR_COMMITMENT_LIMIT`, then `fatal error: out of memory` |
+
+The asymmetry is not a preference. A process cannot place itself under a cgroup limit
+without privileges, and there is no convenient way to apply a Job Object from outside. So
+one platform is wrapped and reads an independent limit; the other applies its own and
+therefore has to prove that limit binds, which `TestCeiling_TheAppliedCeilingBinds` does
+in a subprocess by committing four times the ceiling and requiring the kernel to refuse.
+
+**`RLIMIT_AS` is the wrong instrument and would have inverted the result.** It bounds the
+virtual address space, so it counts every byte of the mapped image — 1,689 MiB of it here
+— even though none of that is charged to the process. A run under `ulimit -v 2G` would
+refuse a store that fits comfortably, and it constrains precisely the term this whole
+program moved *out* of the constrained class. `RLIMIT_RSS` is unenforced on every modern
+kernel.
+
+**The peak is reported and never asserted.** A process that exceeded its ceiling is dead,
+so `peak < ceiling` can only ever be evaluated when it already passed. What is asserted is
+that the sequence completed, that the store afterwards holds what it should, and that a
+ceiling at least as tight as the one quoted was in force while it happened. The peak, the
+headroom, and on linux the cgroup's own reclaim and OOM counters are diagnostics: they say
+whether a pass was comfortable or bare, which the pass alone cannot.
+
+One consequence of the commit-charge rule is worth reading off directly. In the read-only
+arm below, the process holds a working set of **1,354 MiB** while charging **614 MiB**
+against its 2 GiB ceiling. The 740 MiB difference is the mapped image, and it is the whole
+of R2 stated as one row: those bytes are resident, and they are not the process's to keep.
+
+### 9.2 The consumer's sequence at the shape it was sized for
+
+1,400,000 nodes, no edges, 512-byte blobs, 8 unique keys and 5 ordered and 2 composites,
+compacted into a v9 image of **1,689.1 MiB** holding **18,200,000 index entries**. One
+process, defaults throughout, the delta bounded at 64 MiB. Run under a deliberately
+generous 10 GiB ceiling so that nothing was hidden by dying early. Conditions as above;
+the anonymous/file split is windows', which overstates anonymous and understates file-backed
+by a roughly fixed process overhead — one-sided in the direction that makes this table
+pessimistic rather than flattering.
+
+| phase | anon MiB | file MiB | total RSS | peak MiB | wall | held |
+|---|---:|---:|---:|---:|---:|---|
+| open | **560.8** | 740.4 | 1,301.2 | 1,354.4 | 3.1 s | image mapped, index mapped |
+| scan, 10 rows | 560.5 | 740.8 | 1,301.3 | — | 1 ms | unchanged |
+| enumerate 1.4M ids | 571.5 | 740.6 | 1,312.1 | 1,312.0 | 42 ms | unchanged |
+| rebuild the layer | **3,853.5** | 1,256.8 | 5,110.3 | **6,644.0** | 7 m 11 s | — |
+| compact | 3,837.6 | 1,257.1 | 5,094.7 | 5,346.1 | 24.9 s | image **heap**, index mapped |
+| reopen | **1,078.0** | 733.4 | 1,811.4 | — | 2.9 s | image mapped, index mapped |
+
+Read the first three rows and the last three as two different results, because they are.
+
+### 9.3 The read path fits, and §8.6's projection was right
+
+**Opening a 1.65 GiB store and reading it costs 561 MiB of anonymous memory.** Under a real
+2 GiB ceiling the same arm charges 613.9 MiB against the limit and finishes with **70.0%
+headroom**. Enumerating all 1,400,000 identifiers adds 11.0 MiB, which is the 10.7 MiB of
+`[]NodeID` the harness itself keeps at 8 bytes each: `ForEachNodeID` streams and holds
+nothing, and the row measures what the caller chose to retain because the rebuild that
+follows needs the ids.
+
+This is the first direct measurement at the target shape, and it settles two things the
+document had only projected.
+
+**§8.6's projection was accurate to 24 MiB.** It summed the terms to 537 MiB of heap for
+the default configuration at this shape. The engine's own `EstimatedResidentBytes` after
+the run reports **537.1 MiB**, and the measured anonymous figure is 560.8 MiB. The 23.7 MiB
+between them is the Go runtime's fixed overhead, not a term anyone forgot.
+
+**§6.4's ~1,113 MiB was a scaling, and it over-predicted by 1.98×.** That figure came from
+multiplying a 200,000-node arm by seven. The fixed runtime component of an anonymous
+reading does not scale, so seven copies of a small arm count it seven times: at 200,000
+nodes this harness measures 123.5 MiB, of which 71.8 MiB is composites plus records
+(400,000 × 160 B and 200,704 slots × 56 B) and the remaining 51.7 MiB is fixed. Scale only
+the part that scales — 427.2 MiB of composites and 74.8 MiB of records at 1.4M — and the
+answer is **554 MiB against the 561 a direct run measures**. **§6.3's "does the program reach 2 GiB"
+row should be read against 561, not 1,113** — the program reaches it for the read path with
+room to spare, and by a wider margin than this document has been claiming.
+
+### 9.4 The write path does not fit, and the delta is not the reason
+
+**Rebuilding the whole layer in one process holds 3,853 MiB and peaks at 6,644 MiB** —
+3.2× over the ceiling. That is the plan's end-to-end acceptance, and it does not hold.
+
+The first suspicion was the delta, and it is wrong. A rebuild writes thirteen index entries
+per node, so 1,400,000 nodes is 18,200,000 entries, and at ~107 B resident that is 1.81 GiB
+in one delta. `CompactionPolicy.MaxDeltaBytes` exists for exactly this, and it works — the
+run above bounded the delta at 64 MiB, fired **9 interim compactions**, and ended with the
+delta at 56.6 MiB. It bought almost nothing. Differenced at 200,000 nodes, where both arms
+are cheap enough to run side by side:
+
+| 200,000 nodes | delta unbounded | delta bounded at 32 MiB |
+|---|---:|---:|
+| anonymous after the rebuild | 608.9 MiB | 573.8 MiB |
+| charged against the ceiling, peak | 884.6 MiB | 814.2 MiB |
+| interim compactions | 0 | 2 |
+
+**A compaction leaves its own output resident until the store is reopened.** That is the
+reason, and it is visible in one row of §9.2's table: anonymous memory is 3,838 MiB
+immediately after the final compaction and **1,078 MiB after reopening the same directory**,
+with the same store on disk. The 2,760 MiB difference is 18,200,000 index entries at ~107 B
+plus 1,400,000 blobs at 512 B — **2,541 MiB** of entries and payload that the reopened
+process reads out of the mapping and the compacting process holds in the heap, against the
+2,760 MiB actually observed.
+
+Two mechanisms produce it, and both are deliberate as far as they go.
+
+**The image.** `disk/compact.go` states it plainly: a compaction neither creates nor retires
+a mapping. The graph it publishes was built in the heap, and its untouched records still
+alias the mapping Open took, so unmapping would be a use-after-unmap and mapping the new
+file would add one mapping per compaction. `StorageStats.ImageMode` reports `heap` from that
+point, which is the honest answer to "is this image being served out of a file". After a
+*full-layer* rebuild there are no untouched records, so every blob is a heap blob.
+
+**The index.** `PropertyIndex.AttachBase` is called only on the load path
+(`disk/csr_io.go`). A compaction writes a new index section into the new image and does not
+attach it, so the entries it just wrote stay in the shards as resident entries and the
+attached base is the one Open established. This is why bounding the delta does not help:
+each interim compaction empties the delta into a base nobody reads back.
+
+So the arrangement §8 measures — mapped image, mapped index, a store holding 1.04× its own
+file — is an arrangement a process is in **after Open and until its first compaction**. A
+long-running writer leaves it at the first compaction and does not return. Nothing above
+this section measured that, because every arm in this document either opens and reads or
+builds and compacts in a process that then exits.
+
+**What that means for the target.** Open and scan at the consumer's shape fit 2 GiB with
+70% headroom, measured. A whole-layer rebuild in the same process does not, and the remedy
+is not a knob that exists today: re-attaching the image and the index base after a
+compaction would move some 2,541 MiB of the 3,853 out of anonymous memory at this shape, and
+that is the next item rather than a shipped one. A consumer that must rebuild 1.4M nodes on
+a 2 GiB machine today has one supported route, and it is the one the numbers point at
+anyway: **reopen after compacting**, which costs 2.9 seconds and returns the store to 1,078
+MiB.
+
+### 9.5 What the nightly runs
+
+Two arms, because only one of them holds at the full shape and both facts matter. The
+read-only arm runs at 1,400,000 nodes under 2 GiB; the write arm runs the whole sequence at
+200,000 nodes under the same 2 GiB, where it finishes with 53.2% headroom. Neither hides the
+other, and the job fails if no ceiling is in force.
+
+The fixtures are built first and outside the limit — a 1.4M-node build peaks at several
+times what the finished store costs to open, so a run that built its own would fail in the
+builder and say nothing about the store.
+
+```sh
+# Once, unconstrained.
+GRAPHENE_CEILING_BUILD=1 GRAPHENE_RSS_DIR=/var/tmp/fixture GRAPHENE_RSS_NODES=1400000 \
+  go test ./tests/ -tags=stress -run '^TestCeilingFixture_Build$' -v
+
+# Then, under the ceiling. On windows the harness applies its own and needs no wrapper.
+go test ./tests/ -tags=stress -c -o /tmp/graphene.test
+sudo systemd-run --scope --uid=$(id -u) --gid=$(id -g) \
+  -p MemoryMax=2G -p MemorySwapMax=0 \
+  env GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_READONLY=1 \
+      GRAPHENE_RSS_DIR=/var/tmp/fixture GRAPHENE_RSS_NODES=1400000 \
+  /tmp/graphene.test -test.run '^TestCeiling_' -test.v
+```
+
+`MemorySwapMax=0` matters as much as `MemoryMax`: with swap available the cgroup pushes
+anonymous pages out instead of failing, and the run then measures how patient the disk is
+rather than whether the store fits.
+
 ## Reproducing these figures
 
 Every number above comes from `tests/rss_bench_test.go` behind the `stress` tag. The
@@ -1255,6 +1444,10 @@ fixture knobs:
 | `GRAPHENE_RSS_NOINDEX` | declare and populate no index at all — the differencing arm of §3 |
 | `GRAPHENE_RSS_CYCLES` | rebuild cycles for `BenchmarkRSS_RebuildCycle` (§5) |
 | `GRAPHENE_RSS_MODES` | the configuration `BenchmarkRSS_ModeMatrix` opens under (§8): `<image>/<index>/<adjacency>[/live]`, one per process |
+| `GRAPHENE_CEILING_MIB` | the ceiling `TestCeiling_*` claims to run under (§9). The run refuses unless the kernel reports one at least this tight |
+| `GRAPHENE_CEILING_BUILD` | build the ceiling fixture and measure nothing — the step that must run *outside* the limit |
+| `GRAPHENE_CEILING_READONLY` | stop the sequence after the scan: the consumer's aggregate process, and the arm that fits at the full shape |
+| `GRAPHENE_CEILING_DELTA_MIB` | bound the delta during the rebuild via `CompactionPolicy.MaxDeltaBytes`; unset rebuilds into one delta |
 
 **Use `GRAPHENE_RSS_DIR` for anything that reports a peak.** Building a 1.4M-node
 fixture peaks near 9.4 GiB and `peakMiB` is a process-lifetime high-water mark, so a

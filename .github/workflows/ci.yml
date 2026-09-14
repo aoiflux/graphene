@@ -188,6 +188,125 @@ jobs:
           GRAPHENE_PERSISTENT_STRESS: "1"
         run: go test ./tests/ -tags=stress -count=1 -run TestStress -timeout 50m
 
+  # The memory programme's end-to-end acceptance: the consumer's own sequence
+  # under the RAM ceiling it was sized for. Nightly beside the deep stress.
+  #
+  # Two arms, because only one of them holds at the full shape and both facts
+  # matter. A 1,400,000-node store -- 1,689 MiB on disk, thirteen index entries
+  # per node -- opens and scans in 561 MiB of anonymous memory under 2 GiB.
+  # Rebuilding that whole layer in one process needs 3.9 GiB, because a
+  # compaction leaves its own output resident until the store is reopened; see
+  # docs/MEMORY_MODEL.md section 9. So the read-only arm runs at the full shape
+  # and the write arm at one that fits, and neither hides the other.
+  #
+  # The fixtures are built first and outside the limit. A 1.4M-node build peaks
+  # at several times what the finished store costs to open, so a run that built
+  # its own would fail in the builder and say nothing about the store.
+  #
+  # These jobs fail when no ceiling is in force. That is the point: a step whose
+  # limit silently failed to apply would run the workload unconstrained and go
+  # green, which is the one outcome worse than a red one.
+  ceiling-linux:
+    name: 2 GiB ceiling (linux, cgroup v2)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      BIG: /var/tmp/graphene-ceiling-big
+      SMALL: /var/tmp/graphene-ceiling-small
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Compiled once and run under systemd-run, rather than running `go test`
+      # as root inside the scope: the toolchain would then write its caches as
+      # another user, and the thing under test is the store, not the build.
+      - name: Compile the stress binary
+        run: go test ./tests/ -tags=stress -c -o /tmp/graphene.test
+
+      - name: Build both fixtures, unconstrained
+        env:
+          GRAPHENE_CEILING_BUILD: "1"
+        run: |
+          GRAPHENE_RSS_DIR=$BIG GRAPHENE_RSS_NODES=1400000 \
+            /tmp/graphene.test -test.run '^TestCeilingFixture_Build$' -test.v -test.timeout 40m
+          GRAPHENE_RSS_DIR=$SMALL GRAPHENE_RSS_NODES=200000 \
+            /tmp/graphene.test -test.run '^TestCeilingFixture_Build$' -test.v -test.timeout 10m
+
+      # systemd-run rather than `ulimit -v`: RLIMIT_AS bounds the virtual address
+      # space, which counts every byte of the mapped image even though none of it
+      # is charged to this process -- so it would refuse a store that fits, and
+      # it constrains exactly the term this programme moved out of the way.
+      # MemorySwapMax=0 matters as much as MemoryMax: a cgroup with swap pushes
+      # anonymous pages out instead of failing, and the run then measures how
+      # patient the disk is rather than whether the store fits.
+      - name: Open and scan 1.4M nodes under 2 GiB
+        run: |
+          sudo systemd-run --scope --quiet --uid=$(id -u) --gid=$(id -g) \
+            -p MemoryMax=2G -p MemorySwapMax=0 \
+            env GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_READONLY=1 \
+                GRAPHENE_RSS_DIR=$BIG GRAPHENE_RSS_NODES=1400000 \
+            /tmp/graphene.test -test.run '^TestCeiling_' -test.v -test.timeout 30m
+
+      - name: Rebuild and compact 200k nodes under 2 GiB
+        run: |
+          sudo systemd-run --scope --quiet --uid=$(id -u) --gid=$(id -g) \
+            -p MemoryMax=2G -p MemorySwapMax=0 \
+            env GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_DELTA_MIB=64 \
+                GRAPHENE_RSS_DIR=$SMALL GRAPHENE_RSS_NODES=200000 \
+            /tmp/graphene.test -test.run '^TestCeiling_' -test.v -test.timeout 30m
+
+  # The same two arms on windows, where the harness applies its own Job Object
+  # rather than being wrapped: a process may limit itself there without any
+  # privilege, and there is no convenient way to do it from outside. The limit
+  # is on commit charge, which a read-only file mapping does not count toward --
+  # the same asymmetry as a page cache the kernel reclaims.
+  ceiling-windows:
+    name: 2 GiB ceiling (windows, Job Object)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build both fixtures, unconstrained
+        env:
+          GRAPHENE_CEILING_BUILD: "1"
+        run: |
+          $env:GRAPHENE_RSS_DIR = "$env:RUNNER_TEMP\graphene-ceiling-big"
+          $env:GRAPHENE_RSS_NODES = "1400000"
+          go test ./tests/ -tags=stress -run '^TestCeilingFixture_Build$' -v -count=1 -timeout 40m
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $env:GRAPHENE_RSS_DIR = "$env:RUNNER_TEMP\graphene-ceiling-small"
+          $env:GRAPHENE_RSS_NODES = "200000"
+          go test ./tests/ -tags=stress -run '^TestCeilingFixture_Build$' -v -count=1 -timeout 10m
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Open and scan 1.4M nodes under 2 GiB
+        env:
+          GRAPHENE_CEILING_MIB: "2048"
+          GRAPHENE_CEILING_READONLY: "1"
+          GRAPHENE_RSS_NODES: "1400000"
+        run: |
+          $env:GRAPHENE_RSS_DIR = "$env:RUNNER_TEMP\graphene-ceiling-big"
+          go test ./tests/ -tags=stress -run '^TestCeiling_' -v -count=1 -timeout 30m
+
+      - name: Rebuild and compact 200k nodes under 2 GiB
+        env:
+          GRAPHENE_CEILING_MIB: "2048"
+          GRAPHENE_CEILING_DELTA_MIB: "64"
+          GRAPHENE_RSS_NODES: "200000"
+        run: |
+          $env:GRAPHENE_RSS_DIR = "$env:RUNNER_TEMP\graphene-ceiling-small"
+          go test ./tests/ -tags=stress -run '^TestCeiling_' -v -count=1 -timeout 30m
+
   # Cross-compiled release binaries. Runs on every push so a build break on a
   # platform nobody develops on is caught when it is introduced rather than on
   # release day; uploads artifacts only for a tag.
