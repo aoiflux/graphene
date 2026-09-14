@@ -589,20 +589,40 @@ func (p *PropertyIndex) EdgeCardinality(key string, value []byte) int {
 // materialises the entire index — but it does allocate the key's distinct values
 // to order them, for the reason postings.forEach gives.
 func (p *PropertyIndex) ForEachNodeEntry(key string, fn func(id store.NodeID, value []byte) bool) {
-	p.forEachNodeEntryBuf(key, nil, fn)
+	p.forEachNodeEntryBuf(key, &deltaCopy[store.NodeID]{}, fn)
 }
 
-// forEachNodeEntryBuf is ForEachNodeEntry with the value buffer carried in, for
-// a walk that spans keys. See postings.forEachBuf.
-func (p *PropertyIndex) forEachNodeEntryBuf(key string, dst []string, fn func(id store.NodeID, value []byte) bool) []string {
+// forEachNodeEntryBuf is ForEachNodeEntry with the buffers carried in, for a
+// walk that spans keys.
+//
+// fn runs with no shard lock held, and that is a correctness requirement rather
+// than a courtesy. fn is caller code, and a store's own implementation of it
+// resolves the id against the records, which takes the store lock — while every
+// write path takes the store lock first and a shard lock second. A walk that
+// called fn under the shard lock closed that cycle: a snapshot property walk
+// against an ordinary IndexNodeProperty was enough to hang both, with no
+// compaction anywhere near it. stream.go's header had already named the hazard
+// for the id path; this is the same answer for the entry path, and the delta's
+// half of the key is copied out from under the lock for the same reason.
+//
+// The base is loaded after that copy and never before, which is load-bearing
+// against SwapBase. A compaction installs the new base and only then empties the
+// shards, so a copy taken before the clear pairs with either base and is a
+// superset either way, while a copy taken after it has already synchronised with
+// the clear and must therefore observe the new base. Load the base first and a
+// walk can pair the old base with an emptied delta, which is neither half of the
+// answer and is silent about it.
+func (p *PropertyIndex) forEachNodeEntryBuf(key string, d *deltaCopy[store.NodeID], fn func(id store.NodeID, value []byte) bool) {
 	sh := p.shardFor(key)
 	sh.mu.RLock()
-	defer sh.mu.RUnlock()
+	d.fill(sh.nodes.byKey[key])
+	sh.mu.RUnlock()
+
 	if s, hasBase := p.nodeBase(); hasBase {
-		dst, _ = s.mergeForEachEntry(key, sh.nodes.byKey[key], dst, nil, fn)
-		return dst
+		d.merge = s.mergeForEachEntry(key, d.vals, d.idsAt, d.merge, fn)
+		return
 	}
-	return sh.nodes.forEachBuf(key, dst, fn)
+	d.forEach(fn)
 }
 
 // ForEachNodeValue calls fn once per distinct value under key, with that value's
@@ -620,7 +640,9 @@ func (p *PropertyIndex) ForEachNodeValue(key string, fn func(value []byte, ids [
 	// on the unordered form — forEachValue's callers are filter scans — and the
 	// order is not promised, so this is not a contract that has now changed.
 	if s, hasBase := p.nodeBase(); hasBase {
-		s.mergeForEachValue(key, sh.nodes.byKey[key], nil, nil, fn)
+		bucket := sh.nodes.byKey[key]
+		vals := sortedBucketValues(bucket, nil)
+		s.mergeForEachValue(key, vals, func(i int) []store.NodeID { return bucket[vals[i]] }, nil, fn)
 		return
 	}
 	sh.nodes.forEachValue(key, fn)
@@ -632,7 +654,9 @@ func (p *PropertyIndex) ForEachEdgeValue(key string, fn func(value []byte, ids [
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	if s, hasBase := p.edgeBase(); hasBase {
-		s.mergeForEachValue(key, sh.edges.byKey[key], nil, nil, fn)
+		bucket := sh.edges.byKey[key]
+		vals := sortedBucketValues(bucket, nil)
+		s.mergeForEachValue(key, vals, func(i int) []store.EdgeID { return bucket[vals[i]] }, nil, fn)
 		return
 	}
 	sh.edges.forEachValue(key, fn)
@@ -641,19 +665,21 @@ func (p *PropertyIndex) ForEachEdgeValue(key string, fn func(value []byte, ids [
 // ForEachEdgeEntry calls fn for every (id, value) registered under key.
 // Return false from fn to stop early.
 func (p *PropertyIndex) ForEachEdgeEntry(key string, fn func(id store.EdgeID, value []byte) bool) {
-	p.forEachEdgeEntryBuf(key, nil, fn)
+	p.forEachEdgeEntryBuf(key, &deltaCopy[store.EdgeID]{}, fn)
 }
 
 // forEachEdgeEntryBuf is forEachNodeEntryBuf for edge properties.
-func (p *PropertyIndex) forEachEdgeEntryBuf(key string, dst []string, fn func(id store.EdgeID, value []byte) bool) []string {
+func (p *PropertyIndex) forEachEdgeEntryBuf(key string, d *deltaCopy[store.EdgeID], fn func(id store.EdgeID, value []byte) bool) {
 	sh := p.shardFor(key)
 	sh.mu.RLock()
-	defer sh.mu.RUnlock()
+	d.fill(sh.edges.byKey[key])
+	sh.mu.RUnlock()
+
 	if s, hasBase := p.edgeBase(); hasBase {
-		dst, _ = s.mergeForEachEntry(key, sh.edges.byKey[key], dst, nil, fn)
-		return dst
+		d.merge = s.mergeForEachEntry(key, d.vals, d.idsAt, d.merge, fn)
+		return
 	}
-	return sh.edges.forEachBuf(key, dst, fn)
+	d.forEach(fn)
 }
 
 // NodeEntries returns all indexed node property entries, ordered by
@@ -760,6 +786,65 @@ func sortedBucketValues[T entityID](bucket map[string][]T, dst []string) []strin
 	}
 	slices.Sort(dst)
 	return dst
+}
+
+// deltaCopy is one key's delta half, lifted out from under the shard lock so
+// that the walk above it can yield to caller code holding no lock at all.
+//
+// The values did not have to be copied — they are strings and this index never
+// mutates one — but the id lists did: a postings list is the shard's own slice
+// and the next write may reallocate it or shift it under a reader. That is the
+// same reason IDStream copies its delta side, stated in stream.go, and this is
+// the entry walk's form of it.
+//
+// One flat id buffer with an offset per value, rather than a slice per value:
+// the walk is over a whole key and a map of slices would allocate once per
+// distinct value. All four buffers are reused across the keys of one walk, so a
+// walk allocates for its largest key and then not again — and on a compacted
+// store the shards are empty, which makes the whole of this nothing.
+type deltaCopy[T entityID] struct {
+	vals  []string
+	off   []int32
+	ids   []T
+	merge []T
+}
+
+// fill copies key's bucket. The caller holds the shard read lock; nothing the
+// result points at belongs to the shard once it returns.
+//
+// The sort is not optional, and it is not here for the merge's benefit. Entries
+// live in a map, Go randomises map iteration, and an export walks this to write
+// its property section: without it two dumps of one unchanged graph differ in
+// the order of their property lines, so an export cannot tell a caller which of
+// the two is the graph. It reproduced about one run in seven on a 200-value key.
+// postings.forEachValue, whose callers are filter scans that read only the value
+// and do not care in which order they reject it, deliberately does not sort —
+// and the cost is the smaller term either way, being over distinct values while
+// the walk it orders visits every entry under each of them.
+func (d *deltaCopy[T]) fill(bucket map[string][]T) {
+	d.vals = sortedBucketValues(bucket, d.vals)
+	d.off = append(d.off[:0], 0)
+	d.ids = d.ids[:0]
+	for _, v := range d.vals {
+		d.ids = append(d.ids, bucket[v]...)
+		d.off = append(d.off, int32(len(d.ids)))
+	}
+}
+
+// idsAt returns the ids copied out from under vals[i]. Only valid once fill has
+// finished, because the append above may move d.ids.
+func (d *deltaCopy[T]) idsAt(i int) []T { return d.ids[d.off[i]:d.off[i+1]] }
+
+// forEach yields the copy on its own, for an index with no base attached.
+func (d *deltaCopy[T]) forEach(fn func(id T, value []byte) bool) {
+	for i, v := range d.vals {
+		raw := unsafeBytes(v)
+		for _, id := range d.idsAt(i) {
+			if !fn(id, raw) {
+				return
+			}
+		}
+	}
 }
 
 // nodePropKeys and edgePropKeys return every indexed key, sorted.
@@ -1305,49 +1390,6 @@ func (p *postings[T]) forEachValue(key string, fn func(value []byte, ids []T) bo
 	}
 }
 
-// forEach visits every (id, value) under key, values in ascending byte order and
-// ids ascending within each value — the order NodeEntries produces, because this
-// is NodeEntries' streaming form and owes the same contract for the reason that
-// function's comment gives at length.
-//
-// The sort is not optional. Entries live in a map, Go randomises map iteration,
-// and an export walks this to write its property section: without it two dumps
-// of one unchanged graph differ in the order of their property lines, so an
-// export cannot tell a caller which of the two is the graph. It reproduced about
-// one run in seven on a 200-value key.
-//
-// forEachValue above deliberately does not sort. Its callers are filter scans
-// that read only the value and do not care in which order they reject it, and
-// they are the hot path this one is not: the only callers of forEach are
-// ForEachNodeProperty and ForEachEdgeProperty. The sort is over distinct values
-// while the walk it orders visits every entry under each of them, so it is the
-// smaller term either way.
-func (p *postings[T]) forEach(key string, fn func(id T, value []byte) bool) {
-	p.forEachBuf(key, nil, fn)
-}
-
-// forEachBuf is forEach with the value buffer supplied, so a walk over several
-// keys sorts into one slice instead of one per key. It returns the buffer,
-// grown to whatever the largest key needed — the same reuse NodeEntries makes
-// across its keys, and it matters for the same reason: the buffer is as long as
-// a key's distinct values, which on a high-cardinality key is most of the index.
-func (p *postings[T]) forEachBuf(key string, dst []string, fn func(id T, value []byte) bool) []string {
-	bucket := p.byKey[key]
-	if bucket == nil {
-		return dst
-	}
-	dst = sortedBucketValues(bucket, dst)
-	for _, value := range dst {
-		raw := unsafeBytes(value)
-		for _, id := range bucket[value] {
-			if !fn(id, raw) {
-				return dst
-			}
-		}
-	}
-	return dst
-}
-
 // forEachAll visits every (id, key, value) triple in the index, copying each
 // value so the callback may retain it.
 func (p *postings[T]) forEachAll(fn func(id T, key string, value []byte) bool) {
@@ -1607,10 +1649,10 @@ func deleteSorted[T entityID](ids []T, id T) ([]T, bool) {
 //
 // The value slice is owned by the index: read it, do not retain or mutate it.
 func (p *PropertyIndex) ForEachNodeProperty(fn func(id store.NodeID, key string, value []byte) bool) {
-	var vals []string
+	var d deltaCopy[store.NodeID]
 	for _, key := range p.nodePropKeys() {
 		stop := false
-		vals = p.forEachNodeEntryBuf(key, vals, func(id store.NodeID, value []byte) bool {
+		p.forEachNodeEntryBuf(key, &d, func(id store.NodeID, value []byte) bool {
 			if !fn(id, key, value) {
 				stop = true
 				return false
@@ -1625,10 +1667,10 @@ func (p *PropertyIndex) ForEachNodeProperty(fn func(id store.NodeID, key string,
 
 // ForEachEdgeProperty is ForEachNodeProperty for edge properties.
 func (p *PropertyIndex) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value []byte) bool) {
-	var vals []string
+	var d deltaCopy[store.EdgeID]
 	for _, key := range p.edgePropKeys() {
 		stop := false
-		vals = p.forEachEdgeEntryBuf(key, vals, func(id store.EdgeID, value []byte) bool {
+		p.forEachEdgeEntryBuf(key, &d, func(id store.EdgeID, value []byte) bool {
 			if !fn(id, key, value) {
 				stop = true
 				return false

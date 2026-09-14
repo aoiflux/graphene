@@ -21,8 +21,14 @@ package disk
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
+	"runtime"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aoiflux/graphene/store"
 )
@@ -509,5 +515,326 @@ func TestCompactCtx_CancelDuringBuildLeavesTheStoreAlone(t *testing.T) {
 		if _, err := s.GetNode(id); err != nil {
 			t.Fatalf("node %d lost by the following compaction: %v", id, err)
 		}
+	}
+}
+
+// nodePropSet is every indexed node property a snapshot of s can see, keyed by
+// id and key.
+//
+// The value is copied into a string deliberately. A value handed to this
+// callback belongs to the index for the duration of the call and no longer —
+// under IndexMapped it addresses the image — so copying is the contract this
+// test keeps, as distinct from the one it is testing.
+func nodePropSet(s *Store) (map[string]string, error) {
+	sn, err := s.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	defer sn.Close()
+	pe, ok := sn.(store.PropertyEnumerator)
+	if !ok {
+		return nil, errors.New("a disk snapshot no longer enumerates properties")
+	}
+	out := make(map[string]string)
+	pe.ForEachNodeProperty(func(id store.NodeID, key string, value []byte) bool {
+		out[fmt.Sprintf("%d/%s", id, key)] = string(value)
+		return true
+	})
+	return out, nil
+}
+
+// missingFrom names one entry of want that got does not have, or "" when got
+// holds all of them. Entries got has and want does not are not a difference:
+// want is a lower bound taken at an instant, and a walk that ran afterwards is
+// entitled to more.
+//
+// One entry rather than a count, because a count does not say what a walk lost,
+// and the sorted order is so that the one it names is the same on every run.
+func missingFrom(got, want map[string]string) string {
+	for _, k := range slices.Sorted(maps.Keys(want)) {
+		g, ok := got[k]
+		if !ok {
+			return fmt.Sprintf("%s=%q is missing", k, want[k])
+		}
+		if g != want[k] {
+			return fmt.Sprintf("%s reads %q, want %q", k, g, want[k])
+		}
+	}
+	return ""
+}
+
+// TestMapping_ConcurrentCompactUnmap reads the property index out of a mapping
+// while the compactions that produced it release the one before.
+//
+// Until a compaction adopted its own output this test had nothing to race. A
+// store mapped its image once at Open and unmapped it at Close; the only code
+// that ever released a mapping was a live reader's reload, and a compaction
+// neither created one nor retired one. Now every compaction maps the image it
+// has just written, installs the index base read out of it, and sweeps the
+// mapping the previous base was read from as soon as the collector agrees
+// nothing can reach it. That is a compaction unmapping a file while readers are
+// reading one, which is what this is named for.
+//
+// The reader is snapshot.ForEachNodeProperty deliberately. It is the one index
+// path that does not hold the store lock across its walk, so it is the only one
+// a commit can overlap rather than queue behind, and under IndexMapped the
+// values it hands the callback address the mapping. A sweep that released a
+// base a walk was still inside would fault here, attributably, rather than
+// somewhere else much later.
+//
+// Two things are asserted.
+//
+// No compaction makes a walk lose an entry. Each round registers entries that
+// live only in the shards, publishes the whole set as a lower bound, and only
+// then compacts; every walk overlapping that compaction has to hold at least
+// that bound. The entries added per round are what give the bound any force —
+// with a fixed set the old base already holds everything, so any answer at all
+// satisfies it — and the first version of this test did without them.
+//
+// What this does *not* establish is the order in which the walk makes its two
+// reads, and that is worth saying plainly because it is what the comment here
+// first claimed. The window between loading the base and copying the delta is
+// two instructions wide: with the reads deliberately reversed in the source,
+// this test passed ten runs out of ten. The ordering is pinned instead by
+// index's TestForEachNodeEntry_LoadsTheBaseAfterCopyingTheDelta, which holds the
+// walk still on a shard lock and performs the swap's two halves by hand. What
+// remains here is the integration property — a store, real compactions, real
+// mappings — which is worth having and is not the same claim.
+//
+// And a mapping that has left the store's list has been unmapped, while one
+// still in it has not. Identity is tracked rather than the count, because a
+// bounded count is also what a store that quietly stopped mapping would report.
+func TestMapping_ConcurrentCompactUnmap(t *testing.T) {
+	s, _ := openFresh(t)
+	defer s.Close()
+	requireAdoptable(t, s)
+
+	payloadFixture(t, s, 300)
+	if err := s.Compact(); err != nil {
+		t.Fatalf("the compaction that gives this test something to race: %v", err)
+	}
+	if got := s.indexHolding(); got != IndexMapped.String() {
+		t.Skipf("this store did not adopt its own output (%q), so no compaction here unmaps anything", got)
+	}
+
+	first, err := nodePropSet(s)
+	if err != nil {
+		t.Fatalf("the quiescent walk: %v", err)
+	}
+	if len(first) == 0 {
+		t.Fatal("the fixture indexed nothing, so a walk that returned nothing would pass")
+	}
+
+	// The lower bound every walk must hold, republished by the main goroutine
+	// after each round's writes and before that round's compaction. A reader
+	// loads it and then walks, so the walk is always at least as late as the
+	// bound it is judged against.
+	var bound atomic.Pointer[map[string]string]
+	bound.Store(&first)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var walks atomic.Int64
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				want := *bound.Load()
+				got, werr := nodePropSet(s)
+				if werr != nil {
+					t.Errorf("a walk overlapping a compaction: %v", werr)
+					return
+				}
+				if miss := missingFrom(got, want); miss != "" {
+					t.Errorf("a walk overlapping a compaction saw %d entries and lost one of the %d "+
+						"it had to hold: %s", len(got), len(want), miss)
+					return
+				}
+				walks.Add(1)
+			}
+		}()
+	}
+
+	// The mappings this store has held at any point, and the ones it has let go
+	// of. A sweep only releases what the collector has already agreed is
+	// unreachable, so the GC is part of the sample rather than of the setup.
+	seen := map[*mapping]bool{}
+	released := 0
+	sample := func(when string) {
+		runtime.GC()
+		runtime.GC()
+		s.mu.RLock()
+		held := make(map[*mapping]bool, len(s.indexImages))
+		for _, m := range s.indexImages {
+			held[m] = true
+			seen[m] = true
+			if m.unmapped.Load() {
+				t.Errorf("%s: a mapping is listed as the index's after being unmapped", when)
+			}
+		}
+		live := len(s.indexImages)
+		s.mu.RUnlock()
+		for m := range seen {
+			if held[m] {
+				continue
+			}
+			if !m.unmapped.Load() {
+				t.Errorf("%s: a mapping left the list without being unmapped", when)
+			}
+			released++
+			delete(seen, m)
+		}
+		t.Logf("%s: %d mappings held, %d released so far", when, live, released)
+	}
+
+	fail := func(format string, args ...any) {
+		close(stop)
+		wg.Wait()
+		t.Fatalf(format, args...)
+	}
+
+	const rounds = 6
+	for c := range rounds {
+		// Entries that exist only in the shards until this round's compaction
+		// folds them into a new base. Without them the old base is already a
+		// complete answer, and the bound below asks nothing of anybody.
+		for i := range 20 {
+			id, aerr := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+			if aerr != nil {
+				fail("AddNode in round %d: %v", c, aerr)
+			}
+			if ierr := s.IndexNodeProperty(id, "path", []byte(fmt.Sprintf("/r%02d/%02d", c, i))); ierr != nil {
+				fail("IndexNodeProperty in round %d: %v", c, ierr)
+			}
+		}
+		next, nerr := nodePropSet(s)
+		if nerr != nil {
+			fail("the walk that takes round %d's bound: %v", c, nerr)
+		}
+		bound.Store(&next)
+
+		if err := s.Compact(); err != nil {
+			fail("Compact %d: %v", c, err)
+		}
+		sample(fmt.Sprintf("round %d", c))
+	}
+	close(stop)
+	wg.Wait()
+
+	if walks.Load() == 0 {
+		t.Fatal("no walk finished while the compactions ran, so this test raced nothing")
+	}
+
+	// Quiescent now, so the bases the walks were holding on their stacks are
+	// unreachable and the next commit's sweep is free to release them. Without
+	// this the release count is whatever the readers happened to be holding when
+	// they stopped, which is not something to assert on.
+	runtime.GC()
+	runtime.GC()
+	if err := s.Compact(); err != nil {
+		t.Fatalf("the quiescent compaction that sweeps: %v", err)
+	}
+	sample("quiescent")
+
+	if released == 0 {
+		t.Errorf("%d compactions each mapped an image and none was released: either the sweep "+
+			"is not running or nothing here ever becomes retirable", rounds+1)
+	}
+	got, err := nodePropSet(s)
+	if err != nil {
+		t.Fatalf("the final walk: %v", err)
+	}
+	want := *bound.Load()
+	if miss := missingFrom(got, want); miss != "" {
+		t.Errorf("after %d compactions the index answers with %d entries and has lost one of the "+
+			"%d it held: %s", rounds+1, len(got), len(want), miss)
+	}
+	if len(got) <= len(first) {
+		t.Errorf("the rounds added %d entries to the %d the fixture made and the index reports %d: "+
+			"nothing was ever delta-only, so the ordering was not exercised",
+			rounds*20, len(first), len(got))
+	}
+	t.Logf("%d walks finished across %d compactions, %d mappings released", walks.Load(), rounds+1, released)
+}
+
+// TestSnapshot_PropertyWalkAgainstIndexWrite is the whole lock cycle, built out
+// of the two ordinary operations that close it.
+//
+// A store's write path takes the store lock and then a shard lock:
+// IndexNodeProperty is s.mu.Lock followed by PropertyIndex.IndexNode. A snapshot
+// property walk runs the other way round — it enters the index with no store
+// lock at all, and its callback takes s.mu to ask whether the id it was handed
+// still exists. If the walk is holding a shard lock while it does that, the two
+// are a cycle, and this test hung against it: the writer parked on the shard and
+// the walker parked on the store, with no compaction anywhere near either.
+//
+// The index-side half of the guard is index/walk_lock_test.go, which is sharper
+// and deterministic. This one is the integration: it is the arrangement a bulk
+// export against a live writer actually makes, and it is what would have caught
+// the bug where it was found rather than where it lives.
+func TestSnapshot_PropertyWalkAgainstIndexWrite(t *testing.T) {
+	s, _ := openFresh(t)
+	defer s.Close()
+	payloadFixture(t, s, 200)
+
+	// A compaction first, so the walk merges a base with the delta rather than
+	// reading the shards alone. Both shapes have to survive this; the merged one
+	// is the shape a store that has been running for any length of time is in.
+	if err := s.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	// Both sides are bounded rather than run against a stop channel, and that is
+	// about what this measures rather than about tidiness: an unbounded writer
+	// makes every walk longer than the one before it, so a slow run and a hung
+	// one stop being distinguishable by a deadline.
+	const rounds = 1000
+	writes := make(chan struct{})
+	go func() {
+		defer close(writes)
+		for w := range rounds {
+			id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+			if err != nil {
+				t.Errorf("AddNode: %v", err)
+				return
+			}
+			if err := s.IndexNodeProperty(id, "path", []byte(fmt.Sprintf("/w/%06d", w))); err != nil {
+				t.Errorf("IndexNodeProperty: %v", err)
+				return
+			}
+		}
+	}()
+
+	walked := make(chan int)
+	go func() {
+		n := 0
+		for round := range rounds {
+			got, err := nodePropSet(s)
+			if err != nil {
+				t.Errorf("walk %d: %v", round, err)
+				break
+			}
+			n += len(got)
+		}
+		walked <- n
+	}()
+
+	// Twenty seconds is not a latency assertion. Against the cycle this finishes
+	// never; against a walk that holds no shard lock it finishes in a second or
+	// two, and it is the difference between those two that is being tested.
+	select {
+	case n := <-walked:
+		<-writes
+		if n == 0 {
+			t.Fatal("a thousand walks saw no entries at all, so nothing here was tested")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("DEADLOCK: a snapshot property walk and an indexing write, no compaction involved")
 	}
 }

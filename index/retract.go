@@ -366,10 +366,9 @@ func (p *PropertyIndex) clearDelta() {
 // Filing the same (id, pos, value) twice is a no-op, so an entry the base and the
 // delta both hold costs one redundant register and nothing else.
 func fillCompositeFromBase[T entityID](s baseSide[T], idx *compositeIndex[T]) {
-	var vals []string
 	var buf []T
 	for pos, key := range idx.keys {
-		vals, buf = s.mergeForEachEntry(key, nil, vals, buf,
+		buf = s.mergeForEachEntry(key, nil, nil, buf,
 			func(id T, value []byte) bool {
 				idx.register(id, pos, string(value))
 				return true

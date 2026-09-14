@@ -54,11 +54,11 @@ func (p *PropertyIndex) NodeValueWalker() func(key string, fn func(value []byte,
 		sh.mu.RLock()
 		defer sh.mu.RUnlock()
 		bucket := sh.nodes.byKey[key]
+		vals = sortedBucketValues(bucket, vals)
 		if s, hasBase := p.nodeBase(); hasBase {
-			vals, buf = s.mergeForEachValue(key, bucket, vals, buf, fn)
+			buf = s.mergeForEachValue(key, vals, func(i int) []store.NodeID { return bucket[vals[i]] }, buf, fn)
 			return
 		}
-		vals = sortedBucketValues(bucket, vals)
 		for _, value := range vals {
 			if !fn(unsafeBytes(value), bucket[value]) {
 				return
@@ -76,11 +76,11 @@ func (p *PropertyIndex) EdgeValueWalker() func(key string, fn func(value []byte,
 		sh.mu.RLock()
 		defer sh.mu.RUnlock()
 		bucket := sh.edges.byKey[key]
+		vals = sortedBucketValues(bucket, vals)
 		if s, hasBase := p.edgeBase(); hasBase {
-			vals, buf = s.mergeForEachValue(key, bucket, vals, buf, fn)
+			buf = s.mergeForEachValue(key, vals, func(i int) []store.EdgeID { return bucket[vals[i]] }, buf, fn)
 			return
 		}
-		vals = sortedBucketValues(bucket, vals)
 		for _, value := range vals {
 			if !fn(unsafeBytes(value), bucket[value]) {
 				return

@@ -270,6 +270,15 @@ func (s baseSide[T]) mergeKeys(delta []string) []string {
 // mergeForEachValue walks key's distinct values across base and delta together,
 // ascending by value, calling fn once per value with the merged id list.
 //
+// The delta side arrives as an ascending value list and a function returning the
+// ids under vals[i], rather than as the shard's map. That is what lets one merge
+// serve both a walk that holds the shard lock for its whole length — the value
+// walks, whose callers already hold the store lock and so cannot invert against
+// it — and a walk that must not, which is every walk that yields to caller code.
+// See deltaCopy in property_index.go for the second kind and why it exists. A nil
+// idsOf means the delta has no side here at all, which is what the composite
+// refill passes.
+//
 // buf is scratch for the values both sides hold; it is returned so a walk across
 // several keys reuses one allocation. ids handed to fn is either the delta's own
 // slice, a base run merged into buf, or buf alone — in every case it belongs to
@@ -281,21 +290,20 @@ func (s baseSide[T]) mergeKeys(delta []string) []string {
 // stop and a completed walk the same way — as no error — so without the flag the
 // delta's remaining values would be drained into a callback that has already said
 // it wants nothing more. Which is how the first version of this got it wrong.
-func (s baseSide[T]) mergeForEachValue(key string, bucket map[string][]T, vals []string, buf []T,
+func (s baseSide[T]) mergeForEachValue(key string, vals []string, idsOf func(i int) []T, buf []T,
 	fn func(value []byte, ids []T) bool,
-) ([]string, []T) {
-	vals = sortedBucketValues(bucket, vals)
+) []T {
 	j, stopped := 0, false
 	err := s.base().ForEachValue(s.kind, key, nil, func(value []byte, run IDRun) bool {
 		for ; j < len(vals) && bytes.Compare(unsafeBytes(vals[j]), value) < 0; j++ {
-			if !fn(unsafeBytes(vals[j]), bucket[vals[j]]) {
+			if !fn(unsafeBytes(vals[j]), idsOf(j)) {
 				stopped = true
 				return false
 			}
 		}
 		var delta []T
 		if j < len(vals) && vals[j] == string(value) {
-			delta = bucket[vals[j]]
+			delta = idsOf(j)
 			j++
 		}
 		buf = s.mergeRun(buf[:0], run, delta)
@@ -318,20 +326,20 @@ func (s baseSide[T]) mergeForEachValue(key string, bucket map[string][]T, vals [
 		s.fault(err)
 	}
 	for ; !stopped && j < len(vals); j++ {
-		if !fn(unsafeBytes(vals[j]), bucket[vals[j]]) {
+		if !fn(unsafeBytes(vals[j]), idsOf(j)) {
 			break
 		}
 	}
-	return vals, buf
+	return buf
 }
 
 // mergeForEachEntry is mergeForEachValue flattened to one call per entry, in
 // (value, id) order — the order NodeEntries contracts for and ForEachNodeProperty
 // inherits.
-func (s baseSide[T]) mergeForEachEntry(key string, bucket map[string][]T, vals []string, buf []T,
+func (s baseSide[T]) mergeForEachEntry(key string, vals []string, idsOf func(i int) []T, buf []T,
 	fn func(id T, value []byte) bool,
-) ([]string, []T) {
-	return s.mergeForEachValue(key, bucket, vals, buf, func(value []byte, ids []T) bool {
+) []T {
+	return s.mergeForEachValue(key, vals, idsOf, buf, func(value []byte, ids []T) bool {
 		for _, id := range ids {
 			if !fn(id, value) {
 				return false
