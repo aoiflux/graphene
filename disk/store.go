@@ -157,6 +157,13 @@ type Store struct {
 	// which the store says so. Zero disables it. Set once at Open.
 	deltaSoftLimit int64
 
+	// memBudget is Options.MemoryBudget as given: the heap ceiling a compaction
+	// is refused against. Zero disables it. Set once at Open, and kept because
+	// the Open-side check is over by then and the Compact-side one is not — a
+	// store compacting on a timer has to be able to ask months later. See
+	// budget.go.
+	memBudget int64
+
 	// deltaOverBudget is whether the delta is currently above that limit, and
 	// deltaBudgetReported whether the crossing has been announced to a metrics
 	// sink. Both are maintained by noteDeltaBytesLocked under the store lock and
@@ -767,6 +774,12 @@ type Options struct {
 	// both, which makes a failing background compaction silent — see
 	// store.CompactionObserver.
 	//
+	// Worth attaching one if MemoryBudget is set. A compaction refused for its
+	// size arrives here and nowhere else, and it recurs on every tick for as
+	// long as the policy keeps firing — which it will, because the refusal is
+	// what stopped the delta from shrinking. Without an observer that is a
+	// store whose delta grows without bound and says nothing.
+	//
 	// The same nil-by-default shape as Signer and Verifier, and where a metrics
 	// sink will attach. store.CompactionObserverFunc wraps a closure.
 	AutoCompactObserver store.CompactionObserver
@@ -801,9 +814,10 @@ type Options struct {
 	// Three things to know before setting either.
 	//
 	// They bound replay and nothing else. The image is loaded by the same Open
-	// and is not covered — on a compacted store it is the larger half. Gate on
-	// OpenEstimate.ImageBytes yourself; a general memory budget is a separate
-	// piece of work.
+	// and is not covered — on a compacted store it is the larger half. For a
+	// figure covering both, set MemoryBudget, which is modelled rather than
+	// counted and so answers a different question: these two refuse on what the
+	// log *is*, that one on what the whole open would *cost*.
 	//
 	// MaxReplayBytes is measured against the records region, not the file:
 	// OpenEstimate.WALReplayBytes, which is the log's size less its 50-byte
@@ -829,6 +843,52 @@ type Options struct {
 	// way to ask the question.
 	MaxReplayRecords int64
 	MaxReplayBytes   int64
+
+	// MemoryBudget bounds the heap an Open or a Compact may need, in bytes. Zero
+	// — and any negative value — is unlimited, which is the historical
+	// behaviour. Exceeding it refuses the operation with an error wrapping
+	// ErrMemoryBudget and carrying the arithmetic; see MemoryBudgetError.
+	//
+	// # It is a refusal and never a degradation
+	//
+	// Go cannot catch an out-of-memory condition: there is no allocation failure
+	// to handle and no warning before the OOM killer, so a process that has
+	// started allocating past what the machine has cannot do anything about it.
+	// This therefore decides *before* allocating and declines. It does not
+	// shrink a cache, spill a merge to disk, reduce a batch, or degrade a query
+	// plan, and no future version will make it do any of those silently — an
+	// engine that quietly got slower instead of saying no would be the outcome
+	// this option exists to prevent. See budget.go.
+	//
+	// # What it is compared against, at each of the two moments
+	//
+	// An Open is compared against OpenEstimate.HeapBytesFor for these same
+	// Options, which is a model built from the image header and a log walk. A
+	// Compact is compared against its working set plus what the store currently
+	// holds, as EstimateResident reports it. Both are models: retained heap, not
+	// resident set size, and a floor on the latter rather than a prediction of
+	// it — RSS ran 1.19x to 1.54x live heap on the one fixture measured. Leave
+	// room, and prefer a budget derived from a figure this package reported for
+	// a store of the shape you run over one derived from the machine's size.
+	//
+	// # Three things to know before setting it
+	//
+	// A refused Compact leaves a store that works and a delta that goes on
+	// growing. That is a worse position than having compacted, and the only
+	// position available: the compaction is what needs the memory. A caller
+	// running AutoCompact gets the refusal through AutoCompactObserver rather
+	// than as a failed write, and it is deliberately not recorded as a
+	// compaction failure — see checkCompactBudget.
+	//
+	// The Open check costs one sequential pass over the log, on top of the pass
+	// the replay itself will make. What is guaranteed is bounded memory, not
+	// bounded I/O.
+	//
+	// The figure is a whole-store one, not a whole-process one. Nothing here
+	// knows what else the program has allocated, so a budget set to the
+	// container's limit is a budget with no room for the program using the
+	// store.
+	MemoryBudget int64
 
 	// IDHeadroomWarn is the fraction of the identifier space remaining below
 	// which a completed compaction emits MetricIDHeadroomLow and writes an
@@ -1155,6 +1215,17 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		return nil, fmt.Errorf("disk.Open: %w", err)
 	}
 
+	// The memory budget, second, and here for the same two reasons. It is the
+	// more general of the two and the more expensive to evaluate — a model over
+	// the image header as well as the log — so the specific, cheap refusal goes
+	// first and a store over both budgets is refused on the one that names the
+	// log, which is the actionable half.
+	if err := checkOpenBudget(dir, opts); err != nil {
+		wal.Close()
+		lock.release()
+		return nil, fmt.Errorf("disk.Open: %w", err)
+	}
+
 	s := &Store{
 		dir:      dir,
 		wal:      wal,
@@ -1175,6 +1246,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		maxSnapshotAge: opts.MaxSnapshotAge,
 		idHeadroomWarn: opts.IDHeadroomWarn,
 		deltaSoftLimit: opts.DeltaSoftLimit,
+		memBudget:      opts.MemoryBudget,
 		imageMode:      opts.ImageMode,
 		indexMode:      opts.IndexMode,
 		adjacency:      opts.Adjacency,

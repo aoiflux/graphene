@@ -154,6 +154,13 @@ type compactPlan struct {
 	// figure the pin can take for free — both counts are maintained.
 	examined int64
 
+	// deltaBytes is what the delta's record payloads occupied at the pin, which
+	// is what the cloneBytes above has just made a second copy of. Taken here
+	// because the delta maintains it: summing it back out of deltaNodes and
+	// deltaEdges would be a pass over the copies for a number that was already
+	// known. The memory budget is its only reader — see compactWorkingSet.
+	deltaBytes int64
+
 	// propIdx is the store's property index, held by pointer: the one thing in
 	// this plan the store goes on mutating while the build runs. The build
 	// streams it -- see nodePropSeq -- rather than the pin materialising every
@@ -284,6 +291,22 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 		return err
 	}
 	defer s.compactRelease()
+
+	// The memory gate, and this is the only place it can be. Before the pin there
+	// are no counts to model from; after the build there is nothing left to
+	// refuse. Here the plan's figures are real, the release is already deferred,
+	// no temp file exists, and the store is exactly as a caller who never called
+	// Compact would have found it.
+	//
+	// Returned before the compaction metric below, deliberately, and for the
+	// reason the pin's own refusals are: this means no compaction happened, not
+	// that one failed, and a background compactor that reports a refusal as a
+	// failure gives an operator an error rate made entirely of the trigger
+	// working. AutoCompact passes it to AutoCompactObserver, which is where a
+	// caller who set a budget should be watching for it.
+	if err := s.checkCompactBudget(plan); err != nil {
+		return err
+	}
 
 	if s.afterPinHook != nil {
 		s.afterPinHook()
@@ -450,6 +473,7 @@ func (s *Store) compactPin() (*compactPlan, error) {
 	if cur.csr != nil {
 		examined += int64(cur.csr.NodeCount() + cur.csr.EdgeCount())
 	}
+	deltaBytes := cur.delta.bytes
 
 	// Chain this image to the one it replaces, so the sequence of compactions is
 	// itself verifiable. A substituted snapshot breaks the link even when the
@@ -506,6 +530,7 @@ func (s *Store) compactPin() (*compactPlan, error) {
 		deltaKnownNodes: knownNodes,
 		deltaKnownEdges: knownEdges,
 		examined:        examined,
+		deltaBytes:      deltaBytes,
 
 		nodeSeqHW:   s.nodeSeq.Load(),
 		edgeSeqHW:   s.edgeSeq.Load(),

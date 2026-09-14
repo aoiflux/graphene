@@ -2324,8 +2324,10 @@ if errors.Is(err, disk.ErrReplayBudget) { /* names both figures */ }
 Four things to know before setting either.
 
 - **They bound the replay and nothing else.** The image is loaded by the same
-  `Open` and is not covered; on a compacted store it is the larger half. Gate on
-  `est.ImageBytes` yourself.
+  `Open` and is not covered; on a compacted store it is the larger half. For a
+  figure covering both, set `MemoryBudget` below — it answers a different question:
+  these two refuse on what the log *is*, that one on what the whole open would
+  *cost*.
 - **`MaxReplayBytes` is compared against `WALReplayBytes`, not `WALBytes`** — the
   records region, not the file. The two differ by the log's 50-byte container
   header, which is small enough to go unnoticed and large enough to refuse a
@@ -2354,6 +2356,64 @@ A refused `Open` is not a no-op on disk: the directory is created if missing, a
 stranded rebuilt log is adopted, and an empty log is given its container header.
 Nothing is replayed and no ledger is opened. `PreflightOpen` is the only
 genuinely non-mutating way to ask.
+
+### Refusing an operation for its size
+
+```go
+s, err := disk.OpenWithOptions(dir, disk.Options{
+    MemoryBudget: 1 << 30,          // zero, and any negative, is unlimited
+})
+
+var over *disk.MemoryBudgetError
+if errors.As(err, &over) {
+    log.Printf("%s needs %d B on top of %d held, budget %d, short by %d",
+        over.Op, over.Need, over.Have, over.Budget, over.Over())
+}
+```
+
+Go cannot catch an out-of-memory condition — there is no allocation failure to
+handle and no warning before the OOM killer — so **this is a refusal and never a
+degradation**. It does not shrink a cache, spill a merge, reduce a batch, or
+degrade a plan. It decides before allocating and declines, and the store is
+exactly as it was.
+
+Two operations are gated, against two different figures.
+
+- **`Open`** is compared against `HeapBytesFor` for the Options being passed, so a
+  mapped open is not refused on the cost of a heap one. Checked beside the replay
+  budgets, after them: the cheap, specific refusal goes first, so a store over both
+  is refused on the one naming the log.
+- **`Compact`** is compared against its working set *plus* what the store is
+  currently holding, as `EstimateResident().Total` reports it. Checked after the
+  pin, which is the first moment the counts are real and the last before the build
+  has allocated anything: a refusal leaves no temp file and nothing to undo.
+
+Three things to know before setting it.
+
+- **A refused `Compact` is not a failed one.** The store works, and the delta goes
+  on growing — which is a worse position than having compacted and the only one
+  available, because the compaction is what needs the memory. Under `AutoCompact`
+  the refusal reaches `AutoCompactObserver` and nowhere else, and it recurs on
+  every tick for as long as the policy keeps firing. Attach an observer.
+- **Both figures are models**, not measurements: retained heap rather than RSS, and
+  a floor on it — resident ran 1.19–1.54× live heap on the one fixture measured.
+  Leave room, and prefer a budget derived from a figure this package reported for a
+  store of your shape over one derived from the machine's size.
+- **It is a whole-store figure, not a whole-process one.** Nothing here knows what
+  else your program has allocated, so a budget set to the container's limit is a
+  budget with no room for the program using the store. The floor is the log's ring
+  of pending frames, 40 KB, which is what an empty store costs and what a budget
+  below it will refuse.
+
+A compaction's working set is not twice the image, and the reason is worth stating
+because it decides whether the budget is usable at all: `buildSeq` copies record
+*values*, and a record value is two slice headers. Every record the delta did not
+touch arrives in the new image addressing the same arena or the same mapping, so
+**the property blobs are not duplicated at any size**. What is duplicated is
+structure — record arenas, page tables, by-label postings, adjacency — which
+follows records and identifiers rather than bytes written. Measured against the
+image its own build produced, the model runs 1.00× on a dense identifier space, on
+a blob-carrying store and on a heap image, and up to 1.62× on a sparsified one.
 
 ### Finding out what an open is costing, now that it is open
 
@@ -3473,6 +3533,7 @@ if s, ok := g.Forensics(); ok {
 | `Options.Retention` (`RetentionPolicy`) | Which retired WAL segments survive compaction |
 | `Options.Redaction` / `.RedactionPolicy` | Enable the redaction ledger; bound a single cascade |
 | `Options.MaxReplayBytes` / `.MaxReplayRecords` | Refuse an `Open` whose WAL replay exceeds the budget, with `ErrReplayBudget`, rather than replaying into an OOM (§14) |
+| `Options.MemoryBudget` | Refuse an `Open` or a `Compact` whose modelled heap exceeds the budget, with `ErrMemoryBudget` naming the arithmetic — a pre-flight refusal, never a runtime degradation |
 
 ### Snapshot roots, attestations, proofs
 

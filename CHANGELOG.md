@@ -5,6 +5,67 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### A memory budget, which is a refusal and never a degradation
+
+Go cannot catch an out-of-memory condition. There is no allocation failure to
+handle, no error returned from `make`, and no warning before the kernel's OOM
+killer: the process stops mid-write with no chance to flush or record what it was
+doing. So "fails predictably under memory pressure" has exactly one available
+meaning here — decide before allocating, and decline.
+
+- **`Options.MemoryBudget`** bounds the heap an `Open` or a `Compact` may need.
+  Zero, and any negative value, is unlimited and is the behaviour of every version
+  before this one. Exceeding it returns an error wrapping **`ErrMemoryBudget`** and
+  carrying **`MemoryBudgetError{Op, Need, Have, Budget}`**, because a refusal that
+  does not say by how much cannot be acted on: the difference between needing 5%
+  more and needing six times as much is the difference between raising a limit and
+  buying a machine.
+
+  It does not shrink a cache, spill a merge, reduce a batch, or degrade a plan, and
+  no later version will make it do any of those silently. An engine that quietly
+  got slower instead of saying no is the outcome the option exists to prevent.
+
+- **An `Open` is refused beside the replay budget**, on `HeapBytesFor` for the
+  Options actually being opened with rather than on the worst case over them — the
+  same store models at 736 KB under the defaults and 1.45 MB under `ImageHeap` with
+  a resident index, so gating on the worst case would decline work that fits by
+  more than a factor of two. Nothing has been replayed and no ledger is open at
+  that point, so a refusal is repeatable and leaves no trace: a routine outcome
+  that appended a forensic record of a crash that did not happen would be
+  manufacturing history.
+
+- **A `Compact` is refused after the pin**, which is the first moment the counts
+  are real and the last before anything has been allocated for the build. It is
+  *not* recorded as a compaction that failed, for the reason
+  `ErrCompactionInProgress` is not: a background compactor reporting a refusal as a
+  failure gives an operator an error rate made entirely of the trigger working. It
+  arrives at `AutoCompactObserver`, and it recurs on every tick, because the
+  refusal is what stopped the delta from shrinking — attach an observer if you set
+  a budget.
+
+- **What a compaction actually duplicates**, which had no model anywhere before
+  this and turned out not to be what the obvious one says. Not the store:
+  `buildSeq` copies record *values*, and a record value is two slice headers, so
+  every record the delta did not touch arrives in the new image addressing the
+  same arena or the same mapping. **The property blobs are not duplicated by a
+  compaction at any size.** What is duplicated is structure — the record arenas
+  holding the headers, the page tables addressing them, the by-label postings, the
+  adjacency arrays — all of which follow records and identifiers rather than bytes
+  written. The index is absent because both payload encodings stream, and
+  serialisation streams into the temp file rather than through an image-sized
+  buffer.
+
+  Measured against the image its own build produced: **1.00x** on a dense
+  identifier space, on a blob-carrying store, and on a heap image; 1.24x when the
+  delta is written to a band of identifiers the image does not touch, and 1.62x on
+  a sparsified space. Never below 1.00x.
+
+  One term was wrong by 62 bytes in the direction the posture forbids, and only a
+  fixture built to kill a mutation found it: a delta introducing label values the
+  image had never seen grows the by-label *maps*, not only their id lists, so the
+  bound is now taken over the union of the two sides' label sets rather than from
+  the pinned image's.
+
 ### The pre-open estimate now describes the store you are about to open
 
 `PreflightOpen` answers "what will this cost" from a header, in memory bounded by a

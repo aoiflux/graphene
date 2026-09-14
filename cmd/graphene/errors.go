@@ -170,6 +170,18 @@ func classify(err error) (FaultKind, string) {
 		return FaultRefused, "the store is intact; this open was refused by a " +
 			"configured replay budget. `store info` reports what the log holds, " +
 			"and compacting the store is what makes the log small again."
+	case errors.Is(err, disk.ErrMemoryBudget):
+		// The same posture, for the budget that covers the whole operation
+		// rather than the log. The advice differs from the replay case in the
+		// one way that matters: compacting is the remedy there and is itself
+		// one of the things that can be refused here. So the hint points at the
+		// figures rather than at an action, and it does not send the operator to
+		// `store info` — that reports the image and log as they are on disk, and
+		// this refusal is about a model of what holding them would cost.
+		return FaultRefused, "the store is intact and nothing was allocated; " +
+			"this was refused by a configured memory budget. The message names " +
+			"what the operation needed against what was budgeted, so the choice " +
+			"is to raise Options.MemoryBudget or to open with cheaper Options."
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return FaultTimeout, hintFor(FaultTimeout)
 	case os.IsNotExist(underlying(err)):

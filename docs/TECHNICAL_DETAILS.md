@@ -5387,8 +5387,14 @@ Any change must preserve these. Each is enforced by tests.
     replaying into an out-of-memory kill. The engine cannot catch an OOM in Go, so
     a bound can only ever mean refusing before allocating, never degrading while
     allocating. **Both budgets cover the replay only** — the image is loaded by
-    the same `Open` and is not governed by either; gate on
-    `OpenEstimate.ImageBytes` yourself.
+    the same `Open` and is not governed by either. `Options.MemoryBudget` is the
+    one that covers both halves, and it governs `Compact` as well: it compares
+    `OpenEstimate.HeapBytesFor` for the Options being opened with, and a
+    compaction's modelled working set on top of what the store already holds,
+    refusing with `disk.ErrMemoryBudget` and the arithmetic attached. It is a
+    pre-flight refusal for the same reason and under the same limitation — no
+    runtime degradation of any kind, because there is nothing to degrade once the
+    allocation has begun.
 14. **A compaction still stalls writers for its pin and its commit** — ~17–20 ms
     on a 100 000-record store, down from the whole rebuild (§9.4). The remainder
     is the record scan, which is under the lock because the delta layer is
