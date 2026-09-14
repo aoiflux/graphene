@@ -415,6 +415,8 @@ func (tx *Tx) UpsertNode(key string, value []byte, n *store.Node,
     props map[string][]byte) (store.NodeID, bool)
 func (tx *Tx) UpsertEdge(key string, value []byte, e *store.Edge,
     props map[string][]byte) (store.EdgeID, bool)
+func (tx *Tx) UpsertNodeOwned(key string, value []byte, n *store.Node,
+    props map[string][]byte) (store.NodeID, bool)
 
 func (tx *Tx) IndexNodeProperties(id store.NodeID, props map[string][]byte)
 func (tx *Tx) IndexEdgeProperties(id store.EdgeID, props map[string][]byte)
@@ -631,6 +633,41 @@ resolves to whatever the winner wrote. A single-writer caller never sees it.
 
 Upserting one key twice in a transaction returns the same ID both times, and the
 later call wins.
+
+#### Handing a node over instead of copying it
+
+`tx.UpsertNode` copies the node it buffers, so a caller may reuse its slices as
+soon as the call returns. `tx.UpsertNodeOwned` is the same method without that
+copy:
+
+```go
+tx := g.Begin()
+n := &store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}, Properties: blob}
+id, created := tx.UpsertNodeOwned("k", []byte("ver:9f3a"), n, props)
+// n and blob now belong to the store. Do not read, write or reuse either.
+```
+
+The promise runs to the end of the store's use of the record, not to `Commit`:
+both backends retain the pointer as the live record rather than copying it. A
+caller that writes to the slice afterwards changes what the store answers with,
+and **nothing reports it** — not `Commit`, not a read, not `VerifyIndexes`, because
+the bytes stay self-consistent at every layer. Use `UpsertNode` unless a profile
+says the copy matters, and do not use this from any path that returns a buffer to
+a pool.
+
+Two further differences, both deliberate:
+
+- `n.ID` is set to the resolved ID. `UpsertNode` leaves the caller's struct alone.
+- The key's value and the `props` map are still copied. Ownership is of the node,
+  which is where the blob is; a reused key buffer and a refilled entry map are
+  ordinary caller patterns and cost little to copy.
+
+What it saves is one allocation and one copy of `Properties` per node — nothing
+else, because a caller who hands the node over makes the struct and the labels
+escape and pays for those itself. So it is worth having exactly where the payload
+is large or the transaction is big: a 200,000-node transaction at 512-byte blobs
+holds 97.7 MiB less Go heap while it is buffered, and 155.8 MiB less anonymous
+memory. At a handful of small nodes it is not worth the promise.
 
 #### Which should I use?
 

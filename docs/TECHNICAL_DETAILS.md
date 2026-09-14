@@ -5236,6 +5236,152 @@ per-item cost in that file that is not the up-direction choice its header descri
 whose tuples are nearly all distinct returns one entity per lookup and is not a composite
 anyone would declare. `TestEstimatedResident_WithinBand` is what holds it honest.
 
+### 14.27 Taken: a caller may hand the engine a node instead of lending it
+
+The root package's `Tx` copies every record it buffers. `disk.Store`'s transaction
+path does not: `putNode` hangs the caller's `*store.Node` straight off the delta's
+version chain, and `memory.Store`'s `upsertNodeLocked` puts it straight in the map.
+The copy is therefore not the engine protecting itself from the caller; it is the
+root package protecting the caller from a promise it never asked them to make.
+
+Which is the right default. A transaction buffers, so the record has to survive
+from the call until `Commit`, and a caller refilling one `*store.Node` in a loop is
+an ordinary thing to write.
+
+**Taken:** `Tx.UpsertNodeOwned`, identical to `UpsertNode` except that it buffers
+the caller's node rather than a copy of it, under a stated promise: once it
+returns, the node and the memory it points at belong to the store.
+
+**The hazard, stated plainly.** Nothing detects a broken promise. A caller that
+writes to the slice after handing it over changes what the store answers with, and
+there is no error anywhere — not at `Commit`, not at read, not at `VerifyIndexes`,
+because the bytes are consistent with themselves at every layer. That is why this
+is a second method rather than a flag on the first, and why the documentation says
+to use `UpsertNode` unless a measurement says the copy matters.
+
+**Not taken: ownership of the key value and the entry map.** Symmetry would say
+that a method called `Owned` owns everything passed to it. The shape of caller code
+says otherwise. A key value is typically a digest in a reused scratch buffer, and
+an entry map is typically one map refilled per entity — both are patterns a caller
+writes without thinking, both would break silently, and both are small beside the
+blob. `bytes.Clone` and `copyProps` stay, and a test says why, so that a later
+tidy-up has to delete the reason before it can delete the copy.
+
+One visible effect on the caller's own struct: `n.ID` is set to the resolved ID.
+`UpsertNode` leaves the caller's struct untouched, so the two differ there as well,
+and both halves carry a test.
+
+#### Escape analysis decides this item twice, and it is not obvious either time
+
+The first implementation gave the two methods one shared body with an `owned`
+flag, which is the ordinary way to avoid duplicating thirty lines of key
+resolution. It cost `UpsertNode` **two heap allocations per node**, measured
+against HEAD at 16.88k → 18.88k (+11.85%, p=0.000) allocs/op.
+
+The reason is that a body which can store `n` makes `n` a leaking parameter:
+
+```
+HEAD          transaction.go:251:52: n does not escape
+shared body   transaction.go:295:52: leaking param: n
+```
+
+`UpsertNode` never leaked `n`, so a caller's `&store.Node{...}` and its labels
+slice could live on the caller's stack. Sharing the body took that away from every
+existing caller, to save one allocation for a new one — a net loss, and one that
+no test would ever have caught.
+
+So the split is: `claimNodeKey` is shared and never sees `n`; the four lines that
+choose between the caller's node and a copy of it are written out twice. The
+duplication is the point, and `claimNodeKey`'s comment says so.
+
+**The same effect then corrupted the benchmark.** The first fixture ran both arms
+from one function:
+
+```go
+if owned { tx.UpsertNodeOwned(...) } else { tx.UpsertNode(...) }
+```
+
+`n` is passed to `UpsertNodeOwned` on one path, so it escapes at the call site on
+both, and the copying arm was charged the two allocations a real caller does not
+pay. That fixture read the saving as three allocations per node. Split into two
+functions, each mentioning one method, it reads one.
+
+The lesson generalises past this item: **for any change whose subject is a copy, a
+fixture that branches between the arms measures the branch.** Arms that differ in
+what escapes have to be separate functions.
+
+#### `copyNode` allocates three times and one of them is a saving
+
+The obvious arithmetic says this removes three allocations a node: `copyNode`
+makes a struct, a labels slice and a properties slice. The measurement says one.
+Both are right, and the difference is again where the escape analysis puts things.
+
+A caller who hands the node over makes it escape, so the `&store.Node{...}` and
+its labels literal move to the caller's heap. A caller who lends it keeps both on
+the caller's stack and pays for `copyNode`'s heap copies instead. The struct and
+the labels are allocated once either way — they change owner, not count. Only the
+properties slice is allocated twice in the copying arm and once in the owning one,
+because the caller's blob was already on the heap in both.
+
+So the byte figure is the honest one, and it is exactly the payload: 512.04 B per
+node at 512-byte blobs and 65,536 B at 64 KiB. A caller whose nodes are already on
+the heap — decoded from a wire format, say — gives up nothing at all for the one
+allocation, and the blob is the whole of what it saves.
+
+#### Measured
+
+`UpsertNode`, against HEAD, ten interleaved rounds — the control for the
+restructuring, which must be nothing:
+
+| `UpsertNode` | HEAD | after the split | |
+|---|---:|---:|---|
+| allocs/op, blob=512 | 16.88k ± 0% | 16.88k ± 0% | ~ (p=0.246 n=10) |
+| allocs/op, blob=65536 | 16.91k ± 0% | 16.91k ± 0% | ~ (p=0.549 n=10) |
+| B/op, blob=512 | 5.379 MiB ± 0% | 5.379 MiB ± 0% | ~ (p=0.122 n=10) |
+| B/op, blob=65536 | 492.4 MiB ± 0% | 492.4 MiB ± 0% | ~ (p=0.289 n=10) |
+| sec/op, blob=512 | 5.038m ± 32% | 5.185m ± 21% | ~ (p=0.579 n=10) |
+| sec/op, blob=65536 | 152.5m ± 22% | 153.8m ± 20% | ~ (p=0.912 n=10) |
+
+`UpsertNodeOwned` against `UpsertNode`, separate fixtures, twelve
+interleaved rounds each:
+
+| 1,000 nodes a transaction | `UpsertNode` | `UpsertNodeOwned` | |
+|---|---:|---:|---|
+| allocs/op, blob=512 | 16.86k ± 0% | 15.86k ± 0% | **−5.92%** (p=0.000 n=12) |
+| allocs/op, blob=65536 | 16.89k ± 0% | 15.88k ± 0% | **−5.93%** (p=0.000 n=12) |
+| B/op, blob=512 | 5.387 MiB ± 0% | 4.898 MiB ± 0% | **−9.07%** (p=0.000 n=12) |
+| B/op, blob=65536 | 492.4 MiB ± 0% | 429.9 MiB ± 0% | **−12.69%** (p=0.000 n=12) |
+| sec/op, blob=512 | 11.92m ± 47% | 10.64m ± 53% | ~ (p=0.114 n=12) |
+| sec/op, blob=65536 | 285.2m ± 28% | 245.0m ± 37% | ~ (p=0.128 n=12) |
+
+Per node that is 0.999 allocations and 512.04 B at the small blob, 1.002 and
+65,536.98 B at the large one: one allocation, one payload, nothing else.
+
+The wall clock is reported as noise on purpose. Run as two blocks in one process
+— all of one arm, then all of the other — the small-blob arm reads +143% with a
+spread of ±115%, which is the ten fresh `TempDir` stores and their fsyncs drifting
+across the run, not the method. Interleaved one process per arm, twelve rounds, it
+is p=0.114. Memory was never at risk from that ordering; the wall clock was, and
+the interleaved figure is the one that counts.
+
+And a 200,000-node transaction measured while still buffered, one process per
+measurement, seven rounds:
+
+| 200,000 nodes, still buffered | `UpsertNode` | `UpsertNodeOwned` | |
+|---|---:|---:|---|
+| Go heap | 267.7 MiB | 170.0 MiB | **−36.5%** (−97.7 MiB) |
+| anonymous | 300.3 MiB | 144.5 MiB | **−51.9%** (−155.8 MiB) |
+| process peak | 342.2 MiB | 210.1 MiB | **−38.6%** (−132.1 MiB) |
+| file-backed | 0 | 0 | unchanged |
+
+The heap delta is 97.7 MiB and 200,000 × 512 B is 97.65625 MiB, so the copy costs
+the payload and not a byte more. Anonymous memory and the peak move half again as
+far, because a smaller live heap lowers the collector's goal as well as the live
+set — which is the term a caller near a limit actually feels. The Go heap figure
+was identical to a tenth of a MiB in all seven rounds of each arm; the anonymous
+and peak figures are medians, with the copying arm spanning 299.3–338.1 MiB
+anonymous and the owning arm 142.8–149.2.
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.

@@ -5,6 +5,60 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### A transaction can take a node rather than copy it
+
+- **`Tx.UpsertNodeOwned` is `Tx.UpsertNode` without the defensive copy.** The
+  root package copies every record it buffers, which neither backend needs: disk's
+  `putNode` hangs the caller's `*store.Node` straight off the delta version chain
+  and memory's `upsertNodeLocked` puts it straight in the map. The copy is there
+  because a transaction buffers — the record has to live from the call until
+  `Commit` — and refilling one node in a loop is an ordinary thing for a caller to
+  write. This method gives that up for callers who can promise not to: once it
+  returns, the node and the memory it points at belong to the store.
+
+- **One allocation and one blob per node, and the blob is the point.** Against
+  `UpsertNode` on the same tree, separate fixtures, twelve interleaved rounds each:
+  **16.86k → 15.86k allocs/op (−5.92%)** at a thousand nodes a
+  transaction, and **5.387 → 4.898 MiB/op (−9.07%)** at 512-byte blobs,
+  **492.4 → 429.9 MiB/op (−12.69%)** at 64 KiB. `copyNode` allocates three
+  times — struct, labels, properties — but only one of the three shows up as a
+  saving, because a caller who hands the node over makes it escape and pays for
+  the struct and the labels itself. What is genuinely removed is the blob: the
+  byte delta is 512.04 B per node at 512-byte blobs and 65,536 B at 64 KiB, which
+  is the payload and nothing else. Wall clock is unchanged (p=0.114, p=0.128).
+
+- **Where it is worth having: a large transaction held open.** A 200,000-node
+  transaction measured while still buffered, one process per measurement, seven
+  rounds — Go heap **267.7 → 170.0 MiB**, a delta of 97.7 MiB that is exactly
+  200,000 × 512 B; anonymous memory **300.3 → 144.5 MiB** (−51.9%) and process
+  peak **342.2 → 210.1 MiB** (−38.6%), both moving further than the heap does
+  because a smaller live heap lowers the GC's goal as well. File-backed residency
+  is unchanged at zero.
+
+- **Ownership is of the node, not of everything passed.** The unique key's value
+  and the index-entry map are still copied, deliberately: a digest in a reused
+  scratch buffer and one entry map refilled per entity are both patterns a caller
+  writes without thinking, both would break silently, and both are small beside
+  the blob. A test asserts the two copies survive, so a later tidy-up has to delete
+  the reason before it can delete the copy.
+
+- **Nothing detects a broken promise.** A caller that writes to the slice after
+  handing it over changes what the store answers with, with no error at `Commit`,
+  at read, or at `VerifyIndexes` — the bytes are self-consistent at every layer.
+  That is why it is a second method rather than a flag, and why the documentation
+  says to use `UpsertNode` unless a measurement says the copy matters.
+  `n.ID` is set to the resolved ID, which is the one visible effect on the
+  caller's struct and the other way the two methods differ.
+
+- **`UpsertNode` itself is unchanged, and that took work.** The first version gave
+  both methods one body, which made `n` a leaking parameter and cost every
+  existing caller two allocations a node — more than the new method saves. The two
+  now share only the key resolution, which never sees `n`. Ten interleaved rounds
+  against HEAD confirm `UpsertNode` is untouched: allocs/op and B/op identical,
+  wall clock within noise. `TECHNICAL_DETAILS.md` §14.27.
+
+- No format change, no API break: purely additive.
+
 ### A composite index stops holding a second copy of its members' values
 
 - **The largest thing a default configuration held was a Go map of per-entity
