@@ -27,6 +27,7 @@ store built with no index declared holds 161 MiB and peaks at 980 MiB.
 | What is the compaction peak made of? | 512 B × delta records + 118 B × live records + 16 B × live records, predicting a 7× larger store to 2.3% | §4 |
 | What does a rebuild cost, permanently? | 10.83 B per burned identifier, against 72 B before R10(b); ~83 MiB per forty rebuilds | §5 |
 | Does the program reach 2 GiB? | not today — 2,909 MiB is 42% over. With R3, ~607 MiB. Only R3 closes it | §6 |
+| What does each option cost? | index 273 MiB, image 149 MiB of heap, adjacency 6 MiB — independent and additive | §8 |
 
 Four things a reader should take away before the detail.
 
@@ -1058,6 +1059,187 @@ On this fixture that architecture is **about 205 MiB of anonymous memory for a 1
 store, a ratio of 0.17× against today's 3.351×**, and it is R3 plus the composite
 follow-up that gets there. The no-index arm has already measured it.
 
+## 8. Sizing a configuration
+
+Everything above measures one arrangement at a time. Three options decide which
+arrangement a store is in — `ImageMode`, `IndexMode` and `Adjacency` — and this is
+the cross-product: which term each of them moves, by how much, and which of the
+combinations are configurations at all.
+
+Conditions for this section only. 200,000 nodes, 200,000 edges, 512-byte blobs, the
+same declared shape as the rest of this document — 8 unique keys, 5 ordered, 2
+composites — compacted once into a v9 image of **248.1 MiB**, holding **2,600,000
+simple index entries and 400,000 composite entries**. Fourteen mode specifications,
+three rounds, one process per specification, `BenchmarkRSS_ModeMatrix`. The fixture is
+built once and shared, so every figure is a bare Open and not the residue of a build.
+
+### 8.1 Which option moves which term
+
+The engine's own models split the same seven ways, before an open (`OpenEstimate.HeapBytesFor(opts)`,
+which takes the `Options` for exactly this reason) and during one (`Store.EstimateResident`).
+Reading the two side by side is what this table is:
+
+| term | what it is | scales with | moved by |
+|---|---|---|---|
+| record arrays | 56 B per node slot, 80 B per edge slot, 4 B per 4,096 identifiers ever issued | materialised pages | **nothing** |
+| payload | label sequences always; property blobs unless the image is mapped | records, then blob bytes | **ImageMode** |
+| label postings | 8 B per (record, label), plus two map headers | records | **nothing** |
+| adjacency | 16 B × (node slots + 1) + 16 B × live edges | slots and edges | **Adjacency** |
+| index | 107 B per resident entry; a key directory when mapped. Composite entries are 160 B under **both** | entries since the last compaction | **IndexMode** |
+| delta | maintained payload counter plus modelled structure | writes since the last compaction | compaction, not an option |
+| log ring | 1,024 × 40 B | nothing | **nothing** |
+
+Three of the seven are the same under every configuration, and one of those three is
+the term that decides how long a store can live (§5).
+
+### 8.2 The measured terms, per configuration
+
+MiB, from `EstimateResident` — the engine's own account, identical in all three rounds
+because every term is a count of something rather than a sample of it:
+
+| held configuration | records | payload | labels | adjacency | index | mapped (evictable) | total heap |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| image mapped, index mapped, adjacency deferred | 26.03 | 0.76 | 3.05 | 0.00 | 61.04 | 248.1 | **90.9** |
+| image mapped, index mapped, adjacency built | 26.03 | 0.76 | 3.05 | 6.11 | 61.04 | 248.1 | **97.0** |
+| image mapped, index resident, adjacency deferred | 26.03 | 0.76 | 3.05 | 0.00 | 334.30 | 248.1 | **364.2** |
+| image mapped, index resident, adjacency built | 26.03 | 0.76 | 3.05 | 6.11 | 334.30 | 248.1 | **370.3** |
+| image heap, index resident, adjacency deferred | 26.03 | 150.20 | 3.05 | 0.00 | 334.30 | 0 | **513.6** |
+| image heap, index resident, adjacency built | 26.03 | 150.20 | 3.05 | 6.11 | 334.30 | 0 | **519.7** |
+
+And the same six measured from outside the process, anonymous and file-backed
+separately, as the range over three rounds:
+
+| held configuration | anon MiB | file MiB | total RSS | Open ms |
+|---|---|---|---|---|
+| mapped / mapped / deferred | **138.2–143.0** | 73.9–83.8 | 216.4–222.0 | 227–256 |
+| mapped / mapped / built | **146.0–149.0** | 74.3–91.1 | 220.3–240.1 | 216–261 |
+| mapped / resident / deferred | **440.2–442.1** | 148.3–185.7 | 589.1–627.6 | 1,722–3,772 |
+| mapped / resident / built | **446.9–447.6** | 185.2–185.5 | 632.4–632.8 | 1,769–1,871 |
+| heap / resident / deferred | **561.4–561.7** | 0.0 | 561.4–561.7 | 1,648–1,905 |
+| heap / resident / built | **567.7–568.1** | 0.0 | 567.7–568.1 | 1,635–2,055 |
+
+**The cheapest configuration holds a quarter of the anonymous memory of the dearest**,
+138 MiB against 568, on one store that neither of them changed. **And the row with the
+largest total RSS is not the row with the largest anonymous figure** — `mapped/resident/built`
+totals 632 MiB against `heap/resident/built`'s 568, while holding 121 MiB *less* of the
+class a RAM ceiling constrains. A combined number would rank those two backwards, which
+is the fourth rule in this document's opening stated as a row rather than as advice.
+
+### 8.3 The cube is not a cube
+
+Twelve specifications, and a locked reader can reach **six** of them. The collapses are
+not degradations to be fixed; each is a rule with a reason, and the instrument reports
+what is *held* beside what was *asked* so that a table cannot present a fallback as a
+result.
+
+**A heap image cannot carry a mapped index.** `heap/mapped/*` measures byte-for-byte the
+same as `heap/resident/*` — 334.30 MiB of index either way. An index read in place out of
+a heap buffer would pin the whole file to save part of it, so `indexBaseAllowedFor`
+declines, and four specifications become two. It is reported through `MetricIndexFallback`
+and is otherwise invisible: nothing fails, and the store is simply 273 MiB larger than
+the caller configured it to be.
+
+**`ImageMappedUnlocked` is `ImageMapped` for anyone holding a lock.** Four more
+specifications are duplicates of four others — 144.1–149.7 against 146.0–149.0 anon on the
+default cell. The two modes differ only for an opener that excludes no writer, which is
+§8.5.
+
+**Adjacency is the one option that is orthogonal to both others.** 6.11 MiB in every
+configuration that builds it, to the byte, whatever the image and index are doing.
+
+### 8.4 What each option is worth, and what it costs
+
+Differenced from the term table, so each figure is the one option and nothing else:
+
+| option | term moved | worth on this store | what it costs |
+|---|---|---|---|
+| `IndexMapped` over `IndexResident` | index | **273.26 MiB** | Open 1,722–3,772 ms → 216–261 ms, so it is *not* a cost here; a warm point lookup roughly doubles (§6.4) |
+| `ImageMapped` over `ImageHeap` | payload | **149.44 MiB** of heap, moved to 248.1 MiB of evictable page cache | returned slices are valid until the compaction after next (§6.4, `CloneNode`) |
+| `AdjacencyLazy` over `AdjacencyEager` | adjacency | **6.11 MiB** | nothing for a reader that never traverses or deletes; the same bytes later for one that does |
+
+The three are independent and additive: 273.26 + 149.44 + 6.11 = 428.8 MiB, against the
+519.7 → 90.9 MiB the total column actually moves, which is 428.8. That is not a
+coincidence to be pleased about — it is the check that no term is being counted twice,
+and it is the reason the split is worth reporting at all.
+
+**The index arithmetic, worked.** The 273.26 MiB that `IndexMapped` removes is:
+
+| part | count | bytes each | MiB |
+|---|---:|---:|---:|
+| simple postings | 2,600,000 | 107 | 265.31 |
+| ordered indexes, five keys × 1,000 distinct values | 5,000 values + 1,000,000 ids | 72 + 8 | 7.97 |
+| **total** | | | **273.28** |
+
+Measured: 273.26. The model and the instrument agree to 0.01%, which they should, because
+both are counting the same entries — what is being checked here is that the entries the
+mapped arm *stops* holding are exactly the ones the resident arm holds.
+
+**And the 61.04 MiB that no option removes is the composites**, exactly: 400,000 entries
+× 160 B = 61.035 MiB. On this store they are 61.04 MiB of the 90.9 a fully mapped
+configuration holds — two thirds of it — they are resident under every one of the twelve
+specifications, and they are the largest remaining item in this document. §6.4 named them
+as the next thing to look at; this is the figure that says how much is in it.
+
+### 8.5 The live reader takes the defaults and pays 3.8×
+
+The one configuration in the sweep that nobody would choose deliberately, and the one a
+caller reaches by writing nothing at all:
+
+| opener | ImageMode asked | image held | index held | anon MiB |
+|---|---|---|---|---|
+| read-only | `ImageMapped` (default) | mapped | mapped | **146.0–149.0** |
+| `OpenLive` | `ImageMapped` (default) | **heap** | **resident** | **567.7–568.2** |
+| `OpenLive` | `ImageMappedUnlocked` | mapped | mapped | **144.1–149.6** |
+
+`ImageMapped` maps only where something excludes a concurrent writer from the directory,
+and a live reader holds no lock by construction — that is what makes it live. So it falls
+back to a heap image, and a heap image then declines the mapped index by §8.3's first
+rule. **One option not set costs 419 MiB on a 248 MiB store**, both fallbacks together,
+and the second is a consequence of the first rather than an independent decision.
+
+This is the correct default: mapping a file a writer may rewrite underneath you is a
+fatal fault on every platform, not an error (B3, `docs/TECHNICAL_DETAILS.md` §16.15), and
+an engine may not choose that for a caller who has not asked. `ImageMappedUnlocked` is
+how a caller asks, having read what it trades. What the sweep adds is the price of *not*
+asking, which was previously documented as a mode difference and not as a number.
+
+### 8.6 The consumer's store, per configuration
+
+The terms applied to the shape this program was aimed at — 1,400,000 nodes, no edges,
+512-byte blobs, thirteen entries per node and two composites, a 1.2 GiB image. A
+projection from the coefficients above, not a measurement, and stated as one:
+
+| term | mapped / mapped / lazy | mapped / resident / eager | heap / resident / eager |
+|---|---:|---:|---:|
+| record arrays | 74.8 | 74.8 | 74.8 |
+| payload | 2.7 | 2.7 | 1,232 |
+| label postings | 10.7 | 10.7 | 10.7 |
+| adjacency | 0 | 21.4 | 21.4 |
+| index, simple | 0.0 | 1,911 | 1,911 |
+| index, composite | 427.2 | 427.2 | 427.2 |
+| **heap** | **515** | **2,448** | **3,677** |
+
+The first column defers adjacency and the other two build it. Building it costs
+**21.4 MiB** here — all of it the two offset arrays, since this shape has no edges —
+so the default configuration of the first column is **537**, and that is the one to
+compare against a measured arm.
+
+Two things to read off it before trusting it.
+
+**The projection is a floor, and the gap is additive rather than proportional.**
+Anonymous RSS is the Go runtime's retained address space rather than its live set, so
+every row here sits below what a process reports. Against the two arms this document has
+measured at this scale — §1.1's 2,909 MiB with a resident index and §6.4's ~1,113 MiB with
+a mapped one, both of them adjacency-eager, so both against the 2,448 and 537 rows — the
+gap is **461 MiB** and **576 MiB**: the same order on rows that differ by a factor of
+nearly five. Read it as a fixed overhead to add, not a multiplier to apply, and
+size a machine from a measured row. What the projection answers exactly is the other
+question: *which term to attack*.
+
+**The composite term is now the largest thing a default configuration holds**, at 427 MiB
+of the 537. Nothing in the shipped program moves it; it is the R3 follow-up, and §8.4's
+160 B per entry is the coefficient it would have to beat.
+
 ## Reproducing these figures
 
 Every number above comes from `tests/rss_bench_test.go` behind the `stress` tag. The
@@ -1072,6 +1254,7 @@ fixture knobs:
 | `GRAPHENE_RSS_BLOB_DIST` | the long-tailed distribution of §3.2 instead of a fixed size |
 | `GRAPHENE_RSS_NOINDEX` | declare and populate no index at all — the differencing arm of §3 |
 | `GRAPHENE_RSS_CYCLES` | rebuild cycles for `BenchmarkRSS_RebuildCycle` (§5) |
+| `GRAPHENE_RSS_MODES` | the configuration `BenchmarkRSS_ModeMatrix` opens under (§8): `<image>/<index>/<adjacency>[/live]`, one per process |
 
 **Use `GRAPHENE_RSS_DIR` for anything that reports a peak.** Building a 1.4M-node
 fixture peaks near 9.4 GiB and `peakMiB` is a process-lifetime high-water mark, so a

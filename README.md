@@ -758,7 +758,9 @@ arm64, static and reproducible:
 - Benchmark methodology and results: [benchmarks.md](docs/benchmarks.md)
 - How much memory the engine holds, what holds it, and which of those terms a
   configuration can change: [MEMORY_MODEL.md](docs/MEMORY_MODEL.md) — read this
-  before sizing a machine for a store.
+  before sizing a machine for a store. §8 is the worked table: what `ImageMode`,
+  `IndexMode` and `Adjacency` each cost, measured term by term, and which of
+  their combinations are configurations at all.
 - Engine comparison notes: [comparison.md](docs/comparison.md)
 - Where we stand against a native graph database, and what would close the
   gap: [RESEARCH_NATIVE_GRAPH.md](docs/RESEARCH_NATIVE_GRAPH.md)

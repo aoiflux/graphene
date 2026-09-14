@@ -5,6 +5,36 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### What each residency option costs, measured together rather than one at a time
+
+- **`docs/MEMORY_MODEL.md` §8 is the per-configuration table.** `ImageMode`,
+  `IndexMode` and `Adjacency` each had a section describing them alone. This is the
+  cross-product: which of the seven terms each option moves, by how much, and what
+  the combinations do. On a 200,000-node store with 2,600,000 index entries the
+  three are independent and additive — **273.26 MiB** for a mapped index,
+  **149.44 MiB** of heap for a mapped image, **6.11 MiB** for deferred adjacency —
+  and the cheapest configuration holds a quarter of the anonymous memory of the
+  dearest, on a store neither of them changed.
+
+- **A live reader that sets nothing pays 3.8×.** `ImageMapped` maps only where
+  something excludes a concurrent writer, and a live reader holds no lock by
+  construction, so it falls back to a heap image — and a heap image then declines
+  the mapped index, because an index read out of a heap buffer would pin the whole
+  file to save part of it. Two fallbacks from one unset option: **568 MiB against
+  149** on the fixture above. Both defaults are right and the price of them was not
+  written down anywhere. `ImageMappedUnlocked` is how a live reader asks for the
+  other trade, and §8.5 is now what it costs not to.
+
+- **Twelve specifications, six configurations.** Four collapse because a heap image
+  cannot carry a mapped index; four more because `ImageMappedUnlocked` and
+  `ImageMapped` are the same thing to an opener that holds a lock. The new
+  `BenchmarkRSS_ModeMatrix` reports what a store *holds* beside what was *asked*
+  for precisely so that a table cannot report a fallback as a result.
+
+- **The composites are the largest remaining item, and now have a figure.** 160 B
+  per entry, resident under every one of the twelve specifications, and 61.04 MiB
+  of the 90.9 that the cheapest configuration holds — two thirds of it.
+
 ### One figure for what a compaction holds while it builds
 
 - **`CompactOptions{MaxWorkingBytes}`**, set through `Options.Compact`, sizes the

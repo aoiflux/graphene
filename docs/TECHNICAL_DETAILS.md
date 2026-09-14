@@ -7,8 +7,9 @@ were tried and rejected, so they are not re-attempted.
 
 For *using* the engine, read [API_REFERENCE.md](API_REFERENCE.md) and
 [USER_GUIDE.md](USER_GUIDE.md). For numbers, read [benchmarks.md](benchmarks.md);
-for what holds resident memory and why, [MEMORY_MODEL.md](MEMORY_MODEL.md);
-figures here are illustrative and that document is authoritative.
+for what holds resident memory and why, [MEMORY_MODEL.md](MEMORY_MODEL.md) — and
+its §8 for what each of the three residency options costs, before choosing any of
+them; figures here are illustrative and that document is authoritative.
 
 **Status.** Pre-production. This describes the current implementation, not a
 frozen contract. It is an embedded native graph engine — it owns its graph-shaped
