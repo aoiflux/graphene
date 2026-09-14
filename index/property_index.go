@@ -813,6 +813,27 @@ func (p *PropertyIndex) EntryCounts() (nodes, edges int) {
 	return p.nodeEntryCount(), p.edgeEntryCount()
 }
 
+// DeltaEntryCounts returns the triples held in the shards alone, excluding
+// whatever the base holds.
+//
+// EntryCounts is what the index answers with; this is what it is holding. With no
+// base the two agree. With one they diverge at every write and meet again at
+// every compaction that adopts its own output, so this is the figure that says
+// whether a store is carrying the entries it has already written to disk -- which
+// is the question Store.compactCommit's adoption exists to answer with a zero.
+//
+// Exact, and O(shards): each shard keeps a running count.
+func (p *PropertyIndex) DeltaEntryCounts() (nodes, edges int) {
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.RLock()
+		nodes += sh.nodes.count
+		edges += sh.edges.count
+		sh.mu.RUnlock()
+	}
+	return nodes, edges
+}
+
 // nodeEntryCount and edgeEntryCount total the per-shard entry counts so the
 // caller can size its result exactly. Without this the collection loop grows by
 // append and copies the whole slice ~log2(n) times on the way up — 5 MB of

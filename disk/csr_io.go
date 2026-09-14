@@ -953,6 +953,50 @@ func readMappedIndexSections(data []byte, sections []csrSection) (index.Base, bo
 	return b, true, nil
 }
 
+// readImageIndexBase parses an image's mapped index sections and nothing else.
+//
+// deserialiseCSRFrom answers the same question on the way to parsing a whole
+// graph. This is the question on its own, for the one caller that has an image it
+// wants the index out of and a graph it already has: a compaction, installing the
+// index it has just written over the one it wrote it from. Parsing the records
+// again there would cost the compaction an Open to throw the result away.
+//
+// The digest is not checked and neither are the record sections, deliberately.
+// This reads a file this process wrote and fsynced moments ago, against bytes it
+// still holds; a mismatch would mean the storage changed them between the write
+// and the read, which is a fault no reader here could act on and which the next
+// open's VerifyOnOpen is the place to catch. What is checked is everything the
+// parse itself depends on -- the magic, a version that has a section directory,
+// and every bound readCSRSectionDirectory and parseGPIX apply -- because those
+// are what stop a damaged directory being read as a structure.
+//
+// The bool is "this image carries a mapped index", which is not the same as
+// "this succeeded": a v8 image and a v9 image whose index went missing are
+// different answers, and only the second is an error.
+func readImageIndexBase(data []byte) (index.Base, bool, error) {
+	if len(data) < csrV8HeaderSize {
+		return nil, false, fmt.Errorf("readImageIndexBase: %d bytes cannot hold a v8 header", len(data))
+	}
+	if string(data[0:4]) != "GCSR" {
+		return nil, false, fmt.Errorf("readImageIndexBase: invalid magic")
+	}
+	version := binary.LittleEndian.Uint16(data[4:6])
+	if version < csrVersionSectioned {
+		// No section directory, so no GPIX by construction. Not an error: it is
+		// what every image before v8 looks like.
+		return nil, false, nil
+	}
+	if version > csrVersionMax {
+		return nil, false, fmt.Errorf("readImageIndexBase: unsupported version %d (supported: %d-%d)",
+			version, csrVersionV2, csrVersionMax)
+	}
+	sections, err := readCSRSectionDirectory(data, binary.LittleEndian.Uint64(data[62:70]))
+	if err != nil {
+		return nil, false, fmt.Errorf("readImageIndexBase: %w", err)
+	}
+	return readMappedIndexSections(data, sections)
+}
+
 // readCSRIndexSection parses the property-index section at the given offset.
 func readCSRIndexSection(data []byte, offset int) (*csrIndexSection, error) {
 	if offset <= 0 || offset > len(data) {

@@ -29,7 +29,7 @@ store built with no index declared holds 161 MiB and peaks at 980 MiB.
 | Does the program reach 2 GiB? | not today — 2,909 MiB is 42% over. With R3, ~607 MiB. Only R3 closes it | §6 |
 | Does it reach 2 GiB *measured*? | for the read path, yes: 561 MiB anonymous at 1.4M nodes, 70% headroom under a real 2 GiB cgroup. For a whole-layer rebuild in the same process, no — 3,853 MiB | §9 |
 | What does each option cost? | index 273 MiB, image 149 MiB of heap, adjacency 6 MiB — independent and additive | §8 |
-| What does a compaction leave behind? | its own output, resident: 3,838 MiB after compacting against 1,078 MiB after reopening the same store | §9.4 |
+| What does a compaction leave behind? | it used to leave its own output resident — 3,838 MiB after compacting against 1,078 MiB after reopening. The index half of that is closed: a compaction now installs the base it wrote. What remains is the record payloads | §9.4, §9.6 |
 
 Four things a reader should take away before the detail.
 
@@ -1344,7 +1344,7 @@ answer is **554 MiB against the 561 a direct run measures**. **§6.3's "does the
 row should be read against 561, not 1,113** — the program reaches it for the read path with
 room to spare, and by a wider margin than this document has been claiming.
 
-### 9.4 The write path does not fit, and the delta is not the reason
+### 9.4 The write path did not fit, and the delta was not the reason
 
 **Rebuilding the whole layer in one process holds 3,853 MiB and peaks at 6,644 MiB** —
 3.2× over the ceiling. That is the plan's end-to-end acceptance, and it does not hold.
@@ -1392,13 +1392,23 @@ this section measured that, because every arm in this document either opens and 
 builds and compacts in a process that then exits.
 
 **What that means for the target.** Open and scan at the consumer's shape fit 2 GiB with
-70% headroom, measured. A whole-layer rebuild in the same process does not, and the remedy
-is not a knob that exists today: re-attaching the image and the index base after a
-compaction would move some 2,541 MiB of the 3,853 out of anonymous memory at this shape, and
-that is the next item rather than a shipped one. A consumer that must rebuild 1.4M nodes on
-a 2 GiB machine today has one supported route, and it is the one the numbers point at
-anyway: **reopen after compacting**, which costs 2.9 seconds and returns the store to 1,078
-MiB.
+70% headroom, measured. A whole-layer rebuild in the same process did not, and the two
+mechanisms above are why.
+
+**The index half is now closed.** A compaction installs the base it has just written and
+empties the shards behind it — §9.6 measures what that is worth, and it is also what makes
+bounding the delta start working. Everything in §9.2's table and in the two paragraphs above
+is the engine *before* that change, and is left standing as the measurement it was rather
+than rewritten; the figures at 1,400,000 nodes have not been taken again since.
+
+**The image half is not.** Re-mapping the file a compaction wrote and republishing a graph
+parsed from it would move the record payloads too, and it changes what a returned
+`Properties` slice aliases — today a compaction neither creates nor retires the graph's
+mapping, so such a slice stays valid for the life of the handle. That is an API decision
+rather than an implementation one, and it is separate from the index half deliberately.
+
+A consumer that must rebuild 1.4M nodes on a 2 GiB machine still has **reopen after
+compacting** as the route that returns everything, at 2.9 seconds and 1,078 MiB.
 
 ### 9.5 What the nightly runs
 
@@ -1428,6 +1438,55 @@ sudo systemd-run --scope --uid=$(id -u) --gid=$(id -g) \
 `MemorySwapMax=0` matters as much as `MemoryMax`: with swap available the cgroup pushes
 anonymous pages out instead of failing, and the run then measures how patient the disk is
 rather than whether the store fits.
+
+### 9.6 What closing the index half is worth, measured
+
+The same ceiling harness at 200,000 nodes under the same 2 GiB Job Object, on one fixture,
+run with the adoption in force and with it switched off in the source. A 241.4 MiB store;
+5,200,000 node index entries at the compaction, 2,600,000 after it.
+
+**Delta unbounded — one compaction at the end:**
+
+| phase | anon before | anon after |
+|---|---:|---:|
+| rebuild | 609.4 MiB | 604.8 MiB |
+| compact | **576.3 MiB** | **335.9 MiB** |
+| reopen | 214.3 MiB | 176.3 MiB |
+| charged against the ceiling, peak | 863.0 MiB (57.9% headroom) | 810.1 MiB (60.4% headroom) |
+
+**Delta bounded at 16 MiB — four interim compactions during the rebuild:**
+
+| phase | anon before | anon after |
+|---|---:|---:|
+| rebuild | 566.2 MiB | **265.1 MiB** |
+| compact | 564.2 MiB | **263.7 MiB** |
+| reopen | 209.1 MiB | 168.0 MiB |
+| charged against the ceiling, peak | 829.9 MiB (59.5% headroom) | **520.0 MiB (74.6% headroom)** |
+| process peak | 1,008.8 MiB | 799.0 MiB |
+
+Two things in those tables and the second is the larger.
+
+**A compaction gives back 240 MiB at this shape** — 576.3 MiB of anonymous memory after
+compacting becomes 335.9, against 176.3 for the same store reopened. The remainder is the
+record payloads, which §9.4 explains and this change does not touch.
+
+**And bounding the delta starts working.** §9.4 recorded that `MaxDeltaBytes` "works and
+buys almost nothing", and that is visible here in the before column: 863.0 MiB charged
+unbounded against 829.9 MiB bounded, a 3.8% difference for four extra compactions. Each of
+those compactions was leaving its own output resident, so bounding the delta moved entries
+from the delta into a base nobody read back and the peak followed the sum rather than the
+bound. With the adoption in force the same knob is worth **290 MiB**: 810.1 MiB charged
+unbounded against 520.0 MiB bounded, and the process peak falls from 1,008.8 to 799.0 MiB.
+
+That is the answer to a question §9.4 could only pose: the peak was not merely following
+this bug, it was compounding it once per interim compaction.
+
+```sh
+GRAPHENE_CEILING_BUILD=1 GRAPHENE_RSS_DIR=/var/tmp/graphene-200k \
+    GRAPHENE_RSS_NODES=200000 go test ./tests/ -tags=stress -run TestCeilingFixture -v
+GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_DELTA_MIB=16 GRAPHENE_RSS_DIR=/var/tmp/graphene-200k \
+    GRAPHENE_RSS_NODES=200000 go test ./tests/ -tags=stress -run TestCeiling_Consumer -v
+```
 
 ## Reproducing these figures
 

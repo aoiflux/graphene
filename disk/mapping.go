@@ -75,6 +75,7 @@ import (
 	"runtime"
 	"sync/atomic"
 
+	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -212,7 +213,21 @@ func mapImage(path string) (*mapping, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return mapOpenImage(f, path)
+}
 
+// mapOpenImage is mapImage from a handle the caller already holds.
+//
+// It exists because opening a file is not cheap and opening one that was just
+// written is worse: measured on Windows 11, the single extra CreateFile a
+// compaction needed to map the image it had just written was 28% of the whole
+// compaction's CPU at a thousand nodes -- the file is new, and the first open
+// after a write is where a real-time scanner reads it. The handle that wrote it
+// is open, has read access, and is about to be closed for nothing.
+//
+// The caller keeps the handle and closes it; the mapping does not need it. See
+// mapImage for why that is safe on Windows as well as Unix.
+func mapOpenImage(f *os.File, path string) (*mapping, error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -361,6 +376,71 @@ func (s *Store) noteImage(src *imageSource, csr *CSRGraph) {
 	s.images = append(s.images, src.m)
 }
 
+// mappedIndexBase is an index base together with the fact that it was read out
+// of a mapping this store owns.
+//
+// It exists to give runtime.AddCleanup something to watch. A cleanup needs a
+// pointer to a concrete type and index.Base is an interface, so the base is
+// wrapped rather than watched directly; the wrapper is what the index holds, so
+// the wrapper is unreachable exactly when the base is.
+//
+// The mapping is not a field here, and that is the same rule mapping.attach
+// states for a graph: a cleanup never runs while its argument is reachable from
+// the object it watches. What keeps the mapping alive is the store's
+// indexImages slice.
+type mappedIndexBase struct {
+	index.Base
+}
+
+// noteIndexImage records a mapping whose bytes the index base b reads, and
+// arranges for it to be released once nothing can read it any more. Caller holds
+// s.mu exclusively.
+//
+// The reachability test is the one mapping.attach uses and it is a floor on the
+// truth for the same reason: a value yielded out of the base addresses the
+// mapping, and the collector does not trace mapped memory. What makes the floor
+// sound here is that every path yielding base bytes to a caller does so inside a
+// call that holds the base -- ForEachNodeValue hands a value to a callback and
+// the baseSide naming it is live across the whole walk -- so a base cannot be
+// collected while one of its values is being read. A caller that keeps such a
+// value past the call has the same contract as one that keeps a mapped
+// Properties slice, and store.CloneNode is the same answer.
+func (s *Store) noteIndexImage(m *mapping, b *mappedIndexBase) {
+	if m == nil || b == nil {
+		return
+	}
+	runtime.AddCleanup(b, func(m *mapping) { m.retirable.Store(true) }, m)
+	s.indexImages = append(s.indexImages, m)
+}
+
+// sweepIndexImages unmaps every index mapping no reachable base can read any
+// more. Caller holds s.mu exclusively.
+//
+// Separate from sweepImages, and calling that one here would be a bug rather
+// than a saving: a writer's graph mapping is marked retirable as soon as the
+// graph parsed from it is replaced, which a compaction does on its first commit,
+// while the graph the compaction published goes on addressing that mapping for
+// every record the delta did not touch. Sweeping it would be a use-after-unmap
+// on the live graph. Nothing builds a base out of another base, so this list has
+// no such dependency and can be swept the moment the collector says so.
+func (s *Store) sweepIndexImages() {
+	if len(s.indexImages) == 0 {
+		return
+	}
+	keep := s.indexImages[:0]
+	for _, m := range s.indexImages {
+		if !m.retirable.Load() {
+			keep = append(keep, m)
+			continue
+		}
+		_ = m.close()
+	}
+	for i := len(keep); i < len(s.indexImages); i++ {
+		s.indexImages[i] = nil
+	}
+	s.indexImages = keep
+}
+
 // sweepImages unmaps every image mapping no reachable graph can address any
 // more. Caller holds s.mu exclusively.
 //
@@ -403,6 +483,16 @@ func (s *Store) closeImages() error {
 		s.images[i] = nil
 	}
 	s.images = nil
+	// The index's mappings go the same way and for the same reason. A base read
+	// in place is only as valid as the file under it, and Close is where that
+	// ends.
+	for i, m := range s.indexImages {
+		if err := m.close(); err != nil && first == nil {
+			first = err
+		}
+		s.indexImages[i] = nil
+	}
+	s.indexImages = nil
 	return first
 }
 

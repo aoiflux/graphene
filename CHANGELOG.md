@@ -5,6 +5,76 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### A compaction gives its own index back, without being reopened
+
+- **The index a compaction writes is now the index it reads from.** A base was
+  attached on the load path and nowhere else, so a compaction wrote every entry the
+  property index held into the image and then went on holding all of them in the
+  delta shards. Nothing gave that memory back short of reopening the directory. The
+  commit now installs the base it has just written and empties the shards behind it.
+  Measured on a 50,000-node store whose derived layer is deleted and rewritten whole,
+  the index term falls from **83.8 MiB to 15.3 MiB at the compaction** — the same
+  figure the store reports after a reopen, to the tenth of a mebibyte — and anonymous
+  memory held over a reopened store falls from **100.2 MiB to 41.1 MiB**. What is
+  left is the record payloads, which need the aliasing contract changed and are a
+  separate decision.
+
+- **It happens only when the compaction wrote everything the index holds.** If a
+  commit lands between the pin and the drain, the image cannot hold every entry —
+  one registered after the stream is not in it, and one naming an entity committed
+  after the pin was filtered out of it deliberately — so the store keeps answering
+  from the shards and gives nothing back until the next quiet compaction. Both cases
+  are exactly "the log grew", because every index mutation is journaled before it is
+  applied, so the gate is the log tail and costs nothing to evaluate. The floor is
+  no worse than before, never a wrong answer.
+
+- **Nothing here can fail a compaction.** The image is written, fsynced and renamed
+  before any of this is attempted. A mapping that cannot be made or an index section
+  that will not parse leaves the store answering from the resident index it already
+  had, and reports `MetricIndexFallback` saying why. Refusing a compaction that
+  committed, in order to announce that an optimisation did not apply, would turn a
+  memory result into a durability event.
+
+- **A property lookup after a compaction now costs what it costs after a restart.**
+  On a 5,000-node store, `NodesByProperty` measures 98–124 ns once the compaction has
+  adopted its own output and 95–101 ns on the same store reopened. Before this
+  change the same store answered in 70–79 ns after compacting and 112–117 ns after
+  reopening — it was faster only in the window where it was holding a second copy of
+  its own index, and it paid 68 MiB per 50,000 nodes for that window. Compaction wall
+  clock, `CompactStall` and the point-lookup control are all unchanged within noise
+  over six interleaved rounds; the compaction allocates ~180 more objects and ~9 KB
+  more per run.
+
+- **Bounding the delta starts working, which is the larger result.** `MaxDeltaBytes`
+  was measured as something that "works and buys almost nothing", and that was a
+  consequence of this bug rather than of the knob: every interim compaction moved
+  entries out of the delta and into a base nobody read back, so the peak followed
+  the sum and not the bound. Under the ceiling harness at 200,000 nodes and a real
+  2 GiB Job Object, with four interim compactions, the charge against the ceiling
+  falls from **829.9 MiB to 520.0 MiB** and headroom from 59.5% to **74.6%**; the
+  process peak falls from 1,008.8 MiB to 799.0 MiB. Unbounded on the same fixture,
+  anonymous memory after compacting falls from 576.3 MiB to 335.9 MiB. `MEMORY_MODEL.md`
+  §9.6 has both tables; §9.4's figures at 1,400,000 nodes are left as the record of
+  the engine before this and have not been taken again.
+
+- **The image is mapped through the handle that wrote it.** The first version opened
+  the finished file a second time to read its index back, which measured as **28% of
+  the whole compaction's CPU** at a thousand nodes on Windows — a file that has just
+  been written is expensive to open, and `writeStreamSync` was closing a perfectly
+  good read-write handle a moment earlier. It now hands that handle to an `afterSync`
+  hook, which also puts the mapping and the parse in `build`, where no lock is held,
+  rather than in the commit, where the store is shut to readers and writers.
+
+- **`PropertyIndex.SwapBase`, and why `AttachBase` could not be used.** `AttachBase`
+  is a compare-and-swap against nil by design: attaching a second base to an index
+  whose delta still describes the first is how an entry goes missing. `SwapBase`
+  states the precondition instead — the new base holds exactly what the index
+  answers with — installs the base *before* clearing the delta, so a reader between
+  the two sees a superset rather than neither half, and keeps every declaration
+  while replacing the structure under it. `PropertyIndex.DeltaEntryCounts` reports
+  what the shards alone are holding, which is the figure that now returns to zero at
+  every quiet compaction.
+
 ### Measured under an actual RAM ceiling, not projected
 
 - **`tests/ceiling_test.go` runs the consumer's own sequence under a real memory
@@ -35,18 +105,21 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   scale.
 
 - **A whole-layer rebuild does not reach it, and the delta is not the reason.**
-  Rebuilding all 1,400,000 nodes in one process holds **3,853 MiB** and peaks at
-  6,644 MiB. Bounding the delta with `CompactionPolicy.MaxDeltaBytes` works — nine
-  interim compactions, the delta held at 56.6 MiB — and buys almost nothing. The
+  *(Measured before the section above; bounding the delta works properly now — see
+  `MEMORY_MODEL.md` §9.6.)* Rebuilding all 1,400,000 nodes in one process holds
+  **3,853 MiB** and peaks at 6,644 MiB. Bounding the delta with
+  `CompactionPolicy.MaxDeltaBytes` works — nine interim compactions, the delta held
+  at 56.6 MiB — and buys almost nothing. The
   cause is that **a compaction leaves its own output resident until the store is
   reopened**: the graph it publishes was built in the heap, and `AttachBase` is
   called only on the load path, so the 18,200,000 entries it just wrote stay in the
   shards. Anonymous memory is 3,838 MiB after compacting and **1,078 MiB after
   reopening the same directory**. The arrangement §8 measures is therefore one a
   process is in after Open and until its first compaction; a long-running writer
-  leaves it and does not return. `MEMORY_MODEL.md` §9 has the full accounting, and
-  the remedy — re-attaching the image and index base after a compaction — is not a
-  shipped knob.
+  leaves it and does not return. `MEMORY_MODEL.md` §9 has the full accounting. The
+  index half of the remedy is the section above and is now what a compaction does;
+  the image half — re-mapping and republishing the graph from the file just written
+  — changes what a returned `Properties` slice aliases and is not shipped.
 
 - **The nightly runs both arms and neither hides the other.** Read-only at 1,400,000
   nodes under 2 GiB, the whole sequence at 200,000 nodes under the same 2 GiB where

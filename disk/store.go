@@ -119,6 +119,19 @@ type Store struct {
 	// ever accumulates more — see sweepImages.
 	images []*mapping
 
+	// indexImages holds the mappings created for the property index's base, as
+	// distinct from the ones the graph's records address.
+	//
+	// Two lists rather than one because the two have different lifetimes and
+	// only one of them is safe to sweep at a compaction. A graph mapping is
+	// addressed by every graph built from it, including the ones a compaction
+	// publishes later, so a writer's single entry in images above lives until
+	// Close. An index mapping is addressed by exactly one base -- nothing builds
+	// a base out of another one -- so the one a compaction replaces can be
+	// released as soon as the base over it is unreachable. Guarded by mu. See
+	// sweepIndexImages.
+	indexImages []*mapping
+
 	// live, and the three numbers a live reader advances over. Guarded by mu;
 	// zero and unused on every other kind of store. See live.go.
 	live      bool

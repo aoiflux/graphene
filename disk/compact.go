@@ -190,6 +190,29 @@ type compactPlan struct {
 	// compact: Compact goes through mustWrite first.
 	propIdx *index.PropertyIndex
 
+	// mapImages is whether this store may map an image at all, read at the pin
+	// from the same rule the open path applies. Carried rather than re-asked
+	// because build has the plan and not the store.
+	mapImages bool
+
+	// The index this compaction wrote, read back out of the image it wrote it
+	// to, ready for the commit to install. Prepared in build because mapping a
+	// file and parsing a section directory is several milliseconds and build is
+	// the stage that holds no lock -- measured at a thousand nodes, doing it in
+	// the commit instead made the whole compaction 2.9x longer, and every bit of
+	// that was time the store was shut to readers and writers.
+	//
+	// Nil when this store does not map, when the mode writes GIDX instead, or
+	// when the parse failed; pendingErr says which of the last two, for the
+	// commit to report. See Store.adoptCompactedIndex.
+	pendingMap  *mapping
+	pendingBase *mappedIndexBase
+	pendingErr  error
+
+	// adopted records that the commit installed pendingBase, so releasing the
+	// plan does not unmap an image the index is now reading.
+	adopted bool
+
 	// indexMode is which encoding of that index the image will carry: GPIX and
 	// GPIR under IndexMapped, GIDX under IndexResident.
 	//
@@ -319,6 +342,10 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 	}
 
 	newCSR, tmpPath, err := plan.build(ctx, s.dir)
+	// After build, because build is what can create one, and before the commit,
+	// because every way the commit can end leaves this the last word on a
+	// mapping the index did not take.
+	defer plan.releasePendingBase()
 	if err == nil {
 		err = s.compactCommit(plan, newCSR, tmpPath)
 	}
@@ -549,6 +576,7 @@ func (s *Store) compactPin() (*compactPlan, error) {
 
 		propIdx:   s.propIdx,
 		indexMode: s.indexMode,
+		mapImages: s.imageMappingAllowed() == nil,
 		adjacency: s.adjacency,
 		buffers:   s.compactBufs,
 
@@ -888,17 +916,86 @@ func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string,
 	}
 	beforeSync := func() error { return p.fireStep(compactStepSyncTmp) }
 	write := func(f *os.File) error { return newCSR.SerialiseTo(f, p.payload) }
-	if err := writeStreamSync(tmpPath, 0600, beforeSync, write); err != nil {
+	// The index this compaction just wrote, mapped and read back out of the
+	// image through the handle that wrote it.
+	//
+	// Here rather than at the commit because this is the stage that holds no
+	// lock: mapping a file and parsing a section directory in the commit instead
+	// made the whole compaction 2.9x longer at a thousand nodes, and every bit of
+	// that was time the store was shut to readers and writers. And through this
+	// handle rather than a fresh open of the same path, because one extra open of
+	// a file that was just written measured as 28% of the compaction's CPU -- see
+	// mapOpenImage.
+	//
+	// Nothing here can fail the compaction; see prepareBase.
+	afterSync := func(f *os.File) { p.prepareBase(f, tmpPath) }
+	if err := writeStreamSync(tmpPath, 0600, beforeSync, afterSync, write); err != nil {
 		// This is the only statement in build that can have created the file,
 		// so cleaning up here covers every way build can fail with a temp file
 		// on disk. A partial write counts: the file is truncated on open, so a
 		// failure part way through leaves a short file under the real name.
 		// A signer error arrives here too, now that signing happens inside the
 		// write rather than before it.
+		// A prepared mapping is released with the plan, so a write that failed
+		// after afterSync ran does not leave one behind.
 		removeTmpImage(tmpPath)
 		return nil, "", fmt.Errorf("compact: write tmp CSR: %w", err)
 	}
 	return newCSR, tmpPath, nil
+}
+
+// prepareBase maps the image just written and reads its index out of it, leaving
+// the result on the plan for the commit to install or to throw away.
+//
+// Nothing here is allowed to fail the compaction, so nothing here returns an
+// error. The image is written and correct; whether the process goes on to read
+// its index out of a file or out of the heap is a memory decision, and a memory
+// decision that did not go the caller's way is a metric rather than a failed
+// compaction. What is recorded is the reason, for the commit to report once it
+// has the store to report it against.
+// The file is mapped under its temporary name, which the rename in the commit
+// then consumes. That is sound on both platforms and was measured rather than
+// assumed: the handle is closed before the rename, so the name is free and the
+// mapping goes on reading the bytes it mapped. See mapImage.
+func (p *compactPlan) prepareBase(f *os.File, tmpPath string) {
+	// IndexResident writes GIDX and means it: there is no GPIX in the file to
+	// read a base out of, and the caller asked for the index in the heap anyway.
+	if !p.mapImages || p.indexMode != IndexMapped {
+		return
+	}
+	m, err := mapOpenImage(f, tmpPath)
+	if err != nil {
+		p.pendingErr = err
+		return
+	}
+	b, carries, err := readImageIndexBase(m.data)
+	if err != nil {
+		p.pendingErr = err
+		_ = m.close()
+		return
+	}
+	if !carries || b == nil {
+		// A v8 image, which is what IndexMapped falls back to writing when the
+		// mode could not be honoured. Already reported where it was decided.
+		_ = m.close()
+		return
+	}
+	p.pendingMap, p.pendingBase = m, &mappedIndexBase{Base: b}
+}
+
+// releasePendingBase unmaps a prepared index that the commit did not install.
+//
+// Every way a compaction can end after build reaches this: the commit refused,
+// the commit failed part way, the tail made the index unusable, or it was
+// installed and this does nothing. A prepared base that is simply dropped would
+// leave the image mapped for the life of the process, which is the one thing
+// this file's whole lifetime argument exists to prevent.
+func (p *compactPlan) releasePendingBase() {
+	if p.adopted || p.pendingMap == nil {
+		return
+	}
+	_ = p.pendingMap.close()
+	p.pendingMap, p.pendingBase = nil, nil
 }
 
 // removeTmpImage deletes a temp image that will never be installed.
@@ -994,7 +1091,91 @@ func (s *Store) compactCommit(p *compactPlan, newCSR *CSRGraph, tmpPath string) 
 	// after the log that held them was retired.
 	s.publishEpoch(s.mutEpoch.Load())
 
+	// Last, because it is the one step here that can be skipped without changing
+	// what the store holds. Everything above decides what is on disk; this only
+	// decides where the index is read from.
+	s.adoptCompactedIndex(p, p.tailBytes(endOff))
+
 	return nil
+}
+
+// tailBytes is how much landed in the log between the pin and the drain.
+//
+// One definition because two callers ask the same question for opposite reasons:
+// retireLog asks whether the log can be emptied, and adoptCompactedIndex asks
+// whether the image it just wrote is the whole of what the index holds. Both
+// answers are "yes exactly when this is not positive", which is not a
+// coincidence -- every index mutation is journaled before it is applied, so the
+// bytes are the evidence that something changed.
+func (p *compactPlan) tailBytes(endOff int64) int64 { return endOff - p.walOff }
+
+// adoptCompactedIndex points the property index at the image this compaction has
+// just written, and drops the entries it wrote it from. Caller holds s.mu
+// exclusively.
+//
+// # The bug this closes
+//
+// A base is attached on the load path and nowhere else, so a compaction wrote
+// every entry the index held into the image and then went on holding all of
+// them. The store did not give that memory back until something reopened the
+// directory underneath it. Measured over a whole-layer rebuild at the shape this
+// engine is sized for, the index was 68% of the gap between a store that had
+// just compacted and the same store reopened.
+//
+// # Why it is gated on the tail, and not attempted otherwise
+//
+// index.SwapBase requires a base holding exactly what the index answers with, and
+// what makes that true here is that nothing landed between the pin and the drain.
+// Two things go wrong when something did, and they go wrong in opposite
+// directions. An entry registered after the build streamed the index is in the
+// shards and not in the image, so emptying the shards would lose it until the
+// next open. And the stream filters itself against the records the build placed,
+// so an entry naming an entity committed after the pin was skipped on purpose --
+// the image cannot hold an entry for a record it does not have.
+//
+// Both are exactly "the log grew", because every index mutation is journaled
+// before it is applied and both of those are mutations. So the gate is the tail,
+// and a compaction that ran under load takes the old path and gives nothing back
+// until the next quiet one. That is a floor of "no worse than before" rather than
+// a partial fix, which is the right shape for a step that is an optimisation
+// sitting after a commit that has already happened.
+//
+// # Why no failure here fails the compaction
+//
+// Everything above this in compactCommit decided what is on disk and has already
+// succeeded. If the image cannot be mapped or its index sections will not parse,
+// the store carries on answering from the resident index it already had -- the
+// same store it would have been before this existed, correct and larger. Refusing
+// a compaction that committed, in order to report that an optimisation did not
+// apply, would turn a memory result into a durability event.
+func (s *Store) adoptCompactedIndex(p *compactPlan, tail int64) {
+	// Reported here rather than in build, which has no store to report against.
+	// A reason recorded and then dropped is the silent fallback this program
+	// keeps saying it will not have.
+	if p.pendingErr != nil {
+		s.recordIndexFallback(p.pendingErr)
+	}
+	if p.pendingBase == nil || tail > 0 {
+		// Whatever was prepared is unmapped by the release in CompactCtx.
+		return
+	}
+	// Noted before the swap, so the mapping is held by the store before anything
+	// reads through it. The reverse order has a window in which the only
+	// reference to the mapping is one the collector does not trace.
+	s.noteIndexImage(p.pendingMap, p.pendingBase)
+	if err := s.propIdx.SwapBase(p.pendingBase); err != nil {
+		// Unreachable: SwapBase refuses only a nil base. Reported rather than
+		// ignored because an unreachable branch that goes quiet is one nobody
+		// finds out about when it stops being unreachable.
+		s.recordIndexFallback(err)
+		return
+	}
+	p.adopted = true
+	// The base this one replaced is not collectable yet -- it was reachable a
+	// moment ago -- so this releases the one before it, if any. A sweep that
+	// finds nothing is the normal case and costs a walk of a list with one
+	// entry in it.
+	s.sweepIndexImages()
 }
 
 // retireLog empties or rotates the log now that the image holds its records.
@@ -1012,7 +1193,7 @@ func (s *Store) compactCommit(p *compactPlan, newCSR *CSRGraph, tmpPath string) 
 // true of a log about to be retired; left in a log that keeps being appended
 // to, it silently discards every record written after this compaction.
 func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error {
-	tail := endOff - p.walOff
+	tail := p.tailBytes(endOff)
 
 	switch {
 	// Nothing landed during the build. The log holds exactly what the image

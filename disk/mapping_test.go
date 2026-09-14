@@ -643,8 +643,19 @@ func TestImageMapped_RefreshFailureRestoresTheOldMapping(t *testing.T) {
 	}
 	damaged := append([]byte(nil), raw...)
 	copy(damaged[0:4], "XXXX")
-	if err := os.WriteFile(newImage, damaged, 0600); err != nil {
+	// Written aside and renamed over, rather than written in place, because a
+	// compaction now leaves this process holding a mapping of the image it just
+	// installed -- the index is read out of it. Windows refuses to open a file
+	// with a mapped section for writing, which is the same protection
+	// ImageMappedUnlocked's comment describes, and it refuses it here whether or
+	// not the damage is deliberate. A rename is permitted on both platforms and
+	// is how anything outside the engine would realistically replace the file.
+	aside := newImage + ".damaged"
+	if err := os.WriteFile(aside, damaged, 0600); err != nil {
 		t.Fatalf("write the damaged image: %v", err)
+	}
+	if err := os.Rename(aside, newImage); err != nil {
+		t.Fatalf("install the damaged image: %v", err)
 	}
 
 	if _, err := r.Refresh(); err == nil {

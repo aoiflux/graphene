@@ -33,7 +33,7 @@ import (
 // backup manifest, a schema catalogue, a rebuilt log — where holding the bytes
 // costs nothing.
 func writeFileSync(path string, data []byte, perm os.FileMode) error {
-	return writeStreamSync(path, perm, nil, func(f *os.File) error {
+	return writeStreamSync(path, perm, nil, nil, func(f *os.File) error {
 		_, err := f.Write(data)
 		return err
 	})
@@ -55,7 +55,8 @@ func writeFileSync(path string, data []byte, perm os.FileMode) error {
 // the close, and the sync error is the one that means the data is not there. A
 // failure leaves the partial file for the caller to remove, exactly as a failed
 // writeFileSync does.
-func writeStreamSync(path string, perm os.FileMode, beforeSync func() error, write func(*os.File) error) error {
+func writeStreamSync(path string, perm os.FileMode, beforeSync func() error,
+	afterSync func(*os.File), write func(*os.File) error) error {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return err
@@ -73,6 +74,18 @@ func writeStreamSync(path string, perm os.FileMode, beforeSync func() error, wri
 	if err := f.Sync(); err != nil {
 		f.Close()
 		return fmt.Errorf("sync %s: %w", path, err)
+	}
+	// After the sync and before the close, for a caller that wants to read what
+	// it just wrote without opening the file a second time.
+	//
+	// It returns nothing, and that is the contract rather than an omission: this
+	// hook exists for work that is an optimisation on top of a write that has
+	// already succeeded, and a hook that could fail the write would make the
+	// durable path depend on the optional one. Whatever it is doing reports its
+	// own failures its own way. After the sync because a caller reading the file
+	// should read the bytes the caller after a crash would.
+	if afterSync != nil {
+		afterSync(f)
 	}
 	return f.Close()
 }

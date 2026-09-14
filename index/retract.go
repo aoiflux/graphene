@@ -218,17 +218,35 @@ func (p *PropertyIndex) AttachBase(b Base) error {
 	if b == nil {
 		return errIndexf("index: AttachBase needs a base")
 	}
-	st := &baseState{b: b}
-	st.nodeGone.limit = b.MaxID(NodeKind)
-	st.edgeGone.limit = b.MaxID(EdgeKind)
-	st.nodeProbe = reverseProbeCost(b.TotalEntries(NodeKind))
-	st.edgeProbe = reverseProbeCost(b.TotalEntries(EdgeKind))
-	if !p.baseRef.CompareAndSwap(nil, st) {
+	if !p.baseRef.CompareAndSwap(nil, newBaseState(b)) {
 		return errIndexf("index: a base is already attached")
 	}
 	// After the swap, not before: the fill reads through nodeBase and edgeBase,
 	// which is also what records a fault, and both of those are reached from
 	// baseRef.
+	p.fillCompositesFromBase()
+	return nil
+}
+
+// newBaseState builds the state a base is installed with.
+//
+// Everything in it is derived from the base and nothing from the index, which is
+// what lets it be built before either entry point commits to installing it: the
+// probe costs are a function of the base's entry counts and the retraction sets
+// are sized from its highest ids, so a state that is never stored costs two
+// method calls and an allocation and leaves nothing behind.
+func newBaseState(b Base) *baseState {
+	st := &baseState{b: b}
+	st.nodeGone.limit = b.MaxID(NodeKind)
+	st.edgeGone.limit = b.MaxID(EdgeKind)
+	st.nodeProbe = reverseProbeCost(b.TotalEntries(NodeKind))
+	st.edgeProbe = reverseProbeCost(b.TotalEntries(EdgeKind))
+	return st
+}
+
+// fillCompositesFromBase files the attached base's entries into every declared
+// composite. See fillCompositeFromBase.
+func (p *PropertyIndex) fillCompositesFromBase() {
 	if s, ok := p.nodeBase(); ok {
 		for _, idx := range p.nodeComposites.all() {
 			fillCompositeFromBase(s, idx)
@@ -239,7 +257,97 @@ func (p *PropertyIndex) AttachBase(b Base) error {
 			fillCompositeFromBase(s, idx)
 		}
 	}
+}
+
+// SwapBase replaces the base with one that already holds everything this index
+// holds, and empties the delta behind it.
+//
+// # What it is for
+//
+// A compaction writes every entry the index holds into the image it builds, and
+// then goes on holding all of them. AttachBase runs on the load path and nowhere
+// else, so until something reopens the directory the process keeps the entries in
+// the shards it wrote them from -- the compaction's own output, resident. At the
+// shape this engine is sized for that is the largest single thing a compaction
+// fails to give back: measured over a whole-layer rebuild, the index is 68% of
+// the gap between a store that has just compacted and the same store reopened.
+//
+// This is the entry point that closes it. AttachBase cannot: it is a
+// CompareAndSwap against nil, deliberately, because attaching a second base to an
+// index whose delta still describes the first is how an entry goes missing.
+//
+// # The precondition, which is the whole of the correctness argument
+//
+// b must hold exactly what this index currently answers with: base ∪ delta −
+// retracted, as of now. Not a superset and not a subset. The caller is a
+// compaction that has just written b from this index and has established that
+// nothing has been registered or retracted since -- see Store.compactCommit for
+// how that is established and what happens when it cannot be.
+//
+// Everything else follows from it. The delta can be emptied because b holds every
+// entry it held. The new retraction sets start empty because an id retracted from
+// the old base is simply absent from b. The composites are left exactly as they
+// are, and that is not an oversight: their content is already the entries b holds,
+// so refiling from b would walk every entry under every member key to arrive back
+// where it started, once per compaction.
+//
+// # Why the base is installed before the delta is cleared
+//
+// The two are separate stores and a reader can be between them. This index's read
+// paths take a shard lock, release it, and then load the base -- NodesByProperty
+// is the shape -- so a reader that finds an emptied shard goes on to load
+// whichever base is installed by then.
+//
+// Installing first makes that safe by ordering. A reader that saw the cleared
+// shard was necessarily after the clear, which was after the install, so the base
+// it loads is b and b holds what the shard no longer does. The other order has a
+// reader read an emptied shard and then load the *old* base, which answers with
+// neither half.
+//
+// The window the safe order does leave is a reader holding the full delta and the
+// new base at once, which double-counts nothing: every merge here is a set union
+// over ascending ids, so an entry both sides hold is yielded once. See mergeRun.
+//
+// # What the caller must exclude
+//
+// Everything that writes. The delta is emptied shard by shard, and a registration
+// landing in a shard this has already cleared is an entry b does not hold and the
+// delta no longer does. A compaction holds the store's write lock across this,
+// which is the same thing that makes the precondition above checkable at all.
+func (p *PropertyIndex) SwapBase(b Base) error {
+	if b == nil {
+		return errIndexf("index: SwapBase needs a base")
+	}
+	p.baseRef.Store(newBaseState(b))
+	p.clearDelta()
 	return nil
+}
+
+// clearDelta empties the shards, keeping every declaration made over them.
+//
+// Declarations are schema and entries are data. A key declared ordered is
+// declared for the life of the store -- the image records it in GORD and the open
+// path re-states it -- so dropping the declaration here would turn every range
+// query on that key back into a scan until the next reopen, which is the
+// regression loadIndex's own comment exists to prevent. The structure under it is
+// replaced rather than kept, because what it held is now in the base.
+//
+// Unique keys need nothing: uniqueness is a predicate over the postings rather
+// than a second index, and the predicate reads the base as well as the delta.
+func (p *PropertyIndex) clearDelta() {
+	for i := range p.shards {
+		sh := &p.shards[i]
+		sh.mu.Lock()
+		sh.nodes = newPostings[store.NodeID]()
+		sh.edges = newPostings[store.EdgeID]()
+		for k := range sh.orderedNodeKeys {
+			sh.orderedNodeKeys[k] = newOrderedIndex[store.NodeID]()
+		}
+		for k := range sh.orderedEdgeKeys {
+			sh.orderedEdgeKeys[k] = newOrderedIndex[store.EdgeID]()
+		}
+		sh.mu.Unlock()
+	}
 }
 
 // fillCompositeFromBase files every entry the base holds under one composite's
