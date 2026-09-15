@@ -3,7 +3,7 @@
 Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 `git log` for those.
 
-## Unreleased — v0.7.0
+## v0.7.0 "Bookshelf" — the store stops carrying what it can read in place
 
 ### Indexed values can be served without the records that carry them
 
