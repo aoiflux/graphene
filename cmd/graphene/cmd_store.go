@@ -145,6 +145,19 @@ func addStorage(r *Result, ss store.StorageStats) {
 	img.Add("nodes", Int(int64(ss.CSRNodes)))
 	img.Add("edges", Int(int64(ss.CSREdges)))
 
+	// The format, with the consequence attached rather than left to a reader who
+	// would have to know what the number means. An operator running this command
+	// on a store that feels slow to open is asking exactly this question and has
+	// had no way to ask it.
+	if ss.ImageVersion > 0 {
+		note := "(current)"
+		if ss.IndexOnDisk == "entries" {
+			note = "(predates the mapped property index: every open rebuilds it in " +
+				"the heap; `graphene store migrate -to 9` or one Compact fixes it)"
+		}
+		img.AddNote("format version", Uint(uint64(ss.ImageVersion)), note)
+	}
+
 	// Identifiers issued against identifiers addressable. It sits beside the
 	// record counts because that is where an operator will compare it with
 	// them, and the comparison is the point: a store whose records number in
@@ -186,6 +199,14 @@ func addStorage(r *Result, ss store.StorageStats) {
 		if ss.ImageMappedBytes > 0 {
 			m.AddNote("mapped image", Bytes(ss.ImageMappedBytes),
 				"(page cache, evictable, not counted above)")
+		}
+		// Indented under the image figure and labelled "of which", because it is
+		// a part of it and not a second file. Two lines that both say "mapped"
+		// and both carry byte counts will otherwise be added together by the
+		// first operator who reads them.
+		if ss.IndexMappedBytes > 0 {
+			m.AddNote("  of which, property index", Bytes(ss.IndexMappedBytes),
+				"(the index is two sections of the image, not a file of its own)")
 		}
 	}
 

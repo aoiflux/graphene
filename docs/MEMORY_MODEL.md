@@ -572,8 +572,9 @@ no image on disk at all:
 **A WAL-replay open costs 21% more anonymous memory than an image open of the same
 store and peaks at 1.69× its own settled figure.** Nothing is mapped because nothing
 has been written in image form, so every byte of the replayed history lands in private
-memory. That is B6's case measured, and the argument for `Options.MaxReplayRecords`
-refusing an open by naming the figures rather than discovering them inside it.
+memory. That is the never-compacted-store case measured (§4.3), and the argument for
+`Options.MaxReplayRecords` refusing an open by naming the figures rather than
+discovering them inside it.
 
 ### 4.4 Why this section is a differencing result and not a heap profile
 
@@ -1158,7 +1159,7 @@ Differenced from the term table, so each figure is the one option and nothing el
 | option | term moved | worth on this store | what it costs |
 |---|---|---|---|
 | `IndexMapped` over `IndexResident` | index | **273.26 MiB** | Open 1,722–3,772 ms → 216–261 ms, so it is *not* a cost here; a warm point lookup roughly doubles (§6.4) |
-| `ImageMapped` over `ImageHeap` | payload | **149.44 MiB** of heap, moved to 248.1 MiB of evictable page cache | returned slices are valid until the compaction after next (§6.4, `CloneNode`) |
+| `ImageMapped` over `ImageHeap` | payload | **149.44 MiB** of heap, moved to 248.1 MiB of evictable page cache | returned slices address the file: valid for the life of the handle, not past `Close()` (§6.4, `CloneNode`) |
 | `AdjacencyLazy` over `AdjacencyEager` | adjacency | **6.11 MiB** | nothing for a reader that never traverses or deletes; the same bytes later for one that does |
 
 The three are independent and additive: 273.26 + 149.44 + 6.11 = 428.8 MiB, against the
@@ -1184,8 +1185,9 @@ configuration holds — two thirds of it — they are resident under every one o
 specifications, and they are the largest remaining item in this document. §6.4 named them
 as the next thing to look at; this is the figure that says how much is in it.
 
-**Since measured: the coefficient is 48, not 160.** What that 160 B per entry mostly was
-is a second copy of the member values — one `*memberState` per entity, a struct and a
+**Since measured: the model's coefficient is 48, not 160.** What that 160 B per entry
+mostly was is a second copy of the member values — one `*memberState` per entity, a struct
+and a
 backing array of string headers and a copy of every value's bytes, behind a pointer in a
 map. Splitting the composite index in two says how much: over 200,000 entities of a
 width-2 composite the postings cost 11.02 B per entry and the member values **135.65**,
@@ -1194,9 +1196,16 @@ of int32 references into an interned value table measures **146.60 → 43.87 B p
 (twelve interleaved samples) and, on a 200,000-node store reopened from disk, **124.40 →
 89.08 MiB of anonymous memory** and 66.31 → 33.09 MiB of Go heap.
 
+Three numbers appear above and they are not alternatives. **146.60** and **43.87** are the
+measured per-entry costs of the old and new forms at the shape a composite is declared for;
+**48** is the constant in `index/resident.go`, which is the old 160 scaled by that same
+ratio (160 × 43.87/146.60) so that it stays on the basis the 160 was chosen on. The
+estimator uses 48; the measurements are 146.60 and 43.87.
+
 The table above is left as the record of the tree it was taken on and has not been re-run
 at this scale. Scaled by the measured ratio the 61.04 MiB row is about 18.3 MiB, which
-would stop the composites being the largest thing a fully mapped configuration holds. The
+would stop the composites being the largest thing a fully mapped configuration holds *at
+this shape* — §8.6 works the same scaling at 1.4M nodes, where they still lead. The
 follow-up §8.6 asks for — the composites on disk — is unchanged and unstarted; what moved
 is the coefficient it has to beat.
 
@@ -1217,11 +1226,24 @@ back to a heap image, and a heap image then declines the mapped index by §8.3's
 rule. **One option not set costs 419 MiB on a 248 MiB store**, both fallbacks together,
 and the second is a consequence of the first rather than an independent decision.
 
-This is the correct default: mapping a file a writer may rewrite underneath you is a
-fatal fault on every platform, not an error (B3, `docs/TECHNICAL_DETAILS.md` §16.15), and
-an engine may not choose that for a caller who has not asked. `ImageMappedUnlocked` is
-how a caller asks, having read what it trades. What the sweep adds is the price of *not*
-asking, which was previously documented as a mode difference and not as a number.
+This is the correct default: mapping a file a writer may rewrite underneath you fails
+in ways a caller cannot handle, and the shape differs by platform
+(`docs/TECHNICAL_DETAILS.md` §15.14). Shortening the file removes pages a slice still
+addresses, and on unix the next access is `SIGBUS` — unrecoverable in Go, at whatever
+unrelated line touched the slice; windows refuses to shorten a file with a live mapping
+at all, so that hazard does not exist there. Overwriting bytes in place is permitted on
+both, and silently changes what the mapping reads. An engine may not choose either for a
+caller who has not asked. `ImageMappedUnlocked` is how a caller asks, having read what it
+trades. What the sweep adds is the price of *not* asking, which was previously documented
+as a mode difference and not as a number.
+
+*Since written*: the number is now where the charge is made rather than only here.
+`graphene.OpenLive`'s doc comment carries the 419 MiB, names `ImageMappedUnlocked` as
+the way to ask, and states the second fallback as a consequence of the first — a caller
+reading only the image fallback would otherwise conclude that asking for the mapping
+buys back the image half alone. `OpenEstimate.FallbacksFor(Options)` reports the same
+cascade before the open; `store.MetricImageFallback` and `store.MetricIndexFallback`
+already reported it at the open, which is one fsync too late to act on.
 
 ### 8.6 The consumer's store, per configuration
 
@@ -1262,9 +1284,21 @@ of the 537. Nothing in the shipped program moves it; it is the R3 follow-up, and
 
 *Since measured*, and see §8.4: 160 B per entry was mostly a second copy of the member
 values, and the columnar rows that replaced it measure 43.87. This row has not been taken
-again at 1.4M nodes — scaled by that ratio the 427.2 MiB would be about 128, which is no
-longer the largest term in the column. The item itself, composites read from the image
-rather than rebuilt into the heap at open, is unchanged and unstarted.
+again at 1.4M nodes — scaled by that ratio the 427.2 MiB would be about 128. That takes
+the default column's total from 537 to about 238, but it does not change which term leads:
+at ~128 MiB the composites are still the largest single item in that column, ahead of
+record arrays at 74.8. What changed is the size of the prize, not its rank. The item
+itself, composites read from the image rather than rebuilt into the heap at open, is
+unchanged and unstarted.
+
+*Also since measured*: the term no longer has to be derived from this table.
+`ResidentEstimate.Composite` reports it directly, taken out of `Index` rather than
+summed into it, so a store can be asked what its own declarations cost instead of
+being compared against a projection taken on another shape. It is exact in its counts
+and free to read — the loop was already there, per declaration, and was summing itself
+away. That is what the arm at 1.4M will read the number off, and it is what a caller
+who declares composites should look at before concluding that a mapped index brought
+them under a ceiling.
 
 ## 9. Under a ceiling
 
@@ -1384,6 +1418,12 @@ are cheap enough to run side by side:
 | charged against the ceiling, peak | 884.6 MiB | 814.2 MiB |
 | interim compactions | 0 | 2 |
 
+> **Superseded — "it bought almost nothing" is no longer true.** This paragraph and the
+> table above it measure the engine *before* a compaction adopted the index it had just
+> written. With that change in force the same knob is worth **290 MiB** at this shape. The
+> figures are left standing as the measurement they were; §9.6 has the pair, and the reason
+> the knob was worth so little here is in the second paragraph below.
+
 **A compaction leaves its own output resident until the store is reopened.** That is the
 reason, and it is visible in one row of §9.2's table: anonymous memory is 3,838 MiB
 immediately after the final compaction and **1,078 MiB after reopening the same directory**,
@@ -1438,6 +1478,10 @@ Two arms, because only one of them holds at the full shape and both facts matter
 read-only arm runs at 1,400,000 nodes under 2 GiB; the write arm runs the whole sequence at
 200,000 nodes under the same 2 GiB, where it finishes with 53.2% headroom. Neither hides the
 other, and the job fails if no ceiling is in force.
+
+That 53.2% is the nightly's own arm at its own delta bound and matches neither column of
+§9.6; it has not been re-taken since a compaction began adopting its index, and it is on
+the list to retake at 1,400,000 nodes rather than at 200,000.
 
 The fixtures are built first and outside the limit — a 1.4M-node build peaks at several
 times what the finished store costs to open, so a run that built its own would fail in the
@@ -1517,7 +1561,7 @@ fixture knobs:
 
 | variable | effect |
 |---|---|
-| `GRAPHENE_RSS_NODES` | node count (default 200,000) |
+| `GRAPHENE_RSS_NODES` | node count (default 50,000; the figures in this document name the count they were taken at) |
 | `GRAPHENE_RSS_BLOB` | blob bytes per node (default 512) |
 | `GRAPHENE_RSS_DIR` | build the fixture **once** into this directory and reuse it; a shape marker makes a later run with different settings fail rather than silently measure the wrong store |
 | `GRAPHENE_RSS_EDGE_STRIDE` | write one edge per N nodes (0 = no edges) |

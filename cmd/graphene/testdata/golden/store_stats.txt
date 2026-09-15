@@ -19,6 +19,7 @@ TaggedWith                                1
 compacted image                           
   nodes                                   5
   edges                                   5
+  format version                          9 (current)
                                           
 identifiers issued                        
   nodes                                   5 of 4294967296 (100.00% headroom)
@@ -38,6 +39,7 @@ property index
 memory                                    
   estimated heap                          608.7 KiB (retained heap, a floor on RSS: measured at 1.19-1.54x this)
   mapped image                            865 B (page cache, evictable, not counted above)
+    of which, property index              222 B (the index is two sections of the image, not a file of its own)
                                           
 log                                       
   size                                    50 B (the best proxy for how long the next open takes)

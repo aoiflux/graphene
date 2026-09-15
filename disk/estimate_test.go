@@ -376,7 +376,7 @@ func TestEstimateResident_MappingMovesTheBlobsOutOfTheHeap(t *testing.T) {
 		defer r.Close()
 		est := r.EstimateResident()
 		sum := est.RecordArrays + est.Payload + est.LabelPostings +
-			est.Adjacency + est.Index + est.Delta + est.WAL
+			est.Adjacency + est.Index + est.Composite + est.Delta + est.WAL
 		if est.Total != sum {
 			t.Errorf("%s: Total is %d, its terms sum to %d — a term is missing from the sum",
 				mode, est.Total, sum)
@@ -624,5 +624,229 @@ func TestEstimateResident_AdjacencyIsZeroWhileDeferred(t *testing.T) {
 	}
 	if got := lazy.EstimateResident().Adjacency; got == 0 {
 		t.Error("adjacency was built and is still charged nothing")
+	}
+}
+
+// TestEstimateResident_MappedCountsWhatTheStoreOwns is the assertion whose
+// absence was the bug.
+//
+// Until v0.8.0 the mapped figures were read off the live graph: est.Mapped was
+// csr.imgBytes, and StorageStats took its byte column from imageHolding. Both
+// answer "is what a caller reads coming out of a file", and after a compaction
+// the answer is no, because the graph on top was built in memory. The mapping is
+// still held — it is not released until Close, because every blob the compaction
+// carried forward still addresses it — so the store went on paying for a file it
+// reported nothing for.
+//
+// Nothing in the suite noticed, because every mapping assertion in it was taken
+// on a freshly opened store, where the two questions have the same answer. The
+// compaction is the whole test.
+func TestEstimateResident_MappedCountsWhatTheStoreOwns(t *testing.T) {
+	dir := mapFixture(t, 200)
+	s, err := OpenWithOptions(dir, Options{ImageMode: ImageMapped})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	atOpen := s.EstimateResident()
+	if atOpen.Mapped == 0 {
+		t.Skip("this platform fell back to the heap, so there is no mapping to account for")
+	}
+	if st := s.StorageStats(); st.ImageMappedBytes != atOpen.Mapped {
+		t.Errorf("at open, StorageStats says %d mapped image bytes and EstimateResident says %d",
+			st.ImageMappedBytes, atOpen.Mapped)
+	}
+
+	if _, err := s.AddNode(&store.Node{
+		Labels:     []store.NodeType{store.NodeTypeEvidenceFile},
+		Properties: []byte("after"),
+	}); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	// The read path is honestly on the heap now. That is imageHolding answering
+	// its own question, and it is not what is being tested.
+	after := s.EstimateResident()
+	if after.Mapped == 0 {
+		t.Errorf("after compacting, the store reports 0 mapped bytes while still holding "+
+			"the mapping it opened with (%d bytes at open); this is the under-report "+
+			"v0.8.0 fixed, and it is the largest single thing the process is paying for",
+			atOpen.Mapped)
+	}
+	if st := s.StorageStats(); st.ImageMappedBytes != after.Mapped {
+		t.Errorf("after compacting, StorageStats says %d mapped image bytes and "+
+			"EstimateResident says %d — the two must not diverge",
+			st.ImageMappedBytes, after.Mapped)
+	}
+
+	// And the mode is still the read-path answer, deliberately. Asserted so that
+	// a later change which "fixes" the apparent contradiction between
+	// ImageMode:"heap" and a non-zero byte count has to come here and read why.
+	if st := s.StorageStats(); st.ImageMode != ImageHeap.String() {
+		t.Errorf("after compacting, ImageMode is %q; it reports what the read path is "+
+			"served from, which is a graph built in memory", st.ImageMode)
+	}
+}
+
+// TestEstimateResident_MappedIndexCountsTheBase covers the mapping that was
+// counted nowhere at all.
+//
+// gpix_base.go said those bytes "are reported as ImageMappedBytes instead", and
+// they were not: that figure came from the mapping the graph reads, while a base
+// is read through its own, held in a separate list with a separate lifetime.
+// Under IndexMapped at the scale the mode exists for, this is the largest file
+// the store has open and every byte figure it published read zero.
+func TestEstimateResident_MappedIndexCountsTheBase(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 500; i++ {
+		id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
+		if err != nil {
+			t.Fatalf("AddNode: %v", err)
+		}
+		if err := s.IndexNodeProperty(id, "k", []byte(fmt.Sprintf("v%04d", i))); err != nil {
+			t.Fatalf("IndexNodeProperty: %v", err)
+		}
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := OpenWithOptions(dir, Options{ImageMode: ImageMapped, IndexMode: IndexMapped})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer r.Close()
+
+	st := r.StorageStats()
+	if st.IndexMode != "mapped" {
+		t.Skipf("the index did not map (%q); there is no base mapping to account for", st.IndexMode)
+	}
+	est := r.EstimateResident()
+	if est.MappedIndex == 0 {
+		t.Error("the index is mapped and the store reports 0 mapped index bytes")
+	}
+	if st.IndexMappedBytes != est.MappedIndex {
+		t.Errorf("StorageStats says %d mapped index bytes and EstimateResident says %d",
+			st.IndexMappedBytes, est.MappedIndex)
+	}
+	// A subset, not a second file. The index is two sections of the image, so it
+	// has to be smaller than what is mapped and larger than nothing — a figure
+	// equal to Mapped would mean the section lengths had been replaced by the
+	// mapping length somewhere.
+	if est.MappedIndex >= est.Mapped {
+		t.Errorf("the index reports %d mapped bytes out of %d mapped in total; it is a "+
+			"pair of sections inside the image and cannot be the whole of it",
+			est.MappedIndex, est.Mapped)
+	}
+}
+
+// TestStorageStats_AMappedModeNeverReportsZeroBytes is the consistency check
+// across the four fields, run over every configuration that can produce them.
+//
+// They disagreed before v0.8.0 in a way no single-field assertion could catch:
+// IndexMode said "mapped" while every byte figure in the struct said zero, which
+// is not two right answers to two questions but one of them missing. This pins
+// the pairing rather than the values.
+func TestStorageStats_AMappedModeNeverReportsZeroBytes(t *testing.T) {
+	dir := mapFixture(t, 120)
+	for _, tc := range []struct {
+		name string
+		opts Options
+	}{
+		{"defaults", Options{}},
+		{"mapped image, mapped index", Options{ImageMode: ImageMapped, IndexMode: IndexMapped}},
+		{"mapped image, resident index", Options{ImageMode: ImageMapped, IndexMode: IndexResident}},
+		{"heap image", Options{ImageMode: ImageHeap}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := OpenWithOptions(dir, tc.opts)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer s.Close()
+			st := s.StorageStats()
+			if st.IndexMode == "mapped" && st.IndexMappedBytes == 0 {
+				t.Error("IndexMode is mapped and IndexMappedBytes is 0")
+			}
+			if st.IndexMode != "mapped" && st.IndexMappedBytes != 0 {
+				t.Errorf("IndexMode is %q and IndexMappedBytes is %d",
+					st.IndexMode, st.IndexMappedBytes)
+			}
+			if st.IndexMappedBytes > st.ImageMappedBytes {
+				t.Errorf("the index reports %d mapped bytes out of %d mapped in total; "+
+					"it is a subset", st.IndexMappedBytes, st.ImageMappedBytes)
+			}
+			// One direction only for the image. A mapped mode implies bytes, but
+			// bytes do not imply the mode: see the compaction case above.
+			if st.ImageMode == "mapped" && st.ImageMappedBytes == 0 {
+				t.Error("ImageMode is mapped and ImageMappedBytes is 0")
+			}
+		})
+	}
+}
+
+// TestEstimateResident_CompositeIsTakenOutOfIndex is G7a: the term a caller
+// changes by declaring less rather than by writing less.
+//
+// Two assertions, and the second is the one that matters. That Composite is
+// non-zero when a composite is declared is arithmetic; that it was taken *out* of
+// Index rather than left inside it is the claim the field makes about itself, and
+// it is what stops a reader adding the two and double-counting.
+func TestEstimateResident_CompositeIsTakenOutOfIndex(t *testing.T) {
+	build := func(t *testing.T, composite bool) ResidentEstimate {
+		t.Helper()
+		s, _ := openFresh(t)
+		defer s.Close()
+		if composite {
+			if err := s.DeclareCompositeNodeProperties([]string{"a", "b"}); err != nil {
+				t.Fatalf("DeclareCompositeNodeProperties: %v", err)
+			}
+		}
+		for i := 0; i < 300; i++ {
+			id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
+			if err != nil {
+				t.Fatalf("AddNode: %v", err)
+			}
+			if err := s.IndexNodeProperty(id, "a", []byte(fmt.Sprintf("a%02d", i%16))); err != nil {
+				t.Fatalf("IndexNodeProperty: %v", err)
+			}
+			if err := s.IndexNodeProperty(id, "b", []byte(fmt.Sprintf("b%02d", i%8))); err != nil {
+				t.Fatalf("IndexNodeProperty: %v", err)
+			}
+		}
+		return s.EstimateResident()
+	}
+
+	plain := build(t, false)
+	if plain.Composite != 0 {
+		t.Errorf("a store with no composite declared reports %d composite bytes", plain.Composite)
+	}
+
+	withComposite := build(t, true)
+	if withComposite.Composite == 0 {
+		t.Fatal("a declared composite over 300 entities reports 0 bytes")
+	}
+	// The shards hold the same entries in both, so declaring a composite must
+	// leave Index where it was and put the whole difference in Composite.
+	if withComposite.Index != plain.Index {
+		t.Errorf("Index went from %d to %d when a composite was declared; the bytes are "+
+			"landing in Index as well as in Composite (%d)",
+			plain.Index, withComposite.Index, withComposite.Composite)
+	}
+	if got := withComposite.Total - plain.Total; got != withComposite.Composite {
+		t.Errorf("declaring the composite moved Total by %d and Composite reports %d; "+
+			"Composite is supposed to be in Total and nothing else moved", got,
+			withComposite.Composite)
 	}
 }

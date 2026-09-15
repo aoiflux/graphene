@@ -113,13 +113,22 @@ const (
 
 	// MetricIndexFallback is one open that asked for a property index read out of
 	// the image and rebuilt it in the heap instead. Err names why: the mode is
-	// IndexResident, or the image is in the heap, where an index read in place
-	// would pin the whole file to save part of it.
+	// IndexResident, the image is in the heap, where an index read in place would
+	// pin the whole file to save part of it, or the image predates the format
+	// that carries a mappable index.
 	//
-	// A file that simply carries no such index — anything written before the
-	// format could hold one — is not a fallback and emits nothing. There is
-	// nothing in that file to read in place, and the next compaction is what
-	// produces one.
+	// That third cause used to be excluded, and this said so: "a file that simply
+	// carries no such index — anything written before the format could hold one —
+	// is not a fallback and emits nothing. There is nothing in that file to read
+	// in place, and the next compaction is what produces one." Every sentence of
+	// that is true and the conclusion was wrong. The test is not where the cause
+	// lies, it is what the caller is paying, and an old image is the most
+	// expensive of the three: the entries load one at a time, which measured
+	// about sevenfold on the open, and then sit in the heap at about a hundred
+	// bytes each. It was also the only one with no in-process symptom at all —
+	// IndexMode said "resident" with no reason attached and ImageMode said
+	// "mapped", because the image maps perfectly well. Since v0.8.0 it is
+	// reported, and its Err is the one that names a remedy.
 	MetricIndexFallback
 
 	// MetricDeltaOverBudget is emitted when the delta's records first reach

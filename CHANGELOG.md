@@ -3,6 +3,185 @@
 Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 `git log` for those.
 
+## Unreleased — v0.8.0
+
+### The mapped-bytes accounting was wrong, in both directions
+
+- **`ResidentEstimate.Mapped` and `StorageStats.ImageMappedBytes` reported zero
+  for a file the process had open.** Both were taken off the live graph, which
+  answers "is what a caller reads coming out of a file". After a compaction the
+  honest answer to that is no — the graph on top was built in memory — but the
+  mapping taken at `Open` is held until `Close`, because every blob the compaction
+  carried forward still addresses it. A store that compacted once went on paying
+  for its image and reporting nothing for it. Both figures now count the mappings
+  the store *owns*.
+
+- **`ImageMode` is unchanged and still follows the read path**, so a store that
+  has compacted reports `ImageMode: "heap"` beside a non-zero `ImageMappedBytes`.
+  That pairing is not a contradiction: they answer two questions, and both
+  answers are wanted. The one that sizes a machine is the byte count.
+
+- **`StorageStats.IndexMappedBytes` is new, and the thing it reports was reported
+  nowhere at all.** `IndexMode` said `"mapped"` while every byte figure in the
+  struct said zero. `disk/gpix_base.go` sent a reader to `ImageMappedBytes` for
+  it, which was nearly right at open — GPIX and GPIR are sections *inside*
+  `graphene.csr`, so a mapped image has a mapped index inside it — and not right
+  at all after a compaction, when `SwapBase` installs a base over a second mapping
+  held in a different list. The new field is the index's own sections, so it is a
+  **subset** of `ImageMappedBytes` rather than a second figure: adding them
+  double-counts, and `graphene store stats` prints it indented under "of which".
+
+- **The reason to name it separately is that "this store has 1.6 GiB mapped" is
+  not an answer to "what is the property index costing me".** A caller choosing
+  between `IndexMapped` and `IndexResident` is asking the second question, and
+  had no way to.
+
+- `disk.ResidentEstimate` gains `MappedIndex` for the same figure.
+  `index.MappedReporter` is the optional interface a base implements to answer
+  it; a base that holds a decoded copy implements nothing and reports zero.
+
+- No format change. The values `ImageMode` and `IndexMode` can take are
+  unchanged.
+
+### What the composites cost is now a term of its own
+
+- **`ResidentEstimate.Composite` is taken out of `Index` rather than left inside
+  it.** Every other term in the breakdown moves with what the store was asked to
+  hold; this one moves with a declaration. A composite nothing queries costs
+  exactly what one carrying the workload costs, and at the shape this engine is
+  sized for the composites have been the largest single term in a default
+  configuration — the one part of an index that mapping does not get out of the
+  heap.
+
+- **Exact, and free to read.** `index/resident.go` was already looping per
+  declaration to compute this and summing it away; `PropertyIndex.
+  CompositeResidentBytes` surfaces it and `ResidentBytesSplit` returns it with the
+  total it is part of. One call rather than two deliberately: nothing holds a lock
+  across the whole walk, so a caller subtracting two separately taken figures can
+  get a negative "index" out of two honest numbers.
+
+- **`store.CompositeIndexDeclarer`'s documentation now gives the size of "not
+  free".** It already said a declaration no query matches costs memory for
+  nothing. What it did not say is about 48 bytes an entry against a mapped
+  index's near-zero, or that declaring several can put a store back over a ceiling
+  the mapped index had just brought it under.
+
+### A running store can say what format its image is
+
+- **`StorageStats.ImageVersion` and `StorageStats.IndexOnDisk` are new.** An
+  image written before v9 loads its property index entry by entry whatever
+  `IndexMode` asks for, because GIDX is the only form it has — measured at about
+  sevenfold on the open, 301 ms against 2,102 ms on a 462 MiB store and 1.40 s
+  against 9.94 s at 2.26 GiB — and then holds it in the heap at roughly a hundred
+  bytes an entry. Nothing in the running system said so. `IndexMode` reported
+  `"resident"` with no reason attached, `ImageMode` reported `"mapped"` because
+  the image itself maps perfectly well, and no metric fired.
+
+- **`IndexOnDisk` is what separates three causes one field cannot.** A store
+  reporting `IndexMode: "resident"` has either asked for it, or asked for a
+  mapped index over an image that is itself in the heap, or asked for one over a
+  file with nothing mappable in it. Only the third is fixed by compacting, and
+  `"resident"`/`"entries"` read together is how a caller tells.
+
+- **`MetricIndexFallback` now fires on that third cause, and its documentation
+  records the reversal.** It used to exclude it, on the grounds that a file with
+  no mappable index is not something to fall back *from*. That reasoning is about
+  where the cause lies; the metric is about what the caller is paying. The old
+  sentence is quoted in place rather than deleted. This case is also the only one
+  of the three whose reason can name a remedy, and it does: `Compact` under
+  `IndexMapped`, or `graphene store migrate -to 9`.
+
+- **Auto-migrating on open was considered and declined.** An `Open` that silently
+  rewrites the store is a surprise of a different kind, a compaction is not free,
+  and it must never be the default for a read-only open. The remedy is one pass
+  over the store and it is the caller's to run.
+
+- `graphene store stats` prints the format version under "compacted image", with
+  the consequence attached rather than left to a reader who would have to know
+  what the number means.
+
+### `OpenLive` says what its defaults cost
+
+- **One option not set costs 419 MiB on a 248 MiB store**, and the number is now
+  in the doc comment of the function that charges it. A read-only open of that
+  store holds 146–149 MiB; `OpenLive` on the defaults holds 568.
+
+- **The cascade is two steps and the second follows from the first.**
+  `ImageMapped` maps only where something excludes a concurrent writer from the
+  directory, and a live reader holds no lock by construction — that is what makes
+  it live — so the image goes to the heap, and a mapped index is then declined
+  because the image is in the heap. A caller reading only the first fallback would
+  conclude that `ImageMappedUnlocked` buys back the image half alone. It buys
+  back both: the same store falls to 144–150 MiB.
+
+- **`OpenEstimate.FallbacksFor(Options)` is new**, and reports the same cascade
+  before the open rather than after it. Both fallbacks already fired as metrics,
+  naming their reasons — nothing here is a behaviour change — but a metric arrives
+  once the memory has been spent, and the decision it informs is taken before.
+  The reasons come from the two functions an `Open` asks rather than from a second
+  copy of the rule.
+
+- **The default is not moved, and the version number would permit it.** Mapping a
+  file a writer may rewrite underneath you fails in ways a caller cannot handle,
+  and the shape differs by platform: shortening the file removes pages a slice
+  still addresses and the next access is `SIGBUS` on unix, while windows refuses
+  to shorten a file with a live mapping at all. An engine may not choose that for
+  a caller who has not asked. `ImageMappedUnlocked` is how a caller asks, having
+  read what it trades.
+
+### Documentation: the mapped-slice lifetime contract is two rules, not four
+
+- **Eleven statements across the tree said four incompatible things about how
+  long a `[]byte` a read returned stays valid.** No guarantee is weakened and no
+  behaviour changes; what changes is that each statement now carries the
+  precondition under which it is true.
+
+- **Rule A, the default.** Under `ImageMapped` a returned slice is valid for the
+  life of the handle and not past `Close()`. A compaction does not shorten that
+  window — it neither creates nor retires a mapping — which is what three sites
+  got wrong in the safe direction by saying the slice died at the next compaction.
+  Safe is not free: it made "a compaction leaves its output resident until reopen"
+  read as a bug rather than as a resident-set characteristic.
+
+- **Rule B, and it keeps its precondition now.** Under `OpenLive` *with*
+  `ImageMappedUnlocked`, where a `Refresh` across a compaction maps the new image
+  and retires the old, a slice is valid only until the second such reload after
+  it. Two sites stated B without the precondition. It was scoped rather than
+  deleted: it is correct and was misplaced.
+
+- **`OpenReadOnly`'s doc comment still described the pre-mmap engine**, at four
+  sites — "loads a store into memory once at open and never re-reads it". The
+  conclusion each supported is still true and the justification was backwards
+  under `ImageMapped`, which is the configuration that maps best. Corrected to the
+  form `disk/lock.go` already used: one read *or one mapping*, and a mapping does
+  not change it because the image is never rewritten in place.
+
+- **A writer that deletes cannot skip the adjacency build**, and the argument for
+  that already existed in `disk/adjacency_mode.go` — attached to no declaration,
+  where godoc never rendered it. The consequence is now on `Options.Adjacency` and
+  on `AdjacencyLazy`, which is where the choice is made.
+
+- **Corrections to `docs/MEMORY_MODEL.md`.** §8.6's footnote concluded that the
+  composites were "no longer the largest term in the column" after scaling them to
+  ~128 MiB, in a column whose record arrays are 74.8 — they still lead, by 1.7×;
+  what changed is the size of the prize, not its rank. §8.4 stated three
+  coefficients in one paragraph without saying which was the estimator's constant
+  and which were measurements. §8.5 cited a section that does not discuss what it
+  was cited for, cited a label ("B3") defined nowhere in the repository, and said
+  a hazard is fatal "on every platform" where the code refuses it outright on
+  windows. §9.4's retraction marker reached two paragraphs and the claim it
+  retracts is 119 lines further on. Superseded figures are marked in place, not
+  deleted.
+
+- Stale figures: the fixture peak is 9.4 GiB and two code comments said 7.5;
+  `GRAPHENE_RSS_NODES` defaults to 50,000 and the knob table said 200,000;
+  `CommitSeq`'s high-water mark has been carried since v8 rather than by v8; and
+  one CHANGELOG sentence reported a windows working set against a linux cgroup.
+
+- **`DefaultCompactionPolicy` gains a sizing rule for `MaxDeltaBytes`** — the
+  trade, stated so a caller can apply it to their own ceiling. The default is
+  unchanged here; moving it is a measurement, not an edit.
+
 ## v0.7.0 "Bookshelf" — the store stops carrying what it can read in place
 
 ### Indexed values can be served without the records that carry them
@@ -376,7 +555,7 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 - **The read path reaches the target, measured at the target shape.** 1,400,000
   nodes in a 1,689 MiB v9 image with 18,200,000 index entries open and are read in
-  **560.8 MiB of anonymous memory**, charging 613.9 MiB against a real 2 GiB cgroup
+  **560.8 MiB of anonymous memory**, charging 613.9 MiB against a real 2 GiB limit
   and finishing with **70% headroom** — while holding a 1,354 MiB working set, the
   difference being the mapped image the ceiling does not count. `MEMORY_MODEL.md`
   §8.6 projected 537 MiB for this configuration and `EstimatedResidentBytes` reports
@@ -640,8 +819,9 @@ out of memory and could only be told to compact on proxies for it.
   rather than left as something true of the implementation. A `NodeID` held across
   any number of compactions names the same record; identifiers are never reused and
   the sequence counters have high-water marks in the image header, so a reopen does
-  not reissue them either. What does not survive is a `[]byte` a read returned under
-  a mapped image — see `ImageMode` and `store.CloneNode`.
+  not reissue them either. A `[]byte` a read returned under a mapped image survives a
+  compaction too; what it does not survive is `Close()` — see `ImageMode` and
+  `store.CloneNode`.
 
 ### The store can say what it is holding
 

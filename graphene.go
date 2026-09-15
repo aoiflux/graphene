@@ -110,11 +110,14 @@ func loadSidecars(gs store.GraphStore) error {
 // a shared lock so any number of readers coexist.
 //
 // No reader runs alongside a writer, and that is deliberate rather than a
-// limitation of the lock. The engine loads a store into memory once at open and
-// never re-reads it, so a reader admitted alongside a writer would serve a graph
-// frozen at its own open, indefinitely, with nothing to signal that it had gone
-// stale. Being refused is the better answer, and reopening is how a reader
-// advances.
+// limitation of the lock. The engine materialises a store once at open — the
+// delta layer and property index from a WAL replay, the image from one read or
+// one mapping of graphene.csr — and nothing re-reads afterwards. A mapping does
+// not weaken that: the engine never rewrites the image in place, so the bytes
+// behind it are the bytes that were there at Open. A reader admitted alongside a
+// writer would therefore serve a graph frozen at its own open, indefinitely,
+// with nothing to signal that it had gone stale. Being refused is the better
+// answer, and reopening is how a reader advances.
 //
 // Every mutating call returns disk.ErrReadOnly, including Compact. Nothing under
 // dir is modified.
@@ -147,6 +150,35 @@ func OpenReadOnly(dir string) (*Graph, error) {
 // The view is still fixed between calls to Refresh; there is no polling
 // goroutine, because how often to look is the caller's decision. Every mutating
 // call returns disk.ErrReadOnly and nothing under dir is modified.
+//
+// # What the default costs here, which is more than anywhere else
+//
+// Measured on a 248 MiB image: a read-only open holds 146–149 MiB, and this one
+// holds 568 MiB. **One option not set costs 419 MiB on a 248 MiB store.**
+//
+// The cascade is two steps and the second follows from the first. disk.
+// ImageMapped maps only where something excludes a concurrent writer from the
+// directory, and a live reader holds no lock by construction — that is what makes
+// it live — so the image is read into the heap. A mapped property index is then
+// declined because the image is in the heap, where reading an index in place
+// would pin the whole file to save part of it. Both fallbacks are reported:
+// store.MetricImageFallback and store.MetricIndexFallback each fire once at the
+// open, naming their reason, and StorageStats.ImageMode and IndexMode both say so
+// afterwards. Neither is silent, and neither is an error.
+//
+// disk.ImageMappedUnlocked is how to ask for the mapping anyway, and it brings
+// the index with it: the same store falls back to 144–150 MiB. Read what it
+// trades before setting it — a writer that shortens graphene.csr removes pages a
+// returned slice still addresses, and a returned slice then lives only until the
+// second reload after it rather than for the life of the handle. It is a
+// deliberately unattractive option and it is the right one for a reader that
+// knows no compaction is running.
+//
+// The default is not moved, and the version number would permit it. Mapping a
+// file a writer may rewrite underneath you fails in ways a caller cannot handle,
+// and an engine may not choose that for a caller who has not asked. See
+// docs/MEMORY_MODEL.md §8.5 for the sweep and docs/TECHNICAL_DETAILS.md §15.14
+// for the per-platform shape of the hazard.
 //
 //	g, err := graphene.OpenLive(dir)
 //	...

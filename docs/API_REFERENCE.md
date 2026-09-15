@@ -2273,8 +2273,14 @@ the store does not reissue them either. This is a guarantee, and it is what make
 background compaction safe for code holding a slice of ids it collected minutes
 ago.
 
-What does *not* survive is a `[]byte` a read returned, under the default mapped
-image: those address the image file and are valid until the compaction after next.
+A `[]byte` a read returned is the one thing with a shorter life, and how much
+shorter depends on the mode. Under the default `ImageMapped` it addresses the image
+file and is valid **for the life of the handle and not past `Close()`** — a
+compaction does not shorten that window, because a compaction writes a new file and
+goes on reading blobs from the mapping it already had. Under `OpenLive` with
+`ImageMappedUnlocked`, where a `Refresh` across a compaction maps the new image and
+retires the old, such a slice is valid only **until the second such reload after
+it** — the same rule stated at `OpenLive` above.
 `store.CloneNode` and `store.CloneEdge` are the way out for anything you cache. See
 `ImageMode`.
 
@@ -2469,6 +2475,27 @@ whatever `IndexMode` asks, because GIDX is the only form it carries. Measured ag
 the store it predicts, it runs 1.00× under the defaults and up to 1.38× on a v8
 image in the heap.
 
+**`FallbacksFor` is the same resolution as sentences.** `HeapBytesFor` gives you a
+number that is larger than you expected; this tells you why, before the memory is
+spent rather than after.
+
+```go
+for _, why := range est.FallbacksFor(disk.Options{LiveReader: true}) {
+    log.Println("this open will not get what it asked for:", why)
+}
+// the image will be read into the heap: mapping needs a process lock; see ImageMappedUnlocked
+// the property index will be rebuilt in the heap: the image is in the heap, and an
+//   index read out of it would pin the whole file to save part of it
+```
+
+Empty when the Options will be honoured exactly, and empty for a mode you chose —
+asking for `ImageHeap` is not falling back to it. Both fallbacks it reports also
+fire at the open itself, as `store.MetricImageFallback` and
+`store.MetricIndexFallback` with the same reasons; the difference is only when you
+find out. The `OpenLive` pair above is the one worth knowing, because the second
+line is a *consequence* of the first and a caller reading only the first would
+conclude that `ImageMappedUnlocked` buys back the image half alone.
+
 `Open` is the one operation whose cost nobody can see in advance. An image is a
 file whose size is on disk; a log that was never compacted is a whole write
 history that is replayed into memory on every open, and until now the only way to
@@ -2626,13 +2653,40 @@ anything is allocated; this answers it from the structures themselves.
 st, _ := g.StorageStats()
 // st.EstimatedResidentBytes — heap the backend is holding
 // st.DeltaBytes             — what the delta's records hold, exactly
-// st.ImageMappedBytes       — the mapped image: page cache, NOT in the total
+// st.ImageMappedBytes       — file this store has mapped: page cache, NOT in the total
+// st.IndexMappedBytes       — the property index's share of that figure, a subset
+// st.ImageVersion           — the image's on-disk container version
+// st.IndexOnDisk            — what that image carries: "mapped", "entries", "none"
 // st.IndexEntries()         — indexed triples across nodes and edges
 
 est := s.EstimateResident() // disk.Store: the same total, term by term
 // est.RecordArrays est.Payload est.LabelPostings est.Adjacency
-// est.Index est.Delta est.WAL est.Total est.Mapped
+// est.Index est.Composite est.Delta est.WAL est.Total
+// est.Mapped est.MappedIndex
 ```
+
+**`Composite` is taken out of `Index`, not nested inside it.** The two are disjoint
+and both are in `Total`. It is separate because it is separately decidable: every
+other term follows from the records the store was asked to keep, and this one
+follows from a declaration, so a composite nothing queries costs exactly what one
+carrying the workload costs. At the shape this engine is sized for it has been the
+largest single term in a default configuration — the one part of an index that
+mapping does not get out of the heap.
+
+**`MappedIndex` *is* nested inside `Mapped`, and adding them double-counts.** GPIX
+and GPIR are sections of `graphene.csr`, so a store that maps its image has mapped
+its index with it. It is published separately because "this store has 1.6 GiB
+mapped" does not answer "what is the property index costing me", which is the
+question a caller choosing between `IndexMapped` and `IndexResident` is asking.
+
+**`ImageVersion` and `IndexOnDisk` are the pair that separates three causes.** A
+store reporting `IndexMode: "resident"` has either asked for it, or asked for a
+mapped index over an image that is itself in the heap, or asked for one over a file
+with nothing mappable in it. Only the third is fixed by compacting, and it is the
+expensive one: an image below v9 loads its index entry by entry whatever `IndexMode`
+says — about sevenfold on the open — and then holds it in the heap at roughly a
+hundred bytes an entry. Reading `"resident"` with `"entries"` is how a caller tells,
+and `store.MetricIndexFallback` fires at the open with the remedy in its error.
 
 **It costs nothing to read.** Bounded by the number of declared index keys and
 distinct labels, never by the store's size — which is a requirement rather than an
@@ -2646,9 +2700,18 @@ ratio, useful for comparing two configurations of one store or watching one stor
 move, and not as a figure to size a machine from directly. `store stats` prints the
 ratio beside it for that reason.
 
-**Mapped image bytes are not in the total.** They are page cache the kernel may
-evict, so a total that included them would invert exactly the comparison
-`ImageMapped` exists to win. `ImageMappedBytes` reports them separately.
+**Mapped bytes are not in the total.** They are page cache the kernel may evict, so
+a total that included them would invert exactly the comparison `ImageMapped` exists
+to win. `ImageMappedBytes` and `IndexMappedBytes` report them separately.
+
+**They count what the store *owns*, which `ImageMode` deliberately does not.** That
+field reports what the graph a caller reads is being served from, so after a
+compaction it says `"heap"` — the graph on top was built in memory. The mapping
+taken at `Open` is held until `Close` even so, because every blob the compaction
+carried forward still addresses it, and its pages are still in the cache. So
+`ImageMode: "heap"` beside a non-zero `ImageMappedBytes` is two answers to two
+questions rather than a contradiction. Before v0.8.0 the byte figure followed the
+mode, and so reported zero for a file the process was still holding open.
 
 **Its counts are exact; three per-item costs are not.** Record arrays, label
 postings, adjacency and the delta's payload are lengths and maintained counters.
@@ -2812,9 +2875,11 @@ stale lock to clear and no recovery step.
 #### An `OpenReadOnly` store is a snapshot, and this is the part to understand
 
 **Its view is fixed at `Open` and never advances.** The engine materialises a
-store into memory once — the delta layer and property index from a WAL replay,
-the CSR from a single read — and nothing re-reads afterwards. Reopen to see later
-writes.
+store once — the delta layer and property index from a WAL replay, the image from
+a single read *or a single mapping* of `graphene.csr` — and nothing re-reads
+afterwards. A mapping does not change that: the engine never rewrites the image in
+place, so the bytes behind it are the ones that were there at `Open`. Reopen to
+see later writes.
 
 That is also why such a reader is *refused* alongside a writer rather than
 admitted. Admitting it would produce a permanently stale view with nothing to
@@ -2840,6 +2905,28 @@ it: what you give up is `OpenReadOnly`'s "no writer is running" guarantee, which
 is the whole reason that mode may fix its view at open. Nothing on the *writing*
 side changes — a writer still takes an exclusive lock, so two writers remain
 impossible, and a store with live readers attached is written exactly as before.
+
+**It is also the most expensive way to open a store on the defaults, by a long
+way.** Measured on a 248 MiB image: a read-only open holds 146–149 MiB and this
+one holds 568. **One option not set costs 419 MiB on a 248 MiB store.**
+
+The cascade is two steps and the second follows from the first. `ImageMapped` maps
+only where something excludes a concurrent writer from the directory, and a live
+reader holds no lock by construction — that is what makes it live — so the image
+goes to the heap; a mapped property index is then declined because the image is in
+the heap, where reading an index in place would pin the whole file to save part of
+it. Both are reported, by `store.MetricImageFallback` and
+`store.MetricIndexFallback`, and `OpenEstimate.FallbacksFor` says the same thing
+before the open.
+
+`disk.ImageMappedUnlocked` is how to ask for the mapping anyway, and it brings the
+index back with it: the same store falls to 144–150 MiB. Read §8.5 of
+`docs/MEMORY_MODEL.md` and the lifetime note at `Refresh` below before setting it
+— a writer that shortens `graphene.csr` removes pages a returned slice still
+addresses, and under it a returned slice lives only until the second reload after
+it rather than for the life of the handle. The default is not moved for that
+reason and not for a compatibility one: an engine may not choose that hazard for a
+caller who has not asked.
 
 ```go
 g, err := graphene.OpenLive(dir)

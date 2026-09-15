@@ -264,8 +264,19 @@ func (b *gpixBase) MaxID(kind index.EntityKind) uint64 {
 // slice headers for the reverse section, and no term anywhere that mentions
 // Entries. A 28M-entry key and an empty one differ by nothing here. The bytes the
 // entries themselves occupy are the mapping, which is page cache the kernel may
-// evict rather than memory this process must keep, and they are reported as
-// StorageStats.ImageMappedBytes instead.
+// evict rather than memory this process must keep, and MappedBytes below is what
+// reports them.
+//
+// Until v0.8.0 this comment sent a reader to StorageStats.ImageMappedBytes for
+// that figure, and it was wrong in a way worth recording. At open it is nearly
+// right: the index sections are inside graphene.csr, so a mapped index is part of
+// the one mapping the image made and its bytes really are in that total -- but
+// only as part of it, with nothing saying how large the part is, which is the
+// question anyone reading the number has. After a compaction it was not right at
+// all: SwapBase installs a base parsed from a fresh mapping of the image the
+// compaction wrote, held in Store.indexImages rather than Store.images, while
+// ImageMappedBytes followed the live graph and went to zero. The largest file the
+// store had open was then reported by nothing.
 //
 // The per-key figure is spelled out rather than taken from unsafe.Sizeof for the
 // reason disk/view.go's cell sizes are, and estimate_test.go checks it the same
@@ -280,6 +291,25 @@ func (b *gpixBase) ResidentBytes() int64 {
 	}
 	// The reverse section is two slice headers over the same mapping.
 	return total + 48
+}
+
+// MappedBytes is how much mapped file this base reads its entries out of.
+//
+// It implements index.MappedReporter. The sections rather than the file: these
+// are the slices parsed out of GPIX and GPIR, so the figure is the index's share
+// of whatever mapping it was read from and not the size of that mapping. That is
+// the distinction the caller needs -- at open the mapping is the image, shared
+// with every record payload in it, and "the image is 1.6 GiB" does not answer
+// "what is the index costing me".
+func (b *gpixBase) MappedBytes() int64 {
+	var n int64
+	if b.fwd != nil {
+		n += int64(len(b.fwd.body))
+	}
+	if b.rev != nil {
+		n += int64(len(b.rev.nodes)) + int64(len(b.rev.edges))
+	}
+	return n
 }
 
 // TotalEntries returns the entry count across every key of kind.

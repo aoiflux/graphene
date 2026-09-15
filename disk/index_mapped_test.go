@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/aoiflux/graphene/index"
@@ -444,60 +445,149 @@ func TestIndexMapped_FallsBackOnAHeapImage(t *testing.T) {
 	}
 }
 
-// TestIndexResident_EmitsNoFallbackForAModeItWasGiven separates the two silences.
+// TestIndexResident_EmitsNoFallbackForAModeItWasGiven is the remaining silence.
 //
-// A store told to keep its index resident is not falling back to anything, and a
-// store opening a file that carries no mapped index is not either. Reporting
-// either as a fallback would make the metric useless for the case it exists for,
-// which is a store that asked for the mapped index and did not get it.
+// A store told to keep its index resident is not falling back to anything, and
+// reporting it would make the metric useless for the case it exists for.
+//
+// This used to cover a second case — "asked for mapped over a v8 image" — and
+// assert the same silence, on the reasoning that a file with no mapped index is
+// not something to fall back from. v0.8.0 reversed that; the reasoning was about
+// where the cause lay rather than about what the caller was paying, and that case
+// is now TestIndexMapped_ReportsAnImageThatCannotSupplyOne. The two are worth
+// reading together, because this file is where the line between them is drawn.
 func TestIndexResident_EmitsNoFallbackForAModeItWasGiven(t *testing.T) {
+	dir := v9Store(t)
+	var fallbacks int
+	s, err := OpenWithOptions(dir, Options{
+		IndexMode: IndexResident,
+		Metrics: store.MetricsFunc(func(m store.Metric) {
+			if m.Kind == store.MetricIndexFallback {
+				fallbacks++
+			}
+		}),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	if fallbacks != 0 {
+		t.Errorf("%d index fallbacks reported to a caller who asked for a resident index",
+			fallbacks)
+	}
+	if got := s.StorageStats().IndexMode; got != IndexResident.String() {
+		t.Errorf("IndexMode = %q, want %q", got, IndexResident.String())
+	}
+}
+
+// TestIndexMapped_ReportsAnImageThatCannotSupplyOne is G9: the most expensive
+// thing that can happen at an open, which until v0.8.0 had no symptom.
+//
+// A v8 image loads its property index entry by entry whatever IndexMode asks for,
+// because GIDX is the only form it has — about sevenfold on the open, and then
+// the entries sit in the heap at roughly a hundred bytes each, which is the whole
+// cost IndexMapped exists to remove. Every field a caller could look at said
+// something reassuring or nothing: IndexMode said "resident" with no reason
+// attached, ImageMode said "mapped" because the image maps perfectly well, and no
+// metric fired.
+//
+// Three assertions, and the third is the one that makes the finding actionable
+// rather than merely visible: the reason has to name the remedy, because a caller
+// who learns their index is resident and cannot learn that one compaction fixes
+// it has been told the half of it that does not help.
+func TestIndexMapped_ReportsAnImageThatCannotSupplyOne(t *testing.T) {
+	dir := v8Store(t)
+	// Nothing more to do: an IndexResident compaction wrote GIDX, which is the
+	// arrangement every file written before the flip is in.
+	plain, err := OpenWithOptions(dir, Options{IndexMode: IndexResident})
+	if err != nil {
+		t.Fatalf("open to recompact: %v", err)
+	}
+	if err := plain.Compact(); err != nil {
+		t.Fatalf("recompact: %v", err)
+	}
+	if err := plain.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	var reasons []string
+	s, err := OpenWithOptions(dir, Options{
+		IndexMode: IndexMapped,
+		Metrics: store.MetricsFunc(func(m store.Metric) {
+			if m.Kind == store.MetricIndexFallback && m.Err != nil {
+				reasons = append(reasons, m.Err.Error())
+			}
+		}),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	st := s.StorageStats()
+	if st.ImageVersion != csrVersionSectioned {
+		t.Errorf("ImageVersion = %d, want %d", st.ImageVersion, csrVersionSectioned)
+	}
+	if st.IndexOnDisk != indexOnDiskEntries {
+		t.Errorf("IndexOnDisk = %q, want %q", st.IndexOnDisk, indexOnDiskEntries)
+	}
+	if st.IndexMode != IndexResident.String() {
+		t.Errorf("IndexMode = %q, want %q", st.IndexMode, IndexResident.String())
+	}
+	if len(reasons) != 1 {
+		t.Fatalf("%d index fallbacks reported, want 1: %v", len(reasons), reasons)
+	}
+	if !strings.Contains(reasons[0], "migrate -to 9") {
+		t.Errorf("the reason does not name the remedy: %q", reasons[0])
+	}
+}
+
+// TestStorageStats_ImageVersionDistinguishesTheTwoWritableFormats is the other
+// half of G9: the number itself, which a running store could not report at all.
+//
+// Both images here are built by the same fixture and differ only in the mode
+// their compaction ran under, so the field is being read against a difference the
+// test created deliberately rather than against a constant.
+func TestStorageStats_ImageVersionDistinguishesTheTwoWritableFormats(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		v9   bool
-		mode IndexMode
+		name        string
+		dir         func(*testing.T) string
+		version     uint16
+		indexOnDisk string
 	}{
-		{"asked for resident over a v9 image", true, IndexResident},
-		{"asked for mapped over a v8 image", false, IndexMapped},
+		{"v9", v9Store, csrVersionMappedIndex, indexOnDiskMapped},
+		{"v8", v8Store, csrVersionSectioned, indexOnDiskEntries},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var dir string
-			if tc.v9 {
-				dir = v9Store(t)
-			} else {
-				dir = v8Store(t)
-				// Nothing more to do: an IndexResident compaction wrote GIDX, which
-				// is the arrangement every file written before the flip is in.
-				plain, err := OpenWithOptions(dir, Options{IndexMode: IndexResident})
-				if err != nil {
-					t.Fatalf("open to recompact: %v", err)
-				}
-				if err := plain.Compact(); err != nil {
-					t.Fatalf("recompact: %v", err)
-				}
-				if err := plain.Close(); err != nil {
-					t.Fatalf("close: %v", err)
-				}
-			}
-			var fallbacks int
-			s, err := OpenWithOptions(dir, Options{
-				IndexMode: tc.mode,
-				Metrics: store.MetricsFunc(func(m store.Metric) {
-					if m.Kind == store.MetricIndexFallback {
-						fallbacks++
-					}
-				}),
-			})
+			s, err := OpenWithOptions(tc.dir(t), Options{IndexMode: IndexResident})
 			if err != nil {
 				t.Fatalf("open: %v", err)
 			}
 			defer s.Close()
-			if fallbacks != 0 {
-				t.Errorf("%d index fallbacks reported", fallbacks)
+			st := s.StorageStats()
+			if st.ImageVersion != tc.version {
+				t.Errorf("ImageVersion = %d, want %d", st.ImageVersion, tc.version)
 			}
-			if got := s.StorageStats().IndexMode; got != IndexResident.String() {
-				t.Errorf("IndexMode = %q, want %q", got, IndexResident.String())
+			if st.IndexOnDisk != tc.indexOnDisk {
+				t.Errorf("IndexOnDisk = %q, want %q", st.IndexOnDisk, tc.indexOnDisk)
 			}
 		})
+	}
+}
+
+// TestStorageStats_NoImageReportsNoVersion keeps the zero honest. A store that
+// has never compacted has no file to have a version, and reporting the version
+// this build writes would be a claim about a file that does not exist.
+func TestStorageStats_NoImageReportsNoVersion(t *testing.T) {
+	s, _ := openFresh(t)
+	defer s.Close()
+	addNodeD(t, s, store.NodeTypeEvidenceFile)
+	st := s.StorageStats()
+	if st.ImageVersion != 0 {
+		t.Errorf("a store with no image reports version %d", st.ImageVersion)
+	}
+	if st.IndexOnDisk != "" {
+		t.Errorf("a store with no image reports IndexOnDisk %q", st.IndexOnDisk)
 	}
 }
 

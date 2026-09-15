@@ -4060,8 +4060,9 @@ scatter with the *opposite* of the predicted shape.
 
 **The arithmetic explains the scatter, which is what makes this a decision rather
 than a failed run.** At degree 32 768 the walk costs **351 ns per edge**. The
-spike's isolated denormalised hop cost **14.6 ns per edge**. So the work B1
-eliminates is about **4% of what `Neighbours` actually does** — the remaining 96%
+spike's isolated denormalised hop cost **14.6 ns per edge**. So the work a
+denormalised adjacency span would eliminate is about **4% of what `Neighbours`
+actually does** — the remaining 96%
 is result materialisation, dedupe and the caller's own iteration, none of which
 the change touches. Its ceiling is therefore **~2.8% at any degree**, permanently
 below this suite's noise floor. No fixture would have shown it, and building a

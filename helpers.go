@@ -579,8 +579,9 @@ func (g *Graph) GetEdgesBounded(ids []store.EdgeID, maxBytes int64) (found []*st
 //
 // The batch slice handed to fn is fresh each call and is fn's to keep. Its
 // *records* are subject to the usual rule: reads may alias store-internal
-// memory, so a record kept past the next compaction must be copied with
-// store.CloneNode (API_REFERENCE §"Do not mutate returned structs").
+// memory, so a record kept past the life of the handle — or mutated — must be
+// copied with store.CloneNode (API_REFERENCE §"Do not mutate returned structs").
+// A compaction does not shorten that window; Close ends it.
 //
 // A store whose bounded read consumes nothing stops the loop with
 // ErrBatchStalled rather than spinning on it.

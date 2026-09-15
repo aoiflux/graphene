@@ -89,6 +89,31 @@ func (m IndexMode) String() string {
 	return fmt.Sprintf("IndexMode(%d)", uint8(m))
 }
 
+// What an image carries in place of a property index, as reported by
+// StorageStats.IndexOnDisk.
+//
+// Three values and not two, because "the index is resident" has three causes and
+// a caller can act on only some of them. Asking for IndexResident is a choice;
+// an image in the heap is a different setting to change; and an image whose
+// format predates the mappable index is a compaction away from not being one.
+// StorageStats.IndexMode reports the outcome, and this reports what the file
+// brought to it.
+const (
+	// indexOnDiskMapped is an image that carries GPIX and GPIR: its entries can
+	// be read in place. Whether they are is IndexMode.
+	indexOnDiskMapped = "mapped"
+
+	// indexOnDiskEntries is an image that carries its index entry by entry, the
+	// way every version before v9 did. Nothing can read it in place, and an open
+	// under IndexMapped pays about sevenfold for the load and then holds the
+	// result in the heap.
+	indexOnDiskEntries = "entries"
+
+	// indexOnDiskNone is an image carrying no index section at all -- a file
+	// older than the format could hold one. The entries come from the WAL.
+	indexOnDiskNone = "none"
+)
+
 // CSRVersionsWritable lists the container versions this build can produce, in
 // ascending order.
 //

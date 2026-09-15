@@ -184,9 +184,10 @@ So: A and D yes, C structurally plus declared constraints, I opt-in and bounded.
   readers observe a committed transaction as it lands, and a transaction does not
   see a stable view of the graph while it is open.
 - **Live multi-process access.** Graphene enforces one writer and many readers
-  across processes, but a reader's view is fixed at open: it loads the store into
-  memory once and never re-reads, so a reader is refused while a writer holds the
-  store rather than being served a view that would silently go stale. A
+  across processes, but a reader's view is fixed at open: it materialises the
+  store once — from a single read or a single mapping — and never re-reads
+  afterwards, so a reader is refused while a writer holds the store rather than
+  being served a view that would silently go stale. A
   client/server database has no such constraint.
 - Full-text and vector similarity search over properties.
 

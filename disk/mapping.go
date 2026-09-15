@@ -97,6 +97,14 @@ const (
 	// StorageStats.ImageMode reporting it, when the platform has no mapping
 	// primitive, when the file is empty or larger than an int, or when the
 	// mapping syscall fails. The fallback is always correct and never silent.
+	//
+	// StorageStats.ImageMode answers what the read path is doing, which is not
+	// the same as what is mapped: a compaction publishes a graph built in memory
+	// while the mapping taken at Open stays held for the blobs it carried
+	// forward, and the mode says "heap" from then until Close. Store.
+	// EstimateResident is what answers "what is this store still holding a file
+	// open for" — ResidentEstimate.Mapped and MappedIndex count the mappings the
+	// store owns rather than the one the live graph reads.
 	ImageMapped ImageMode = iota
 
 	// ImageHeap reads the image with one os.ReadFile and copies every property
@@ -245,6 +253,55 @@ func mapOpenImage(f *os.File, path string) (*mapping, error) {
 		return nil, fmt.Errorf("mapping %s: %w", path, err)
 	}
 	return &mapping{data: data, path: path, release: release}, nil
+}
+
+// bytes is how much of a file this mapping addresses, and zero once it has been
+// released.
+//
+// The unmapped check is not defensive. A mapping stays in one of the store's two
+// lists until the sweep that closes it returns, and a sweep closes before it
+// drops the entry, so a figure totalled from the lists without this would charge
+// a caller for address space the process has already given back.
+func (m *mapping) bytes() int64 {
+	if m == nil || m.unmapped.Load() {
+		return 0
+	}
+	return int64(len(m.data))
+}
+
+// mappedBytes totals every mapping this store owns, across both lists. Caller
+// holds s.mu.
+//
+// Owns, not serves, and the distinction is the whole reason this is not
+// imageHolding. That function answers "is the graph a caller reads being served
+// out of a file", so it reports heap after a compaction even though the mapping
+// taken at Open is still held, still addressed by every blob the compaction
+// carried forward, and still costing page cache. Both answers are wanted and
+// they are different questions; this is the one a caller sizing a machine needs,
+// because the pages are there whichever graph is on top.
+//
+// One total rather than a per-list split, because the split is not the one a
+// caller would think they were getting. Both lists hold mappings of an image
+// file: images is the one Open took, indexImages the one a compaction made of
+// the image it had just written so that SwapBase could read an index out of it.
+// Neither of them is "the mapping the index uses" — at open the index is read out
+// of the entry in images, because GPIX and GPIR are sections of graphene.csr.
+// What the index costs is a question about sections rather than about files, and
+// index.PropertyIndex.MappedBytes is what answers it.
+//
+// So this can transiently exceed the image on disk. A compaction installs the
+// base it wrote, and the mapping the previous base read is released at the next
+// sweep rather than at the swap; between those points the store genuinely holds
+// both, and this says so.
+func (s *Store) mappedBytes() int64 {
+	var total int64
+	for _, m := range s.images {
+		total += m.bytes()
+	}
+	for _, m := range s.indexImages {
+		total += m.bytes()
+	}
+	return total
 }
 
 // close releases the mapping. Idempotent.
@@ -496,8 +553,9 @@ func (s *Store) closeImages() error {
 	return first
 }
 
-// imageHolding reports how the store is holding its image, for StorageStats.
-// Caller holds s.mu.
+// imageHolding reports how the store is holding its image: the mode
+// StorageStats.ImageMode publishes, and the live graph's own mapped byte count
+// beside it. Caller holds s.mu.
 //
 // The live graph's own figure rather than the mappings the store owns, and the
 // difference matters after a compaction: the store still has the mapping it
@@ -505,6 +563,13 @@ func (s *Store) closeImages() error {
 // the compaction built, so what a caller is served from is record arrays. This
 // reports "heap" then, which is the honest answer to "is this image being served
 // out of a file".
+//
+// Only the mode goes into StorageStats. The byte half stops there as of v0.8.0,
+// because the two halves were answering different questions under one name: a
+// caller reading ImageMappedBytes is asking what the machine is paying, and the
+// answer to that is mappedBytes, which counts what the store owns. This half
+// remains the right answer to the read-path question and is what the mapping
+// tests assert.
 func (s *Store) imageHolding() (string, int64) {
 	v := s.viewPtr.Load()
 	if v == nil || v.csr == nil {

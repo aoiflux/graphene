@@ -51,7 +51,7 @@ var (
 	// Two reasons, and the second invalidates figures rather than merely costing
 	// time. A 1.2 GiB fixture takes minutes to build, which is the annoyance. The
 	// build also peaks at several times what the finished store costs to open --
-	// near 7.5 GiB at 1.4M nodes against 2.7 GiB of settled residency -- and
+	// near 9.4 GiB at 1.4M nodes against 2.7 GiB of settled residency -- and
 	// peakMiB is the high-water mark of the *process*, so a process that builds
 	// and then measures reports the build's peak under the name of the open's.
 	// Splitting the build into its own process is the only way that figure means

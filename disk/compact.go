@@ -285,8 +285,10 @@ func (s *Store) Compact() error {
 // what makes a background compaction safe for a caller holding a slice of ids it
 // collected minutes ago.
 //
-// What does not survive is a []byte a read returned, under a mapped image: see
-// ImageMode for the lifetime those have and store.CloneNode for the way out.
+// A []byte a read returned survives a compaction too — this function neither
+// creates nor retires a mapping, so a slice taken before one still reads after it.
+// What it does not survive is Close. See ImageMode for the lifetime those have and
+// store.CloneNode for the way out.
 //
 // Cancellation reaches the build and stops there. Once the commit begins —
 // the flush, the rename, the retire — the compaction runs to completion

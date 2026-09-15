@@ -185,6 +185,19 @@ type OpenEstimate struct {
 	ImageBytes int64
 
 	// ImageVersion is the container version in the file's header.
+	//
+	// Worth reading before an open rather than after one, because it is the one
+	// property of a store that makes the open itself expensive. Below
+	// csrVersionMappedIndex the property index is loaded entry by entry whatever
+	// IndexMode asks for -- measured at about sevenfold, 301 ms against 2,102 ms
+	// on a 462 MiB store and 1.40 s against 9.94 s at 2.26 GiB -- and is then
+	// held in the heap. ImageIndexMapped below is the same fact stated as the
+	// thing that follows from it, and ImageHeapBytes has already taken it into
+	// account.
+	//
+	// The remedy is a compaction under IndexMode: IndexMapped, or
+	// `graphene store migrate -to 9`: one pass over the store, not an export and
+	// import. An Open does not do it silently -- see Options.IndexMode.
 	ImageVersion uint16
 
 	// ImageNodeCount and ImageEdgeCount are the record counts the header
@@ -898,6 +911,54 @@ func (e OpenEstimate) HeapBytesFor(opts Options) int64 {
 		}
 	}
 	return total + e.WALHeapBytes + defaultWALRingCapacity*sizeofWALSlot
+}
+
+// FallbacksFor names every mode an Open under opts would ask for and not get,
+// and why. Empty when opts would be honoured exactly.
+//
+// It is the cascade as sentences, before the open rather than after it. Both
+// fallbacks are already reported at the open itself, by store.MetricImageFallback
+// and store.MetricIndexFallback — but a metric arrives once the memory has
+// already been spent, and the case this exists for is a caller deciding whether
+// to spend it. An OpenLive on the defaults is the example worth knowing: it asks
+// for a mapped image, holds no lock, reads the image into the heap, and is then
+// declined the mapped index because the image is in the heap. Measured, that is
+// 419 MiB on a 248 MiB store, and nothing in the call said so.
+//
+// The reasons are the same strings the metrics carry, and they come from the same
+// two functions an Open asks — imageMappingAllowedFor and indexBaseAllowedFor —
+// for the reason HeapBytesFor does it that way: a second copy of the rule is a
+// second thing to keep true.
+//
+// A fresh slice per call, so a caller cannot edit the answer.
+func (e OpenEstimate) FallbacksFor(opts Options) []string {
+	if e.ImageBytes == 0 {
+		// No image, no modes to fall back from. A store that has never been
+		// compacted builds everything from the log whatever it was asked for.
+		return nil
+	}
+
+	var out []string
+	mapped := imageMappingAllowedFor(opts.ImageMode, opts.LiveReader) == nil
+	if !mapped && opts.ImageMode != ImageHeap {
+		out = append(out, "the image will be read into the heap: "+
+			imageMappingAllowedFor(opts.ImageMode, opts.LiveReader).Error())
+	}
+
+	switch {
+	case !e.ImageIndexMapped && opts.IndexMode == IndexMapped:
+		out = append(out, fmt.Sprintf(
+			"the property index will be rebuilt in the heap: the image is version %d, "+
+				"which carries it entry by entry; a mappable index arrives with version %d, "+
+				"written by the next Compact under IndexMode: IndexMapped, or by "+
+				"`graphene store migrate -to %d`",
+			e.ImageVersion, csrVersionMappedIndex, csrVersionMappedIndex))
+	case e.ImageIndexMapped:
+		if why := indexBaseAllowedFor(opts.IndexMode, mapped); why != nil && opts.IndexMode != IndexResident {
+			out = append(out, "the property index will be rebuilt in the heap: "+why.Error())
+		}
+	}
+	return out
 }
 
 // --- the log walk ---

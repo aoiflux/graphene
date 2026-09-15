@@ -30,7 +30,7 @@
 //
 // The fixture is built outside the ceiling, by a separate invocation, because a
 // build peaks at several times what the finished store costs to open: near
-// 7.5 GiB at 1.4M nodes. A run that built its own fixture under a 2 GiB limit
+// 9.4 GiB at 1.4M nodes (9,584 MiB measured). A run that built its own fixture under a 2 GiB limit
 // would be testing the builder, and would fail before it reached the store.
 //
 //	# once, unconstrained

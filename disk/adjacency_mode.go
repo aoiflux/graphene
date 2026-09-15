@@ -64,6 +64,11 @@ const (
 	// traverses gets the same arrays, built at the first call rather than at
 	// Open, and pays the same total. There is no mode in which a traversal
 	// answers without them.
+	//
+	// In particular a writer that deletes gets nothing from it: DeleteNode's
+	// cascade to incident edges reads these arrays, so the first delete builds
+	// them. Check StorageStats.Adjacency to see which side of the build a handle
+	// is actually on.
 	AdjacencyLazy
 )
 

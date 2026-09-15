@@ -118,7 +118,25 @@ type ResidentEstimate struct {
 	// Index is the property index: the resident delta, the retraction sets, and
 	// a mapped base's directory. Its counts are exact and its per-entry costs
 	// measured; see index.PropertyIndex.ResidentBytes.
+	//
+	// The composites are taken out of it and reported below, so Index and
+	// Composite are disjoint and both are in Total.
 	Index int64
+
+	// Composite is what the declared composite indexes hold, taken out of Index
+	// rather than left inside it.
+	//
+	// It is here because it is the term a caller reduces by deciding something
+	// rather than by holding less. Every other term follows from the records the
+	// store was asked to keep; this one follows from a declaration, and a
+	// composite nothing queries costs exactly what one that carries the workload
+	// costs. At the shape this engine is sized for it has been the largest single
+	// term in a default configuration, which is why a store that wants its memory
+	// down is asked to look here first.
+	//
+	// Exact in its counts and O(declared composites) to read; see
+	// index.PropertyIndex.CompositeResidentBytes.
+	Composite int64
 
 	// Delta is everything written since the last compaction: the record
 	// payloads (exact, maintained -- see deltaLayer.bytes) plus the maps,
@@ -131,11 +149,41 @@ type ResidentEstimate struct {
 	// Total is the sum of the fields above: heap this process must keep.
 	Total int64
 
-	// Mapped is the image file addressed through a mapping, and zero when the
-	// image is in the heap. Not in Total, deliberately: these are page cache the
-	// kernel may evict, so counting them as memory the process must keep would
-	// invert the comparison ImageMapped exists to win.
+	// Mapped is every byte of file this store has mapped, and zero when nothing
+	// is. Not in Total, deliberately: these are page cache the kernel may evict,
+	// so counting them as memory the process must keep would invert the
+	// comparison mapping exists to win.
+	//
+	// It counts the mappings the store *owns*, which is not the question
+	// StorageStats.ImageMode answers, and the two disagree on purpose. That field
+	// reports what the graph a caller reads is being served from, so after a
+	// compaction it says "heap": the graph on top was built in memory. The
+	// mapping taken at Open is held until Close even so -- every blob the
+	// compaction carried forward addresses it -- and its pages are still in the
+	// cache. This is the figure for a caller sizing a machine; that one is the
+	// figure for a caller asking whether the read path is reading a file. Before
+	// v0.8.0 this term was the graph's own, and so reported zero for a file the
+	// process was still holding open.
+	//
+	// It can exceed the image on disk after a compaction under IndexMapped, and
+	// that is not an error: the store then holds the mapping it opened with and a
+	// second one over the image it just wrote, until the base over the first
+	// becomes unreachable and the next sweep releases it.
 	Mapped int64
+
+	// MappedIndex is how much of Mapped the property index accounts for. A
+	// subset, not a second term -- adding the two double-counts.
+	//
+	// A subset because the index usually has no file of its own: GPIX and GPIR
+	// are sections of graphene.csr, so a store that maps its image has mapped its
+	// index with it. Which is exactly why the figure is worth publishing
+	// separately. "This store has 1.6 GiB mapped" is not an answer to "what is
+	// the property index costing me", and a caller choosing between IndexMapped
+	// and IndexResident is asking the second question.
+	//
+	// Zero when the index is in the heap, and reported nowhere at all before
+	// v0.8.0.
+	MappedIndex int64
 
 	// At is when the estimate was taken.
 	At time.Time
@@ -167,15 +215,25 @@ func (s *Store) estimateResidentLocked() ResidentEstimate {
 		est.Payload = csr.payloadBytes
 		est.LabelPostings = csr.labelPostingBytes()
 		est.Adjacency = csr.adjacencyBytes()
-		est.Mapped = csr.imgBytes
 	}
-	est.Index = s.index().ResidentBytes()
+	// From the store's own mapping lists rather than from csr.imgBytes, which is
+	// what the live graph reads and therefore reports zero for a graph a
+	// compaction built while the mapping under it is still held. See
+	// Store.mappedBytes.
+	est.Mapped = s.mappedBytes()
+	est.MappedIndex = s.index().MappedBytes()
+
+	// Split in one call so that the subtraction cannot straddle a write and
+	// leave Index negative; see index.PropertyIndex.ResidentBytesSplit.
+	indexTotal, composite := s.index().ResidentBytesSplit()
+	est.Composite = composite
+	est.Index = indexTotal - composite
 	est.Delta = v.delta.residentBytes()
 	if s.wal != nil {
 		est.WAL = s.wal.residentBytes()
 	}
 	est.Total = est.RecordArrays + est.Payload + est.LabelPostings +
-		est.Adjacency + est.Index + est.Delta + est.WAL
+		est.Adjacency + est.Index + est.Composite + est.Delta + est.WAL
 	return est
 }
 

@@ -110,7 +110,14 @@ const (
 // Bounded time: O(declared keys), never O(entries). Read the file header before
 // acting on the number -- its counts are exact, its per-item costs are measured
 // or assumed, and it deliberately does not include the base's mapped bytes, which
-// are page cache rather than heap and are reported as StorageStats.ImageMappedBytes.
+// are page cache rather than heap. Those are reported by the storage layer, which
+// is the only place that knows how large the mapping under a base is: see
+// StorageStats.IndexMappedBytes and disk.ResidentEstimate.MappedIndex.
+//
+// It includes the composite declarations. CompositeResidentBytes is their share
+// and ResidentBytesSplit is both at once, which disk.ResidentEstimate uses so it
+// can report them as two disjoint terms: the composites are the one part of this
+// figure a caller changes by declaring less rather than by writing less.
 //
 // Under a base this is the *delta* plus the base's resident overhead, which is
 // the whole point of a base: entries that moved into the image stop costing a
@@ -119,21 +126,53 @@ const (
 // climbs again with what is written after it, which is exactly the shape an
 // operator is being asked to watch.
 func (p *PropertyIndex) ResidentBytes() int64 {
-	var total int64
+	total, _ := p.ResidentBytesSplit()
+	return total
+}
+
+// ResidentBytesSplit is ResidentBytes with the composites' share named, and it
+// is the call to make when both figures are wanted.
+//
+// One call rather than two because a caller reporting "index" as total minus
+// composite must not subtract a figure taken at a different instant. Nothing
+// here holds a lock across the whole walk -- each shard and each declaration is
+// read under its own -- so two separate calls straddling a write can be
+// inconsistent with each other by a shard's worth of entries, and a difference of
+// two figures can be negative in a way neither figure is. Taking the composite
+// total once and returning it with the sum it is part of makes that impossible
+// by construction rather than by clamping afterwards.
+func (p *PropertyIndex) ResidentBytesSplit() (total, composite int64) {
 	for i := range p.shards {
 		sh := &p.shards[i]
 		sh.mu.RLock()
 		total += sh.residentBytes()
 		sh.mu.RUnlock()
 	}
-	total += p.nodeComposites.residentBytes() + p.edgeComposites.residentBytes()
+	composite = p.CompositeResidentBytes()
+	total += composite
 	if st := p.baseRef.Load(); st != nil {
 		// The retraction sets are exact: one bit per base id, and they report
 		// their own size.
 		total += int64(st.nodeGone.bytes() + st.edgeGone.bytes())
 		total += baseResidentBytes(st.b)
 	}
-	return total
+	return total, composite
+}
+
+// CompositeResidentBytes is the share of ResidentBytes that the declared
+// composites account for, across both kinds.
+//
+// Separate because it is separately decidable. Every other term here moves with
+// what the store was asked to hold; this one moves with how many composites were
+// declared, and a caller looking at a figure they want smaller can act on that
+// today without rewriting anything. At the shape this engine is sized for it has
+// been the largest single term in a default configuration, so which half of the
+// index a store is paying for is not a detail.
+//
+// O(declared composites), like everything else in this file, and exact in its
+// counts: compositeIndex.entries is maintained by the registration path.
+func (p *PropertyIndex) CompositeResidentBytes() int64 {
+	return p.nodeComposites.residentBytes() + p.edgeComposites.residentBytes()
 }
 
 // residentBytes is one shard's share. Caller holds sh.mu.
@@ -193,6 +232,43 @@ type ResidentReporter interface {
 	// ResidentBytes is the heap the base holds, excluding any file it maps --
 	// mapped bytes are page cache and are reported separately.
 	ResidentBytes() int64
+}
+
+// MappedReporter is a Base that reads its entries out of a mapped file and can
+// say how many bytes of one.
+//
+// Optional, and for the same reason ResidentReporter is: a base that holds a
+// decoded copy has nothing to answer here, and requiring an answer would make
+// Base a claim about how a base is built rather than about what it answers.
+//
+// The figure is the base a caller asked for, not the file it happens to live in.
+// A store maps one file and reads both its graph and its index out of it, so the
+// index is a *part* of what is mapped rather than a mapping of its own -- which
+// is the whole reason the number is worth having separately. Without it, an
+// operator can see that a store has 1.6 GiB of file mapped and cannot see that
+// most of it is the property index they are choosing to keep on disk.
+type MappedReporter interface {
+	// MappedBytes is how much mapped file this base reads its entries out of.
+	MappedBytes() int64
+}
+
+// MappedBytes is how much mapped file the property index is read out of, and
+// zero when there is no base or the base holds no mapping.
+//
+// Not part of ResidentBytes and never added to it. These are page cache the
+// kernel may evict, and the point of a mapped index is that they are *not*
+// memory this process must keep; see disk.ResidentEstimate.MappedIndex, which
+// reports it beside the total rather than inside it.
+func (p *PropertyIndex) MappedBytes() int64 {
+	st := p.baseRef.Load()
+	if st == nil || st.b == nil {
+		return 0
+	}
+	m, ok := st.b.(MappedReporter)
+	if !ok {
+		return 0
+	}
+	return m.MappedBytes()
 }
 
 // baseResidentBytes asks the base what it costs, or models a floor.

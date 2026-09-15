@@ -1302,3 +1302,95 @@ func TestPreflight_MappedModelDoesNotFollowTheBlobBytes(t *testing.T) {
 			"arena term is not charged to a heap image either", d, grew)
 	}
 }
+
+// TestFallbacksFor_NamesTheLiveReaderCascade is G11: the 419 MiB a caller was
+// charged for an option they did not set, made readable before they are charged
+// for it rather than after.
+//
+// Both fallbacks already fired at the open and both named their reason, so
+// nothing here is a behaviour change. What was missing is that a metric arrives
+// once the memory has been spent, and the decision this informs is taken before
+// the open. The second string is the one worth having: it is a *consequence* of
+// the first rather than an independent choice, and a caller reading only the
+// image fallback would conclude that setting ImageMappedUnlocked buys back the
+// image half alone.
+func TestFallbacksFor_NamesTheLiveReaderCascade(t *testing.T) {
+	dir := v9Store(t)
+	e, err := PreflightOpen(dir)
+	if err != nil {
+		t.Fatalf("PreflightOpen: %v", err)
+	}
+
+	live := e.FallbacksFor(Options{LiveReader: true, Constraints: ConstraintDrop})
+	if len(live) != 2 {
+		t.Fatalf("OpenLive on the defaults reports %d fallbacks, want both halves of the "+
+			"cascade: %q", len(live), live)
+	}
+	if !strings.Contains(live[0], "process lock") {
+		t.Errorf("the image fallback does not name the lock: %q", live[0])
+	}
+	if !strings.Contains(live[1], "the image is in the heap") {
+		t.Errorf("the index fallback does not name its cause: %q", live[1])
+	}
+
+	// Asking for the mapping buys back both, which is the claim the paragraph in
+	// graphene.OpenLive makes and the reason the number is 419 and not 149.
+	unlocked := e.FallbacksFor(Options{
+		LiveReader:  true,
+		Constraints: ConstraintDrop,
+		ImageMode:   ImageMappedUnlocked,
+	})
+	if len(unlocked) != 0 {
+		t.Errorf("ImageMappedUnlocked still reports %q", unlocked)
+	}
+
+	// A caller who asked for the heap is not falling back to it, and a caller who
+	// asked for a resident index is not either. The same two silences the metrics
+	// keep.
+	if got := e.FallbacksFor(Options{ImageMode: ImageHeap, IndexMode: IndexResident}); len(got) != 0 {
+		t.Errorf("a caller who asked for both is told they fell back: %q", got)
+	}
+
+	// And the writer's defaults, which are the configuration the whole memory
+	// programme is about, report nothing at all.
+	if got := e.FallbacksFor(Options{}); len(got) != 0 {
+		t.Errorf("the defaults over a v9 image report %q", got)
+	}
+}
+
+// TestFallbacksFor_NamesTheRemedyForAnOldImage is the G9 half of the same
+// question asked before the open.
+//
+// A v8 image is the one cause of a resident index that a caller can actually fix,
+// so it is the one whose reason has to say how.
+func TestFallbacksFor_NamesTheRemedyForAnOldImage(t *testing.T) {
+	dir := v8Store(t)
+	plain, err := OpenWithOptions(dir, Options{IndexMode: IndexResident})
+	if err != nil {
+		t.Fatalf("open to recompact: %v", err)
+	}
+	if err := plain.Compact(); err != nil {
+		t.Fatalf("recompact: %v", err)
+	}
+	if err := plain.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	e, err := PreflightOpen(dir)
+	if err != nil {
+		t.Fatalf("PreflightOpen: %v", err)
+	}
+	got := e.FallbacksFor(Options{})
+	if len(got) != 1 {
+		t.Fatalf("a v8 image under the defaults reports %d fallbacks, want 1: %q", len(got), got)
+	}
+	if !strings.Contains(got[0], "migrate -to 9") {
+		t.Errorf("the reason does not name the remedy: %q", got[0])
+	}
+
+	// Asking for the resident index is a choice, not a fallback — even here,
+	// where the file would have forced it anyway.
+	if got := e.FallbacksFor(Options{IndexMode: IndexResident}); len(got) != 0 {
+		t.Errorf("a caller who asked for a resident index is told they fell back: %q", got)
+	}
+}

@@ -316,10 +316,20 @@ type Refresher interface {
 // nodes, is ten thousand candidates thinned to about a thousand. A composite
 // over the pair returns the thousand directly.
 //
-// It is opt-in because it is not free. Every registration on a member key files
-// the entity into the composite as well, and the composite holds that entity's
+// It is opt-in because it is not free, and the size of "not free" is worth
+// knowing before declaring one. Every registration on a member key files the
+// entity into the composite as well, and the composite holds that entity's
 // values for each of its keys — so a declaration that no query matches costs
 // memory and write time for nothing.
+//
+// The memory is the part that surprises. A composite entry costs about 48 bytes
+// against a mapped index's near-zero per entry, which makes the composites the
+// one part of an index that mapping does not get out of the heap — measured, they
+// have been the largest single term in a default configuration of this engine. A
+// caller who declares several can put themselves back over a ceiling a mapped
+// index had just brought them under. StorageStats does not break it out, but
+// disk.Store.EstimateResident does: ResidentEstimate.Composite is that term on
+// its own, exactly so that this is a number rather than a warning.
 //
 // A composite is used only when the query pins *every* one of its keys with an
 // equality filter. The postings are keyed by the whole tuple, so there is no
@@ -1120,10 +1130,11 @@ type StorageStats struct {
 	// that will not fit; it is not a number to put in a capacity plan without the
 	// ratio beside it.
 	//
-	// Mapped image bytes are deliberately not in it. Those are page cache the
-	// kernel may evict, so counting them as memory the process must keep would
-	// invert exactly the comparison a mapped image exists to win -- see
-	// ImageMappedBytes, which reports them separately.
+	// Mapped bytes are deliberately not in it, the index's as well as the
+	// image's. Those are page cache the kernel may evict, so counting them as
+	// memory the process must keep would invert exactly the comparison mapping
+	// exists to win -- see ImageMappedBytes and IndexMappedBytes, which report
+	// them separately.
 	//
 	// Zero from a backend that cannot estimate. On the disk backend the terms are
 	// available individually; see disk.Store.EstimateResident.
@@ -1134,9 +1145,9 @@ type StorageStats struct {
 	WALBytes int64
 
 	// CommitSeq is the last commit sequence number issued. It is durable across
-	// compaction: v8 carries a high-water mark in the CSR header, so the counter
-	// survives the log truncation that used to reset it and names a commit for
-	// the life of the store rather than for the life of one WAL generation.
+	// compaction: the image header has carried a high-water mark since v8, so the
+	// counter survives the log truncation that used to reset it and names a commit
+	// for the life of the store rather than for the life of one WAL generation.
 	CommitSeq uint64
 
 	// VisibleEpoch is the newest version of the graph a reader can see. It
@@ -1198,10 +1209,71 @@ type StorageStats struct {
 	// available, always correct, and always more expensive.
 	ImageMode string
 
-	// ImageMappedBytes is how much of the image is mapped rather than resident,
-	// zero when it is not mapped. These bytes are page cache the kernel may
-	// evict, so they are not part of what the process must keep.
+	// ImageMappedBytes is how much image file the backend has mapped, zero when
+	// it has none. These bytes are page cache the kernel may evict, so they are
+	// not part of what the process must keep.
+	//
+	// It does *not* follow ImageMode, and before v0.8.0 it did. That field
+	// reports what the graph a caller reads is served from, so it says "heap"
+	// after a compaction publishes a graph built in memory — while the mapping
+	// taken at open is held until Close, because every blob the compaction
+	// carried forward still addresses it. Following the mode meant reporting zero
+	// bytes for a file the process had open and was paying for. This counts what
+	// is mapped; the mode answers whether the read path is reading it.
+	//
+	// It can briefly exceed the image on disk. A compaction under a mapped index
+	// maps the image it has just written so it can install an index out of it,
+	// and the mapping the previous index read is released at the next sweep
+	// rather than at the swap.
 	ImageMappedBytes int64
+
+	// IndexMappedBytes is how much of ImageMappedBytes the property index
+	// accounts for, and zero when the index is in the heap. A subset of that
+	// figure rather than a second one: adding them double-counts.
+	//
+	// A subset because the index has no file of its own — it is a pair of
+	// sections inside the image — which is exactly why it is worth naming. A
+	// caller deciding between a mapped and a resident index is asking what the
+	// index costs, and "the store has 1.6 GiB mapped" does not answer that.
+	//
+	// Reported nowhere before v0.8.0. IndexMode said "mapped" while every byte
+	// figure here said zero, which is not two answers to two questions but one of
+	// them missing.
+	IndexMappedBytes int64
+
+	// ImageVersion is the on-disk container version of the image this store
+	// opened, and zero from a backend with no image or a store that has never
+	// been compacted.
+	//
+	// It is here because it is not otherwise knowable from a running store, and
+	// because the number decides something expensive. An image written before the
+	// format could carry a mappable property index loads its entries one at a
+	// time however the store was configured — measured at about sevenfold on the
+	// open, 301 ms against 2,102 ms on a 462 MiB store and 1.40 s against 9.94 s
+	// at 2.26 GiB — and then holds them in the heap at roughly a hundred bytes
+	// each. Nothing else in this struct says so: IndexMode reports "resident"
+	// with no reason attached, and ImageMode reports "mapped", because the image
+	// itself maps perfectly well.
+	//
+	// The remedy is a compaction under a mapped index mode, or
+	// `graphene store migrate -to 9`, and it is one pass over the store rather
+	// than an export and import. IndexOnDisk below is the same fact as an answer
+	// rather than as a number.
+	ImageVersion uint16
+
+	// IndexOnDisk names what the image file carries in place of a property
+	// index: "mapped" when it carries one that can be read where it lies,
+	// "entries" when it carries one that has to be rebuilt in the heap at every
+	// open, "none" when it carries none at all, and "" from a backend with no
+	// image.
+	//
+	// It is the companion to IndexMode, and the pair is what separates three
+	// causes a single field cannot. A store reporting IndexMode "resident" has
+	// either chosen it, or asked for a mapped index over an image that is itself
+	// in the heap, or asked for one over a file that has nothing mappable in it —
+	// and only the third is fixed by compacting. Reading "resident"/"entries"
+	// together is how a caller tells.
+	IndexOnDisk string
 
 	// IndexMode names where the property index is: "mapped" when it is read out
 	// of the image, "resident" when it is held in the heap, and "" from a backend
@@ -1305,6 +1377,26 @@ type CompactionPolicy struct {
 // and a byte limit equal to it would almost never be the rule that fired. Half
 // of it fires first on the workload the rule exists for -- few records, large
 // blobs -- and stays quiet on the one MaxWALBytes already covers.
+//
+// # Sizing MaxDeltaBytes against a ceiling
+//
+// The rule, rather than a number, because the number depends on a ceiling only
+// the caller knows.
+//
+// MaxDeltaBytes trades interim compactions against peak memory. The delta is
+// held in anonymous memory until a compaction folds it into the image, so the
+// bound is roughly the most the delta will add to what the store already holds,
+// and lowering it lowers the peak by firing more compactions during the write.
+// Each of those costs its own wall clock and its own transient, so the knob is
+// not free in either direction: bound it too tightly and a rebuild spends its
+// time compacting; leave it unbounded and the peak follows the whole write.
+//
+// Pick it by subtracting what the store holds at rest -- StorageStats.
+// EstimatedResidentBytes, or disk.PreflightOpen before the store is open -- from
+// the ceiling the process must fit, and leaving room for the compaction's own
+// transient (disk.Options.Compact.MaxWorkingBytes bounds that separately).
+// What is left is what the delta may hold. See docs/MEMORY_MODEL.md section 9.6
+// for the same knob measured both ways on one store.
 func DefaultCompactionPolicy() CompactionPolicy {
 	return CompactionPolicy{
 		MaxDeltaRecords: 100_000,

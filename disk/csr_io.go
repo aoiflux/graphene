@@ -59,6 +59,12 @@ func (s *Store) loadImage(src *imageSource) error {
 		return err
 	}
 
+	// What the file itself said, taken before noteImage hands src away. The
+	// parse above has already validated these bytes, so re-reading the two of
+	// them is cheaper than threading a version out of a function whose job is to
+	// produce a graph.
+	s.noteImageFormat(binary.LittleEndian.Uint16(src.data[4:6]), section)
+
 	s.publishCSR(csr)
 
 	// After the graph is published, because noteImage attaches the cleanup that
@@ -94,6 +100,44 @@ func (s *Store) loadImage(src *imageSource) error {
 		s.edgeSeq.Store(csr.edgeSeqHW)
 	}
 	return nil
+}
+
+// noteImageFormat records what the image on disk is, and reports a mapped index
+// that the file cannot supply. Caller holds s.mu exclusively.
+//
+// The report is the point. A v8 image opened under IndexMapped gets a resident
+// index, and that is not a bug -- there is no mappable index in the file to read
+// -- but it is the most expensive thing that can happen at an open with no
+// symptom attached to it. Measured, the difference is about sevenfold: 301 ms
+// against 2,102 ms on a 462 MiB store, 1.40 s against 9.94 s at 2.26 GiB,
+// because the entries are loaded one at a time whatever the mode asked for. And
+// then the index sits in the heap at about a hundred bytes an entry, which is
+// the cost the mode exists to avoid.
+//
+// MetricIndexFallback's documentation used to say this case emitted nothing,
+// on the grounds that a file with no mappable index is not something to fall
+// back *from*. That reasoning was about where the cause lies and the metric is
+// about what the caller is paying, and the second is what a caller subscribes to
+// it for. The three causes are distinguished by Err, and this one names its
+// remedy, which the other two cannot.
+func (s *Store) noteImageFormat(version uint16, section *csrIndexSection) {
+	s.imageVersion = version
+	switch {
+	case version >= csrVersionMappedIndex:
+		s.imageIndexOnDisk = indexOnDiskMapped
+	case section != nil:
+		s.imageIndexOnDisk = indexOnDiskEntries
+	default:
+		s.imageIndexOnDisk = indexOnDiskNone
+	}
+
+	if s.indexMode == IndexMapped && s.imageIndexOnDisk == indexOnDiskEntries {
+		s.recordIndexFallback(fmt.Errorf(
+			"the image is version %d, which carries its property index entry by entry; "+
+				"a mappable index arrives with version %d, written by the next Compact "+
+				"under IndexMode: IndexMapped, or by `graphene store migrate -to %d`",
+			version, csrVersionMappedIndex, csrVersionMappedIndex))
+	}
 }
 
 // loadIndex installs the property index the image carries (v6+).

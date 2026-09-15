@@ -508,9 +508,11 @@ exists on disk. Acquisition never blocks: whether to wait for a busy store is th
 caller's policy, not the engine's. A crashed process releases the lock — there is
 nothing stale to clean up.
 
-**A read-only store is a snapshot fixed at open.** The engine loads a store into
-memory once — delta and property index from a WAL replay, CSR from a single read
-— and never re-reads. That is also why a reader is refused alongside a writer
+**A read-only store is a snapshot fixed at open.** The engine materialises a
+store once — delta and property index from a WAL replay, the image from a single
+read *or a single mapping* — and never re-reads afterwards. A mapping does not
+change that: the image is never rewritten in place, so the bytes behind it are
+the ones that were there at open. That is also why a reader is refused alongside a writer
 instead of being admitted: it would serve a permanently stale view with nothing
 to signal it had gone stale, which is a worse failure than being told no. Reopen
 to advance. Nothing under the directory is modified by a read-only open, and

@@ -119,6 +119,18 @@ type Store struct {
 	// ever accumulates more — see sweepImages.
 	images []*mapping
 
+	// imageVersion is the container version of the image this store loaded, and
+	// imageIndexOnDisk what that image carries in place of a property index.
+	// Both are zero on a store with no image. Guarded by mu; see
+	// StorageStats.ImageVersion, which is the only thing that reads them.
+	//
+	// Held on the store rather than on the graph because they are facts about
+	// the file, and the graph outlives it: a compaction publishes a graph with no
+	// file behind it at all, and a caller asking what version is on disk after
+	// one is asking about the image that is still there.
+	imageVersion     uint16
+	imageIndexOnDisk string
+
 	// indexImages holds the mappings created for the property index's base, as
 	// distinct from the ones the graph's records address.
 	//
@@ -405,8 +417,24 @@ func (s *Store) StorageStats() store.StorageStats {
 		st.CSRNodes = csr.NodeCount()
 		st.CSREdges = csr.EdgeCount()
 	}
-	st.ImageMode, st.ImageMappedBytes = s.imageHolding()
+	st.ImageMode, _ = s.imageHolding()
 	st.IndexMode = s.indexHolding()
+	st.ImageVersion = s.imageVersion
+	st.IndexOnDisk = s.imageIndexOnDisk
+
+	// The byte figures come from the store's own mapping lists, not from the pair
+	// imageHolding returns. The mode above is about the *read path* -- whether
+	// what a caller is served addresses a file -- and after a compaction the
+	// answer is honestly "heap", because the graph on top was built in memory.
+	// The pages are still there even so: the mapping taken at Open is held until
+	// Close, every blob the compaction carried forward addresses it, and until
+	// v0.8.0 this field reported zero for it. An operator sizing a machine wants
+	// what is mapped, not what is being read out of it. See Store.mappedBytes.
+	st.ImageMappedBytes = s.mappedBytes()
+
+	// And the index's share of it, a subset rather than a second file: GPIX and
+	// GPIR are sections of the image. See index.PropertyIndex.MappedBytes.
+	st.IndexMappedBytes = s.index().MappedBytes()
 	st.Adjacency = s.adjacencyHolding()
 	st.PropertyNodeEntries, st.PropertyEdgeEntries = s.index().EntryCounts()
 
@@ -999,8 +1027,17 @@ type Options struct {
 	// and 16 per node slot that are then never allocated. A process that does
 	// walk it pays the same total either way, at a different moment.
 	//
+	// A writer that deletes cannot skip the build. DeleteNode cascades to the
+	// incident edges and finds them through exactly these arrays, so a lazily
+	// opened writer builds them on its first delete, having also paid for the
+	// branch on every read until then. The mode is worth asking for in a process
+	// that reads properties or aggregates without traversing and without
+	// deleting, and worth nothing at all in one that deletes.
+	//
 	// Nothing in the file changes and nothing about an answer changes.
-	// StorageStats.Adjacency reports which side of the build a handle is on.
+	// StorageStats.Adjacency reports which side of the build a handle is on --
+	// the answer rather than the request, so a caller that expected "deferred"
+	// and finds "built" can see that something asked.
 	Adjacency AdjacencyMode
 }
 
