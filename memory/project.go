@@ -14,7 +14,19 @@ import (
 	"github.com/aoiflux/graphene/store"
 )
 
-var _ store.Projector = (*Store)(nil)
+var (
+	_ store.Projector         = (*Store)(nil)
+	_ store.PropertyKeyLister = (*Store)(nil)
+)
+
+// NodePropKeys implements store.PropertyKeyLister.
+//
+// Exact here rather than an upper bound: this backend has no base to merge, so
+// a key with no remaining entries is not in the index to be named.
+func (s *Store) NodePropKeys() []string { return s.propIdx.NodePropKeys() }
+
+// EdgePropKeys implements store.PropertyKeyLister.
+func (s *Store) EdgePropKeys() []string { return s.propIdx.EdgePropKeys() }
 
 // ForEachNodeProjection implements store.Projector.
 func (s *Store) ForEachNodeProjection(ctx context.Context, ids []store.NodeID, keys []string,

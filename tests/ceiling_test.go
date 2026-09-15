@@ -35,11 +35,27 @@
 //
 //	# once, unconstrained
 //	GRAPHENE_CEILING_BUILD=1 GRAPHENE_RSS_DIR=/var/tmp/graphene-fixture \
-//	    GRAPHENE_RSS_NODES=1400000 go test ./tests/ -tags=stress -run TestCeilingFixture -v
+//	    GRAPHENE_RSS_NODES=1400000 go test ./tests/ -tags=stress -count=1 \
+//	    -run TestCeilingFixture -v
 //
 //	# then, under the ceiling -- see ceilingHowTo for the platform's wrapper
 //	GRAPHENE_CEILING_MIB=2048 GRAPHENE_RSS_DIR=/var/tmp/graphene-fixture \
-//	    GRAPHENE_RSS_NODES=1400000 go test ./tests/ -tags=stress -run TestCeiling_ -v
+//	    GRAPHENE_RSS_NODES=1400000 go test ./tests/ -tags=stress -count=1 \
+//	    -run TestCeiling_ -v
+//
+// # -count=1 is not decoration, and leaving it off silently fabricates results
+//
+// Every arm of a sweep differs only in an environment variable, and go test
+// caches a result across invocations that differ only in one it did not see the
+// test read. A sweep run without it reports the first arm's figures under every
+// arm's name -- identical to the millisecond, phase table and all, with
+// "(cached)" on a line the eye skips -- and the differences it was run to find
+// are exactly the ones it cannot show. This cost a full sweep of this file
+// before it was written down.
+//
+// It is the same failure as the fixture cache below: a measurement rig that
+// answers from a cache is not a measurement rig, and the wrong answer it gives
+// looks exactly like the right one.
 
 //go:build stress
 

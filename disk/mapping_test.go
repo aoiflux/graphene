@@ -1035,3 +1035,154 @@ func TestLoadImage_ReleasesTheMappingWhenTheParseFails(t *testing.T) {
 		t.Errorf("closing an already-released mapping: %v", err)
 	}
 }
+
+// --- Rule A, the mapped-slice lifetime contract ---
+
+// TestImageMapped_ContractRuleA_SliceLivesForTheHandle is the positive
+// assertion behind the sentence in this file's header and on every doc comment
+// that repeats it: under ImageMapped a slice a read returned is valid for the
+// life of the handle, and a compaction does not shorten that window.
+//
+// # What this adds over the tests above it
+//
+// TestImageMapped_CompactRenamesOverALiveMapping already shows a retained slice
+// reading its own bytes across two compactions, and asserts the mapping count
+// stays at one. That is the observable half. What it does not establish is *why*
+// the mapping is still there, and the why is what makes the contract a
+// guarantee rather than something that happens to hold.
+//
+// The machinery for releasing a mapping exists and runs on this store: attach
+// registers a runtime.AddCleanup on the CSRGraph, a compaction publishes a new
+// graph, the old one becomes unreachable, and the cleanup marks the mapping
+// retirable. Retirable is not released. Nothing on the default path sweeps --
+// sweepImages is called from live.go and from nowhere else -- so the mark is
+// recorded and acted on only by a live reader that reloads. That asymmetry is
+// the contract, and this test is what fails if a sweep is ever added to the
+// compaction path for symmetry, which would be the natural-looking change that
+// silently shortens every caller's slice lifetime.
+//
+// Run it under -race with the rest of the package.
+func TestImageMapped_ContractRuleA_SliceLivesForTheHandle(t *testing.T) {
+	dir := mapFixture(t, 120)
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	m := theMapping(t, s)
+	first, err := s.GetNode(1)
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if !inMapping(first.Properties, m) {
+		t.Skip("this platform did not map the image; rule A has no mapping to be about")
+	}
+	held := first.Properties
+	want := []byte("node-000000-payload")
+
+	// Two rounds, and the delta is grown with real writes rather than one node,
+	// so the compaction has a merge to do and the new image is genuinely built
+	// rather than copied.
+	for round := 1; round <= 2; round++ {
+		for i := 0; i < 400; i++ {
+			if _, err := s.AddNode(&store.Node{
+				Labels:     []store.NodeType{store.NodeTypeEvidenceFile},
+				Properties: []byte(fmt.Sprintf("round-%d-filler-%06d-padding-to-make-the-delta-real", round, i)),
+			}); err != nil {
+				t.Fatalf("AddNode: %v", err)
+			}
+		}
+		if err := s.Compact(); err != nil {
+			t.Fatalf("Compact %d: %v", round, err)
+		}
+
+		// Twice, because the first collection is what makes the graph published
+		// at Open unreachable and the second is what runs the cleanup that
+		// observed it.
+		runtime.GC()
+		runtime.GC()
+
+		if !bytes.Equal(held, want) {
+			t.Fatalf("after compaction %d a slice taken before it reads %q", round, held)
+		}
+
+		s.mu.RLock()
+		listed, live := false, len(s.images)
+		for _, held := range s.images {
+			if held == m {
+				listed = true
+			}
+		}
+		s.mu.RUnlock()
+
+		if !listed {
+			t.Fatalf("after compaction %d the mapping the caller's slice addresses has left "+
+				"the store's list", round)
+		}
+		if live != 1 {
+			t.Errorf("after compaction %d the store holds %d mappings, want 1: a compaction "+
+				"neither creates one nor retires one", round, live)
+		}
+		// The assertion the contract actually rests on. retirable may well be
+		// true by now -- the graph that was current at Open is gone -- and that is
+		// fine and expected. What must not have happened is the release.
+		if m.unmapped.Load() {
+			t.Fatalf("after compaction %d the mapping was released while a caller still held "+
+				"a slice into it: rule A says the window is the handle's life, and something "+
+				"swept on the compaction path", round)
+		}
+		t.Logf("round %d: mapping retirable=%v unmapped=%v, %d listed",
+			round, m.retirable.Load(), m.unmapped.Load(), live)
+	}
+
+	// Nothing above may be credited to the collector having kept the store alive
+	// by accident; the handle is live here because a caller holds it, which is
+	// the premise of the rule.
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(held)
+}
+
+// TestImageMapped_ContractRuleA_CloseIsTheEnd is the second half of the same
+// sentence: "and not past Close()".
+//
+// The read after a Close cannot be tested -- the pages are gone, and touching
+// them is a SIGSEGV on unix and an unrecoverable EXCEPTION_IN_PAGE_ERROR on
+// windows, neither of which a test can survive to report. So what is asserted is
+// the bookkeeping that makes the sentence true: Close releases every mapping the
+// store owns, reachable or not, and does it before the process lock goes. Saying
+// why the stronger test is absent is worth more here than the test would be.
+func TestImageMapped_ContractRuleA_CloseIsTheEnd(t *testing.T) {
+	dir := mapFixture(t, 40)
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	m := theMapping(t, s)
+	n, err := s.GetNode(1)
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if !inMapping(n.Properties, m) {
+		t.Skip("this platform did not map the image")
+	}
+	if m.unmapped.Load() {
+		t.Fatal("the mapping is released while the store is open")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !m.unmapped.Load() {
+		t.Error("Close left the image mapped, so the one sentence Close adds to the aliasing " +
+			"contract is not true of it")
+	}
+	// A defer plus an explicit Close is the shape callers write, and the second
+	// one must not double-unmap. It reports whatever the WAL makes of being
+	// closed twice, which TestLock_DoubleCloseIsHarmless already pins; what
+	// matters here is that the mapping is released exactly once.
+	_ = s.Close()
+	if !m.unmapped.Load() {
+		t.Error("a second Close left the mapping listed as live")
+	}
+}

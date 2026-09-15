@@ -30,11 +30,67 @@ package disk
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"slices"
 
 	"github.com/aoiflux/graphene/store"
 )
 
-var _ store.Projector = (*Store)(nil)
+// ErrUnindexedProjectionKey is returned by the projection methods, under
+// Options.RefuseUnindexedProjectionKeys, for a key no id in this store is
+// indexed under.
+//
+// Wrapped with the offending key, so errors.Is identifies the class and the
+// message identifies the mistake. The first key in request order wins, so the
+// error is the same on every run over the same request.
+var ErrUnindexedProjectionKey = errors.New("disk: no id is indexed under this projection key")
+
+// checkProjectionKeys refuses a key absent from the index's key list.
+//
+// Absence is the only direction this may act on. Under a mapped base the list is
+// an upper bound -- a key whose entries have all been retracted is still named --
+// so a key present in it may still project nothing, and refusing on presence
+// would be wrong. A key missing from it matches nothing for certain, whatever ids
+// are passed, which is exactly the check the option promises.
+//
+// known is sorted, which NodePropKeys guarantees.
+func checkProjectionKeys(known, want []string) error {
+	for _, k := range want {
+		if _, found := slices.BinarySearch(known, k); !found {
+			return fmt.Errorf("%w: %q", ErrUnindexedProjectionKey, k)
+		}
+	}
+	return nil
+}
+
+var (
+	_ store.Projector         = (*Store)(nil)
+	_ store.PropertyKeyLister = (*Store)(nil)
+)
+
+// NodePropKeys implements store.PropertyKeyLister.
+//
+// Through the reader for the reason the file header gives: a compaction
+// publishes a new view with a new index, and reading Store.propIdx directly
+// would let a pass straddle the two. Under a mapped base the list is the union
+// of the image's keys and the delta's, which is what makes it usable on a store
+// that has just been opened and never written to -- every key it has is in the
+// base, and a validator that saw only the delta would reject all of them.
+func (s *Store) NodePropKeys() []string {
+	s.mu.RLock()
+	idx := s.readerLocked().index()
+	s.mu.RUnlock()
+	return idx.NodePropKeys()
+}
+
+// EdgePropKeys implements store.PropertyKeyLister.
+func (s *Store) EdgePropKeys() []string {
+	s.mu.RLock()
+	idx := s.readerLocked().index()
+	s.mu.RUnlock()
+	return idx.EdgePropKeys()
+}
 
 // ForEachNodeProjection implements store.Projector.
 func (s *Store) ForEachNodeProjection(ctx context.Context, ids []store.NodeID, keys []string,
@@ -51,6 +107,12 @@ func (s *Store) ForEachNodeProjection(ctx context.Context, ids []store.NodeID, k
 	s.mu.RLock()
 	idx := s.readerLocked().index()
 	s.mu.RUnlock()
+
+	if s.strictProjectionKeys {
+		if err := checkProjectionKeys(idx.NodePropKeys(), keys); err != nil {
+			return err
+		}
+	}
 
 	var stop error
 	idx.ProjectNodes(ids, keys, func(idIdx, keyIdx int, value []byte) bool {
@@ -78,6 +140,12 @@ func (s *Store) ForEachEdgeProjection(ctx context.Context, ids []store.EdgeID, k
 	s.mu.RLock()
 	idx := s.readerLocked().index()
 	s.mu.RUnlock()
+
+	if s.strictProjectionKeys {
+		if err := checkProjectionKeys(idx.EdgePropKeys(), keys); err != nil {
+			return err
+		}
+	}
 
 	var stop error
 	idx.ProjectEdges(ids, keys, func(idIdx, keyIdx int, value []byte) bool {

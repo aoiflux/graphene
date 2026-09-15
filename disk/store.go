@@ -346,6 +346,10 @@ type Store struct {
 	// field.
 	readOnly bool
 
+	// strictProjectionKeys is Options.RefuseUnindexedProjectionKeys. Set once at
+	// Open and never changed, on the same terms as readOnly above.
+	strictProjectionKeys bool
+
 	// dropped names the constraints the catalogue recorded that the data did not
 	// satisfy at open, and which were therefore not applied. Always empty under
 	// ConstraintRefuse, which fails the open instead. Guarded by mu.
@@ -768,6 +772,36 @@ type Options struct {
 	// writes, and reading a damaged store is exactly what a reader opens one to
 	// do. See DroppedDeclarations.
 	Constraints ConstraintPolicy
+
+	// RefuseUnindexedProjectionKeys makes a projection fail on a key no id in
+	// this store is indexed under, instead of returning nothing for it.
+	//
+	// Off by default, and the default behaviour is unchanged to the byte. A
+	// projection is positioned by the keys it is given and the property index
+	// accepts any key handed to IndexNodeProperty, so an unindexed key is not
+	// wrong to it: it matches nothing, the pass succeeds, and a materialised
+	// result comes back full length and entirely nil. That is correct for a pass
+	// that legitimately finds nothing and indistinguishable from a typo. See
+	// store.PropertyKeyLister.
+	//
+	// The intended shape is on in tests and off in production, which is why it is
+	// set here and not per call: a caller wanting the check does not want to
+	// remember it at each of twenty call sites, and a caller not wanting it
+	// should pay nothing. Turning it on costs one key-list read per projection
+	// call, which is bounded by the number of distinct keys in the index and not
+	// by the ids being projected -- negligible for a streaming pass over
+	// millions, and per-call overhead for a loop of small ones.
+	//
+	// It is not the default, and the reason is consistency rather than cost. This
+	// engine is organised against silent wrong answers, which is the argument for
+	// making it the default; against that, turning a call that succeeds today
+	// into one that returns an error is a break a caller finds at runtime rather
+	// than at compile time, and this release declined to weaken the mapped-slice
+	// lifetime contract for exactly that reason. Graph.NodePropKeys makes the
+	// same check available to a caller who would rather write it themselves.
+	//
+	// Not offered by the in-memory backend, which has no options to carry it.
+	RefuseUnindexedProjectionKeys bool
 
 	// LiveReader opens a read-only store that can be advanced with Refresh,
 	// taking **no process lock at all**. It implies ReadOnly.
@@ -1321,22 +1355,23 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 
 		uniqueEdgeTypes: make(store.UniqueEdgeTypeSet),
 
-		maxSnapshotAge: opts.MaxSnapshotAge,
-		idHeadroomWarn: opts.IDHeadroomWarn,
-		deltaSoftLimit: opts.DeltaSoftLimit,
-		memBudget:      opts.MemoryBudget,
-		compactBufs:    compactBuffersFor(opts.Compact.MaxWorkingBytes),
-		imageMode:      opts.ImageMode,
-		indexMode:      opts.IndexMode,
-		adjacency:      opts.Adjacency,
-		syncOnCommit:   true,
-		metrics:        opts.Metrics,
-		signer:         opts.Signer,
-		verifier:       opts.Verifier,
-		requireSigned:  opts.RequireSignedCommits,
-		attestActorID:  opts.AttestActorID,
-		retention:      opts.Retention,
-		redaction:      opts.RedactionPolicy,
+		maxSnapshotAge:       opts.MaxSnapshotAge,
+		idHeadroomWarn:       opts.IDHeadroomWarn,
+		deltaSoftLimit:       opts.DeltaSoftLimit,
+		memBudget:            opts.MemoryBudget,
+		compactBufs:          compactBuffersFor(opts.Compact.MaxWorkingBytes),
+		imageMode:            opts.ImageMode,
+		indexMode:            opts.IndexMode,
+		strictProjectionKeys: opts.RefuseUnindexedProjectionKeys,
+		adjacency:            opts.Adjacency,
+		syncOnCommit:         true,
+		metrics:              opts.Metrics,
+		signer:               opts.Signer,
+		verifier:             opts.Verifier,
+		requireSigned:        opts.RequireSignedCommits,
+		attestActorID:        opts.AttestActorID,
+		retention:            opts.Retention,
+		redaction:            opts.RedactionPolicy,
 	}
 
 	// The three ledgers all open their files for append, so a read-only store
@@ -2486,13 +2521,21 @@ func (s *Store) Close() error {
 }
 
 // LockMode reports which process-level lock this store holds: LockExclusive for
-// a writable store, LockShared for one opened with Options.ReadOnly.
-func (s *Store) LockMode() LockMode {
-	if s.readOnly {
-		return LockShared
-	}
-	return LockExclusive
-}
+// a writable store, LockShared for one opened with Options.ReadOnly, LockNone
+// for a live reader, which takes none.
+//
+// It reports the lock the store is holding rather than re-deriving one from the
+// options it was opened with. That is the same distinction StorageStats draws
+// throughout -- what is held, not what was asked for -- and here the two differ.
+// Before v0.8.0 this re-derived from Options.ReadOnly, which LiveReader implies,
+// and so answered LockShared for a store holding no lock at all: a shared lock
+// excludes every writer, and not excluding the writer is precisely what OpenLive
+// gives up. LockNone existed and was documented as the mode OpenLive takes; it
+// was simply not reachable from a handle.
+//
+// Pair it with LockEnforced. A mode says what this process asked for and that
+// says whether the platform made it true.
+func (s *Store) LockMode() LockMode { return s.lock.mode }
 
 // LockEnforced reports whether the process-level lock is real on this platform.
 //

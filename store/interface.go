@@ -639,6 +639,39 @@ type Projector interface {
 		fn func(idIdx, keyIdx int, value []byte) bool) error
 }
 
+// PropertyKeyLister reports which property keys the index actually carries.
+//
+// It exists because Projector has no way to refuse a key. A projection reads the
+// property index, which accepts any key handed to IndexNodeProperty, so a key
+// that was never indexed is not an error there -- it produces no callback, and a
+// materialised projection comes back positioned, full length and entirely nil,
+// with no error. That is the right behaviour for a pass that may legitimately
+// find nothing and the wrong thing to hand a caller who typed the key wrongly,
+// and nothing in the result can tell the two apart. The key list can.
+//
+// This is not the declared set. OrderedProperties, UniqueProperties and
+// CompositeProperties report what a store was asked to enforce; this reports
+// what it holds. The two differ in both directions: a declared key with no rows
+// yet is declared and absent here, and every key indexed without a declaration
+// is here and undeclared. For validating a projection it is this one that
+// answers, because this is the set a projection reads.
+//
+// Both bundled backends implement it.
+type PropertyKeyLister interface {
+	// NodePropKeys returns every node property key the index carries, sorted.
+	//
+	// An upper bound rather than an exact set, for the same reason
+	// PropertyIndex.EntryCounts is: under a mapped base the base reports its own
+	// keys without being walked, so a key whose every entry has since been
+	// retracted is still named. Finding out would cost the pass this avoids. A
+	// key named here may therefore project nothing; a key absent from here
+	// projects nothing for certain, which is the direction a validator needs.
+	NodePropKeys() []string
+
+	// EdgePropKeys is NodePropKeys for edge properties.
+	EdgePropKeys() []string
+}
+
 // IndexVerifier is an optional extension implemented by stores that can
 // self-check their indexes against the records those indexes describe.
 type IndexVerifier interface {

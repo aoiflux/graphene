@@ -660,6 +660,16 @@ func (g *Graph) ForEachEdgeBatchCtx(ctx context.Context, ids []store.EdgeID, max
 // Values[i] holds every value the index carries for keys[i] — several, because a
 // key may be registered more than once for one entity — and is nil for a key the
 // entity is not indexed under. A projected value is a copy and is the caller's.
+//
+// Values is always len(keys) long, including when every entry in it is nil, and
+// that is the one thing about this type worth reading twice. A nil at position i
+// says the index carried nothing for keys[i] and this id. It does not say
+// whether that is because the id has no such value or because keys[i] is a key
+// this store has never indexed under any id — a typo, most often. Nothing in the
+// result distinguishes those, because the projection is positioned by request
+// and a key it has never seen is not an error to it. Graph.NodePropKeys is what
+// distinguishes them, and validating against it is a line of code the callers
+// who care should write.
 type NodeProjection struct {
 	ID     store.NodeID
 	Values [][][]byte
@@ -679,11 +689,19 @@ type EdgeProjection struct {
 // retain it. Returning false stops the pass without an error.
 //
 // **It reads the index, not the record.** The values are the ones handed to
-// IndexNodeProperty or to a transaction's index entries. A key that was never
-// indexed produces no callback at all, and a non-indexed field still needs the
-// record. See store.Projector for when this is cheaper than reading the records,
-// which is not always: the record wins while the payloads are in page cache and
-// loses once they are not.
+// IndexNodeProperty or to a transaction's index entries. A non-indexed field
+// still needs the record. See store.Projector for when this is cheaper than
+// reading the records, which is not always: the record wins while the payloads
+// are in page cache and loses once they are not.
+//
+// **A key that was never indexed produces no callback and no error**, and that
+// is the surprising thing about an otherwise mechanical API. It is deliberate:
+// the index accepts any key handed to IndexNodeProperty, so it has no notion of
+// a key being wrong, and a pass that legitimately finds nothing must not be an
+// error either. The consequence is that a mistyped key is indistinguishable from
+// a key nothing happens to carry, and the pass reports success over a result
+// built entirely from absence. Graph.NodePropKeys is the discriminator — a key
+// absent from it will match nothing, for certain, whatever ids are passed.
 //
 // A backend without store.Projector is an error rather than a slow fallback,
 // because there is no fallback that is this API: reading the records to
@@ -727,6 +745,52 @@ func (g *Graph) ForEachEdgeProjectionCtx(ctx context.Context, ids []store.EdgeID
 // ErrNoProjector is returned by the projection methods for a backend that does
 // not implement store.Projector. Both bundled backends do.
 var ErrNoProjector = errors.New("graphene: this store cannot project indexed values")
+
+// NodePropKeys reports every node property key the index carries, sorted, and
+// whether the backend can say.
+//
+// This is the projection API's missing validator. A projection is positioned by
+// the keys it is given and the property index accepts any key at all, so a key
+// that was never indexed is not refused anywhere: it simply matches nothing, and
+// the caller gets a full-length result of nils and a nil error. Checking the
+// requested keys against this list is what turns that into a mistake someone
+// finds out about.
+//
+//	known, ok := g.NodePropKeys()
+//	if ok {
+//	    for _, k := range keys {
+//	        if _, found := slices.BinarySearch(known, k); !found {
+//	            return fmt.Errorf("no node is indexed under %q", k)
+//	        }
+//	    }
+//	}
+//
+// Sorted, so BinarySearch is the intended shape and the list is also usable as a
+// key directory. It is what the index holds and not what the store declared — see
+// Declarations for the other set, and store.PropertyKeyLister for why validating
+// a projection wants this one.
+//
+// An upper bound on the disk backend: under a mapped base a key whose every
+// entry has since been retracted is still named, because establishing otherwise
+// would mean the walk this avoids. So a key named here may still project
+// nothing; a key missing from here projects nothing for certain, and that is the
+// direction a validator needs.
+func (g *Graph) NodePropKeys() ([]string, bool) {
+	l, ok := g.GraphStore.(store.PropertyKeyLister)
+	if !ok {
+		return nil, false
+	}
+	return l.NodePropKeys(), true
+}
+
+// EdgePropKeys is NodePropKeys for edge properties.
+func (g *Graph) EdgePropKeys() ([]string, bool) {
+	l, ok := g.GraphStore.(store.PropertyKeyLister)
+	if !ok {
+		return nil, false
+	}
+	return l.EdgePropKeys(), true
+}
 
 // GetNodesProjected materialises what ForEachNodeProjection streams: one
 // NodeProjection per id, in request order.

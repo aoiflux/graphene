@@ -415,6 +415,28 @@ func TestReadOnly_Accessors(t *testing.T) {
 	if !r.LockEnforced() {
 		t.Error("LockEnforced is false on a platform the build tags say is supported")
 	}
+
+	// The third mode, which LockMode could not report before v0.8.0 because it
+	// re-derived the answer from Options.ReadOnly -- which LiveReader implies.
+	// The two wrong answers are not equivalent: LockShared says every writer is
+	// excluded, and running alongside the writer is the whole of what OpenLive
+	// trades its fixed view for. A caller checking the mode to find out whether a
+	// writer could be active was told the opposite of the truth.
+	l, err := OpenLive(dir)
+	if err != nil {
+		t.Fatalf("OpenLive: %v", err)
+	}
+	defer l.Close()
+	if !l.ReadOnly() {
+		t.Error("a live reader does not report ReadOnly")
+	}
+	if l.LockMode() != LockNone {
+		t.Errorf("live-reader LockMode = %v, want none", l.LockMode())
+	}
+	if !l.LockEnforced() {
+		t.Error("LockEnforced is false for a live reader: it reports whether the platform " +
+			"locks at all, not whether this store took one")
+	}
 }
 
 // --- unclean shutdown ---

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -623,4 +624,121 @@ func TestProjection_TheDedupIsKeyedOnTheKeyAsWellAsTheValue(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A key nothing is indexed under is not an error, and the result it produces
+// looks exactly like an answer.
+//
+// This is the hazard the key list exists for, asserted rather than described.
+// The projection comes back one entry per id, positioned to the keys asked for,
+// full length, with a nil error -- and every value in it is absent. A caller who
+// checks the error and reads the positions cannot tell this from a store where
+// those ids simply carry nothing, and the two want very different responses.
+//
+// It is deliberate that this is not an error. The property index accepts any key
+// handed to IndexNodeProperty, so it has no notion of a wrong one, and a pass
+// that legitimately finds nothing must not fail either. What was missing is any
+// way to ask.
+func TestProjection_AMistypedKeyIsSilentAndTheKeyListIsWhatCatchesIt(t *testing.T) {
+	projBackends(t, func(t *testing.T, e *projEnv) {
+		keys := []string{"digest"}
+		ids := projFixture(t, e.g, 8, keys)
+		e.settle(t)
+
+		typo := []string{"digset"}
+
+		// The silence, both halves of it.
+		n := 0
+		if err := e.g.ForEachNodeProjection(ids, typo, func(int, int, []byte) bool {
+			n++
+			return true
+		}); err != nil {
+			t.Fatalf("ForEachNodeProjection over an unindexed key: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("an unindexed key produced %d callbacks", n)
+		}
+
+		got, err := e.g.GetNodesProjected(ids, typo)
+		if err != nil {
+			t.Fatalf("GetNodesProjected over an unindexed key: %v", err)
+		}
+		if len(got) != len(ids) {
+			t.Fatalf("got %d projections, want %d", len(got), len(ids))
+		}
+		for i := range got {
+			if len(got[i].Values) != len(typo) {
+				t.Fatalf("projection %d has %d value slots, want %d: the result is positioned "+
+					"by the request and stays so", i, len(got[i].Values), len(typo))
+			}
+			if got[i].Values[0] != nil {
+				t.Errorf("projection %d found values under a key nothing was indexed under: %q",
+					i, got[i].Values[0])
+			}
+		}
+
+		// And the discriminator. Absent from the list is the answer a validator
+		// acts on; present is only "may match".
+		known, ok := e.g.NodePropKeys()
+		if !ok {
+			t.Fatal("NodePropKeys reports nothing on a backend that implements store.Projector")
+		}
+		if !slices.IsSorted(known) {
+			t.Errorf("NodePropKeys is unsorted, so BinarySearch on it is wrong: %q", known)
+		}
+		if _, found := slices.BinarySearch(known, typo[0]); found {
+			t.Errorf("the key list names %q, which nothing was indexed under: %q", typo[0], known)
+		}
+		if _, found := slices.BinarySearch(known, keys[0]); !found {
+			t.Errorf("the key list omits %q, which every id is indexed under: %q", keys[0], known)
+		}
+	})
+}
+
+// The declared set and the indexed set are different questions, and only one of
+// them validates a projection.
+//
+// A key declared and never written is enforced and empty: it belongs in
+// Declarations and not in the key list, because a projection over it matches
+// nothing. A key indexed without a declaration is the reverse. Validating a
+// projection against the declarations would therefore reject working keys and
+// accept dead ones, which is why store.PropertyKeyLister is a separate thing
+// from the declaration accessors rather than a view over them.
+func TestPropKeys_IsTheIndexedSetAndNotTheDeclaredOne(t *testing.T) {
+	g := openDisk(t)
+
+	// Declared, never written.
+	if err := g.DeclareOrderedProperty("declared-empty"); err != nil {
+		t.Fatalf("DeclareOrderedProperty: %v", err)
+	}
+	// Written, never declared.
+	id, err := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeMicroArtefact}})
+	if err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	if err := g.IndexNodeProperty(id, "indexed-undeclared", []byte("v")); err != nil {
+		t.Fatalf("IndexNodeProperty: %v", err)
+	}
+
+	known, ok := g.NodePropKeys()
+	if !ok {
+		t.Fatal("NodePropKeys reports nothing on a disk-backed graph")
+	}
+	if slices.Contains(known, "declared-empty") {
+		t.Errorf("the key list names a declared key nothing is indexed under: %q", known)
+	}
+	if !slices.Contains(known, "indexed-undeclared") {
+		t.Errorf("the key list omits an indexed key because it was never declared: %q", known)
+	}
+
+	cat, ok := g.Declarations()
+	if !ok {
+		t.Fatal("Declarations reports nothing on a disk-backed graph")
+	}
+	if !slices.Contains(cat.OrderedNodeKeys, "declared-empty") {
+		t.Errorf("the catalogue omits the declared key: %q", cat.OrderedNodeKeys)
+	}
+	if slices.Contains(cat.OrderedNodeKeys, "indexed-undeclared") {
+		t.Errorf("the catalogue names a key that was only ever indexed: %q", cat.OrderedNodeKeys)
+	}
 }
