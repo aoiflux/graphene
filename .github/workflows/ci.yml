@@ -227,12 +227,48 @@ jobs:
       - name: Compile the stress binary
         run: go test ./tests/ -tags=stress -c -o /tmp/graphene.test
 
-      - name: Build both fixtures, unconstrained
+      # The 1.4M fixture takes up to forty minutes to build and peaks near
+      # 9.4 GiB doing it, which is most of a nightly run spent producing bytes
+      # that did not change. So it is cached -- and the key is the whole of what
+      # makes that safe.
+      #
+      # It hashes every package that decides what lands in the image. That is
+      # deliberately more than the fixture builder: a change in disk/ or index/
+      # can move a byte in the file without touching tests/, and a cache that
+      # survived it would measure the previous format under this commit's name.
+      # That is exactly the failure class G9 is about, reintroduced into the
+      # instrument rather than into the engine.
+      #
+      # There is no restore-keys. A prefix match is how a cache usually degrades
+      # gracefully, and here it degrades into silently measuring a store built by
+      # different code -- the one outcome this job exists to rule out. A miss
+      # should cost forty minutes, not correctness.
+      #
+      # The fixture's own shape marker is the backstop: it records the format
+      # version the build wrote, and a run that opens a fixture from another
+      # format fails rather than measuring it. Two independent checks, because
+      # the cache key is a guess about what matters and the marker is a fact.
+      - name: Restore the 1.4M fixture
+        id: bigfixture
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BIG }}
+          key: ceiling-fixture-1400k-linux-${{ hashFiles('disk/**/*.go', 'index/**/*.go', 'store/**/*.go', 'tests/rss_bench_test.go', 'go.mod') }}
+
+      - name: Build the 1.4M fixture, unconstrained
+        if: steps.bigfixture.outputs.cache-hit != 'true'
         env:
           GRAPHENE_CEILING_BUILD: "1"
         run: |
           GRAPHENE_RSS_DIR=$BIG GRAPHENE_RSS_NODES=1400000 \
             /tmp/graphene.test -test.run '^TestCeilingFixture_Build$' -test.v -test.timeout 40m
+
+      # The 200k fixture is not cached. It builds in well under a minute, and a
+      # cache entry costs more to reason about than it saves.
+      - name: Build the 200k fixture, unconstrained
+        env:
+          GRAPHENE_CEILING_BUILD: "1"
+        run: |
           GRAPHENE_RSS_DIR=$SMALL GRAPHENE_RSS_NODES=200000 \
             /tmp/graphene.test -test.run '^TestCeilingFixture_Build$' -test.v -test.timeout 10m
 
@@ -276,7 +312,17 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build both fixtures, unconstrained
+      # See the linux job for why this key hashes the engine's packages and
+      # carries no restore-keys.
+      - name: Restore the 1.4M fixture
+        id: bigfixture
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/graphene-ceiling-big
+          key: ceiling-fixture-1400k-windows-${{ hashFiles('disk/**/*.go', 'index/**/*.go', 'store/**/*.go', 'tests/rss_bench_test.go', 'go.mod') }}
+
+      - name: Build the 1.4M fixture, unconstrained
+        if: steps.bigfixture.outputs.cache-hit != 'true'
         env:
           GRAPHENE_CEILING_BUILD: "1"
         run: |
@@ -284,6 +330,11 @@ jobs:
           $env:GRAPHENE_RSS_NODES = "1400000"
           go test ./tests/ -tags=stress -run '^TestCeilingFixture_Build$' -v -count=1 -timeout 40m
           if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build the 200k fixture, unconstrained
+        env:
+          GRAPHENE_CEILING_BUILD: "1"
+        run: |
           $env:GRAPHENE_RSS_DIR = "$env:RUNNER_TEMP\graphene-ceiling-small"
           $env:GRAPHENE_RSS_NODES = "200000"
           go test ./tests/ -tags=stress -run '^TestCeilingFixture_Build$' -v -count=1 -timeout 10m

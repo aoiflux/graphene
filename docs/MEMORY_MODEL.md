@@ -902,6 +902,30 @@ nodes per cycle, and a read-only aggregate that opens and reads ten rows — and
 option is worth exactly nothing to the first and its full value to the second. That
 asymmetry is why the engine does not choose: it cannot see which process it is in.
 
+**Why the deleting writer cannot be given a cheaper route, which closes the
+question rather than deferring it.** The obvious follow-up is to serve the delete
+cascade from something other than the adjacency arrays, so that a deleting writer
+could stay lazy too. There is nothing to serve it from. `DeleteNode` reaches
+`incidentEdgeIDsLocked` → `reader.incidentEdgeIDsOf` → `csrEdgeIDs` →
+`CSRGraph.OutboundEdgeIDs`, whose first statement is `ensureAdjacency()`; and
+`EdgesOf`, `Neighbours`, `DegreeOf`, `IncidentEdges` and `EdgeBetween` all land on
+the same four arrays, so the cascade is not even a special caller. There is no
+index over `Edge.Src` or `Edge.Dst` anywhere in the engine — the edge arena is
+`rawEdge` records addressed by identifier — and adjacency has not been written to
+the file since v7 (`csrVersionNoAdjacency`), so there is no section to read
+instead. The only remaining route is to scan the edge arena per delete: O(edges)
+**per delete**, against one O(edges) build amortised over every delete in the
+process. For a writer that deletes once it is a wash, and for the rebuild this
+document is written against — 1.5M deletes per cycle — it is worse by six orders
+of magnitude.
+
+So the asymmetry is structural, not an omission. The build is the cheap way to
+answer "which edges touch this node", it is paid once, and `AdjacencyLazy` moves
+*when* it is paid rather than *whether*. A process that deletes pays it at the
+first delete plus a branch on every read until then; a process that does not
+never pays it at all. That is the whole of what the option does, and there is no
+third outcome hiding behind an index someone has not written yet.
+
 **What it does not cover.** The label postings (`nodesByLabel`, `edgesByLabel`) are
 also derived, also anonymous, also built at open, and also unread by a property-only
 pass. They are not deferred here. At 2M edges they are the larger term of the two,

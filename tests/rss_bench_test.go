@@ -84,6 +84,33 @@ var (
 	// only honest way to size it against a real store is to build the same store
 	// twice, once with the declarations and once without, and subtract.
 	rssNoIndex = os.Getenv("GRAPHENE_RSS_NOINDEX") == "1"
+
+	// rssBuildChunk builds the fixture in passes of this many nodes, compacting
+	// and reopening between them. Zero keeps the single-shot build.
+	//
+	// The single-shot build holds every node it has written in the delta until
+	// the one compaction at the end, so its peak is roughly the size of the
+	// finished store plus the machinery to compact it. At 1.4M nodes of 512-byte
+	// blobs that is 1.7 GiB and merely slow. At the shape this knob exists for --
+	// twenty gigabytes carried as fat records -- it is twenty gigabytes of heap
+	// on a machine with thirty-one, and the build dies before it can measure
+	// anything.
+	//
+	// The reopen is the part that matters, and it is not decoration. Section 9.4
+	// of docs/MEMORY_MODEL.md measures a compaction leaving its own output
+	// resident until the store is reopened -- 3,838 MiB after compacting against
+	// 1,078 after reopening. A builder that compacted between passes and did not
+	// reopen would start each pass from a higher floor than the last, which is
+	// the climb section 9.6 names, and it would die a few passes later than the
+	// single-shot build rather than not at all.
+	//
+	// Sizing it trades heap against disk, not against time in the obvious way.
+	// Each compaction rewrites the whole image, so the bytes a chunked build
+	// writes come to about nodes^2 * bytesPerNode / (2 * chunk): quadratic in the
+	// node count and inversely proportional to the chunk. Halving the chunk
+	// halves the peak heap and doubles the I/O. The peak heap is roughly
+	// chunk * blob, which is the figure to size against the machine.
+	rssBuildChunk = envIntDefault("GRAPHENE_RSS_BUILD_CHUNK", 0)
 )
 
 // rssShapeFile records, inside a persistent fixture, what it was built to.
@@ -278,16 +305,32 @@ func rssWriteNodes(b testing.TB, g *graphene.Graph, from, n, blob int) []store.N
 // plausible, and nothing in the output says the store held 400,000 nodes while
 // the heading said 1,400,000. So the shape is written down, and a mismatch is
 // fatal rather than a silent measurement of the wrong store.
+//
+// csr is in the line for a reason the parameters are not. A fixture cached
+// across CI runs -- which is the only way a forty-minute build is viable
+// nightly -- outlives the code that built it, and the image format is the one
+// input to these figures that is not visible in the environment. A v8 fixture
+// measured by a v9 engine reports a sevenfold slower open and a resident index,
+// correctly, as facts about a store nobody deployed: every column would be
+// plausible and the heading would say v9. So the format the build wrote is part
+// of the shape, and a cache that outlives a format change is refused here rather
+// than believed. It is the rule that the ceiling is read back, applied to the
+// fixture instead of to the limit.
 func rssShape(nodes, blob int) string {
 	return fmt.Sprintf(
-		"nodes=%d blob=%d blobdist=%t edgestride=%d noindex=%t unique=%d ordered=%d composite=%d\n",
+		"nodes=%d blob=%d blobdist=%t edgestride=%d noindex=%t unique=%d ordered=%d composite=%d csr=%d\n",
 		nodes, blob, rssBlobDist, rssEdgeStride, rssNoIndex,
-		len(rssUniqueKeys), len(rssOrderedKeys), len(rssComposites))
+		len(rssUniqueKeys), len(rssOrderedKeys), len(rssComposites), disk.CSRVersionCurrent)
 }
 
 // rssBuildFixture writes the fixture into dir and compacts it.
 func rssBuildFixture(b testing.TB, dir string, nodes, blob int) {
 	b.Helper()
+
+	if rssBuildChunk > 0 && rssBuildChunk < nodes {
+		rssBuildFixtureChunked(b, dir, nodes, blob, rssBuildChunk)
+		return
+	}
 
 	g, err := graphene.Open(dir)
 	if err != nil {
@@ -303,6 +346,107 @@ func rssBuildFixture(b testing.TB, dir string, nodes, blob int) {
 	}
 	if err := g.Close(); err != nil {
 		b.Fatalf("Close: %v", err)
+	}
+
+	// Read back, for the reason the ceiling is read back. rssShape records what
+	// the constant says this build writes; this is what it wrote. A compaction
+	// that fell back to an older format would otherwise be recorded under the
+	// newer one's name for every run that ever reuses this directory.
+	info, err := disk.InspectCSR(dir)
+	if err != nil {
+		b.Fatalf("InspectCSR after build: %v", err)
+	}
+	if info.Version != disk.CSRVersionCurrent {
+		b.Fatalf("the build wrote a v%d image where this engine writes v%d: the "+
+			"fixture would be marked with a format it does not carry",
+			info.Version, disk.CSRVersionCurrent)
+	}
+}
+
+// rssBuildFixtureChunked builds the fixture a pass at a time, compacting and
+// reopening between passes, so the peak is set by the chunk rather than by the
+// finished store. See rssBuildChunk for why, and for how to size it.
+//
+// It reports each pass on stderr as it happens rather than through the testing
+// log, for the reason ceilingProgress exists: a build at this size is exactly
+// the kind that dies, and a process that dies takes testing's buffered output
+// with it. A build that reported only at the end would report nothing in
+// precisely the case a reader needs it to.
+//
+// Edges are refused rather than skipped. An edge needs the ids of both of its
+// endpoints and a chunked build holds only the current pass's, so writing them
+// here would quietly produce a fixture with a fraction of the edges its shape
+// marker claims -- and the marker records the stride, so nothing downstream
+// would notice the shortfall.
+func rssBuildFixtureChunked(b testing.TB, dir string, nodes, blob, chunk int) {
+	b.Helper()
+
+	if rssEdgeStride != 0 {
+		b.Fatalf("GRAPHENE_RSS_EDGE_STRIDE=%d with GRAPHENE_RSS_BUILD_CHUNK=%d: a chunked "+
+			"build cannot write edges, because it does not hold the ids of earlier passes",
+			rssEdgeStride, chunk)
+	}
+
+	start := time.Now()
+	for from := 0; from < nodes; from += chunk {
+		n := chunk
+		if remaining := nodes - from; remaining < n {
+			n = remaining
+		}
+
+		g, err := graphene.Open(dir)
+		if err != nil {
+			b.Fatalf("open for pass at %d: %v", from, err)
+		}
+		// Every pass, not only the first: declaring a key already declared is a
+		// no-op (store/interface.go), and a build that declared solely on the
+		// pass that created the store would depend on the directory having been
+		// empty when it started.
+		if err := rssDeclare(g); err != nil {
+			b.Fatal(err)
+		}
+		rssWriteNodes(b, g, from, n, blob)
+		if err := g.Compact(); err != nil {
+			b.Fatalf("Compact after pass at %d: %v", from, err)
+		}
+		if err := g.Close(); err != nil {
+			b.Fatalf("Close after pass at %d: %v", from, err)
+		}
+
+		now := readRSS()
+		ceilingProgress("build: %d/%d nodes, %.1f MiB on disk, %.1f MiB anon / %.1f MiB total, %s elapsed",
+			from+n, nodes, float64(rssStoreBytes(dir))/bytesPerMiB,
+			float64(now.Anon)/bytesPerMiB, float64(now.Total)/bytesPerMiB,
+			time.Since(start).Round(time.Second))
+	}
+
+	// What the store holds, not what the loop believes it wrote. A pass that
+	// wrote short is the failure this builder can have and the single-shot one
+	// cannot, and it would otherwise be recorded under a shape marker claiming
+	// the full count.
+	g, err := graphene.Open(dir)
+	if err != nil {
+		b.Fatalf("reopen to verify: %v", err)
+	}
+	got, err := g.NodeCount()
+	if err != nil {
+		b.Fatalf("NodeCount to verify: %v", err)
+	}
+	if err := g.Close(); err != nil {
+		b.Fatalf("close after verify: %v", err)
+	}
+	if got != uint64(nodes) {
+		b.Fatalf("the chunked build wrote %d nodes where the shape says %d", got, nodes)
+	}
+
+	info, err := disk.InspectCSR(dir)
+	if err != nil {
+		b.Fatalf("InspectCSR after build: %v", err)
+	}
+	if info.Version != disk.CSRVersionCurrent {
+		b.Fatalf("the build wrote a v%d image where this engine writes v%d: the "+
+			"fixture would be marked with a format it does not carry",
+			info.Version, disk.CSRVersionCurrent)
 	}
 }
 

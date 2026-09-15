@@ -131,6 +131,70 @@ var (
 // past the bound, large enough that the question costs nothing measurable.
 const ceilingRebuildChunk = 50_000
 
+// ceilingProgress writes one line to stderr as it happens, outside the testing
+// framework's buffer.
+//
+// The report at the end of this test is the deliverable and this is not a second
+// copy of it. It exists because of how this test fails. A run that exceeds its
+// ceiling does not return an error: on linux the OOM killer takes the process,
+// and on windows the Go runtime throws "out of memory" from a failed arena
+// reservation. Either way the process is gone, and every t.Logf it had issued
+// goes with it -- testing buffers a test's output until the test ends, and this
+// one does not end. A whole sweep of arms died in the rebuild and reported a
+// stack trace and nothing else: not which phase, not how far into it, not what
+// the process was holding on the way. The figures the sweep exists to collect
+// are collected up to the moment of death, and then discarded at it.
+//
+// So each phase reports as it completes, and the rebuild -- the long phase, and
+// so far the only one that dies -- reports as it goes. A failed arm then says
+// where the wall was rather than only that there was one.
+//
+// The reading here is readRSS and deliberately not settledRSS. settledRSS runs
+// two collections and debug.FreeOSMemory, which would return memory to the
+// operating system fifty-six times during a rebuild and could turn an arm that
+// fails into an arm that passes. An instrument may not decide the result it is
+// measuring. What this prints is the instantaneous counter, which is what a
+// sampler reads and what the ceiling is enforced against.
+// ceilingTerms is the engine's own breakdown of what it is holding, as one
+// line.
+//
+// The settled reading beside it says how much; this says which of it a caller
+// could decide to stop holding, which is a different question and the one two
+// open items in the release turn on. Deferring the label postings is worth
+// building only if LabelPostings is a term rather than a rounding error at this
+// shape, and putting the composites on disk is worth a release only if Composite
+// is. Section 6.7 of docs/MEMORY_MODEL.md asserts the first without measuring it,
+// at a shape an order smaller than this one.
+//
+// It reads through the facade rather than through Forensics, which is the point
+// of forwarding EstimateResident in the first place: if a measurement rig has to
+// reach for the concrete type, so does everyone else.
+//
+// Free to call. EstimateResident is bounded by declared index keys and distinct
+// labels rather than by the store -- a requirement, because AutoCompact polls it
+// on a ticker -- so a line per phase and per rebuild chunk costs nothing the
+// figures would notice.
+func ceilingTerms(g *graphene.Graph) string {
+	if g == nil {
+		return "no handle yet"
+	}
+	est, ok := g.EstimateResident()
+	if !ok {
+		return "backend does not estimate"
+	}
+	mib := func(v int64) float64 { return float64(v) / bytesPerMiB }
+	return fmt.Sprintf("records %.1f payload %.1f labels %.1f adjacency %.1f "+
+		"index %.1f composite %.1f delta %.1f wal %.1f = %.1f MiB heap; "+
+		"mapped %.1f (index %.1f)",
+		mib(est.RecordArrays), mib(est.Payload), mib(est.LabelPostings),
+		mib(est.Adjacency), mib(est.Index), mib(est.Composite), mib(est.Delta),
+		mib(est.WAL), mib(est.Total), mib(est.Mapped), mib(est.MappedIndex))
+}
+
+func ceilingProgress(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "ceiling-progress: "+format+"\n", args...)
+}
+
 // ceilingSelfBuildMax is the largest fixture this test will build for itself
 // rather than demanding a prebuilt one.
 //
@@ -368,7 +432,14 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 			Name: name, Note: note, Wall: wall,
 			Settled: settled, Peak: peak, Samples: samples,
 		})
+		ceilingProgress("phase %s done in %s: settled %.1f MiB anon / %.1f MiB total, "+
+			"peak %.1f MiB total (%s)", name, wall.Round(time.Millisecond),
+			float64(settled.Anon)/bytesPerMiB, float64(settled.Total)/bytesPerMiB,
+			float64(peak.Total)/bytesPerMiB, note)
+		ceilingProgress("phase %s terms: %s", name, ceilingTerms(g))
 	}
+	ceilingProgress("fixture %s: %d nodes, %.1f MiB on disk, delta bound %d MiB",
+		dir, rssNodes, diskMiB, ceilingDeltaMiB)
 
 	run("open", func() string {
 		var err error
@@ -440,7 +511,7 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 	if ceilingReadOnly {
 		t.Log("read-only arm: the sequence stops after the scan")
 		st, _ := g.StorageStats()
-		ceilingReport(t, dir, diskMiB, phases, st, st)
+		ceilingReport(t, dir, diskMiB, phases, st, st, ceilingTerms(g))
 		return
 	}
 
@@ -471,6 +542,11 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 			}
 			if (i+1)%ceilingRebuildChunk == 0 {
 				maybeCompact()
+				now := readRSS()
+				ceilingProgress("rebuild: %d/%d deleted, %d interim compactions, "+
+					"%.1f MiB anon / %.1f MiB total", i+1, len(live), interim,
+					float64(now.Anon)/bytesPerMiB, float64(now.Total)/bytesPerMiB)
+				ceilingProgress("rebuild: %d deleted, terms: %s", i+1, ceilingTerms(g))
 			}
 		}
 		written := 0
@@ -481,6 +557,11 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 			}
 			written += len(rssWriteNodes(t, g, rssNodes+base, n, rssBlob))
 			maybeCompact()
+			now := readRSS()
+			ceilingProgress("rebuild: %d/%d written, %d interim compactions, "+
+				"%.1f MiB anon / %.1f MiB total", written, rssNodes, interim,
+				float64(now.Anon)/bytesPerMiB, float64(now.Total)/bytesPerMiB)
+			ceilingProgress("rebuild: %d written, terms: %s", written, ceilingTerms(g))
 		}
 		if written != rssNodes {
 			t.Fatalf("wrote %d nodes, want %d", written, rssNodes)
@@ -527,7 +608,7 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 	})
 
 	afterCompact, _ := g.StorageStats()
-	ceilingReport(t, dir, diskMiB, phases, beforeCompact, afterCompact)
+	ceilingReport(t, dir, diskMiB, phases, beforeCompact, afterCompact, ceilingTerms(g))
 }
 
 // ceilingReport prints what the run cost and what it ran under.
@@ -536,7 +617,7 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 // a cgroup that killed something during the run did not produce a result, so an
 // OOM kill fails even though this process obviously survived its own.
 func ceilingReport(t *testing.T, dir string, diskMiB float64, phases []ceilingPhase,
-	beforeCompact, afterCompact store.StorageStats,
+	beforeCompact, afterCompact store.StorageStats, terms string,
 ) {
 	// Deliberately not a t.Helper: this prints a table over many lines, and a
 	// helper would stamp every one of them with the single line that called it.
@@ -572,6 +653,7 @@ func ceilingReport(t *testing.T, dir string, diskMiB float64, phases []ceilingPh
 	t.Logf("the engine's own estimate after the sequence: %.1f MiB heap, %.1f MiB mapped",
 		float64(afterCompact.EstimatedResidentBytes)/bytesPerMiB,
 		float64(afterCompact.ImageMappedBytes)/bytesPerMiB)
+	t.Logf("term by term: %s", terms)
 
 	// The headroom line. ceilingInfo.Peak is the high-water mark of the charge
 	// the limit is enforced against, which is the only peak the ceiling can be

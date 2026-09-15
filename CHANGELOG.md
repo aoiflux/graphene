@@ -129,6 +129,77 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   a caller who has not asked. `ImageMappedUnlocked` is how a caller asks, having
   read what it trades.
 
+### Six facts about the store are reachable from `Graph`
+
+- **`Graph` embeds `store.GraphStore`, and a fact the interface does not carry was
+  reachable only by type-asserting back to `*disk.Store`.** Six of them now
+  forward: `EstimateResident`, `ReadOnly`, `RecoveredFromUncleanShutdown`,
+  `Declarations`, `DroppedDeclarations` and `LockState`. A consumer sizing a 2 GB
+  deployment needed the first, and reaching past the facade for it defeats the
+  point of the facade.
+
+- **Each returns `(value, ok)`, the shape `StorageStats` already used**, because
+  the in-memory backend has no answer to any of them and its zero value reads like
+  one. `false` from `ReadOnly` or from `LockEnforced` is a claim about the store;
+  `ok == false` is the statement that the question does not apply to this backend.
+
+- **`LockMode` was wrong, and writing the forward is what found it.** It
+  re-derived its answer from `Options.ReadOnly` rather than reading the lock the
+  store holds. `Options.LiveReader` implies `ReadOnly`, so a live reader — which
+  takes no lock at all, by construction, because not excluding the writer is the
+  whole of what `OpenLive` is for — reported `LockShared`, a mode that excludes
+  every writer. `LockNone` existed, was documented as the mode `OpenLive` takes,
+  and was unreachable from a handle. It now reports what it holds. A caller who
+  branched on `LockMode() == LockShared` to decide whether a concurrent writer was
+  possible got the opposite of the truth.
+
+- **`LockMode` and `LockEnforced` forward as one accessor.** They are two facts
+  about one thing, and the platform property (`LockEnforced`) is what says whether
+  the open-mode property (`LockMode`) means anything.
+
+- **`SetSyncOnCommit` is deliberately not forwarded**, and stays on `*disk.Store`.
+  It is a mutator, and a durability switch that silently does nothing on a backend
+  without durability is worse than one a caller had to prove which backend they
+  held in order to reach.
+
+### A projection cannot refuse a key, so the key list is now askable
+
+- **A mistyped projection key is silent, and the result looks like an answer.**
+  `NodeProjection` is positional: `Values[i]` is the value for `keys[i]`, the slice
+  is always `len(keys)` long, and a key nothing is indexed under produces a nil
+  entry — which is exactly what a key that is indexed but empty for this entity
+  produces. The pass succeeds, `err` is nil, and nothing in the result separates
+  the two.
+
+- **`NodePropKeys` and `EdgePropKeys` are the discriminator**, on both backends,
+  now that they are reachable from `Graph` and from `disk.Store`. They report the
+  keys the property index actually carries — not the declared set, which is a
+  different question: a projection reads whatever was handed to
+  `IndexNodeProperty`, declared or not. Under a mapped base the list is an **upper
+  bound**, because a key whose entries have all been retracted is still named by
+  the image, so a validator may act on absence and not on presence. Absence means
+  "matches nothing, for certain", which is the check worth having.
+
+- **The list unions the mapped base with the delta.** A store opened on a v9 image
+  and not yet written to holds every key it owns in the base and none in the
+  shards, which is the shape this engine is built for; a list read off the shards
+  alone would have rejected every key the store carries.
+
+- **The all-nil pre-fill was left in place, because it is the contract and not the
+  defect.** Removing it would shorten the result when every key missed, and turn an
+  entity that happens to carry nothing into a panic for the positional callers the
+  doc comment tells to index by key position. The silence is the surprising part,
+  and it is now stated at `ForEachNodeProjection` and at `NodeProjection` rather
+  than inferable.
+
+- **`Options.RefuseUnindexedProjectionKeys` makes the silence an error**, at store
+  level rather than per call, because what a consumer wants is strict in tests and
+  lenient in production. It costs one binary search per key per pass and it is
+  opt-in: the default is unchanged to the byte. It is not the default for the same
+  reason the lifetime contract was not weakened — this release does not turn a
+  silent success into a runtime error for callers who cannot see the change in a
+  diff of their own code. The in-memory backend does not offer it.
+
 ### Documentation: the mapped-slice lifetime contract is two rules, not four
 
 - **Eleven statements across the tree said four incompatible things about how
@@ -142,6 +213,16 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   got wrong in the safe direction by saying the slice died at the next compaction.
   Safe is not free: it made "a compaction leaves its output resident until reopen"
   read as a bug rather than as a resident-set characteristic.
+
+- **Rule A now has a test, and it pins the reason rather than the observation.**
+  That a retained slice reads its own bytes across two compactions was already
+  asserted; what was not is why. A compaction does publish a new graph, the old
+  one does become unreachable, and the cleanup registered when the image was
+  mapped does mark the mapping retirable — and retirable is not released, because
+  nothing on the default path sweeps. `sweepImages` is called from `disk/live.go`
+  and from nowhere else. The new test asserts that asymmetry directly, so adding a
+  sweep to the compaction path "for symmetry" fails here instead of silently
+  shortening every caller's slice lifetime.
 
 - **Rule B, and it keeps its precondition now.** Under `OpenLive` *with*
   `ImageMappedUnlocked`, where a `Refresh` across a compaction maps the new image
@@ -161,6 +242,17 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   where godoc never rendered it. The consequence is now on `Options.Adjacency` and
   on `AdjacencyLazy`, which is where the choice is made.
 
+- **And the obvious follow-up is closed rather than left open.** §6.7 of
+  `MEMORY_MODEL.md` now says why the delete cascade cannot be given a cheaper route
+  than the adjacency arrays: there is no index over `Edge.Src` or `Edge.Dst`
+  anywhere in the engine, `EdgesOf`, `Neighbours`, `DegreeOf`, `IncidentEdges` and
+  `EdgeBetween` all land on the same four arrays so the cascade is not even a
+  special caller, and adjacency has not been written to the file since v7 — so
+  there is no section to read instead. The only alternative is scanning the edge
+  arena per delete: O(edges) *per delete* against one O(edges) build amortised over
+  every delete in the process. `AdjacencyLazy` moves when the build is paid, not
+  whether, and there is no third outcome behind an index nobody has written yet.
+
 - **Corrections to `docs/MEMORY_MODEL.md`.** §8.6's footnote concluded that the
   composites were "no longer the largest term in the column" after scaling them to
   ~128 MiB, in a column whose record arrays are 74.8 — they still lead, by 1.7×;
@@ -177,6 +269,17 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   `GRAPHENE_RSS_NODES` defaults to 50,000 and the knob table said 200,000;
   `CommitSeq`'s high-water mark has been carried since v8 rather than by v8; and
   one CHANGELOG sentence reported a windows working set against a linux cgroup.
+
+- **The ceiling harness's own documented invocation omitted `-count=1`.** Every
+  arm of a sweep differs only in an environment variable, and `go test` replays a
+  cached result across invocations that differ only in one it did not see the test
+  read — so a sweep run without it reports the first arm's figures under every
+  arm's name, identical to the millisecond, phase table and all, with "(cached)" on
+  a line the eye skips. The differences the sweep exists to find are exactly the
+  ones it then cannot show. This cost a full sweep before it was written down, and
+  it is the same failure as a stale fixture cache: a measurement rig that answers
+  from a cache is not a measurement rig, and its wrong answer looks exactly like
+  the right one.
 
 - **`DefaultCompactionPolicy` gains a sizing rule for `MaxDeltaBytes`** — the
   trade, stated so a caller can apply it to their own ceiling. The default is

@@ -724,6 +724,9 @@ func (g *Graph) ForEachEdgeProjection(ids []store.EdgeID, keys []string, fn func
 func (g *Graph) GetNodesProjected(ids []store.NodeID, keys []string) ([]NodeProjection, error)
 func (g *Graph) GetEdgesProjected(ids []store.EdgeID, keys []string) ([]EdgeProjection, error)
 // Each has a ...Ctx form.
+func (g *Graph) NodePropKeys() ([]string, bool) // the keys the index carries; a
+func (g *Graph) EdgePropKeys() ([]string, bool) // projection cannot refuse one, so
+                                                // this is what catches a typo
 
 func (g *Graph) Neighbours(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]store.NeighbourResult, error)
 func (g *Graph) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]*store.Edge, error)
@@ -845,6 +848,52 @@ each. The order is unspecified; the indices are how a result is placed.
 `IndexNodeProperty` or to a transaction's index entries. A key you never indexed
 produces no callback at all — silence, not an error — and a non-indexed field
 still needs the record.
+
+**A mistyped key is indistinguishable from an empty one, and the key list is what
+separates them.** A projection is positioned by the keys it is given: it cannot
+refuse one, because "this id carries nothing under this key" is a legitimate
+outcome it must be able to report. So `"bucekt"` yields no callback and
+`GetNodesProjected` returns a `Values` slice that is still `len(keys)` long with a
+nil at that position — the same result an id genuinely carrying nothing produces.
+`err` is nil in both cases, and nothing in the result tells them apart.
+
+```go
+keys := []string{"digest", "bucekt"}
+if known, ok := g.NodePropKeys(); ok {
+    for _, k := range keys {
+        if _, found := slices.BinarySearch(known, k); !found {
+            return fmt.Errorf("nothing is indexed under %q", k)
+        }
+    }
+}
+```
+
+```go
+func (g *Graph) NodePropKeys() ([]string, bool) // sorted; false on an unsupported backend
+func (g *Graph) EdgePropKeys() ([]string, bool)
+```
+
+**Act on absence, never on presence.** The list is what the property index carries,
+and under a mapped base it is an *upper bound*: a key whose entries have all been
+retracted is still named by the image until the next compaction drops it. So a key
+in the list may still project nothing, while a key missing from it matches nothing
+for certain, whatever ids are passed. Only the second direction is a guarantee, and
+it is the one a validator needs.
+
+**This is not the declared set, and the difference is the point.**
+`OrderedProperties`, `UniqueProperties` and `CompositeProperties` report what was
+declared; a projection reads whatever reached `IndexNodeProperty`, declared or not.
+A declared key nothing was ever written under is in the first list and not the
+second, and an undeclared key that has been indexed is in the second and not the
+first. The projection follows the second.
+
+**`Options.RefuseUnindexedProjectionKeys` makes it an error** instead, inside the
+store, for callers who would rather find out at the call than at the assertion. It
+is on the `disk` open, not per call, because what a consumer usually wants is
+strict in tests and lenient in production; the pass then fails with
+`disk.ErrUnindexedProjectionKey` naming the first offending key in request order.
+It costs one binary search per key per pass, it is opt-in, and the default is
+unchanged. The in-memory backend does not offer it.
 
 **When it is cheaper, which is not always.** Reading a record is one contiguous
 read; reading the index is a few scattered ones. So the record wins while the
@@ -2733,6 +2782,45 @@ published reports the payload its records *reference*, which after a compaction 
 a mapped image is page cache counted as heap. The next open corrects it. Over-reporting
 is the direction a figure a budget refuses on should be wrong in.
 
+### Six other facts about the store, without reaching past the façade
+
+`Graph` is an interface value, and a fact the interface does not carry used to mean
+a type assertion back to `*disk.Store`. Six of them forward directly:
+
+```go
+est, ok  := g.EstimateResident()            // disk.ResidentEstimate, term by term
+ro, ok   := g.ReadOnly()                    // opened with Options.ReadOnly
+rec, ok  := g.RecoveredFromUncleanShutdown() // this open replayed a WAL tail
+cat, ok  := g.Declarations()                // disk.Catalogue: unique, ordered, composite
+drop, ok := g.DroppedDeclarations()         // what ConstraintDrop discarded, and why
+mode, enforced, ok := g.LockState()         // disk.LockMode + whether the platform enforces it
+```
+
+**The second return is not an error, it is whether the question applies.** The
+in-memory backend has no lock, no WAL and no image, and its zero value for each of
+these reads like an answer: `false` from `ReadOnly` is a claim that the store is
+writable, where what is true is that the concept does not apply. `ok == false`
+says that, and it is the same shape `StorageStats` uses.
+
+**`LockState` returns two facts because one is meaningless without the other.**
+`LockMode` is a property of the open — `LockExclusive` for a writer, `LockShared`
+under `Options.ReadOnly`, `LockNone` for a live reader, which takes no lock at all.
+`LockEnforced` is a property of the *platform*, and it is false where the build has
+no locking primitive, which `disk/lock_unsupported.go` states as a design rule: a
+store on such a platform must not pretend. A caller branching on the mode alone on
+a platform that enforces nothing is reading a plan, not a guarantee.
+
+> **Corrected in v0.8.0.** `LockMode` re-derived its answer from `Options.ReadOnly`
+> rather than reading the lock held. `Options.LiveReader` implies `ReadOnly`, so a
+> live reader reported `LockShared` — a mode that excludes every writer, when not
+> excluding the writer is precisely what `OpenLive` is for. `LockNone` was
+> documented and unreachable. It now reports what the store holds.
+
+`SetSyncOnCommit` is deliberately **not** here. It is a mutator, and a durability
+switch that silently does nothing on a backend without durability is worse than one
+a caller had to prove which backend they held in order to reach: `Forensics()` is
+that proof.
+
 ---
 
 ## 15. Visualization export
@@ -3803,6 +3891,14 @@ is the supported way to reach it — the store itself, not a copy, and `false` o
 the in-memory backend, which supports none of this. Forwarding fifty methods
 through the façade would double the API surface and give every one of them
 somewhere to drift.
+
+A handful of non-forensic facts *are* forwarded, and the line between the two is
+not the count. `EstimateResident`, `ReadOnly`, `RecoveredFromUncleanShutdown`,
+`Declarations`, `DroppedDeclarations` and `LockState` (§14) describe the store a
+caller has open — what it is holding, what it will refuse, what it recovered from
+— and are read by code that never intends to prove anything. Everything in this
+section produces or checks evidence, which is a posture a caller opts into, and
+`Forensics()` is where they say so.
 
 ```go
 if s, ok := g.Forensics(); ok {
