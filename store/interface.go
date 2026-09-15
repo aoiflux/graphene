@@ -585,6 +585,50 @@ type NodeQueryStreamer interface {
 	ForEachNodeID(ctx context.Context, query NodeQuery, fn func(id NodeID) bool) error
 }
 
+// Projector is an optional extension implemented by stores that can serve
+// indexed property values for many entities without reading their records.
+//
+// **This reads the index, not the records.** The values are the ones handed to
+// the store when the entity was indexed. If a caller indexed something other
+// than what it put in the payload, this returns what it indexed; a key that was
+// never indexed produces no callback at all. It is exact for indexed keys and
+// silent about everything else, which is the trade that makes it cheap.
+//
+// # When it is cheaper, which is not always
+//
+// Reading the record is one contiguous read; reading the index is a few scattered
+// ones. So the record wins while the payloads are in page cache and loses once
+// they are not, and payload size is what decides which. Measured on the disk
+// backend with four keys an entity: reading the records is 12-14x cheaper at 512-
+// byte and 4 KiB payloads, and 4-15x dearer at 16 KiB and 64 KiB. Against a
+// caller that also decodes what it reads, the break-even is a decode of roughly
+// 1.4 us an entity at the small end — below that, read the record.
+//
+// See docs/TECHNICAL_DETAILS.md §14.29 for the measurements and the crossover.
+type Projector interface {
+	// ForEachNodeProjection calls fn once per (id, key, value) the index holds
+	// for the requested keys.
+	//
+	// fn receives positions, not names: idIdx indexes ids and keyIdx indexes
+	// keys. The value belongs to the store for the duration of the call — read
+	// it, do not retain it. Returning false stops the pass without an error.
+	//
+	// An entity may carry several values under one key, and fn is called once
+	// for each, so that is expressible rather than reduced to the first. The
+	// order is unspecified; the indices are how a result is placed.
+	//
+	// This is not a point-in-time read of the whole pass: ids are resolved in
+	// batches, so a write landing mid-pass may be visible for later ids and not
+	// earlier ones. Each entity's values are read at one instant, which is the
+	// guarantee a loop of GetNode calls gives.
+	ForEachNodeProjection(ctx context.Context, ids []NodeID, keys []string,
+		fn func(idIdx, keyIdx int, value []byte) bool) error
+
+	// ForEachEdgeProjection is ForEachNodeProjection for edges.
+	ForEachEdgeProjection(ctx context.Context, ids []EdgeID, keys []string,
+		fn func(idIdx, keyIdx int, value []byte) bool) error
+}
+
 // IndexVerifier is an optional extension implemented by stores that can
 // self-check their indexes against the records those indexes describe.
 type IndexVerifier interface {
@@ -843,6 +887,52 @@ type EdgeQueryExplainer interface {
 type BatchReader interface {
 	GetNodesBatch(ids []NodeID) (found []*Node, missing []NodeID)
 	GetEdgesBatch(ids []EdgeID) (found []*Edge, missing []EdgeID)
+}
+
+// BoundedBatchReader is implemented by stores that can stop a batch read at a
+// byte ceiling rather than resolving every id they are given.
+//
+// The ceiling counts **payload bytes**: the sum of len(Properties) over the
+// records returned. It does not count the per-record struct or the slice of
+// pointers holding them — together about 72 bytes a record, independent of the
+// blobs — so a caller budgeting for a very large number of very small records
+// should allow for that term separately.
+//
+// The ceiling is not a statement about what the engine allocates, and on a
+// backend serving records out of a mapped image it is not one about resident
+// memory either: a record's Properties can point into the image, in which case
+// the bytes are file-backed pages that the caller makes resident by reading
+// them. What it bounds is what the caller takes on per call. That quantity
+// means the same thing on every backend and in every residency mode, which is
+// why it is the one in the contract.
+//
+// Everything BatchReader promises holds here too — request order preserved,
+// missing ids reported rather than left as holes, duplicates resolved
+// independently — over the prefix of ids the call reached.
+type BoundedBatchReader interface {
+	// GetNodesBatchBounded resolves ids in order until the next record would
+	// take the batch's payload total past maxBytes, and returns the ids it did
+	// not reach in rest.
+	//
+	// **A call always consumes at least one id**, so a resume loop terminates.
+	// The budget is only consulted once a record is already in the batch, which
+	// means a record larger than maxBytes is returned alone rather than
+	// refused, and that the bound governs all but the first record of a batch.
+	//
+	// maxBytes of zero or less needs no special case and gets none: nothing
+	// fits beside the first record, so the call yields exactly one.
+	//
+	// rest is empty when ids ran out, which is how a loop knows it is done:
+	//
+	//	for len(ids) > 0 {
+	//		found, missing, rest := br.GetNodesBatchBounded(ids, budget)
+	//		use(found, missing)
+	//		ids = rest
+	//	}
+	GetNodesBatchBounded(ids []NodeID, maxBytes int64) (found []*Node, missing []NodeID, rest []NodeID)
+
+	// GetEdgesBatchBounded is GetNodesBatchBounded for edges.
+	GetEdgesBatchBounded(ids []EdgeID, maxBytes int64) (found []*Edge, missing []EdgeID, rest []EdgeID)
 }
 
 // Transactor is implemented by stores that can apply a mixed set of nodes and

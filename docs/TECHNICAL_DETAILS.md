@@ -5382,6 +5382,272 @@ was identical to a tenth of a MiB in all seven rounds of each arm; the anonymous
 and peak figures are medians, with the copying arm spanning 299.3–338.1 MiB
 anonymous and the owning arm 142.8–149.2.
 
+### 14.28 Taken: a batch read may be bounded by the bytes it hands back
+
+`GetNodes` resolves every id it is given. The size of its answer is therefore set
+by two things the method has no say over — the caller's id slice and the store's
+blobs — and the shape it is wrong for is the one this engine is being sized for: a
+consumer resolving half a million ids against a store whose payloads run from a
+few hundred bytes to 64 MiB. There is no id count that is safe at both ends of
+that distribution, which is why a count is the wrong unit and this item exists.
+
+**Taken:** a byte budget on the batch read. `store.BoundedBatchReader` on both backends
+(`GetNodesBatchBounded`, `GetEdgesBatchBounded`), and on `Graph` the step
+(`GetNodesBounded`, `GetEdgesBounded`) and the loop around it
+(`ForEachNodeBatch`, `ForEachEdgeBatch`, each with a `…Ctx` form). The loop is the
+form to reach for; the step exists because a caller that wants to drive its own
+paging should not have to reimplement the budget to do it.
+
+#### The rule that keeps a resume loop from being a hang
+
+The budget is not consulted until a record is already in the batch. A record
+whose payload alone exceeds `maxBytes` is therefore returned on its own rather
+than refused, and every call consumes at least one id.
+
+Without that rule the failure is not a wrong answer, it is a spin: a store
+holding one 64 MiB blob, read with an 8 MiB budget, returns an empty batch and
+the same `rest` forever. That is a hang with no error and no output, found in
+production rather than in a test, and it is the worst shape a bug in a paging API
+can take. The cost of the rule is that the bound governs all but the first record
+of a batch, which the doc comment and `API_REFERENCE.md` both state rather than
+bury.
+
+The same rule makes `maxBytes <= 0` need no special case: nothing fits beside the
+first record, so the call yields exactly one. A caller computing
+`remaining - used` that slips to zero or below gets safe-and-slow rather than the
+unbounded batch it was trying to avoid. Writing it as a special case would have
+been more code and a worse answer.
+
+`Graph.ForEachNodeBatch` additionally refuses to spin on a *third-party* store
+that gets the rule wrong: a call that returns as many ids as it was given stops
+the loop with `ErrBatchStalled` naming both counts. Neither bundled backend can
+reach it, which is exactly why it is cheap to have.
+
+#### What the budget counts, and the two things it is not
+
+It counts payload bytes: the sum of `len(Properties)` over the records returned.
+It does not count the per-record `*store.Node` or the pointer slice holding it —
+about 72 bytes a record whatever the blobs weigh.
+
+It is **not a bound on what the engine allocates**, and under the default
+`ImageMapped` it is **not a bound on resident memory** either. A record served
+from the image has `Properties` pointing into the mapping, so the engine
+allocates the struct and nothing else, and the blob bytes are file-backed pages
+that become resident when the caller reads them. What the budget bounds is what
+the caller takes on per call — the bytes it is about to touch, decode or copy.
+That quantity means the same thing on both backends and in both residency modes,
+which is the only reason it is the one in the contract. The measurement below
+shows this directly: the file-backed row does not move.
+
+#### Two things the measurement caught
+
+**The first fixture measured the wrong residency, for a reason already written
+down.** It built a store, compacted it, and read — and reported `fileMiB` of zero
+with 115 MiB of heap holding what should have been mapped payloads. The cause is
+`MEMORY_MODEL.md` §9.4: a compaction neither creates nor retires a mapping, so
+the graph it publishes was built in the heap and `StorageStats` reports
+`ImageMode=heap` until the next `Open` maps the file. That is documented
+behaviour and the fixture simply did not respect it; the figures it produced
+described the heap-image path under the name of the mapped one. `boundedBenchStore`
+now closes and reopens before it measures anything, and logs if the image it ends
+up with is still unmapped rather than letting a silent fallback be read as a
+result.
+
+The rule — **a fixture reporting residency for a compacted store has to reopen
+it** — was already in the repository and this fixture simply did not follow it:
+`rssBuildFixture` closes the store it built, and `rssFixtureDir` says in as many
+words that the caller reopens so the measurement covers a cold decode rather than
+the residue of the build. The footprint suite next door does measure a graph
+built in the running process, but that is its question rather than an oversight.
+What was new here was only a second fixture that had to learn it.
+
+**The first version allocated more than the method it was replacing.** Each
+batch's slice grew by doubling from `nil`, which over a whole walk allocates
+roughly twice the pointers it ends up holding: `+23.5%` B/op against `GetNodes`,
+churn the paging is supposed to be saving rather than adding. `batchHint` now
+reserves from the first record's payload, clamped at both ends — never more than
+the ids on offer, and never more than 65,536 entries (512 KiB of pointers)
+however small that first record was. The upper clamp is the load-bearing half: a
+first record much smaller than its successors then costs a fixed 512 KiB of
+over-reservation instead of one pointer per id in the whole request. With it the
+bounded walk allocates *less* than the unbounded one, because `GetNodesBatch`
+presizes a per-id `pending` index slice that the bounded path never needs.
+
+#### Measured
+
+200,000 nodes, 512-byte payloads, a compacted store **reopened** so the image is
+mapped, an 8 MiB budget — 16,384 records a batch, 13 batches. Residency is a
+median of seven rounds, one process per measurement, sampled with one batch live
+for the bounded arm and the whole answer live for the unbounded one.
+
+| 200,000 records in hand | `GetNodes` | `ForEachNodeBatch` | |
+|---|---|---|---|
+| Go heap held | 30.09 MiB | 17.50 MiB | **−41.8%** |
+| anonymous | 86.8 MiB | 73.6 MiB | **−15.2%** |
+| file-backed | 98.7 MiB | 98.8 MiB | ~ unchanged |
+| total resident | 185.5 MiB | 172.4 MiB | **−7.1%** |
+| records live at once | 200,000 | 16,384 | |
+
+The heap delta of 12.59 MiB is 183,616 records that are no longer live at 64
+bytes apiece — the `store.Node` size class — plus the pointer slice, which is
+12.6 MiB. The model and the measurement agree to a hundredth of a MiB. The
+file-backed row not moving is the contract restated as a number: both arms alias
+the same mapped payloads, so what changed is how many records one caller holds,
+not how much of the file is resident.
+
+Throughput, six interleaved rounds of ten iterations each, one process per arm:
+
+| Whole walk, 200,000 records | `GetNodes` | `ForEachNodeBatch` | |
+|---|---|---|---|
+| sec/op | 16.63m ± 40% | 18.34m ± 73% | ~ (p=0.818 n=6) |
+| B/op | 15.27 MiB ± 0% | 13.83 MiB ± 0% | **−9.45%** (p=0.002 n=6) |
+| allocs/op | 200,002 | 200,013 | +11 (p=0.002 n=6) |
+
+Wall clock is unchanged and the spread says why no stronger claim is available
+from this machine: both arms span more than two-fold across rounds, so a
+difference smaller than that is not visible here and is not asserted. The
+allocation figures have no spread at all, and they are the ones the item is
+judged on.
+
+### 14.29 Taken: indexed values may be served without their records
+
+A caller that wants three fields of a million records reads a million records to
+get them. Under a mapped image that means faulting in a million payloads — tens
+of kilobytes apiece at the shape this engine is sized for — to reach a few dozen
+bytes of each. The index already holds those values; what was missing was a way
+to ask for them that does not cost more than the records did.
+
+**Taken:** `index.PropertyIndex.ProjectNodes`/`ProjectEdges`, `store.Projector`
+on both backends, and on `Graph` the streaming form
+(`ForEachNodeProjection`/`ForEachEdgeProjection`, each with a `…Ctx`) plus the
+materialising convenience (`GetNodesProjected`/`GetEdgesProjected`).
+
+**Not taken: a projection of the record.** This reads the index. The values are
+the ones handed to `IndexNodeProperty`; a caller that indexed something other
+than what it put in the payload gets back what it indexed, and a key that was
+never indexed produces no callback at all rather than an error. It is exact for
+indexed keys and silent about everything else, and that is the trade that makes
+it cheap. Non-indexed fields still need the record.
+
+#### The measurement came before the implementation, and nearly stopped it
+
+The feasibility arms were written and run before any of this existed, against
+`NodeEntriesOf` — the index's existing reverse read, which takes all sixteen
+shard locks, copies every value and sorts, once per id. That is the index at its
+worst, and it was deliberately the arm to beat: if the worst case had been an
+order of magnitude off the record path, no amount of shard-grouping would have
+closed it and the right answer would have been to report that and not build.
+
+It was 12–14× *dearer* than reading the records at 512-byte and 4 KiB payloads,
+which looked like a refusal. What that framing missed is that the record arm is
+charged only for **reaching** the bytes: the engine never parses a payload, so
+the decode is the caller's and is precisely what a projection removes. The
+comparison is not index-versus-blob, it is index-versus-blob-plus-decode, and
+what a projection has to beat is therefore a break-even rather than a number.
+
+#### Measured
+
+25,000 nodes, four indexed keys each, medians of four rounds, one process per
+arm. `record` is `GetNodesBatch` plus a touch of every payload page; `entriesOf`
+is `NodeEntriesOf` filtered to the four keys; `projection` is what shipped.
+
+| payload | record | `entriesOf` | projection | projection vs record |
+|---|---:|---:|---:|---|
+| 512 B | 89 ns | 1,386 ns | **418 ns** | 4.7× dearer |
+| 4 KiB | 172 ns | 1,284 ns | **449 ns** | 2.6× dearer |
+| 16 KiB | 6,728 ns | 1,555 ns | **502 ns** | **13.4× cheaper** |
+| 64 KiB | 32,556 ns | 1,798 ns | **559 ns** | **58× cheaper** |
+
+| per 25,000 records, any payload size | B/op | allocs/op |
+|---|---:|---:|
+| record | 2,009,600 | 25,002 |
+| `entriesOf` | 11,600,000 | 225,000 |
+| **projection** | **434,704** | **150** |
+
+The projection column is flat — 418 to 559 ns across a 128-fold change in payload
+— because it never touches a payload. The record column is not, and **what moves
+it is not really the payload size**: it is whether the store still fits in page
+cache, and payload size is what decides that. At 25,000 nodes the fixture is
+13 MiB at 512 B and 1.6 GiB at 64 KiB. That confound is stated rather than
+hidden, because it is also the regime this engine is for: a 2 GiB store on a
+machine with other tenants is on the far side of it by construction.
+
+So: below the crossover a projection costs about **300 ns a record more** than
+reading the record, and pays for itself as soon as the caller's own decode of
+those fields exceeds 300 ns. Above it there is no crossover to discuss. And it
+allocates less than reading the records at every size — 4.6× fewer bytes and 167×
+fewer allocation events — which is not a trade at all.
+
+The shard path is measured separately, because every arm above is served from the
+image's index section and would have left the delta side an assertion:
+
+| 25,000 nodes, entries still in the shards | `entriesOf` | projection | |
+|---|---:|---:|---|
+| ns/record | 1,790 | **564** | **3.2× faster** |
+| B/op | 10,400,000 | **466,448** | **22× less** |
+| allocs/op | 175,000 | **444** | **394× fewer** |
+
+That is where naming the keys pays: a key lives in exactly one shard, so four
+keys touch four shards, against the sixteen `NodeEntriesOf` must take because it
+answers "everything this entity is indexed under" and cannot know where that is.
+Four lock acquisitions per 512-id chunk instead of sixteen per record.
+
+#### Three things that had to be got right, and two that were not at first
+
+**A shard lock is never held across the callback.** The caller's sink is expected
+to read the store, the store's read path takes its own locks, and a shard lock
+held across arbitrary caller code is the deadlock `disk/scan.go`'s header
+describes and `index/walk_lock_test.go` pins. Each chunk of 512 ids is collected
+under the locks into a scratch slab and yielded once they are released.
+
+**The base half is de-duplicated against the delta half, on the pair.** An entity
+indexed, compacted, then re-registered with the same value holds that entry in
+both halves; yielding it twice would make an idempotent re-ingest double-count.
+A bucket chain over the chunk's own hits does it without a per-chunk map. The
+dedup is on (key, value) and on the whole value: two keys carrying the same bytes
+are two entries, and two values sharing a leading byte are two values — which for
+content digests is one pair in 256.
+
+**It is not a point-in-time read of the whole pass.** `NodesByPropertyFunc` is,
+because the index copies its delta side once when the stream is made. A
+projection resolves each chunk as it reaches it, so a write landing mid-pass can
+be visible for later ids and not earlier ones. Each entity's values are read at
+one instant, which is what a loop of `GetNode` calls gives, and API_REFERENCE §6
+already records that the property index is a live structure a snapshot does not
+fix.
+
+**Not got right at first: a closure allocated per entity.** The base walk's
+callback was built inside the per-id loop, capturing a fresh index each time —
+one heap closure per record, which for a method whose whole point is to allocate
+nothing per record was the entire budget. The delta walk had the same bug. Both
+are now one closure per chunk over a mutable position, and the figure went from
+25,052 allocations per 25,000 records to 150.
+
+**Not got right at first: a `[]byte` conversion per delta hit.** The delta holds
+values as interned strings and the slab is bytes; `[]byte(s)` allocates and
+`append(slab, s...)` does not. Neither of these was visible to review. Both were
+visible the moment allocations were counted.
+
+#### What mutation testing found that the tests did not
+
+Twenty-two mutants across four passes. Three survived for real reasons, and each
+would have produced a **wrong answer** rather than a crash:
+
+- **A key sharing a shard with a requested key leaked**, under the requested
+  key's index. No fixture had ever put a non-requested key in the same shard as a
+  requested one, so the filter was never exercised. The test that closes it
+  *searches* for a colliding pair rather than hard-coding one, because the hash
+  is an implementation detail and a hard-coded pair would stop testing anything
+  the day it changed — silently, since both keys would still exist.
+- **A dedup matching on a leading byte** passed everything, because every fixture
+  used obviously-different strings.
+- **A dedup ignoring the key** passed everything, because no fixture had one
+  entity carrying the same bytes under two keys.
+
+Three further survivors were equivalent mutants — a redundant fast path, a dead
+store, and a reset whose state is never re-read — checked one by one rather than
+counted as passes.
+
 ## 15. Invariants
 
 Any change must preserve these. Each is enforced by tests.

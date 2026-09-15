@@ -5,6 +5,94 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.7.0
 
+### Indexed values can be served without the records that carry them
+
+- **`ForEachNodeProjection` reads the property index instead of the payloads.**
+  A caller that wants three indexed fields of a million records reads a million
+  records to get them, and under a mapped image that means faulting in a million
+  payloads to reach a few dozen bytes of each. The index already holds those
+  values. `GetNodesProjected` is the materialising form;
+  `ForEachEdgeProjection`/`GetEdgesProjected` are the edge forms; each has a
+  `…Ctx`.
+
+- **It reads the index, not the record, and says so.** The values are the ones
+  handed to `IndexNodeProperty`. A key that was never indexed produces no
+  callback at all — silence, not an error — and a non-indexed field still needs
+  the record. Exact for indexed keys and silent about the rest is the trade that
+  makes it cheap.
+
+- **The crossover is the result, not a footnote.** Reading a record is one
+  contiguous read and reading the index is a few scattered ones, so the record
+  wins while the payloads are in page cache and loses once they are not. Four
+  keys an entity, 25,000 nodes, medians of four rounds — **89 → 418 ns/record**
+  at 512-byte payloads and **172 → 449 ns** at 4 KiB (the record path winning),
+  then **6,728 → 502 ns** at 16 KiB and **32,556 → 559 ns** at 64 KiB (the
+  projection winning by 13× and 58×). The projection column is flat across a
+  128-fold change in payload because it never touches one.
+
+- **Below the crossover it costs about 300 ns a record more than reading the
+  record**, so it pays for itself as soon as the caller's own decode of those
+  fields exceeds 300 ns. Above it there is nothing to weigh up.
+
+- **It allocates less than reading the records at every size**: 434,704 B and
+  **150 allocations** per 25,000 records, against 2,009,600 B and 25,002. Against
+  the index's existing reverse read it is 3.2× faster on the delta path with 22×
+  less memory and 394× fewer allocations, because naming the keys means four
+  shard locks a chunk rather than sixteen a record.
+
+- **It is not a point-in-time read of the whole pass.** Ids resolve in batches,
+  so a write landing mid-pass may be visible for later ids and not earlier ones;
+  each entity's values are read at one instant. A shard lock is never held across
+  the callback, which is the deadlock `disk/scan.go` documents.
+
+- No format change, no API break: purely additive.
+
+### A batch read can be bounded by the bytes it hands back
+
+- **`ForEachNodeBatch` is `GetNodes` with a ceiling on the payload in hand.** The
+  size of `GetNodes`' answer is set by the caller's id slice and the store's
+  blobs, and nothing in between gets a say — which is right for a few hundred ids
+  and wrong for half a million against a store whose payloads run from a few
+  hundred bytes to 64 MiB. There is no id count that is safe at both ends of that
+  distribution, so the unit is bytes. `GetNodesBounded` is one step of the loop
+  for callers driving their own paging, `GetEdgesBounded` and `ForEachEdgeBatch`
+  are the edge forms, and each loop has a `…Ctx` form cancelled between batches.
+
+- **A call always consumes at least one id, and that is the whole safety
+  argument.** The budget is not consulted until a record is already in the batch,
+  so a record whose payload alone exceeds the budget comes back on its own rather
+  than being refused. Without that rule a store holding one 64 MiB blob read at an
+  8 MiB budget returns an empty batch and the same remainder forever — a hang with
+  no error and no output. The price is that the ceiling governs all but the first
+  record of a batch, and the docs say so. It also makes a budget of zero or less
+  need no special case: nothing fits beside the first record, so a budget that
+  slipped negative yields safe-and-slow instead of the unbounded batch it was
+  avoiding.
+
+- **−41.8% of the Go heap held, and the file-backed row does not move.** At
+  200,000 records with 512-byte payloads and an 8 MiB budget against a reopened,
+  mapped store: Go heap **30.09 → 17.50 MiB**, anonymous **86.8 → 73.6 MiB**
+  (−15.2%), total resident **185.5 → 172.4 MiB**, file-backed **unchanged** at
+  ~98.8 MiB. The heap delta is 183,616 records no longer live at 64 bytes apiece
+  plus the pointer slice — 12.6 MiB against 12.59 measured. File-backed residency
+  not moving is the contract as a number: under a mapped image both arms alias the
+  same payloads, so what the budget bounds is what the *caller* takes on, not what
+  the engine allocates.
+
+- **It is cheaper, not dearer, per walk.** Over the whole 200,000 records:
+  **−9.45% B/op** (p=0.002, n=6) for **+11 allocs/op**, wall clock unchanged
+  (p=0.818) — `GetNodesBatch` presizes a per-id index slice the bounded path never
+  needs. The first version was 23.5% *worse* on B/op, because each batch's slice
+  grew by doubling from nil; it now reserves from the first record's payload,
+  clamped so that a first record much smaller than its successors costs a fixed
+  512 KiB of over-reservation rather than one pointer per id in the request.
+
+- **A store that consumes nothing is an error, not a spin.** A third-party
+  `store.BoundedBatchReader` that returns as many ids as it was given stops the
+  loop with `ErrBatchStalled`. Neither bundled backend can reach it.
+
+- No format change, no API break: purely additive.
+
 ### A transaction can take a node rather than copy it
 
 - **`Tx.UpsertNodeOwned` is `Tx.UpsertNode` without the defensive copy.** The
@@ -2611,6 +2699,48 @@ exported — the export is streamed precisely so it does not hold the graph.
   before and after a rename-over compare equal. The held-handle test re-reads
   the bytes it holds instead of comparing identities, which asserts the property
   directly on both platforms.
+
+### Upgrading a store written by v0.6.0: compact it once
+
+**Opening is several times faster, and none of that arrives until the image has
+been rewritten.** Two things made a v0.6.0 open slow: the whole image was read
+into the heap and every blob copied into an arena, and the property index was
+rebuilt one entry at a time through `IndexNode`. `ImageMapped` removed the first
+and v9's GPIX section removed the second, and both are defaults now.
+
+But a file v0.6.0 wrote is format v8, and a v8 image carries its property index
+as a GIDX section. `deserialiseCSR` loads a GIDX entry by entry **whatever
+`IndexMode` says**, because `IndexMapped` has nothing to map — the mappable
+section is exactly what v8 does not have. So upgrading the library under an
+existing store leaves the index half of the open costing what it always cost.
+
+Measured on a 462 MiB store, four interleaved rounds per arm, one process each,
+on an AMD Ryzen 9 5980HS with the store on NVMe:
+
+| Open | median | minimum |
+|---|---:|---:|
+| v9 image, defaults | 301 ms | 221 ms |
+| **v8 image, same defaults** | **2,102 ms** | 1,262 ms |
+| v9 image, forced into v0.6.0's modes (`ImageHeap` + `IndexResident`) | 2,149 ms | 1,097 ms |
+
+At 2.26 GiB the v9 default open is **1.40 s** against **9.94 s** for the same
+store served the v0.6.0 way — about 7×, holding across both sizes.
+
+The fix is one `Compact()`, or `graphene store migrate -to 9`, which rewrites the
+image as v9. It is a one-time cost and it is also what makes the memory figures in
+this release apply: the same v8 file holds its whole property index on the heap.
+
+Two other causes of a slow open that this does not address, worth ruling out
+separately. **A store that has never been compacted replays its whole WAL**,
+which is bounded by write history rather than by data size —
+`disk.PreflightOpen(dir)` reports what an open is about to cost before you pay
+it, and `Options.MaxReplayRecords` / `MaxReplayBytes` refuse rather than grind.
+And spare RAM does not help either case: v0.6.0's open was slow because it
+*copied* roughly 3.5× the file, not because it ran out of room.
+
+The wall-clock spread above is wide — every arm varies about two-fold across
+rounds on this machine — so the ratio is the claim and the individual figures are
+not. Both minima and medians are given for that reason.
 
 ---
 

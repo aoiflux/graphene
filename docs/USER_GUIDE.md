@@ -918,6 +918,15 @@ instead of materialising every candidate edge record.
 - `AddNodes`, `AddEdges` — atomic ordered batch insert
 - `Begin` → `*Tx` — creates, updates and deletes committing together (§5)
 - `GetNodes`, `GetEdges` — resolve many IDs under one lock hold
+- `ForEachNodeBatch`, `ForEachEdgeBatch` — the same, in batches bounded by
+  payload bytes rather than by ID count, for resolving more IDs than you want
+  records in hand at once. `GetNodesBounded`/`GetEdgesBounded` are one step of
+  that loop. See API_REFERENCE §6 for what the bound does and does not count.
+- `ForEachNodeProjection`, `ForEachEdgeProjection` — indexed property values for
+  many IDs without reading the records that carry them; exact for indexed keys
+  only. `GetNodesProjected`/`GetEdgesProjected` are the materialising forms.
+  Cheaper than reading records once the payloads no longer fit in page cache,
+  dearer while they do — API_REFERENCE §6 has the crossover.
 - `Sync` — force pending writes durable without a full `Compact()`
 - `Stats`
 - `NodesByAnyType`, `EdgesByAnyType`

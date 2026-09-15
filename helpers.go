@@ -1,6 +1,7 @@
 package graphene
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -458,6 +459,321 @@ func (g *Graph) GetEdges(ids []store.EdgeID) (found []*store.Edge, missing []sto
 		found = append(found, e)
 	}
 	return found, missing, nil
+}
+
+// --- Bounded batch reads ---
+
+// ErrBatchStalled is returned by ForEachNodeBatch and ForEachEdgeBatch when the
+// store hands back a batch that consumed none of the ids it was given.
+//
+// Both bundled backends guarantee progress — store.BoundedBatchReader requires
+// it, and the rule that delivers it is that the budget is not consulted until a
+// record is already in the batch. A third-party store that gets that wrong
+// turns the paging loop into a spin with no output and no error, which is the
+// worst shape a bug can take. This makes it an error instead, named for what
+// went wrong and where.
+var ErrBatchStalled = errors.New("graphene: bounded batch consumed no ids")
+
+// GetNodesBounded is GetNodes with a ceiling on the payload bytes one call
+// returns, for a caller resolving more ids than it wants records in hand at
+// once.
+//
+// It resolves ids in order and stops before the record that would take the
+// batch's payload total past maxBytes, returning the ids it did not reach in
+// rest. A call always consumes at least one id — a record whose blob alone
+// exceeds maxBytes comes back on its own rather than being refused — so a
+// resume loop terminates:
+//
+//	for len(ids) > 0 {
+//		found, missing, rest, err := g.GetNodesBounded(ids, 8<<20)
+//		if err != nil {
+//			return err
+//		}
+//		use(found, missing)
+//		ids = rest
+//	}
+//
+// ForEachNodeBatch is that loop, written once.
+//
+// **What the ceiling counts.** The payloads, and only those: the per-record
+// struct and the slice holding it come to about 72 bytes a record whatever the
+// blobs weigh, and are not counted. Nor is it a claim about resident memory —
+// under Options.ImageMode = ImageMapped a record's Properties points into the
+// image file, so the bound is on the bytes the *caller* is about to touch and
+// retain, not on an allocation the engine made. See store.BoundedBatchReader.
+//
+// The fallback for a backend implementing neither batch interface resolves one
+// id at a time, which honours the budget exactly and pays a lock acquisition per
+// record to do it.
+func (g *Graph) GetNodesBounded(ids []store.NodeID, maxBytes int64) (found []*store.Node, missing []store.NodeID, rest []store.NodeID, err error) {
+	if len(ids) == 0 {
+		return nil, nil, nil, nil
+	}
+	if br, ok := g.GraphStore.(store.BoundedBatchReader); ok {
+		f, m, r := br.GetNodesBatchBounded(ids, maxBytes)
+		return f, m, r, nil
+	}
+	var total int64
+	for i, id := range ids {
+		n, err := g.GetNode(id)
+		if err != nil {
+			var nf *store.ErrNotFound
+			if errors.As(err, &nf) {
+				missing = append(missing, id)
+				continue
+			}
+			return nil, nil, nil, err
+		}
+		b := int64(len(n.Properties))
+		if len(found) > 0 && total+b > maxBytes {
+			return found, missing, ids[i:], nil
+		}
+		found = append(found, n)
+		total += b
+	}
+	return found, missing, nil, nil
+}
+
+// GetEdgesBounded is GetNodesBounded for edges.
+func (g *Graph) GetEdgesBounded(ids []store.EdgeID, maxBytes int64) (found []*store.Edge, missing []store.EdgeID, rest []store.EdgeID, err error) {
+	if len(ids) == 0 {
+		return nil, nil, nil, nil
+	}
+	if br, ok := g.GraphStore.(store.BoundedBatchReader); ok {
+		f, m, r := br.GetEdgesBatchBounded(ids, maxBytes)
+		return f, m, r, nil
+	}
+	var total int64
+	for i, id := range ids {
+		e, err := g.GetEdge(id)
+		if err != nil {
+			var nf *store.ErrNotFound
+			if errors.As(err, &nf) {
+				missing = append(missing, id)
+				continue
+			}
+			return nil, nil, nil, err
+		}
+		b := int64(len(e.Properties))
+		if len(found) > 0 && total+b > maxBytes {
+			return found, missing, ids[i:], nil
+		}
+		found = append(found, e)
+		total += b
+	}
+	return found, missing, nil, nil
+}
+
+// ForEachNodeBatch resolves ids in payload-bounded batches, calling fn once per
+// batch and stopping early without an error if fn returns false.
+//
+// This is the loop GetNodesBounded is the step of, and it is the form to reach
+// for: a caller that wants every record of a large id set but never more than
+// maxBytes of payload in hand writes the body and not the paging. Records are
+// delivered in request order across batches, and every batch holds at least one
+// record.
+//
+// missing accumulates the ids that were looked for and not found, over the
+// batches actually run — an early stop leaves the rest of the ids unexamined,
+// so a short missing does not mean the remaining ids exist.
+//
+// The batch slice handed to fn is fresh each call and is fn's to keep. Its
+// *records* are subject to the usual rule: reads may alias store-internal
+// memory, so a record kept past the next compaction must be copied with
+// store.CloneNode (API_REFERENCE §"Do not mutate returned structs").
+//
+// A store whose bounded read consumes nothing stops the loop with
+// ErrBatchStalled rather than spinning on it.
+func (g *Graph) ForEachNodeBatch(ids []store.NodeID, maxBytes int64,
+	fn func(batch []*store.Node) bool,
+) (missing []store.NodeID, err error) {
+	return g.ForEachNodeBatchCtx(context.Background(), ids, maxBytes, fn)
+}
+
+// ForEachNodeBatchCtx is ForEachNodeBatch, cancellable.
+//
+// Cancellation is checked once per batch rather than once per record, so it
+// takes effect between batches and a batch already resolved is still delivered
+// to fn. That is the useful granularity: a batch is bounded work by
+// construction, and tearing one up mid-flight would only hand fn a partial view
+// it has no way to recognise.
+func (g *Graph) ForEachNodeBatchCtx(ctx context.Context, ids []store.NodeID, maxBytes int64,
+	fn func(batch []*store.Node) bool,
+) (missing []store.NodeID, err error) {
+	for len(ids) > 0 {
+		if err := ctx.Err(); err != nil {
+			return missing, err
+		}
+		found, miss, rest, err := g.GetNodesBounded(ids, maxBytes)
+		if err != nil {
+			return missing, err
+		}
+		if len(rest) >= len(ids) {
+			return missing, fmt.Errorf("%w: %d ids in, %d back", ErrBatchStalled, len(ids), len(rest))
+		}
+		missing = append(missing, miss...)
+		if len(found) > 0 && !fn(found) {
+			return missing, nil
+		}
+		ids = rest
+	}
+	return missing, nil
+}
+
+// ForEachEdgeBatch is ForEachNodeBatch for edges.
+func (g *Graph) ForEachEdgeBatch(ids []store.EdgeID, maxBytes int64,
+	fn func(batch []*store.Edge) bool,
+) (missing []store.EdgeID, err error) {
+	return g.ForEachEdgeBatchCtx(context.Background(), ids, maxBytes, fn)
+}
+
+// ForEachEdgeBatchCtx is ForEachEdgeBatch, cancellable.
+func (g *Graph) ForEachEdgeBatchCtx(ctx context.Context, ids []store.EdgeID, maxBytes int64,
+	fn func(batch []*store.Edge) bool,
+) (missing []store.EdgeID, err error) {
+	for len(ids) > 0 {
+		if err := ctx.Err(); err != nil {
+			return missing, err
+		}
+		found, miss, rest, err := g.GetEdgesBounded(ids, maxBytes)
+		if err != nil {
+			return missing, err
+		}
+		if len(rest) >= len(ids) {
+			return missing, fmt.Errorf("%w: %d ids in, %d back", ErrBatchStalled, len(ids), len(rest))
+		}
+		missing = append(missing, miss...)
+		if len(found) > 0 && !fn(found) {
+			return missing, nil
+		}
+		ids = rest
+	}
+	return missing, nil
+}
+
+// --- Projections ---
+
+// NodeProjection is one entity's requested values, positioned to match the keys
+// that were asked for.
+//
+// Values[i] holds every value the index carries for keys[i] — several, because a
+// key may be registered more than once for one entity — and is nil for a key the
+// entity is not indexed under. A projected value is a copy and is the caller's.
+type NodeProjection struct {
+	ID     store.NodeID
+	Values [][][]byte
+}
+
+// EdgeProjection is NodeProjection for edges.
+type EdgeProjection struct {
+	ID     store.EdgeID
+	Values [][][]byte
+}
+
+// ForEachNodeProjection calls fn once per (id, key, value) the index holds for
+// the requested keys, without reading the records that carry them.
+//
+// fn receives positions, not names: idIdx indexes ids and keyIdx indexes keys.
+// The value belongs to the store for the duration of the call — read it, do not
+// retain it. Returning false stops the pass without an error.
+//
+// **It reads the index, not the record.** The values are the ones handed to
+// IndexNodeProperty or to a transaction's index entries. A key that was never
+// indexed produces no callback at all, and a non-indexed field still needs the
+// record. See store.Projector for when this is cheaper than reading the records,
+// which is not always: the record wins while the payloads are in page cache and
+// loses once they are not.
+//
+// A backend without store.Projector is an error rather than a slow fallback,
+// because there is no fallback that is this API: reading the records to
+// reconstruct a projection is the thing the caller was avoiding, and doing it
+// silently would turn an optimisation into a pessimisation nobody asked for.
+func (g *Graph) ForEachNodeProjection(ids []store.NodeID, keys []string,
+	fn func(idIdx, keyIdx int, value []byte) bool,
+) error {
+	return g.ForEachNodeProjectionCtx(context.Background(), ids, keys, fn)
+}
+
+// ForEachNodeProjectionCtx is ForEachNodeProjection, cancellable.
+func (g *Graph) ForEachNodeProjectionCtx(ctx context.Context, ids []store.NodeID, keys []string,
+	fn func(idIdx, keyIdx int, value []byte) bool,
+) error {
+	p, ok := g.GraphStore.(store.Projector)
+	if !ok {
+		return ErrNoProjector
+	}
+	return p.ForEachNodeProjection(ctx, ids, keys, fn)
+}
+
+// ForEachEdgeProjection is ForEachNodeProjection for edges.
+func (g *Graph) ForEachEdgeProjection(ids []store.EdgeID, keys []string,
+	fn func(idIdx, keyIdx int, value []byte) bool,
+) error {
+	return g.ForEachEdgeProjectionCtx(context.Background(), ids, keys, fn)
+}
+
+// ForEachEdgeProjectionCtx is ForEachEdgeProjection, cancellable.
+func (g *Graph) ForEachEdgeProjectionCtx(ctx context.Context, ids []store.EdgeID, keys []string,
+	fn func(idIdx, keyIdx int, value []byte) bool,
+) error {
+	p, ok := g.GraphStore.(store.Projector)
+	if !ok {
+		return ErrNoProjector
+	}
+	return p.ForEachEdgeProjection(ctx, ids, keys, fn)
+}
+
+// ErrNoProjector is returned by the projection methods for a backend that does
+// not implement store.Projector. Both bundled backends do.
+var ErrNoProjector = errors.New("graphene: this store cannot project indexed values")
+
+// GetNodesProjected materialises what ForEachNodeProjection streams: one
+// NodeProjection per id, in request order.
+//
+// It is the convenient form and not the one to reach for at scale. One entry per
+// id means one slice header per id per key and a copy of every value, which at a
+// million ids is the allocation the callback form exists to avoid — the same
+// argument index/batch.go makes about returning a slice of slices. Use it for
+// thousands; use ForEachNodeProjection for millions.
+func (g *Graph) GetNodesProjected(ids []store.NodeID, keys []string) ([]NodeProjection, error) {
+	return g.GetNodesProjectedCtx(context.Background(), ids, keys)
+}
+
+// GetNodesProjectedCtx is GetNodesProjected, cancellable.
+func (g *Graph) GetNodesProjectedCtx(ctx context.Context, ids []store.NodeID, keys []string) ([]NodeProjection, error) {
+	out := make([]NodeProjection, len(ids))
+	for i, id := range ids {
+		out[i] = NodeProjection{ID: id, Values: make([][][]byte, len(keys))}
+	}
+	err := g.ForEachNodeProjectionCtx(ctx, ids, keys, func(idIdx, keyIdx int, value []byte) bool {
+		out[idIdx].Values[keyIdx] = append(out[idIdx].Values[keyIdx], bytes.Clone(value))
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetEdgesProjected is GetNodesProjected for edges.
+func (g *Graph) GetEdgesProjected(ids []store.EdgeID, keys []string) ([]EdgeProjection, error) {
+	return g.GetEdgesProjectedCtx(context.Background(), ids, keys)
+}
+
+// GetEdgesProjectedCtx is GetEdgesProjected, cancellable.
+func (g *Graph) GetEdgesProjectedCtx(ctx context.Context, ids []store.EdgeID, keys []string) ([]EdgeProjection, error) {
+	out := make([]EdgeProjection, len(ids))
+	for i, id := range ids {
+		out[i] = EdgeProjection{ID: id, Values: make([][][]byte, len(keys))}
+	}
+	err := g.ForEachEdgeProjectionCtx(ctx, ids, keys, func(idIdx, keyIdx int, value []byte) bool {
+		out[idIdx].Values[keyIdx] = append(out[idIdx].Values[keyIdx], bytes.Clone(value))
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // --- Batch writes ---

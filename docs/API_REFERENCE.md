@@ -711,6 +711,20 @@ func (g *Graph) GetEdge(id store.EdgeID) (*store.Edge, error)
 func (g *Graph) GetNodes(ids []store.NodeID) (found []*store.Node, missing []store.NodeID, err error)
 func (g *Graph) GetEdges(ids []store.EdgeID) (found []*store.Edge, missing []store.EdgeID, err error)
 
+// Byte-aware forms: resolve ids in payload-bounded batches rather than all at once.
+func (g *Graph) GetNodesBounded(ids []store.NodeID, maxBytes int64) (found []*store.Node, missing, rest []store.NodeID, err error)
+func (g *Graph) GetEdgesBounded(ids []store.EdgeID, maxBytes int64) (found []*store.Edge, missing, rest []store.EdgeID, err error)
+func (g *Graph) ForEachNodeBatch(ids []store.NodeID, maxBytes int64, fn func(batch []*store.Node) bool) (missing []store.NodeID, err error)
+func (g *Graph) ForEachEdgeBatch(ids []store.EdgeID, maxBytes int64, fn func(batch []*store.Edge) bool) (missing []store.EdgeID, err error)
+// Each has a ...Ctx form taking a context.Context, cancelled between batches.
+
+// Projections: indexed values without the records that carry them.
+func (g *Graph) ForEachNodeProjection(ids []store.NodeID, keys []string, fn func(idIdx, keyIdx int, value []byte) bool) error
+func (g *Graph) ForEachEdgeProjection(ids []store.EdgeID, keys []string, fn func(idIdx, keyIdx int, value []byte) bool) error
+func (g *Graph) GetNodesProjected(ids []store.NodeID, keys []string) ([]NodeProjection, error)
+func (g *Graph) GetEdgesProjected(ids []store.EdgeID, keys []string) ([]EdgeProjection, error)
+// Each has a ...Ctx form.
+
 func (g *Graph) Neighbours(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]store.NeighbourResult, error)
 func (g *Graph) EdgesOf(id store.NodeID, dir store.Direction, edgeTypes []store.EdgeType) ([]*store.Edge, error)
 
@@ -740,6 +754,126 @@ if len(missing) > 0 { /* these were deleted concurrently — usually fine */ }
 Both backends implement `store.BatchReader`, resolving the whole batch under one
 lock hold. Worth **10–15% on the in-memory backend**; the disk backend already
 resolved reads without a per-item lock, so it gains nothing measurable there.
+
+#### Resolving more ids than you want records for
+
+`GetNodes` resolves every id it is given. The size of what comes back is set by
+your id slice and the store's blobs, and nothing in between gets a say — which is
+right for a few hundred ids and wrong for half a million, where the answer can be
+larger than the machine.
+
+`ForEachNodeBatch` is the same read with a ceiling on the payload bytes in hand
+at any moment:
+
+```go
+missing, err := g.ForEachNodeBatch(ids, 8<<20, func(batch []*store.Node) bool {
+    for _, n := range batch {
+        consume(n)          // decode, aggregate, write out — whatever you came for
+    }
+    return true             // false stops the walk, without an error
+})
+```
+
+`GetNodesBounded` is one step of that loop, for a caller that wants to drive it:
+it returns the records it reached, the ids among them it did not find, and in
+`rest` the ids it did not reach. `rest` empty means done.
+
+**A call always consumes at least one id.** The budget is not consulted until a
+record is already in the batch, so a record whose blob alone exceeds `maxBytes`
+comes back on its own rather than being refused — otherwise a resume loop over a
+store holding one 64 MiB blob would spin forever on an 8 MiB budget, which is a
+hang rather than an error, and would be found in production rather than in a
+test. The price is that the ceiling governs all but the first record of a batch.
+
+`maxBytes` of zero or less is not a special case and needs none: nothing fits
+beside the first record, so the call yields exactly one. A budget computed as
+`remaining - used` that slips negative gives you safe-and-slow rather than the
+unbounded batch you were trying to avoid.
+
+**What the ceiling counts.** The payloads: the sum of `len(Properties)` over the
+records returned. Not the per-record `*store.Node` and the slice of pointers
+holding it, which come to about 72 bytes a record whatever the blobs weigh — so
+budget for that term separately if you are resolving a very large number of very
+small records.
+
+**What the ceiling is not.** It is not a statement about what the engine
+allocates, and under `ImageMapped` — the default — it is not one about resident
+memory either. A record served from the image has `Properties` pointing into the
+mapped file, so the engine allocates the struct and nothing else, and the blob
+bytes are file-backed pages that become resident when *you* read them. What the
+ceiling bounds is what the caller takes on per call. Measured on a 200,000-record
+store with 512-byte payloads, an 8 MiB budget, mapped image: Go heap held drops
+**30.09 → 17.50 MiB (−41.8%)** and anonymous memory **86.8 → 73.6 MiB (−15.2%)**,
+while file-backed residency is unchanged at ~98.8 MiB in both — because the
+payloads alias the mapping either way, and bounding them changes who is holding
+how many records, not how much of the file is mapped.
+
+It is not slower and it is not more allocation: over the whole walk it allocates
+**−9.4% B/op** against `GetNodes` (the unbounded path presizes a per-id index
+slice that the bounded path never needs) for **+11 allocs/op**, with wall clock
+unchanged.
+
+A store whose bounded read consumes nothing stops the loop with
+`graphene.ErrBatchStalled` rather than spinning on it. Both bundled backends
+guarantee progress; the guard is for third-party stores implementing
+`store.BoundedBatchReader`.
+
+#### Reading indexed fields without reading the records
+
+If the fields you want are ones you indexed, you can have them without touching
+the payloads that also contain them:
+
+```go
+err := g.ForEachNodeProjection(ids, []string{"digest", "bucket"},
+    func(idIdx, keyIdx int, value []byte) bool {
+        // ids[idIdx] is indexed under keys[keyIdx] with this value.
+        return true                      // false stops the pass
+    })
+```
+
+`fn` receives **positions, not names** — `idIdx` indexes your `ids`, `keyIdx`
+indexes your `keys` — so nothing is allocated per entity to tell you which result
+is which. The value belongs to the store for the duration of the call: read it,
+do not retain it. `GetNodesProjected` is the materialising form, one
+`NodeProjection` per id; it is the convenient one and not the one for a million
+ids, since it allocates a slice header per id per key.
+
+An entity may carry several values under one key, and `fn` is called once for
+each. The order is unspecified; the indices are how a result is placed.
+
+**It reads the index, not the record.** The values are the ones you passed to
+`IndexNodeProperty` or to a transaction's index entries. A key you never indexed
+produces no callback at all — silence, not an error — and a non-indexed field
+still needs the record.
+
+**When it is cheaper, which is not always.** Reading a record is one contiguous
+read; reading the index is a few scattered ones. So the record wins while the
+payloads are in page cache and loses once they are not, and payload size is what
+decides which. On the disk backend, four keys an entity, medians of four rounds:
+
+| payload | reading the records | projecting |
+|---|---:|---:|
+| 512 B | 89 ns/record | 418 ns/record |
+| 4 KiB | 172 ns/record | 449 ns/record |
+| 16 KiB | 6,728 ns/record | **502 ns/record** |
+| 64 KiB | 32,556 ns/record | **559 ns/record** |
+
+Below the crossover a projection costs about **300 ns a record more** than
+reading the record — so it pays for itself the moment your own decode of those
+fields costs more than that, which most msgpack or JSON decoding does. Above it
+there is nothing to weigh up. And it allocates less either way: 434,704 B and
+**150 allocations** per 25,000 records, against 2,009,600 B and 25,002.
+
+**It is not a point-in-time read of the whole pass.** Ids are resolved in
+batches, so a write landing mid-pass may be visible for later ids and not earlier
+ones. Each entity's values are read at one instant — the guarantee a loop of
+`GetNode` calls gives. This is the same live-index caveat §6's snapshot section
+already describes.
+
+A backend implementing neither method returns `graphene.ErrNoProjector` rather
+than falling back, because the only fallback is reading the records — the thing
+you were avoiding — and doing that silently would turn an optimisation into a
+pessimisation nobody asked for. Both bundled backends implement it.
 
 - Pass `nil` `edgeTypes` to match all edge types; otherwise OR semantics.
 - `Neighbours` deduplicates by neighbour node ID (one entry per neighbour).
