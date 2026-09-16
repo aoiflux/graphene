@@ -73,6 +73,15 @@ type baseState struct {
 	nodeProbe int
 	edgeProbe int
 
+	// nodeCarried and edgeCarried name the composites this base answers in
+	// place, by compositeName. Empty for every base written before GCPX
+	// existed, and for one written by a store that declared no composite.
+	//
+	// Derived from the base and computed once here, so the read paths test one
+	// map without a lock. See carriedComposites.
+	nodeCarried map[string]bool
+	edgeCarried map[string]bool
+
 	// firstFault holds the first error read out of the base, if any. Most read
 	// paths on PropertyIndex have no error to return — NodesByProperty returns a
 	// slice and nothing else — so a run that will not decode is recorded here
@@ -241,19 +250,34 @@ func newBaseState(b Base) *baseState {
 	st.edgeGone.limit = b.MaxID(EdgeKind)
 	st.nodeProbe = reverseProbeCost(b.TotalEntries(NodeKind))
 	st.edgeProbe = reverseProbeCost(b.TotalEntries(EdgeKind))
+	st.nodeCarried = carriedComposites(b, NodeKind)
+	st.edgeCarried = carriedComposites(b, EdgeKind)
 	return st
 }
 
 // fillCompositesFromBase files the attached base's entries into every declared
-// composite. See fillCompositeFromBase.
+// composite the base does not already answer in place. See fillCompositeFromBase
+// for the fill, and CompositeBase for the alternative to it.
+//
+// The skip is per composite and it is the whole of the saving: a composite the
+// image carries postings for is read out of the image, so filing those same
+// entries into the heap would pay for the section twice and hold what it was
+// written to stop holding. One the image does not carry is filled exactly as
+// before, which is what every base written before GCPX gets.
 func (p *PropertyIndex) fillCompositesFromBase() {
 	if s, ok := p.nodeBase(); ok {
 		for _, idx := range p.nodeComposites.all() {
+			if s.carriesComposite(idx.keys) {
+				continue
+			}
 			fillCompositeFromBase(s, idx)
 		}
 	}
 	if s, ok := p.edgeBase(); ok {
 		for _, idx := range p.edgeComposites.all() {
+			if s.carriesComposite(idx.keys) {
+				continue
+			}
 			fillCompositeFromBase(s, idx)
 		}
 	}
@@ -286,10 +310,28 @@ func (p *PropertyIndex) fillCompositesFromBase() {
 //
 // Everything else follows from it. The delta can be emptied because b holds every
 // entry it held. The new retraction sets start empty because an id retracted from
-// the old base is simply absent from b. The composites are left exactly as they
-// are, and that is not an oversight: their content is already the entries b holds,
-// so refiling from b would walk every entry under every member key to arrive back
-// where it started, once per compaction.
+// the old base is simply absent from b.
+//
+// # The composites, which b may or may not answer
+//
+// A composite b does not carry is left exactly as it is, and that is not an
+// oversight: its content is already the entries b holds, so refiling from b would
+// walk every entry under every member key to arrive back where it started, once
+// per compaction.
+//
+// A composite b does carry is emptied, and that is the point of carrying it. Its
+// postings are in the image, read in place; keeping the resident copy as well
+// would mean the section bought the process nothing until something reopened the
+// directory, which is the whole defect SwapBase exists to close for the rest of
+// the index. The precondition above is what makes it safe -- b holds exactly what
+// this index answers, so it holds every tuple these postings hold -- and it is the
+// same precondition the delta is emptied under, on the same call, for the same
+// reason.
+//
+// That is also where the composite half of a compaction's resident cost actually
+// goes. At the shape this engine is sized for the composites are the largest
+// single term a default configuration holds, and before this they survived every
+// compaction in the heap and were shed only by a reopen. See compositeIndex.reset.
 //
 // # Why the base is installed before the delta is cleared
 //
@@ -318,8 +360,17 @@ func (p *PropertyIndex) SwapBase(b Base) error {
 	if b == nil {
 		return errIndexf("index: SwapBase needs a base")
 	}
-	p.baseRef.Store(newBaseState(b))
+	st := newBaseState(b)
+	p.baseRef.Store(st)
 	p.clearDelta()
+	// After the store, not before: resetCarried reads which composites the new
+	// base answers, and that is a property of the state just installed.
+	if s, ok := p.nodeBase(); ok {
+		p.nodeComposites.resetCarried(s)
+	}
+	if s, ok := p.edgeBase(); ok {
+		p.edgeComposites.resetCarried(s)
+	}
 	return nil
 }
 
@@ -370,7 +421,11 @@ func fillCompositeFromBase[T entityID](s baseSide[T], idx *compositeIndex[T]) {
 	for pos, key := range idx.keys {
 		buf = s.mergeForEachEntry(key, nil, nil, buf,
 			func(id T, value []byte) bool {
-				idx.register(id, pos, string(value))
+				// s is threaded on so that register has the base it needs for a
+				// hydration it will not do: this runs only for a composite the
+				// base does not carry, and that is the test the hydration is
+				// gated on. Passing it costs a branch and keeps one signature.
+				idx.register(id, pos, string(value), s, true)
 				return true
 			})
 	}
@@ -474,6 +529,11 @@ type baseSide[T entityID] struct {
 	st   *baseState
 	kind EntityKind
 	gone *retractSet
+
+	// carried is this kind's set of composites the base answers in place. Read
+	// through carriesComposite; nil is the answer for every base that carries
+	// none, and indexing a nil map is the branch-free way to say so.
+	carried map[string]bool
 }
 
 // base returns the interface to read through.
@@ -491,7 +551,7 @@ func (p *PropertyIndex) nodeBase() (baseSide[store.NodeID], bool) {
 	if st == nil {
 		return baseSide[store.NodeID]{}, false
 	}
-	return baseSide[store.NodeID]{st: st, kind: NodeKind, gone: &st.nodeGone}, true
+	return baseSide[store.NodeID]{st: st, kind: NodeKind, gone: &st.nodeGone, carried: st.nodeCarried}, true
 }
 
 // edgeBase is nodeBase for edges.
@@ -500,7 +560,7 @@ func (p *PropertyIndex) edgeBase() (baseSide[store.EdgeID], bool) {
 	if st == nil {
 		return baseSide[store.EdgeID]{}, false
 	}
-	return baseSide[store.EdgeID]{st: st, kind: EdgeKind, gone: &st.edgeGone}, true
+	return baseSide[store.EdgeID]{st: st, kind: EdgeKind, gone: &st.edgeGone, carried: st.edgeCarried}, true
 }
 
 // retractNode hides every base entry for id.

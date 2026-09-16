@@ -105,6 +105,20 @@ const (
 	// deliberately not yet in checkCriticalSections; see the note there.
 	csrSectionMappedIndex   = "GPIX"
 	csrSectionMappedReverse = "GPIR"
+
+	// The composite postings, written only by a v9 writer that was asked for
+	// them. OPTIONAL, unlike GPIX, and the difference is a fallback that really
+	// exists: a reader that skips this section fills every declared composite
+	// from the property entries in the same image, which is what every reader did
+	// before the section existed and what index.fillCompositesFromBase still
+	// does. So it costs an open-time pass and no answer.
+	//
+	// It is a section of its own rather than more of GCMP because GCMP carries
+	// the declarations and a v0.7.x reader parses them. Appending postings to
+	// that body would hand an older build bytes it would read as a malformed
+	// declaration list -- the one outcome the optional flag is supposed to
+	// prevent. See csr_gcpx.go.
+	csrSectionCompositeIndex = "GCPX"
 )
 
 // csrSection is one entry in the directory.

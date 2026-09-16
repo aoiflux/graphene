@@ -165,9 +165,23 @@ func (p *PropertyIndex) ResidentBytesSplit() (total, composite int64) {
 // Separate because it is separately decidable. Every other term here moves with
 // what the store was asked to hold; this one moves with how many composites were
 // declared, and a caller looking at a figure they want smaller can act on that
-// today without rewriting anything. At the shape this engine is sized for it has
-// been the largest single term in a default configuration, so which half of the
-// index a store is paying for is not a detail.
+// today without rewriting anything. At the shape this engine is sized for it was
+// the largest single term in a default configuration, so which half of the index
+// a store is paying for is not a detail.
+//
+// # What a base that carries the composites does to this figure
+//
+// It empties it. A composite the attached base answers in place holds no postings
+// and no rows -- AttachBase skips its fill and SwapBase resets it -- so what it
+// contributes here is its declaration's key names and nothing else. The floor is
+// therefore not zero, and a caller comparing two stores should compare against a
+// bare declaration rather than against zero. See composite_base.go.
+//
+// What is still counted, and is the point of continuing to report it: a composite
+// the base does *not* carry is filled into the heap exactly as before, and a
+// composite the base does carry still accumulates whatever has been registered
+// since the base was installed. Both are real memory and neither is visible from
+// the declaration alone.
 //
 // O(declared composites), like everything else in this file, and exact in its
 // counts: compositeIndex.entries is maintained by the registration path.

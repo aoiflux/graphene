@@ -57,6 +57,30 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   A reopen sheds what accumulated since the last one, so how often it happens is
   the setting that matters.
 
+- **Where it stops fitting is between 96 and 128 MiB, and the margin goes before
+  the pass does.** Two further arms bisect the gap the sweep left open: 64 MiB
+  passes at 1,368.5 MiB charged and 33.2% headroom, 96 MiB passes at 1,697.3 and
+  17.1%, against 32 MiB's 1,285.2 and 37.2%. So the pass/fail boundary is in
+  (96, 128] — and that is the less useful half. Headroom is flat from 32 to 64,
+  four points for a doubling, then loses sixteen points over the next 50% and the
+  rest over the 33% after that. Two thirds of the margin goes in the last
+  doubling, because the transient a bound admits is not the bound: it is the
+  bound plus a property index running at 1.85× it, plus the compaction that
+  folds them in, against a ceiling the mapped image already takes 703 MiB of.
+
+- **Nothing on the curve argues for loosening it.** Peak rises with the bound
+  (1,285 → 1,369 → 1,697 MiB), compaction count falls as designed (15 → 9 → 7),
+  and the wall clock *rises* rather than falling (242 → 273 → 288s) — the saving
+  fewer compactions is supposed to buy does not appear. The other direction was
+  already measured: 29 compactions cost more than 15. 32 MiB sits at the optimum
+  of both curves, and it is now the documented configuration because three looser
+  bounds were measured and none is better at anything.
+
+- **The bound moves the peak and nothing else.** All three passing arms settle at
+  238.0 MiB of modelled heap, term for term identical, against the read-only
+  arm's 237.8. `MaxDeltaBytes` sizes a rebuild's transient; it does not change
+  what the process holds at rest, at either end of the curve.
+
 - **`DefaultCompactionPolicy` is unchanged, and that is the measurement's
   conclusion rather than a deferral.** The release was expected to move
   `MaxDeltaBytes` off this curve. No value on the curve completes the rebuild on
@@ -73,35 +97,132 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   the blobs, that the receiver is closed and the returned handle holds the lock,
   and that the in-memory backend hands back the same `Graph`.
 
-### The composite index on disk is deferred to v0.9.0, and what was settled is written down
+### The composite index moves into the image: `GCPX`
 
-- **It is the largest remaining term and it is now measured rather than
-  projected**: 128.2 MiB of the 237.8 MiB a default configuration holds at
-  1,400,000 nodes — **53.9%** — and 164.8 of 305.8 at the 1,800,000-node shape,
-  the same fraction to a tenth of a point across a twentyfold difference in blob
-  size. Ahead of record arrays at 74.8 MiB. `ResidentEstimate.Composite` reports
-  it directly, so a store can be asked instead of compared against a projection.
+- **What it buys, on the arm that was already passing.** Same fixture, same
+  2,048 MiB Job Object, same 32 MiB delta bound and reopen, 1,400,000 nodes — the
+  only difference is that the build writes and reads the section. The peak charged
+  against the ceiling falls from **1,285.2 MiB to 880.7**, headroom from 37.2% to
+  **57.0%**, and the settled modelled heap from 238.0 MiB to **109.9**. The heap
+  falls by 128.1 and the composite term falls by 128.2: the same number to a tenth,
+  with records, payload, label postings and adjacency reporting 75.0, 2.7, 10.7 and
+  21.4 in both arms, digit for digit. Nothing else moved.
 
-- **It is not being built here, because it is a release on its own.** GPIX cost
-  four implementation files and nine test files; a `GCMP` written as an index
-  rather than as declarations is the same shape.
+- **It costs 21.4 MiB of image for 128.1 MiB of heap — 6.0×.** The section is the
+  postings and nothing else; what it replaces is the postings *plus* the per-entity
+  rows of member values a resident composite needs in order to file a tuple, and
+  those rows were 85% of what a composite index held. The image pays for the half
+  that is data; the heap was paying for both halves.
 
-- **Two things that looked like blockers are not, and both are recorded in
-  `docs/MEMORY_MODEL.md` §8.6 so the work does not begin by re-deriving them.**
-  `csrSectionComposite = "GCMP"` is already registered *optional, non-critical*,
-  and `checkCriticalSections` skips non-critical sections it does not understand —
-  `GORD` is the precedent — so a v0.7.x reader would skip a composite index and
-  rebuild composites at open exactly as it does today. No version bump past v9, no
-  stranded readers, no bidirectional migration. And the per-table random `maphash`
-  seed, which exists because caller-supplied values could otherwise be chosen to
-  collide, is not a blocker either: GPIX met the same problem and answered it by
-  being sorted and binary-searched rather than hashed.
+- **An open is 2.9× faster into the bargain, which was not the argument for it.**
+  The reopen phase goes from 2.44s to 0.828s, because an open over an image
+  carrying the section does not walk the member keys' entries to fill the
+  composites. The rebuild's wall clock is unchanged — 3m31.85s against 3m32.02s.
 
-- **What is genuinely unsettled is whether it is worth a release.** At the audited
-  consumer's shape — 387,000 records and two composites, one with no reader at all
-  — it is worth roughly 32 MiB, an engine win rather than a win for the integrator
-  who asked for this work. With the acceptance now passing at 37.2% headroom,
-  nothing is blocked on it.
+- **A pre-GCPX image reads exactly as it did, measured at the full shape on the
+  same run.** A read-only arm over the old 1.4M fixture — a v9 image this build did
+  not write — reports the composite term at 128.2 MiB and the total at 237.8,
+  unchanged to the tenth, at 80.0% headroom.
+
+- **It was the largest single term a default configuration held, and it is now a
+  section rather than a structure.** At 1,400,000 nodes the declared composites
+  held **128.2 MiB of 237.8 MiB — 53.9%**, ahead of record arrays at 74.8, and
+  164.8 of 305.8 at the 1,800,000-node shape: the same fraction to a tenth of a
+  point across a twentyfold difference in blob size. GPIX made the single-key
+  postings readable in place; this is the same move for the one part of the index
+  GPIX deliberately left behind.
+
+- **What GPIX left behind, and why it was not an oversight.** A composite is an
+  index over a tuple of keys the forward direction holds *separately*, so
+  answering one out of GPIX would mean intersecting the member keys' runs on every
+  query — exactly the work a composite is declared to do once. So composites were
+  filled into the heap at open and stayed there. That argument establishes a
+  composite cannot cheaply be *derived* from GPIX, which is a reason to store it,
+  not a reason to store it in memory.
+
+- **The one argument in the codebase against doing this is answered, not
+  bypassed.** `appendCompositeSection` says the postings' bytes "buy nothing that
+  the entries do not already hold". That was an argument about the *image*, made
+  when the index was rebuilt into the heap at open and the only question was file
+  size. Once the index is read in place those bytes buy the difference between
+  mapped and resident. Its other clause — a derived structure written to a file
+  can go stale — still holds, and GCPX takes GPIX's answer unchanged: a base is
+  only installed by the code that just wrote it from the index it replaces, and
+  everything since is `base − retracted ∪ delta`.
+
+- **A new magic, and not an extension of `GCMP` — the plan's route would have
+  broken older readers.** `GCMP` is not unused: it carries the composite
+  *declarations* and a v0.7.x reader parses its body, so appending postings to it
+  would hand an older build bytes it reads as a malformed declaration list and it
+  would **fail the image rather than skip it**, inverting the exact guarantee the
+  optional flag exists to provide. `GCPX` is optional and non-critical on its own,
+  and `checkCriticalSections` skips a non-critical magic it does not understand.
+  `GORD` is the precedent. **No version bump past v9, no stranded readers, no
+  bidirectional migration.**
+
+- **The reader that skips it is tested, because nothing else here can fail if it
+  is wrong.** A v0.7.x binary is not available to run, so the claim is checked by
+  building both bases this build can build out of one image — the same GPIX and
+  GPIR, once with the section and once without — and asserting they answer every
+  tuple identically while holding different amounts. Without the section is
+  exactly what an older reader has: the decision is a type assertion on
+  `index.CompositeBase` and no version number is consulted anywhere.
+
+- **One thing a base-backed composite needs that a filled one does not.** A
+  composite files a tuple only from a *complete* row, and over a base-backed
+  composite an entity the image holds has no row at all — so a caller adding one
+  member value to such an entity would file nothing, and the new tuple would be
+  held by neither side. A row created for an entity the base knows is therefore
+  hydrated from the base's reverse direction first. It costs one reverse walk per
+  entity *written*, never per entity in the base.
+
+- **A compaction now sheds the composites as well as the index.** `SwapBase` used
+  to leave them alone, correctly: their content was already the entries the new
+  base holds, so refiling would walk every entry under every member key to arrive
+  back where it started. A base that *carries* them is different — the postings
+  are in the image, and keeping the resident copy would mean the section bought
+  the process nothing until something reopened the directory. That was the whole
+  defect `SwapBase` exists to close for the rest of the index.
+
+- **A capability that degrades into correctness needs a test that asserts the
+  capability.** The compaction installs a `mappedIndexBase` wrapping the base it
+  parsed, and that wrapper embeds `index.Base` as an *interface* — so it promoted
+  `index.Base`'s methods and silently dropped `index.CompositeBase`'s. Every
+  answer stayed correct, because the fallback is to fill from the entries; the
+  only symptom was that the whole saving evaporated one compaction after it was
+  won, with nothing logged and nothing failing. The wrapper forwards the
+  capability now, and the end-to-end test asserts the resident figure rather than
+  the answers.
+
+- **Damage in a GPIX run now surfaces on the read rather than at open, and that is
+  a real change.** Filling the composites used to read every run under every member
+  key, so a run that would not decode was met at open and the store refused to come
+  up. That was never a verification pass — it was a side effect of one, it covered
+  only the member keys of declared composites, and a store with no composite had no
+  such check at all. Those keys now behave like every other key in the image:
+  damage is met by the read that touches it, recorded by `BaseFault`, and reported
+  by `Verify` and `VerifyIndexes`. An open that wants the O(entries) pass asks for
+  it with a `Verifier`. `TestIndexMapped_DamagedRunSurfacesAsAFault` pins both
+  halves, including that the composite query is *unaffected* — its postings are in
+  GCPX, which is the difference between a section that is derived and one that is
+  a second copy.
+
+- **The tuple encoding stays in one package, in both directions.** The writer is
+  handed the map keys of the resident postings and the reader hands the same bytes
+  back, so `disk` never parses or constructs a tuple. `index.encodeTuple` is
+  little-endian length-prefixed and therefore **not order-preserving** with respect
+  to the values it encodes, so two implementations of it that disagreed by a byte
+  would produce a file whose binary search is bounded, silent and wrong.
+
+- **`verifyGCPX` checks what the reader assumes and does not re-check**: that
+  tuples ascend, that each tuple table entry's prefix is its tuple's, that a run's
+  ids ascend, that the runs region is tiled exactly, and that the directory's
+  counts are the counts the bytes hold. What it deliberately does not check is
+  agreement with the property entries — that is an O(entries × width) pass over
+  GPIX, and the staleness argument above is why it is not needed. What that leaves
+  genuinely unverified is a writer that computed the wrong tuples, which a verifier
+  cannot separate from a caller who registered them; stated rather than left to be
+  discovered.
 
 ### The nightly gains a third arm, non-blocking
 
@@ -496,10 +617,30 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   measurement does. The same argument carries the bounded batch API, and it makes
   the mapped point lookup's warm doubling a small part of the real cost.
 
-- **What it does not settle, stated rather than glossed.** The batch join's 1.17×
-  on unsorted values is untouched — `projection batch` runs one ordering, and
-  separating them needs a second arm — so the advice to supply ascending values
-  still rests on the warm figures it always rested on. The bounded batch read's
+- **The batch join's ordering now has a second arm, and it changes the number.**
+  `projection batch` is two arms over the same ids in the same count — ascending,
+  and a fixed shuffle — differing only in the order values reach the join. Across
+  three runs at 1,400,000 nodes the shuffled arm costs **1.34–1.59×** the
+  ascending one trimmed and **1.27–1.78×** resident, so the advice to supply
+  ascending values rests on a measurement at the shape the advice is for, and the
+  penalty is larger than the 1.17× the warm microbenchmark reports at a smaller
+  one. The shuffle is a hand-rolled splitmix64 rather than `math/rand`, whose
+  sequence for a given seed is explicitly not guaranteed across Go releases — a
+  figure in `docs/benchmarks.md` should reproduce on a later toolchain.
+
+- **What that arm does *not* show is the thing it was expected to.** The
+  hypothesis was that the sort pays for itself cold, a search per value being
+  eighteen page faults rather than eighteen cache misses. The trimmed and resident
+  ranges overlap heavily and one run puts the resident penalty above the trimmed
+  one, so at this sample count they cannot be separated. That is the instrument
+  and it was predicted before the arm ran: ascending order buys a monotonic cursor
+  advance *and* kernel readahead, and `EmptyWorkingSet` measures the first honestly
+  while largely removing the second, because the standby list is where a
+  mispredicted readahead costs almost nothing. The linux arm is the one that can
+  size the readahead half, and it has not been run at this shape. Reading the null
+  result as "ordering does not matter cold" would be reading the instrument.
+
+- **What it still does not settle.** The bounded batch read's
   cold pass lands at 19.1–19.5 ms against the harness's own 20 ms trust threshold
   and was flagged in three runs of four; the flag is reported beside the figure
   rather than argued away. And the linux arm, the one that evicts for real, has

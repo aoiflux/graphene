@@ -271,6 +271,22 @@ type csrPayload struct {
 	CompositeNodeKeys [][]string
 	CompositeEdgeKeys [][]string
 
+	// Composites asks for the declared composites' *postings* as GCPX, read in
+	// place out of the image, instead of being rebuilt into the heap from the
+	// entries at every open.
+	//
+	// Separate from CompositeNodeKeys and not a replacement for it. Those are the
+	// declarations and they go in GCMP, which a v0.7.x reader parses; the
+	// postings are a section of their own precisely so that appending them to
+	// GCMP's body cannot hand an older reader bytes it would read as a malformed
+	// declaration list. See csr_gcpx.go, which argues the whole arrangement.
+	//
+	// Nil writes no section, which is what every image before this carried and
+	// what a reader still handles: index.fillCompositesFromBase rebuilds the
+	// composites from the entries in the same image, correctly, for the price of
+	// a pass at open.
+	Composites *gcpxSource
+
 	// PrevSnapshotRoot chains this image to the one it replaces. Zero for a
 	// first compaction.
 	PrevSnapshotRoot merkle.Hash
@@ -549,6 +565,27 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 			Magic:  csrSectionComposite,
 			Offset: cmpOffset,
 			Length: iw.at() - cmpOffset,
+		})
+	}
+
+	// The composite postings, after the declarations they are postings for. The
+	// order is not required by either reader -- both are found through the
+	// section directory -- and it is what a person reading a hexdump would
+	// expect, which is the only argument for it.
+	if src := payload.Composites; src != nil {
+		cpxOffset := iw.at()
+		if _, err := writeGCPX(iw, cpxOffset, *src); err != nil {
+			return err
+		}
+		sections = append(sections, csrSection{
+			// OPTIONAL, unlike GPIX, and the difference is a fallback that really
+			// exists: a reader that skips this fills every declared composite
+			// from the property entries in the same image and answers every query
+			// correctly, paying an open-time pass and no answer. GPIX has nothing
+			// to fall back to.
+			Magic:  csrSectionCompositeIndex,
+			Offset: cpxOffset,
+			Length: iw.at() - cpxOffset,
 		})
 	}
 

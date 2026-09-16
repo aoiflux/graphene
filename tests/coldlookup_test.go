@@ -111,6 +111,39 @@ type coldOp struct {
 type coldSample struct {
 	ids     []store.NodeID
 	digests [][]byte
+	// shuffled is ids in a fixed pseudo-random order, so the batch join can be
+	// measured both ways. It holds the same ids and the same count: the two
+	// projection arms differ in the order values reach the join and in nothing
+	// else, which is what makes their ratio attributable to the ordering.
+	shuffled []store.NodeID
+}
+
+// coldShuffle returns a copy of ids in a deterministic pseudo-random order.
+//
+// Deterministic because the ordering is the independent variable: a run that
+// shuffled differently each time would report a different arm each time, and
+// the difference being measured here is small enough that that would swamp it.
+//
+// It carries its own generator rather than using math/rand for one reason --
+// math/rand's sequence for a given seed is explicitly not guaranteed across Go
+// releases, and a figure in docs/benchmarks.md should be reproducible by
+// someone on a later toolchain. splitmix64 is six lines and fixed forever.
+func coldShuffle(ids []store.NodeID) []store.NodeID {
+	out := make([]store.NodeID, len(ids))
+	copy(out, ids)
+	state := uint64(0x9E3779B97F4A7C15)
+	next := func() uint64 {
+		state += 0x9E3779B97F4A7C15
+		z := state
+		z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+		z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+		return z ^ (z >> 31)
+	}
+	for i := len(out) - 1; i > 0; i-- {
+		j := int(next() % uint64(i+1))
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
 }
 
 func TestColdLookup_WhatAReadCostsWhenThePagesAreNotResident(t *testing.T) {
@@ -170,19 +203,39 @@ func TestColdLookup_WhatAReadCostsWhenThePagesAreNotResident(t *testing.T) {
 			// The batch join: many ids, several keys, one pass over the base.
 			// Warm it costs 1.17x the per-id form on unsorted values; if the
 			// single pass is worth anything it is worth it here.
-			name: "projection batch",
+			//
+			// ForEachNodeID yields ascending, so this arm supplies exactly the
+			// ordering the documentation advises. The arm below supplies the same
+			// ids shuffled, and the pair is the whole point: the advice to sort
+			// has only ever rested on warm figures.
+			name: "projection batch (ascending)",
 			run: func(t *testing.T, g *graphene.Graph, s coldSample) int {
-				got, err := g.GetNodesProjected(s.ids, []string{"ord0", "ord1"})
-				if err != nil {
-					t.Fatalf("GetNodesProjected: %v", err)
-				}
-				n := 0
-				for _, p := range got {
-					for _, v := range p.Values {
-						n += len(v)
-					}
-				}
-				return n
+				return coldProject(t, g, s.ids)
+			},
+		},
+		{
+			// The same join over the same ids in a fixed shuffled order.
+			//
+			// # What this arm can and cannot settle, on this platform
+			//
+			// Ascending order buys two different things, and they are not equally
+			// visible here. It makes the join's pass over the base monotonic, so
+			// each posting is found by advancing a cursor rather than by seeking
+			// back -- that is CPU and page locality, and it shows up under any
+			// instrument. And it lets the kernel's readahead predict the next
+			// page, which is worth far more when the page must come from a disk
+			// than when it is on the standby list a soft fault away.
+			//
+			// Windows measures the first effect honestly and largely removes the
+			// second, because "trimmed" is exactly the state in which a mispredicted
+			// readahead costs almost nothing. So a small difference here is a lower
+			// bound on the difference, and the linux arm -- which evicts for real --
+			// is the one that can size the readahead half. Reading a null result on
+			// this platform as "ordering does not matter cold" would be reading the
+			// instrument.
+			name: "projection batch (shuffled)",
+			run: func(t *testing.T, g *graphene.Graph, s coldSample) int {
+				return coldProject(t, g, s.shuffled)
 			},
 		},
 		{
@@ -215,7 +268,7 @@ func TestColdLookup_WhatAReadCostsWhenThePagesAreNotResident(t *testing.T) {
 		},
 	}
 
-	t.Logf("%-22s %14s %14s %8s %10s", "operation", coldEvictMethod, "resident", "ratio", "results")
+	t.Logf("%-29s %14s %14s %8s %10s", "operation", coldEvictMethod, "resident", "ratio", "results")
 	noisy := 0
 	for _, op := range ops {
 		method, err := coldEvictBeforeOpen(csr)
@@ -296,7 +349,7 @@ func TestColdLookup_WhatAReadCostsWhenThePagesAreNotResident(t *testing.T) {
 		per := func(d time.Duration) string {
 			return fmt.Sprintf("%.2f us", float64(d.Nanoseconds())/float64(len(sample.ids))/1000)
 		}
-		t.Logf("%-22s %14s %14s %7.2fx %10d %s (warm x%d, cold %s)",
+		t.Logf("%-29s %14s %14s %7.2fx %10d %s (warm x%d, cold %s)",
 			op.name, per(coldD), per(warmD), float64(coldD)/float64(warmD),
 			coldN, mark, reps, coldD.Round(time.Microsecond))
 	}
@@ -309,6 +362,23 @@ func TestColdLookup_WhatAReadCostsWhenThePagesAreNotResident(t *testing.T) {
 	}
 
 	t.Logf("what %q means on this platform: %s", coldEvictMethod, coldEvictNote)
+}
+
+// coldProject runs the batch join over ids in the order given and returns how
+// many values came back, so the two projection arms are the same code reached
+// with two orderings rather than two bodies that might drift apart.
+func coldProject(t *testing.T, g *graphene.Graph, ids []store.NodeID) int {
+	got, err := g.GetNodesProjected(ids, []string{"ord0", "ord1"})
+	if err != nil {
+		t.Fatalf("GetNodesProjected: %v", err)
+	}
+	n := 0
+	for _, p := range got {
+		for _, v := range p.Values {
+			n += len(v)
+		}
+	}
+	return n
 }
 
 // coldTakeSample picks the ids and reads the value each is indexed under,
@@ -368,7 +438,8 @@ func coldTakeSample(t *testing.T, dir string) coldSample {
 	}
 	if len(s.digests) == 0 {
 		t.Fatal("no sampled id carries an indexed digest: the fixture was built " +
-			"with GRAPHENE_RSS_NOINDEX, and three of the four arms measure the index")
+			"with GRAPHENE_RSS_NOINDEX, and four of the five arms measure the index")
 	}
+	s.shuffled = coldShuffle(s.ids)
 	return s
 }

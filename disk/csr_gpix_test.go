@@ -565,7 +565,7 @@ func TestMappedIndex_ReverseMatchesTheObviousDerivation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseGPIR: %v", err)
 			}
-			if _, err := newGPIXBase(sec, rev); err != nil {
+			if _, err := newGPIXBase(sec, rev, nil); err != nil {
 				t.Fatalf("newGPIXBase: %v", err)
 			}
 		})
@@ -1029,7 +1029,7 @@ func FuzzVerifyMappedIndex(f *testing.F) {
 		if err != nil {
 			return
 		}
-		b, err := newGPIXBase(fwdSec, revSec)
+		b, err := newGPIXBase(fwdSec, revSec, nil)
 		if err != nil {
 			return
 		}

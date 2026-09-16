@@ -94,7 +94,7 @@ func TestComposite_ReusesTheRowOfARemovedEntity(t *testing.T) {
 	if err := p.Verify(); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if got := len(idx.lookup([]string{"c", "b"})); got != 100 {
+	if got := len(idx.lookup(baseSide[store.NodeID]{}, false, []string{"c", "b"})); got != 100 {
 		t.Errorf("the rewritten entities answer %d rows, want 100", got)
 	}
 }
@@ -208,7 +208,7 @@ func TestComposite_RowReuseDoesNotCarryTheOldEntitysValues(t *testing.T) {
 	if idx.entries != 0 {
 		t.Errorf("%d entries are filed for an entity that holds one of two positions", idx.entries)
 	}
-	if got := idx.lookup([]string{"x", "y"}); len(got) != 0 {
+	if got := idx.lookup(baseSide[store.NodeID]{}, false, []string{"x", "y"}); len(got) != 0 {
 		t.Errorf("the reused row answers %v for a tuple no live entity holds", got)
 	}
 	if err := p.Verify(); err != nil {

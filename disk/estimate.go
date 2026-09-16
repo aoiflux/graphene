@@ -130,9 +130,18 @@ type ResidentEstimate struct {
 	// rather than by holding less. Every other term follows from the records the
 	// store was asked to keep; this one follows from a declaration, and a
 	// composite nothing queries costs exactly what one that carries the workload
-	// costs. At the shape this engine is sized for it has been the largest single
-	// term in a default configuration, which is why a store that wants its memory
-	// down is asked to look here first.
+	// costs. At the shape this engine is sized for it was the largest single term
+	// in a default configuration -- 128.2 MiB of 237.8 at 1,400,000 nodes -- which
+	// is why a store that wants its memory down was asked to look here first.
+	//
+	// It is normally zero now. A v9 image written by this build carries the
+	// composite postings as its GCPX section and they are read in place, so what
+	// is counted here is the declarations plus whatever the delta has filed since
+	// the last compaction. It is non-zero and worth looking at in exactly two
+	// cases: a composite declared over an image that does not carry it -- declared
+	// since the last compaction, or carried by an image an older build wrote --
+	// which is filled into the heap at open exactly as before; and a store that
+	// has written a great deal since it last compacted. See disk/csr_gcpx.go.
 	//
 	// Exact in its counts and O(declared composites) to read; see
 	// index.PropertyIndex.CompositeResidentBytes.

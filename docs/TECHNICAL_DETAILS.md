@@ -318,6 +318,19 @@ that cannot check an attestation must not present the file as though it had.
 | `GATT` | signed attestation | **yes** |
 | `GRDT` | redaction tombstones | **yes** |
 | `GCMP` | composite index declarations | no — losing it costs an intersection, not an answer |
+| `GPIX` | property index, forward (v9) | **yes** — a v9 image carries no `GIDX` to fall back to |
+| `GPIR` | property index, reverse (v9) | **yes** — nothing else says what an entity is indexed under |
+| `GCPX` | composite index postings (v9) | no — losing it costs an open-time fill, not an answer |
+
+`GPIX` and `GPIR` are the one pair here that is critical *because* of what it
+replaced: v9 writes the property index as those two sections and writes no `GIDX`,
+so there is no second copy to degrade to and a reader that skipped them would
+answer every property query with no matches — a wrong answer rather than a slow
+one. `GCPX` sits the other way round for the same reason read from the other end:
+the composites it carries can be rebuilt from the entries in `GPIX`, which is what
+every reader did before the section existed, so skipping it costs a pass at open
+and no answer. That is the whole of its compatibility story, and it is why a
+v0.7.x build meets one of these images and reads it.
 
 **Snapshot roots (`GHSH`) are themselves versioned**, because adding a component
 changes what a snapshot root *is* and a retained root must stay verifiable:

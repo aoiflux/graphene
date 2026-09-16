@@ -69,7 +69,7 @@ func verifyBodies(gpix, gpir []byte) error {
 	if err != nil {
 		return fmt.Errorf("parseGPIR: %w", err)
 	}
-	b, err := newGPIXBase(fwd, rev)
+	b, err := newGPIXBase(fwd, rev, nil)
 	if err != nil {
 		return fmt.Errorf("newGPIXBase: %w", err)
 	}
@@ -540,7 +540,7 @@ func TestVerifyMappedIndex_MemoryDoesNotScaleWithEntries(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		b, err := newGPIXBase(fwd, rev)
+		b, err := newGPIXBase(fwd, rev, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -578,7 +578,7 @@ func TestVerifyMappedIndex_StopsWhenCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := newGPIXBase(fwd, rev)
+	b, err := newGPIXBase(fwd, rev, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

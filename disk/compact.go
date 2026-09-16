@@ -823,6 +823,74 @@ func (p *compactPlan) mappedIndexSource(csr *CSRGraph, dir string) *gpixSource {
 	}
 }
 
+// mappedCompositeSource is the declared composites in the shape GCPX is written
+// from: each one's distinct tuples ascending, with the ascending ids filed under
+// each, filtered against the image that has just been built.
+//
+// # The filter is the same one the entries get, and for the same reason
+//
+// A compaction drops what the image does not hold, so a tuple's id list is
+// narrowed to the ids newCSR carries, and a tuple every one of whose holders was
+// dropped is not written at all. Without that the next image would carry a
+// composite naming entities its own record sections do not, which is the shape of
+// wrong answer this whole layer is organised against -- and unlike a stale
+// forward entry there is nothing downstream that would catch it, because a
+// composite is not cross-checked against the reverse direction.
+//
+// # Why the index does the walking
+//
+// PropertyIndex.ForEachCompositeTuple yields base union delta minus retracted,
+// merged, in ascending tuple order. Both halves are needed: a store compacting
+// over an image that already carries GCPX holds most of its composites in that
+// image and the rest in the shards, and a writer that read only the shards would
+// write an image missing everything the last one held. The ordering is the
+// format's requirement and the index is where both sides can be merged to meet
+// it in one pass. See index.compositeIndex.forEachMergedTuple.
+//
+// The tuple bytes are opaque here in both directions -- index encodes them, GCPX
+// stores them, index decodes them -- which is what keeps one encoder in the
+// codebase. See index.CompositeBase.
+func (p *compactPlan) mappedCompositeSource(csr *CSRGraph, dir string) *gcpxSource {
+	nodes := p.propIdx.CompositeNodeKeys()
+	edges := p.propIdx.CompositeEdgeKeys()
+	if len(nodes) == 0 && len(edges) == 0 {
+		return nil
+	}
+	var live []uint64
+	return &gcpxSource{
+		NodeComposites: nodes,
+		EdgeComposites: edges,
+		Tuples: func(kind uint8, keys []string, fn func(tuple []byte, ids []uint64) bool) error {
+			ek := index.NodeKind
+			if kind == gcpxKindEdge {
+				ek = index.EdgeKind
+			}
+			_, err := p.propIdx.ForEachCompositeTuple(ek, keys,
+				func(tuple []byte, ids []uint64) bool {
+					live = live[:0]
+					for _, id := range ids {
+						if kind == gcpxKindNode {
+							if csr.containsNode(store.NodeID(id)) {
+								live = append(live, id)
+							}
+							continue
+						}
+						if csr.containsEdge(store.EdgeID(id)) {
+							live = append(live, id)
+						}
+					}
+					if len(live) == 0 {
+						return true
+					}
+					return fn(tuple, live)
+				})
+			return err
+		},
+		ScratchDir: dir,
+		buffers:    p.buffers,
+	}
+}
+
 // build turns the plan into a serialised image on disk, with no lock held.
 //
 // A failure here changes nothing: the log is intact, the image on disk is the
@@ -885,6 +953,13 @@ func (p *compactPlan) build(ctx context.Context, dir string) (*CSRGraph, string,
 	// it is what stamps the image v8 or v9.
 	if p.indexMode == IndexMapped {
 		p.payload.MappedIndex = p.mappedIndexSource(newCSR, dir)
+		// The composite postings ride with the mapped index and only with it.
+		// Writing them beside a GIDX would produce an image whose composites are
+		// read in place while its property entries are loaded entry by entry --
+		// a configuration nothing asks for, since a caller choosing v8 has
+		// chosen the resident index, and one more combination for the fallback
+		// rules to account for. See Options.IndexMode.
+		p.payload.Composites = p.mappedCompositeSource(newCSR, dir)
 	} else {
 		p.payload.NodeProps = p.nodePropSeq(newCSR)
 		p.payload.EdgeProps = p.edgePropSeq(newCSR)

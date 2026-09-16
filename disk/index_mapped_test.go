@@ -591,18 +591,38 @@ func TestStorageStats_NoImageReportsNoVersion(t *testing.T) {
 	}
 }
 
-// TestIndexMapped_RefusesADamagedRun is the guard on the fault check at open.
+// TestIndexMapped_DamagedRunSurfacesAsAFault pins where damage to a GPIX run
+// shows up, which GCPX moved.
 //
-// Under a mapped index the composites are the one thing the open reads out of the
-// base, and a run that will not decode is damage to the file. A store that came
-// up on it would serve a composite index missing whatever that run held — a wrong
-// answer, silently, which is the outcome the Base interface refuses to produce.
+// # What it used to be, and why it changed
 //
-// The corruption is a value's length prefix, overwritten to claim more bytes than
-// its run holds. That passes parseGPIX, which deliberately bounds regions and not
-// their contents, and fails at the read — which is exactly the class of damage
-// this check exists for.
-func TestIndexMapped_RefusesADamagedRun(t *testing.T) {
+// This test was TestIndexMapped_RefusesADamagedRun, and it asserted that a
+// mapped open *refused* an image whose run would not decode. That was never a
+// verification pass; it was a side effect of one. Filling the declared
+// composites from the base read every run under every member key, so damage
+// under one of those keys was met at open and the fault check at
+// loadIndexFromSection turned it into a refusal. Damage under any other key was
+// not caught at open then either, and a store with no composite declared had no
+// such check at all.
+//
+// With the composites read out of GCPX the fill is skipped, so the runs are no
+// longer read at open, so a mapped open succeeds. The member keys now behave like
+// every other key in the image: damage is met by the read that touches it,
+// recorded by baseState.note, and reported by BaseFault, Verify and
+// VerifyIndexes. That is the mapped index's documented design rather than an
+// exception to it, and a caller who wants damage found at open sets a Verifier —
+// which is the knob that pays the O(entries) pass on purpose.
+//
+// # What this asserts
+//
+// Three things, and the third is the one worth having. The resident arm still
+// refuses, because rebuilding the index is reading every run. The mapped arm
+// opens, and the read that touches the damaged run records a fault rather than
+// reporting the value as absent. And the composite query the damaged key is a
+// member of still answers correctly, because its postings are in GCPX and GCPX is
+// undamaged — which is the difference between a section that is derived and one
+// that is a second copy.
+func TestIndexMapped_DamagedRunSurfacesAsAFault(t *testing.T) {
 	dir := v9Store(t)
 	path := filepath.Join(dir, csrFileName)
 	data, err := os.ReadFile(path)
@@ -610,34 +630,74 @@ func TestIndexMapped_RefusesADamagedRun(t *testing.T) {
 		t.Fatalf("read image: %v", err)
 	}
 
-	// "b3" is a bucket value, so it is in the runs of a composite member key. The
-	// run holds its length and then its bytes, and that pair occurs once.
-	needle := []byte{2, 0, 0, 0, 'b', '3'}
-	at := bytes.Index(data, needle)
-	if at < 0 || bytes.Contains(data[at+1:], needle) {
-		t.Fatalf("the value's run prefix occurs %d times, so the corruption is not aimed",
-			bytes.Count(data, needle))
+	// Aimed inside GPIX, not across the whole file. "b3" is a bucket value, so
+	// its length prefix and bytes sit in the runs of a composite member key —
+	// and GCPX encodes a tuple's members with the same little-endian length
+	// prefix, so those same six bytes now occur in the composite postings too.
+	// Bounding the search to the section is what keeps the corruption aimed at
+	// the run this test is about.
+	sections := sectionsOf(t, data)
+	gpix, ok := findSection(sections, csrSectionMappedIndex)
+	if !ok {
+		t.Fatal("the v9 image carries no GPIX")
 	}
-	binary.LittleEndian.PutUint32(data[at:], 1<<30)
+	body := data[gpix.Offset : gpix.Offset+gpix.Length]
+	needle := []byte{2, 0, 0, 0, 'b', '3'}
+	rel := bytes.Index(body, needle)
+	if rel < 0 || bytes.Contains(body[rel+1:], needle) {
+		t.Fatalf("the value's run prefix occurs %d times within GPIX, so the corruption is not aimed",
+			bytes.Count(body, needle))
+	}
+	binary.LittleEndian.PutUint32(data[int(gpix.Offset)+rel:], 1<<30)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write image: %v", err)
 	}
 
-	// Both arms refuse, for different reasons in the same class. The mapped arm
-	// reads the run while filling a composite; the resident arm reads every run
-	// there is, because rebuilding the index is reading all of them.
-	for _, mode := range []IndexMode{IndexMapped, IndexResident} {
-		t.Run(mode.String(), func(t *testing.T) {
-			s, err := OpenWithOptions(dir, Options{IndexMode: mode})
-			if err == nil {
-				s.Close()
-				t.Fatal("a store opened on an image whose index cannot be read")
-			}
-			if !bytes.Contains([]byte(err.Error()), []byte("gpix")) {
-				t.Errorf("err = %v, want it to name the section it could not read", err)
-			}
-		})
-	}
+	t.Run("resident refuses at open", func(t *testing.T) {
+		s, err := OpenWithOptions(dir, Options{IndexMode: IndexResident})
+		if err == nil {
+			s.Close()
+			t.Fatal("a store rebuilt its index from an image whose runs cannot be read")
+		}
+		if !bytes.Contains([]byte(err.Error()), []byte("gpix")) {
+			t.Errorf("err = %v, want it to name the section it could not read", err)
+		}
+	})
+
+	t.Run("mapped records a fault on the read", func(t *testing.T) {
+		s, err := OpenWithOptions(dir, Options{IndexMode: IndexMapped})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer s.Close()
+
+		if f := s.propIdx.BaseFault(); f != nil {
+			t.Fatalf("a fault was recorded before anything read the damaged run: %v", f)
+		}
+		if _, err := s.NodesByProperty("bucket", []byte("b3")); err != nil {
+			t.Fatalf("NodesByProperty: %v", err)
+		}
+		f := s.propIdx.BaseFault()
+		if f == nil {
+			t.Fatal("reading the damaged run recorded no fault, so the damage is invisible")
+		}
+		if !bytes.Contains([]byte(f.Error()), []byte("gpix")) {
+			t.Errorf("fault = %v, want it to name the section it could not read", f)
+		}
+
+		// The positive half: the composite is not derived from those runs any
+		// more, so it is unaffected by damage to them.
+		m, ok := s.propIdx.MatchNodeComposite([]store.PropertyFilter{
+			{Key: "bucket", Op: store.PropertyOpEqual, Value: []byte("b3")},
+			{Key: "shard", Op: store.PropertyOpEqual, Value: []byte("s0")},
+		}, store.MatchAll)
+		if !ok {
+			t.Fatal("the declared composite did not match a query covering it")
+		}
+		if _, ok := s.propIdx.NodesByComposite(m); !ok {
+			t.Fatal("the composite declaration went away")
+		}
+	})
 }
 
 // TestReadMappedIndexSections_RefusesHalfAnIndex covers the loader's own

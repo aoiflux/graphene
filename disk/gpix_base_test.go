@@ -80,7 +80,7 @@ func newBasePair(t testing.TB, triples []propTriple) *basePair {
 	if err != nil {
 		t.Fatalf("parseGPIR: %v", err)
 	}
-	base, err := newGPIXBase(sec, rev)
+	base, err := newGPIXBase(sec, rev, nil)
 	if err != nil {
 		t.Fatalf("newGPIXBase: %v", err)
 	}
@@ -635,7 +635,7 @@ func TestGPIXBase_RefusesHalfAnImage(t *testing.T) {
 		{"forward only", p.sec, nil},
 		{"reverse only", nil, rev},
 	} {
-		if _, err := newGPIXBase(tc.fwd, tc.rev); err == nil {
+		if _, err := newGPIXBase(tc.fwd, tc.rev, nil); err == nil {
 			t.Fatalf("newGPIXBase accepted %s", tc.name)
 		}
 	}
@@ -685,7 +685,7 @@ func TestGPIXBase_RefusesHostileReverseEntries(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseGPIR: %v", err)
 			}
-			base, err := newGPIXBase(sec, rev)
+			base, err := newGPIXBase(sec, rev, nil)
 			if err != nil {
 				t.Fatalf("newGPIXBase: %v", err)
 			}
@@ -780,7 +780,7 @@ func TestGPIXBase_ReadsDoNotAllocatePerEntry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseGPIR: %v", err)
 		}
-		base, err := newGPIXBase(sec, rev)
+		base, err := newGPIXBase(sec, rev, nil)
 		if err != nil {
 			t.Fatalf("newGPIXBase: %v", err)
 		}

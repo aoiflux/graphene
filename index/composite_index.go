@@ -610,7 +610,16 @@ func (c *compositeIndex[T]) tupleBuf() []string {
 // filed. That is right in both directions: if pos had no value before, the
 // entity was in no tuple at all and this is its whole cross product; if it did,
 // the tuples not carrying value were filed when their own values arrived.
-func (c *compositeIndex[T]) register(id T, pos int, value string) {
+//
+// s and hasBase are the attached base, threaded down from PropertyIndex because
+// a composite holds no reference to one. They are used for exactly one thing: a
+// row created here for an entity the base already describes is filled from the
+// base first, without which a write to one member of such an entity would file
+// nothing. See baseSide.hydrateCompositeRow, which is also where the case that
+// makes it necessary is written out. A composite the base does not carry needs
+// none of this -- its rows were filled at open -- so the hydration is gated on
+// the same test the fill is skipped by.
+func (c *compositeIndex[T]) register(id T, pos int, value string, s baseSide[T], hasBase bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -618,6 +627,11 @@ func (c *compositeIndex[T]) register(id T, pos int, value string) {
 	if !ok {
 		row = c.newRow()
 		c.members[id] = row
+		if hasBase && s.carriesComposite(c.keys) {
+			s.hydrateCompositeRow(id, c.keys, func(p int, v string) {
+				c.addValue(row, p, v)
+			})
+		}
 	}
 	if !c.addValue(row, pos, value) {
 		return
@@ -673,28 +687,55 @@ func (c *compositeIndex[T]) remove(id T) {
 	c.releaseRow(row)
 }
 
-// lookup returns a copy of the ascending ids filed under the given values.
-func (c *compositeIndex[T]) lookup(values []string) []T {
+// lookup returns the ascending ids filed under the given values, over
+// base(tuple) - retracted union delta(tuple).
+//
+// The delta side is copied out under the read lock and the base is read after it
+// is released, which is postings.lookup's arrangement and is available for the
+// same reason: the answer is one slice, so the copy is bounded by the answer
+// rather than by the composite.
+//
+// With no base, or with a base that does not carry this composite, the second
+// term is absent and this is the map lookup it always was -- a composite the base
+// does not carry was filled at open, so its postings already hold the image's
+// entries.
+func (c *compositeIndex[T]) lookup(s baseSide[T], hasBase bool, values []string) []T {
 	tuple := encodeTuple(values)
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	ids := c.postings[tuple]
-	if len(ids) == 0 {
+	var delta []T
+	if len(ids) > 0 {
+		delta = make([]T, len(ids))
+		copy(delta, ids)
+	}
+	c.mu.RUnlock()
+
+	if !hasBase || !s.carriesComposite(c.keys) {
+		return delta
+	}
+	out := s.mergeCompositeRun(c.keys, tuple, delta)
+	if len(out) == 0 {
 		return nil
 	}
-	out := make([]T, len(ids))
-	copy(out, ids)
 	return out
 }
 
 // cardinality is lookup's size without the copy — what the planner costs a
 // composite driver by. Exact, not estimated: the answer is one map lookup away,
 // so there is nothing here for stats.go's two regimes to decide between.
-func (c *compositeIndex[T]) cardinality(values []string) int {
+func (c *compositeIndex[T]) cardinality(s baseSide[T], hasBase bool, values []string) int {
 	tuple := encodeTuple(values)
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.postings[tuple])
+	n := len(c.postings[tuple])
+	c.mu.RUnlock()
+
+	if !hasBase || !s.carriesComposite(c.keys) {
+		return n
+	}
+	// An upper bound once a base carries the tuple, because the retracted ids
+	// are not counted out. See mergeCompositeCardinality for why that is the
+	// right trade for a planner input and not for an answer.
+	return s.mergeCompositeCardinality(c.keys, tuple, n)
 }
 
 // verify checks the postings against the member states it holds and reports the
@@ -1016,9 +1057,9 @@ func (c *compositeSet[T]) tuples() [][]string {
 // Called after the owning shard's lock has been released, and taking only the
 // composite's own lock — so no operation ever holds a shard lock and a composite
 // lock at once, and there is still no lock order to get wrong.
-func (c *compositeSet[T]) registered(id T, key, value string) {
+func (c *compositeSet[T]) registered(id T, key, value string, s baseSide[T], hasBase bool) {
 	for _, m := range c.membersOf(key) {
-		m.idx.register(id, m.pos, value)
+		m.idx.register(id, m.pos, value, s, hasBase)
 	}
 }
 
@@ -1079,6 +1120,7 @@ func (m CompositeMatch) Name() string { return strings.Join(m.Keys, "+") }
 // every other driver is chosen by.
 func matchComposite[T entityID](
 	c *compositeSet[T],
+	s baseSide[T], hasBase bool,
 	filters []store.PropertyFilter,
 	mode store.MatchMode,
 ) (CompositeMatch, bool) {
@@ -1118,7 +1160,7 @@ func matchComposite[T entityID](
 		if !covered {
 			continue
 		}
-		size := idx.cardinality(values)
+		size := idx.cardinality(s, hasBase, values)
 		if found && size >= best.Size {
 			continue
 		}
@@ -1140,7 +1182,7 @@ func matchComposite[T entityID](
 // lookupComposite resolves a match to its ascending, deduplicated ids. ok is
 // false only if the declaration went away between planning and execution, which
 // nothing in the engine does.
-func lookupComposite[T entityID](c *compositeSet[T], m CompositeMatch) ([]T, bool) {
+func lookupComposite[T entityID](c *compositeSet[T], s baseSide[T], hasBase bool, m CompositeMatch) ([]T, bool) {
 	idx, ok := c.find(m.Keys)
 	if !ok {
 		return nil, false
@@ -1149,5 +1191,5 @@ func lookupComposite[T entityID](c *compositeSet[T], m CompositeMatch) ([]T, boo
 	for i, v := range m.Values {
 		values[i] = string(v)
 	}
-	return idx.lookup(values), true
+	return idx.lookup(s, hasBase, values), true
 }

@@ -298,9 +298,15 @@ jobs:
       # The third arm: the whole-layer rebuild at the full shape, which is the
       # release's end-to-end acceptance and the one that failed for two releases.
       # It passes with the delta bounded and a reopen after each interim
-      # compaction -- 1,285.2 MiB of 2,048 with 37.2% headroom, measured on
+      # compaction -- 880.7 MiB of 2,048 with 57.0% headroom, measured on
       # windows; see docs/MEMORY_MODEL.md section 9.8, which also has the sweep
-      # showing that no delta bound alone completes it.
+      # showing that no delta bound alone completes it, the bisection placing the
+      # bound's cliff in (96, 128], and what GCPX moved.
+      #
+      # It was 1,285.2 MiB and 37.2% before the composite postings went into the
+      # image. Both figures are on this configuration; the older one is what an
+      # image written by v0.7.x still costs to rebuild, since a pre-GCPX image is
+      # read exactly as it always was.
       #
       # continue-on-error until it has passed here. The figures above are from a
       # Job Object, which bounds commit charge; this is a cgroup, which bounds

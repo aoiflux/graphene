@@ -221,11 +221,21 @@ func (s *Store) loadIndex(section *csrIndexSection, mapped bool) error {
 
 	if attached {
 		// Every entry is already where it is read from, so there is nothing to
-		// load. What the declarations above did do is the only reading of the base
-		// this open performs — the composites' backfill — and a fault recorded
-		// there is a run that would not decode, which is damage to the file. The
-		// alternative to refusing is a store that comes up serving a composite
-		// index missing whatever the damaged run held.
+		// load. The one thing this open may still read out of the base is the
+		// composites' backfill, and a fault recorded there is a run that would
+		// not decode -- damage to the file. The alternative to refusing is a
+		// store that comes up serving a composite index missing whatever the
+		// damaged run held.
+		//
+		// A composite the image carries postings for is not backfilled, so it
+		// reads nothing here and this check has nothing to find for it. That is a
+		// real change and not a gap left open: those runs stop being read at open
+		// because the composite stops being derived from them, and they then
+		// behave like every other key in the image -- damage is met by the read
+		// that touches it and recorded for BaseFault, Verify and VerifyIndexes to
+		// report. An open that wants the O(entries) pass asks for it with a
+		// Verifier. See TestIndexMapped_DamagedRunSurfacesAsAFault, which pins
+		// both halves.
 		return s.propIdx.BaseFault()
 	}
 	if section.Base != nil {
@@ -990,7 +1000,26 @@ func readMappedIndexSections(data []byte, sections []csrSection) (index.Base, bo
 			return nil, true, fmt.Errorf("deserialiseCSR: %w", err)
 		}
 	}
-	b, err := newGPIXBase(fwdSec, revSec)
+	// The composite postings, if the image carries them. Absent is the normal
+	// case and not a degradation: every v9 image written before GCPX existed is
+	// absent here, and index.fillCompositesFromBase fills the composites from
+	// the entries exactly as it always did.
+	//
+	// Malformed, though, is a refusal and not a fallback. The section being
+	// optional means an older reader may skip a magic it does not know, which is
+	// what checkCriticalSections does for it; it does not mean this reader may
+	// read a directory that will not bound and carry on. A file whose GCPX does
+	// not parse is a damaged file, the fill would answer correctly out of the
+	// same bytes that produced the damage, and quietly taking the slow path
+	// would turn a diagnosis into a performance mystery. This is newGPIXBase's
+	// position for the same reason.
+	var cmpSec *gcpxSection
+	if cmp, hasCmp := findSection(sections, csrSectionCompositeIndex); hasCmp {
+		if cmpSec, err = parseGCPX(data[cmp.Offset : cmp.Offset+cmp.Length]); err != nil {
+			return nil, true, fmt.Errorf("deserialiseCSR: %w", err)
+		}
+	}
+	b, err := newGPIXBase(fwdSec, revSec, cmpSec)
 	if err != nil {
 		return nil, true, fmt.Errorf("deserialiseCSR: %w", err)
 	}

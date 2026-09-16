@@ -249,7 +249,7 @@ func TestSerialiseTo_MappedIndexSectionsAnswerQueries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseGPIR: %v", err)
 	}
-	base, err := newGPIXBase(fwd, rev)
+	base, err := newGPIXBase(fwd, rev, nil)
 	if err != nil {
 		t.Fatalf("newGPIXBase: %v", err)
 	}

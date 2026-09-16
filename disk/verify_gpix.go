@@ -95,7 +95,10 @@ func (b *gpixBase) Verify(cc *store.CancelCheck) error {
 				index.EntityKind(k.Kind), k.Name, revCounts[i], k.Entries)
 		}
 	}
-	return nil
+	// The composite postings, when the image carries them. Last because it is the
+	// optional section: a base with no GCPX verifies exactly as it did before, and
+	// verifyGCPX returns nil for a nil section rather than being branched on here.
+	return verifyGCPX(b.cmp, cc)
 }
 
 // verifyGPIXKey checks one key's value table and runs against each other.

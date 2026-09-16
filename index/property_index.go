@@ -235,7 +235,11 @@ func (p *PropertyIndex) DeclareCompositeNodeKeys(keys []string) error {
 	// AttachBase does the same for the other order — a composite declared before
 	// the base arrived, which is every composite a store restores from its
 	// catalogue at Open. See fillCompositeFromBase.
-	if s, hasBase := p.nodeBase(); hasBase {
+	// A composite the base carries postings for is skipped, exactly as
+	// fillCompositesFromBase skips it on the other order: the image answers it
+	// in place, and filling it here would hold it twice.
+	s, hasBase := p.nodeBase()
+	if hasBase && !s.carriesComposite(idx.keys) {
 		fillCompositeFromBase(s, idx)
 	}
 
@@ -258,7 +262,7 @@ func (p *PropertyIndex) DeclareCompositeNodeKeys(keys []string) error {
 		}
 		sh.mu.RUnlock()
 		for _, e := range pending {
-			idx.register(e.id, pos, e.value)
+			idx.register(e.id, pos, e.value, s, hasBase)
 		}
 	}
 	return nil
@@ -275,7 +279,11 @@ func (p *PropertyIndex) DeclareCompositeEdgeKeys(keys []string) error {
 	}
 	p.compDeclared.Store(true)
 	// See DeclareCompositeNodeKeys for why the base is walked first.
-	if s, hasBase := p.edgeBase(); hasBase {
+	// A composite the base carries postings for is skipped, exactly as
+	// fillCompositesFromBase skips it on the other order: the image answers it
+	// in place, and filling it here would hold it twice.
+	s, hasBase := p.edgeBase()
+	if hasBase && !s.carriesComposite(idx.keys) {
 		fillCompositeFromBase(s, idx)
 	}
 	for pos, key := range idx.keys {
@@ -293,7 +301,7 @@ func (p *PropertyIndex) DeclareCompositeEdgeKeys(keys []string) error {
 		}
 		sh.mu.RUnlock()
 		for _, e := range pending {
-			idx.register(e.id, pos, e.value)
+			idx.register(e.id, pos, e.value, s, hasBase)
 		}
 	}
 	return nil
@@ -314,7 +322,8 @@ func (p *PropertyIndex) MatchNodeComposite(filters []store.PropertyFilter, mode 
 	if !p.compDeclared.Load() {
 		return CompositeMatch{}, false
 	}
-	return matchComposite(&p.nodeComposites, filters, mode)
+	s, hasBase := p.nodeBase()
+	return matchComposite(&p.nodeComposites, s, hasBase, filters, mode)
 }
 
 // MatchEdgeComposite is MatchNodeComposite for edge queries.
@@ -322,18 +331,21 @@ func (p *PropertyIndex) MatchEdgeComposite(filters []store.PropertyFilter, mode 
 	if !p.compDeclared.Load() {
 		return CompositeMatch{}, false
 	}
-	return matchComposite(&p.edgeComposites, filters, mode)
+	s, hasBase := p.edgeBase()
+	return matchComposite(&p.edgeComposites, s, hasBase, filters, mode)
 }
 
 // NodesByComposite returns the ascending node IDs filed under a match's tuple.
 // ok is false only if the declaration is gone, which nothing in the engine does.
 func (p *PropertyIndex) NodesByComposite(m CompositeMatch) ([]store.NodeID, bool) {
-	return lookupComposite(&p.nodeComposites, m)
+	s, hasBase := p.nodeBase()
+	return lookupComposite(&p.nodeComposites, s, hasBase, m)
 }
 
 // EdgesByComposite is NodesByComposite for edge properties.
 func (p *PropertyIndex) EdgesByComposite(m CompositeMatch) ([]store.EdgeID, bool) {
-	return lookupComposite(&p.edgeComposites, m)
+	s, hasBase := p.edgeBase()
+	return lookupComposite(&p.edgeComposites, s, hasBase, m)
 }
 
 // OrderedNodeKeys returns the declared ordered node keys, sorted.
@@ -382,7 +394,8 @@ func (p *PropertyIndex) IndexNode(id store.NodeID, key string, value []byte) {
 	// The shard write above happens first, which is what makes a declaration
 	// racing this one unable to lose the entry — see DeclareCompositeNodeKeys.
 	if p.compDeclared.Load() {
-		p.nodeComposites.registered(id, key, vk)
+		s, hasBase := p.nodeBase()
+		p.nodeComposites.registered(id, key, vk, s, hasBase)
 	}
 }
 
@@ -400,7 +413,8 @@ func (p *PropertyIndex) IndexEdge(id store.EdgeID, key string, value []byte) {
 
 	// See IndexNode for why this sits outside the shard lock.
 	if p.compDeclared.Load() {
-		p.edgeComposites.registered(id, key, vk)
+		s, hasBase := p.edgeBase()
+		p.edgeComposites.registered(id, key, vk, s, hasBase)
 	}
 }
 

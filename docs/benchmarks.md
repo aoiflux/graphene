@@ -3022,9 +3022,12 @@ been measured here** — there is no way to drop the page cache from a Go test o
 Windows — and it is recorded as an open measurement rather than claimed.
 
 > **Superseded, v0.8.0.** The measurement is no longer closed off: `tests/coldlookup_test.go`
-> runs this join as its `projection batch` arm against an evicted image. See the note under
-> "the cold cost" above for what each platform's column actually achieves — the linux arm
-> answers this question, the windows arm bounds it from below.
+> runs this join as two arms, `projection batch (ascending)` and `projection batch
+> (shuffled)`, over the same ids in the same count. Trimmed at 1,400,000 nodes the shuffled
+> arm costs **1.34–1.59×** the ascending one, against **1.27–1.78×** resident — so the
+> penalty is real and larger than the 1.17× above, and the expectation that it *arrives*
+> cold is not supported by the windows arm. See "The batch join's ordering" below for why
+> that arm cannot settle the second half and the linux one can.
 
 ### What it holds
 
@@ -3544,7 +3547,8 @@ bound on the cold cost.** The linux arm, which evicts for real with
 |---|---:|---:|---:|
 | record point read | 1.04–1.29 µs | 0.05 µs | 20.6–26.1× |
 | index point lookup | 2.53–3.00 µs | 0.48–0.52 µs | 4.8–6.1× |
-| projection batch | 4.76–5.68 µs | 0.95–0.99 µs | 5.0–5.9× |
+| projection batch (ascending) | 5.41–5.89 µs | 1.08–1.18 µs | 4.58–5.21× |
+| projection batch (shuffled) | 7.42–9.34 µs | 1.37–2.10 µs | 3.62–5.70× |
 | bounded batch read | 0.95–1.23 µs | 0.05–0.07 µs | 16.5–21.1× |
 
 ### The figure depends on how many samples you take, and that is the instrument's shape
@@ -3586,8 +3590,35 @@ of the four runs. The figure is quoted because the flag is the honest thing to r
 alongside it, not because the flag can be argued away; at this fixture size that arm is at
 the edge of what the platform's clock resolves.
 
-**The batch join's 1.17× on unsorted values is not decided, and this arm cannot decide it.**
-`projection batch` runs one ordering. Separating sorted from unsorted needs a second arm,
-and until it exists the documented advice — supply ascending values — rests on the warm
-figures it always rested on.
+### The batch join's ordering, which this arm now does decide
+
+The `projection batch` row used to be one arm over one ordering, and the paragraph here used
+to say the join's 1.17× on unsorted values was undecided. It is two arms now — the same ids,
+the same count, the same body, differing only in the order values reach the join — and the
+shuffled one uses a hand-rolled splitmix64 rather than `math/rand`, because `math/rand`'s
+sequence for a given seed is explicitly not guaranteed across Go releases and a figure in this
+document should reproduce on a later toolchain.
+
+**Ordering costs more than the warm microbenchmark said.** Across three runs the shuffled arm
+is **1.34–1.59×** the ascending arm trimmed, and **1.27–1.78×** resident. The 1.17× that
+`BenchmarkRSS_PropertyBatch` reports is at a smaller shape; at 1,400,000 nodes against a
+1,689.1 MiB image the penalty is larger, and the advice to supply ascending values now rests
+on a measurement at the shape the advice is for.
+
+**What it does not show is the thing that was expected.** The hypothesis was that the sort
+pays for itself *cold* — that a search per value is eighteen page faults rather than eighteen
+cache misses, and the ordering win therefore arrives when pages are away. These runs do not
+support that: the trimmed range (1.34–1.59×) and the resident range (1.27–1.78×) overlap
+heavily, and run 2 puts the resident penalty *above* the trimmed one. At this sample count the
+two cannot be separated.
+
+**That is a limitation of the instrument and it was predicted before the arm was run.**
+Ascending order buys two distinct things: a monotonic advance over the base's cursor, and
+kernel readahead. `EmptyWorkingSet` measures the first honestly and **largely removes the
+second**, because the standby list is exactly where a mispredicted readahead costs almost
+nothing. So the figure above is the cursor half with the readahead half suppressed, which is
+a lower bound on the cold gap and not the cold gap. **The linux arm, which evicts for real, is
+the one that can size the readahead half**, and it has not been run at this shape. Reading a
+null result here as "ordering does not matter cold" would be reading the instrument rather
+than the store.
 

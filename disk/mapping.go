@@ -445,8 +445,56 @@ func (s *Store) noteImage(src *imageSource, csr *CSRGraph) {
 // states for a graph: a cleanup never runs while its argument is reachable from
 // the object it watches. What keeps the mapping alive is the store's
 // indexImages slice.
+//
+// # Embedding an interface drops every capability the interface does not name
+//
+// The embedded field's static type is index.Base, so what gets promoted is
+// index.Base's method set and nothing else. A concrete base that also implements
+// index.CompositeBase is wrapped into something that does not, the index's type
+// assertion fails, and the composites are quietly filled from the entries --
+// correct answers, and the whole saving gone, with no error anywhere to say so.
+// That is not hypothetical: it is what this wrapper did until GCPX's first
+// end-to-end test caught it, one compaction after the section started being
+// written.
+//
+// So the optional capability is forwarded explicitly below. A wrapper around a
+// base that is not a CompositeBase answers "I carry no composite", which is a
+// true statement and the same one such a base makes for itself.
 type mappedIndexBase struct {
 	index.Base
+}
+
+var _ index.CompositeBase = (*mappedIndexBase)(nil)
+
+// composites returns the wrapped base's composite capability, or nil.
+func (b *mappedIndexBase) composites() index.CompositeBase {
+	cb, _ := b.Base.(index.CompositeBase)
+	return cb
+}
+
+func (b *mappedIndexBase) CompositeTuples(kind index.EntityKind) [][]string {
+	cb := b.composites()
+	if cb == nil {
+		return nil
+	}
+	return cb.CompositeTuples(kind)
+}
+
+func (b *mappedIndexBase) LookupComposite(kind index.EntityKind, keys []string, tuple []byte) (index.IDRun, error) {
+	cb := b.composites()
+	if cb == nil {
+		return index.IDRun{}, nil
+	}
+	return cb.LookupComposite(kind, keys, tuple)
+}
+
+func (b *mappedIndexBase) ForEachCompositeTuple(kind index.EntityKind, keys []string,
+	fn func(tuple []byte, ids index.IDRun) bool) error {
+	cb := b.composites()
+	if cb == nil {
+		return nil
+	}
+	return cb.ForEachCompositeTuple(kind, keys, fn)
 }
 
 // noteIndexImage records a mapping whose bytes the index base b reads, and

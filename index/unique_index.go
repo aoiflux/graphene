@@ -323,7 +323,8 @@ func (p *PropertyIndex) IndexNodeUnique(id store.NodeID, key string, value []byt
 	sh.mu.Unlock()
 
 	if p.compDeclared.Load() {
-		p.nodeComposites.registered(id, key, vk)
+		s, hasBase := p.nodeBase()
+		p.nodeComposites.registered(id, key, vk, s, hasBase)
 	}
 	return nil
 }
@@ -351,7 +352,8 @@ func (p *PropertyIndex) IndexEdgeUnique(id store.EdgeID, key string, value []byt
 	sh.mu.Unlock()
 
 	if p.compDeclared.Load() {
-		p.edgeComposites.registered(id, key, vk)
+		s, hasBase := p.edgeBase()
+		p.edgeComposites.registered(id, key, vk, s, hasBase)
 	}
 	return nil
 }

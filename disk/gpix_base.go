@@ -35,6 +35,12 @@ import (
 type gpixBase struct {
 	fwd *gpixSection
 	rev *gpirSection
+
+	// cmp is the composite postings, when the image carries them. Optional in a
+	// way the other two are not: nil means the composites are filled from the
+	// entries at open, which is what every image written before GCPX existed
+	// gets and what index.fillCompositesFromBase still does. See gcpx_base.go.
+	cmp *gcpxSection
 }
 
 var _ index.Base = (*gpixBase)(nil)
@@ -57,7 +63,7 @@ var (
 // one needs, and the reverse alone names values it cannot resolve. Accepting
 // half would mean answering some queries and silently missing others, so a
 // half-written image is refused at load rather than at the first delete.
-func newGPIXBase(fwd *gpixSection, rev *gpirSection) (*gpixBase, error) {
+func newGPIXBase(fwd *gpixSection, rev *gpirSection, cmp *gcpxSection) (*gpixBase, error) {
 	switch {
 	case fwd == nil && rev == nil:
 		return nil, fmt.Errorf("gpix: the image carries neither %s nor %s",
@@ -69,7 +75,7 @@ func newGPIXBase(fwd *gpixSection, rev *gpirSection) (*gpixBase, error) {
 		return nil, fmt.Errorf("gpix: the image carries %s without %s",
 			csrSectionMappedIndex, csrSectionMappedReverse)
 	}
-	return &gpixBase{fwd: fwd, rev: rev}, nil
+	return &gpixBase{fwd: fwd, rev: rev, cmp: cmp}, nil
 }
 
 // kindOf converts the interface's kind to the on-disk one.
@@ -290,7 +296,21 @@ func (b *gpixBase) ResidentBytes() int64 {
 		total += int64(len(b.fwd.keys[i].Name))
 	}
 	// The reverse section is two slice headers over the same mapping.
-	return total + 48
+	total += 48
+	if b.cmp != nil {
+		// One gcpxComposite per carried composite: the keys slice header, kind
+		// with its padding, distinct, entries, and the ttab and runs headers,
+		// plus the key strings themselves. Spelled out rather than taken from
+		// unsafe.Sizeof, as the per-key figure above is.
+		const perComposite = 24 + 8 + 8 + 8 + 24 + 24
+		total += int64(len(b.cmp.composites)) * perComposite
+		for i := range b.cmp.composites {
+			for _, k := range b.cmp.composites[i].keys {
+				total += int64(len(k)) + 16
+			}
+		}
+	}
+	return total
 }
 
 // MappedBytes is how much mapped file this base reads its entries out of.
@@ -309,7 +329,7 @@ func (b *gpixBase) MappedBytes() int64 {
 	if b.rev != nil {
 		n += int64(len(b.rev.nodes)) + int64(len(b.rev.edges))
 	}
-	return n
+	return n + b.compositeMappedBytes()
 }
 
 // TotalEntries returns the entry count across every key of kind.
