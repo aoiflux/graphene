@@ -13,6 +13,10 @@ import (
 // and RssFile as separate counters, and VmHWM as the peak. All three are in kB.
 const rssSupported = true
 
+// And it reads the process's *current* size, not only its high-water mark, so
+// the calibration in rss_test.go can watch a reading move with an allocation.
+const rssCurrent = true
+
 func readRSS() rssSample {
 	data, err := os.ReadFile("/proc/self/status")
 	if err != nil {

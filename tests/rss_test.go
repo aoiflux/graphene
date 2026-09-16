@@ -171,14 +171,27 @@ func TestRSSInstrument_TracksAnonymousGrowth(t *testing.T) {
 	// half of a quarter-gigabyte answers it.
 	const floor = grow / 2
 
-	if after.Split {
+	switch {
+	case after.Split:
 		if after.Anon < before.Anon+floor {
 			t.Errorf("anon did not track a %d MiB touched allocation: before=%d after=%d",
 				grow/bytesPerMiB, before.Anon, after.Anon)
 		}
-	} else if after.Total < before.Total+floor {
-		t.Errorf("total did not track a %d MiB touched allocation: before=%d after=%d",
-			grow/bytesPerMiB, before.Total, after.Total)
+	case rssCurrent:
+		if after.Total < before.Total+floor {
+			t.Errorf("total did not track a %d MiB touched allocation: before=%d after=%d",
+				grow/bytesPerMiB, before.Total, after.Total)
+		}
+	default:
+		// A peak-only reader — darwin, which would need Mach calls and therefore
+		// cgo to report the size now. Total is zero for it at every moment, so
+		// asserting that a *difference* of zero covers a quarter-gigabyte is a
+		// test of nothing that fails. The peak below is the whole of what this
+		// platform can be calibrated on, and asserting it there rather than
+		// silently skipping is what keeps a reader that returned a plausible
+		// constant from passing.
+		t.Logf("%s reports a peak and no current size; calibrating on the peak alone",
+			runtime.GOOS)
 	}
 	if after.Peak < floor {
 		t.Errorf("peak %d is below the size of an allocation already made", after.Peak)

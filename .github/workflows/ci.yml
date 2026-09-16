@@ -50,6 +50,14 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # And again with the stress tag on, because nothing else in CI compiles
+      # those files any more: the unit run cannot see them, and the test job now
+      # runs only the tests that live in them. They are where the measurement
+      # harness lives, so a rename in the engine breaks them silently and is
+      # found the next time somebody tries to measure something.
+      - name: go vet (stress tag)
+        run: go vet -tags=stress ./...
+
   # macOS joined the matrix with the process lock. The engine now makes an
   # explicit claim about Darwin — flock semantics, and a reader/writer exclusion
   # that depends on them — and a platform claim nothing exercises is a guess.
@@ -77,16 +85,49 @@ jobs:
       # it and it can rot unnoticed. The default path is 100k nodes / 500k edges
       # and finishes in well under a minute; the 1M-node path is separately gated
       # behind GRAPHENE_PERSISTENT_STRESS and runs in the scheduled job below.
-      - name: Stress tests (race)
-        run: go test ./tests/ -tags=stress -race -count=1 -run Test
+      #
+      # Only the tests that the tag adds. This step used to run the whole tests
+      # package with the tag on, which re-ran the 479 tests the step above had
+      # just finished for the sake of the 19 that exist only under it — 253
+      # seconds of duplicate on windows, more than the unit run itself.
+      #
+      # The names are derived from the tree rather than written out here, for the
+      # reason the fuzz matrix below gives at length: a hand-kept list of what to
+      # run is a list that silently shrinks relative to what exists. A test in a
+      # stress-tagged file is exactly a test that exists only under the tag, so
+      # the set comes out of the files themselves and needs no build to find.
+      # Names from another platform's file match nothing here, which is correct
+      # rather than merely harmless: ceiling_windows_test.go is the windows
+      # runner's to run.
+      #
+      # Compile rot in every other tagged file — disk's spikes, the whole
+      # benchmark suite — is caught by `go vet -tags=stress ./...` in the lint
+      # job: one command on one platform, rather than a run on three.
+      - name: Stress-only tests (race)
+        shell: bash
+        run: |
+          names=$(grep -l '^//go:build stress' tests/*_test.go | xargs grep -hoE '^func Test[A-Za-z0-9_]+' | sed 's/^func //' | grep -v '^TestMain$' | sort -u | paste -sd'|' -)
+          if [ -z "$names" ]; then
+            echo "no stress-only tests found; the filter that selects them is broken" >&2
+            exit 1
+          fi
+          echo "stress-only tests: $names"
+          go test ./tests/ -tags=stress -race -count=1 -run "^($names)$"
 
   # Benchmarks are not a pass/fail gate — benchmark timings are far too sensitive
   # to runner load to assert on, and CONTRIBUTING.md's method (interleaved A/B
   # against a control) cannot be run meaningfully on ephemeral CI hardware.
   # This runs each benchmark exactly once purely to prove they still compile and
   # do not panic, which is the failure mode that would otherwise go unnoticed.
+  #
+  # Nightly rather than per-push, and the half that was worth three minutes of
+  # every push is now a vet: `go vet -tags=stress ./...` in the lint job proves
+  # they compile, in seconds. What is left here is whether they *run* — a
+  # benchmark that panics on its first iteration compiles perfectly -- and that
+  # is worth a nightly and not a gate on a documentation commit.
   bench-smoke:
     name: benchmarks compile and run
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

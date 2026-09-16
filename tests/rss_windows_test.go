@@ -42,6 +42,9 @@ import (
 // megabytes in the conservative direction.
 const rssSupported = true
 
+// WorkingSetSize is a current reading, so the calibration can watch it move.
+const rssCurrent = true
+
 // processMemoryCountersEx mirrors PROCESS_MEMORY_COUNTERS_EX. The layout must
 // match exactly: cb is validated by the kernel against the struct it was given.
 type processMemoryCountersEx struct {

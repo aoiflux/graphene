@@ -21,15 +21,16 @@ import (
 	"testing"
 )
 
-// goListLines runs `go list` from the module root and returns its non-empty
-// output lines.
+// goListLines runs `go list -deps` from the module root with CGO_ENABLED set as
+// given, and returns its non-empty output lines.
 //
-// CGO_ENABLED is forced on rather than inherited. `.CgoFiles` is empty for
-// every package when cgo is disabled, so a machine that happens to build with
-// CGO_ENABLED=0 — every container in the release job, for one — would turn the
-// cgo assertion below into a test that cannot fail. Asking the question with
-// cgo enabled is the only way the answer means anything.
-func goListLines(t *testing.T, format string) []string {
+// CGO_ENABLED is passed rather than inherited, because each assertion below is
+// about a *setting*: with cgo on, which packages compile C; with it off, which
+// packages are left with nothing to build. Inheriting it would make whichever
+// question the machine happened to ask the only one asked — and `.CgoFiles` is
+// empty for every package when cgo is off, which is a form of the first
+// assertion that cannot fail.
+func goListLines(t *testing.T, cgoEnabled, format string, extra ...string) []string {
 	t.Helper()
 
 	goBin, err := exec.LookPath("go")
@@ -39,9 +40,11 @@ func goListLines(t *testing.T, format string) []string {
 		t.Skipf("no go toolchain on PATH, cannot verify build constraints: %v", err)
 	}
 
-	cmd := exec.Command(goBin, "list", "-deps", "-f", format, "./...")
+	args := append([]string{"list", "-deps"}, extra...)
+	args = append(args, "-f", format, "./...")
+	cmd := exec.Command(goBin, args...)
 	cmd.Dir = moduleRoot(t)
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED="+cgoEnabled)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("go list -deps: %v\n%s", err, out)
@@ -70,19 +73,66 @@ func moduleRoot(t *testing.T) string {
 	return root
 }
 
-// TestZeroCgo asserts that no package in the transitive closure — graphene's
-// own and every standard-library package it reaches — compiles a cgo file.
+// modulePath is this module's import path: the prefix that separates graphene's
+// own packages from the standard library in a `go list` closure.
+const modulePath = "github.com/aoiflux/graphene"
+
+// TestZeroCgo asserts the property the release build actually rests on — that
+// `CGO_ENABLED=0 GOOS=... go build` produces a binary for every target in the
+// matrix from one machine, with no C toolchain anywhere on the path.
 //
-// The closure, not just this module: a dependency on net or os/user would put
-// a C compiler on the build path just as surely as an `import "C"` here, and
-// the failure would be a release build that no longer cross-compiles.
+// That is two questions, and they are asked separately because only one of them
+// is about this module.
+//
+// # Nothing here compiles C
+//
+// An `import "C"` in a graphene package is not a setting and no build flag
+// undoes it: with cgo off the file is excluded and the package stops building,
+// with cgo on the cross-build wants a C compiler per target. So the first
+// assertion is scoped to this module and asked with cgo *on*, because that is
+// the only setting under which its answer can be anything but empty.
+//
+// # Nothing in the closure requires C
+//
+// This used to be the same assertion widened to the whole closure, on the
+// reasoning that a standard-library dependency puts a C compiler on the build
+// path just as surely as an import here does. That reasoning is wrong about the
+// standard library, and the gate was red on linux and macos for a property
+// neither had lost: `cmd/graphene` writes a tar for `export bundle`,
+// `archive/tar` reads owner names through `os/user`, and `os/user` compiles a
+// cgo file *when cgo is enabled* and a pure-Go one when it is not. Forcing
+// CGO_ENABLED=1 to stop the question being vacuous also manufactured its answer.
+// Windows stayed green throughout, because os/user needs no cgo there — a gate
+// whose result depends on which platform asks is measuring the platform.
+//
+// What matters is not whether a package *can* use C but whether it can be built
+// without it. So the second assertion turns cgo off and asks whether anything in
+// the closure is then left with no Go files to compile. A package that genuinely
+// required cgo — net with a custom resolver, or an `import "C"` that somehow
+// escaped the first check — says exactly that, and says it for every target the
+// release builds.
 func TestZeroCgo(t *testing.T) {
-	withCgo := goListLines(t, `{{if .CgoFiles}}{{.ImportPath}}{{end}}`)
-	if len(withCgo) != 0 {
-		t.Errorf("packages in the build closure compile cgo files: %s\n"+
+	var own []string
+	for _, pkg := range goListLines(t, "1", `{{if .CgoFiles}}{{.ImportPath}}{{end}}`) {
+		if strings.HasPrefix(pkg, modulePath) {
+			own = append(own, pkg)
+		}
+	}
+	if len(own) != 0 {
+		t.Errorf("graphene packages compile cgo files: %s\n"+
+			"an import \"C\" here costs the cross-build a C toolchain per target",
+			strings.Join(own, ", "))
+	}
+
+	// -e so a package that cannot be built is named rather than collapsing the
+	// whole listing: without it `go list` exits non-zero with one error and no
+	// closure, and the name is the whole of what this assertion is for.
+	broken := goListLines(t, "0", `{{if .Error}}{{.ImportPath}}: {{.Error}}{{end}}`, "-e")
+	if len(broken) != 0 {
+		t.Errorf("packages in the build closure cannot be built without cgo:\n%s\n"+
 			"graphene cross-compiles to every release platform from one machine, "+
-			"which holds only while the whole closure is pure Go",
-			strings.Join(withCgo, ", "))
+			"and build.sh sets CGO_ENABLED=0 to do it",
+			strings.Join(broken, "\n"))
 	}
 }
 

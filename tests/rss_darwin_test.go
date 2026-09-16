@@ -12,6 +12,12 @@ import "syscall"
 // only and declares no split, and callers that need the split run on linux.
 const rssSupported = true
 
+// Peak only: getrusage reports the high-water mark and nothing about the size
+// now, so a caller — and the calibration in rss_test.go — must not read a zero
+// Total as "this process holds nothing". This is what separates "no instrument"
+// from "an instrument that answers one of the two questions".
+const rssCurrent = false
+
 func readRSS() rssSample {
 	var ru syscall.Rusage
 	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {

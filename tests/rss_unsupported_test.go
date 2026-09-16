@@ -6,5 +6,6 @@ package graphene_test
 // the absence visible in the benchmark log rather than turning every memory
 // result into an apparent success.
 const rssSupported = false
+const rssCurrent = false
 
 func readRSS() rssSample { return rssSample{} }

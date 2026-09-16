@@ -241,6 +241,51 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   less commit and a slower disk than the machine the measurement was made on. Drop
   the flag once each is green, not before.
 
+### CI was running the same 479 tests twice, and two gates were red
+
+- **The push job ran the tests package, then ran it again.** `go test ./tests/
+  -tags=stress` compiles the tagged files *and* every untagged one beside them,
+  so the stress step re-ran all 479 tests the unit step had just finished for the
+  sake of the nineteen that exist only under the tag — 253 seconds on the windows
+  runner, more than the unit run itself, on all three platforms. The step now
+  runs only the tests the tag adds, and the names are derived from the tree
+  rather than written into the workflow, for the reason the fuzz matrix already
+  gives: a hand-kept list of what to run is a list that silently shrinks relative
+  to what exists. A test in a stress-tagged file is exactly a test that exists
+  only under the tag, so the set comes out of the files and needs no build to
+  find. Locally the arm goes from 147.6s to 60.7s.
+
+- **Compile rot for the tagged files is now caught by `go vet -tags=stress
+  ./...`** in the lint job, which is where it should have been: the old step
+  covered `./tests/` only, so `disk`'s four measurement spikes and the benchmark
+  files in every other package were compiled by nothing in CI at all. One command
+  on one platform now covers more than a run on three did.
+
+- **The benchmark smoke job moves to the nightly.** Its two purposes were "they
+  still compile" and "they do not panic on their first iteration"; the vet above
+  answers the first in seconds, and the second is not worth three minutes of
+  every documentation commit.
+
+- **`TestZeroCgo` was red on linux and macos for a property neither had lost.**
+  It asserted that no package in the closure compiles a cgo file, with
+  CGO_ENABLED forced on so the question would not be vacuous — but forcing it on
+  also manufactured the answer: `cmd/graphene` writes a tar for `export bundle`,
+  `archive/tar` reads owner names through `os/user`, and `os/user` compiles a cgo
+  file when cgo is enabled and a pure-Go one when it is not. Windows stayed green
+  throughout, because os/user needs no cgo there, and a gate whose result depends
+  on which platform asks is measuring the platform. It now asks the two questions
+  the release build actually rests on: nothing in *this module* compiles C, and
+  nothing in the closure is left unbuildable with cgo *off* — which is how
+  `build.sh` builds all six release targets.
+
+- **The darwin arm of the RSS calibration could not pass.** Darwin reports the
+  peak through getrusage and nothing about the size now, because the current
+  figure needs Mach calls and therefore cgo; the calibration read that zero as a
+  current reading and asserted a quarter-gigabyte allocation had moved it. The
+  platform readers now say which of the two questions they answer, and the
+  calibration asserts the peak where that is all there is — rather than skipping,
+  which would let a reader returning a plausible constant through.
+
 ### The mapped-bytes accounting was wrong, in both directions
 
 - **`ResidentEstimate.Mapped` and `StorageStats.ImageMappedBytes` reported zero
