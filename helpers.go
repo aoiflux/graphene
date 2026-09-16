@@ -19,6 +19,17 @@ type edgeBatchAdder interface {
 	AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error)
 }
 
+// A backend that caps batch size also knows how to split one. Backends without
+// caps need no splitting and do not implement these; see AddNodesInBatches for
+// what happens then.
+type nodeBatchSplitter interface {
+	AddNodesInBatches(nodes []*store.Node) ([]store.NodeID, error)
+}
+
+type edgeBatchSplitter interface {
+	AddEdgesInBatches(edges []*store.Edge) ([]store.EdgeID, error)
+}
+
 // GraphStats holds high-level statistics about the graph.
 type GraphStats struct {
 	NodeCount uint64
@@ -388,7 +399,7 @@ func (g *Graph) CompactIfDue(p store.CompactionPolicy) (bool, string, error) {
 
 // CompactIfDueCtx is CompactIfDue, with the compaction abandoned if ctx is
 // cancelled. The policy is evaluated first and is not cancellable: it is a read
-// lock and four comparisons.
+// lock, five comparisons and the O(1) resident estimate the fifth one reads.
 func (g *Graph) CompactIfDueCtx(ctx context.Context, p store.CompactionPolicy) (bool, string, error) {
 	due, why := g.ShouldCompact(p)
 	if !due {
@@ -892,6 +903,43 @@ func (g *Graph) AddEdges(edges []*store.Edge) ([]store.EdgeID, error) {
 		ids[i] = id
 	}
 	return ids, nil
+}
+
+// AddNodesInBatches adds nodes in as many batches as the backend's configured
+// caps require, returning every identifier assigned, in order.
+//
+// # It is not atomic, and AddNodes is
+//
+// Each batch is its own commit. A failure partway through returns the
+// identifiers already committed alongside the error, and those records are in
+// the store — there is no rollback. Use AddNodes when either-all-or-none
+// matters; use this when the work may be larger than one batch is allowed to be
+// and the alternative is writing the splitting loop by hand.
+//
+// This exists because disk.Options.MaxBatchBytes and MaxBatchRecords refuse an
+// oversized batch rather than splitting it, which is the only thing they can do
+// without breaking the guarantee AddNodes makes. The split is offered here
+// instead, where the different contract can be stated rather than assumed.
+//
+// A backend that caps nothing has nothing to split, and this is then exactly
+// AddNodes — atomic, on that backend, in that configuration. Do not rely on it:
+// which you get depends on how the store was opened, not on which call you made.
+func (g *Graph) AddNodesInBatches(nodes []*store.Node) ([]store.NodeID, error) {
+	if b, ok := g.GraphStore.(nodeBatchSplitter); ok {
+		return b.AddNodesInBatches(nodes)
+	}
+	return g.AddNodes(nodes)
+}
+
+// AddEdgesInBatches is AddNodesInBatches for edges, with the same contract.
+//
+// Endpoints must already exist. Splitting does not relax that: an edge may name
+// a node an earlier call committed, but nothing here creates one.
+func (g *Graph) AddEdgesInBatches(edges []*store.Edge) ([]store.EdgeID, error) {
+	if b, ok := g.GraphStore.(edgeBatchSplitter); ok {
+		return b.AddEdgesInBatches(edges)
+	}
+	return g.AddEdges(edges)
 }
 
 // --- Bulk property indexing ---

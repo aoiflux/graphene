@@ -147,6 +147,64 @@ type Options struct {
 	// wants when re-deriving entries from the blobs themselves, and never what
 	// they want by accident, which is why it has to be asked for.
 	SkipProperties bool
+
+	// MaxBatchBytes commits a batch once its records hold this many bytes,
+	// whichever of the two limits is reached first. Zero caps nothing by bytes.
+	//
+	// BatchSize counts records, which is the wrong unit as soon as records vary
+	// in size: a thousand records is a few hundred kilobytes of small nodes and
+	// a gigabyte of large ones, and a figure chosen for the first is a memory
+	// event on the second. A dump is exactly where the caller does not know
+	// which they have, because they are importing it.
+	//
+	// The two are both enforced for the reason disk.Options.MaxBatchBytes gives:
+	// a byte cap alone does not bound a million empty nodes, and a record cap
+	// alone does not bound ten records carrying a gigabyte each.
+	//
+	// Counted as the destination counts it, near enough: the record structures
+	// plus their labels and property blobs. This package is backend-agnostic and
+	// cannot ask the store what it will charge, so the figure is an estimate
+	// used to decide when to flush and never reported as a measurement.
+	MaxBatchBytes int64
+
+	// Compact is evaluated after every batch, and a destination that can compact
+	// is compacted when it fires. The zero policy never fires, which is what an
+	// import did before this existed.
+	//
+	// An import with no schedule accumulates the whole dump in the delta and the
+	// index before anything folds it into an image, so its peak follows the size
+	// of the dump rather than the size of a batch. That is fine for a dump that
+	// fits and is the failure mode for one that does not. See
+	// store.DefaultCompactionPolicy and, for what to set it to against a
+	// ceiling, docs/USER_GUIDE.md.
+	//
+	// The destination must report StorageStats and offer Compact for this to do
+	// anything; both bundled backends do. One that does not is not an error and
+	// the schedule is silently inert, the same position every other optional
+	// fast-path in this package takes.
+	Compact store.CompactionPolicy
+
+	// Reopen, when set, is called after each compaction Compact fired, and
+	// returns the destination the import goes on writing to.
+	//
+	// # Why this is a callback and not a flag
+	//
+	// A compaction writes a new image and then goes on serving the records it
+	// wrote from the heap, because a base is attached on the load path and a
+	// compaction is not one. Reopening after one is what gives those bytes back,
+	// and it is the difference between an ingest that holds a stated ceiling and
+	// one that ratchets past it -- docs/MEMORY_MODEL.md section 9.8 measured a
+	// rebuild that died holding 661.8 MiB of payload it had already written.
+	//
+	// But reopening closes the handle, and the handle belongs to the caller: it
+	// is the thing they will use after this returns, and this package cannot
+	// reach it. So the caller performs the reopen and hands back what to write
+	// to next. disk.Store.CompactAndReopen is the call to make inside it.
+	//
+	// Returning an error stops the import. Returning a nil Dest is an error for
+	// the same reason -- there would be nothing to write the rest of the dump
+	// to.
+	Reopen func(Dest) (Dest, error)
 }
 
 // DefaultBatchSize is how many records an import commits at once when Options
@@ -187,6 +245,78 @@ type nodeBatcher interface {
 
 type edgeBatcher interface {
 	AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error)
+}
+
+// compactor is the optional schedule fast-path, in the same shape and for the
+// same reason as the two batchers above: a destination that offers both halves
+// can be kept bounded during the import, and one that does not is imported
+// exactly as it was before.
+//
+// Two methods rather than a CompactIfDue, because those are the two the disk
+// backend actually exposes on the store -- the paired helper lives a layer up on
+// graphene.Graph, and asserting for it here would mean the wrapper satisfied the
+// interface and the thing the wrapper is holding did not.
+type compactor interface {
+	StorageStats() store.StorageStats
+	Compact() error
+}
+
+// nodeBatchBytes estimates what a batch of nodes holds.
+//
+// The constant is the disk backend's empty-record cost -- a version cell and a
+// record header -- and the labels are two bytes each, which is what a NodeType
+// is. It is an estimate and is documented as one on Options.MaxBatchBytes: this
+// package writes to an interface and cannot ask what the implementation on the
+// other side will charge. What it has to be is monotonic in the record's size,
+// and it is.
+func nodeBatchBytes(n *store.Node) int64 {
+	return 80 + int64(len(n.Properties)) + int64(len(n.Labels))*2
+}
+
+// edgeBatchBytes is nodeBatchBytes for edges, whose empty cost is higher by the
+// two endpoints and the weight.
+func edgeBatchBytes(e *store.Edge) int64 {
+	return 104 + int64(len(e.Properties)) + int64(len(e.Labels))*2
+}
+
+// maybeCompact runs the schedule after a batch, returning the destination to go
+// on writing to.
+//
+// Returns dst unchanged when nothing fired, when the destination cannot compact,
+// or when no reopen hook was given -- three quiet paths and one that does work,
+// which is the shape that lets the caller assign unconditionally.
+func maybeCompact(dst Dest, opts Options) (Dest, error) {
+	// Before the assertion and before StorageStats, which on the disk backend is
+	// a read lock and a reach into the log and the property index. An import
+	// with no schedule runs this once per batch and it must cost a comparison,
+	// so that "behaves exactly as it did before" is true of the work as well as
+	// of the result.
+	if opts.Compact == (store.CompactionPolicy{}) {
+		return dst, nil
+	}
+	c, ok := dst.(compactor)
+	if !ok {
+		return dst, nil
+	}
+	if due, _ := opts.Compact.Evaluate(c.StorageStats()); !due {
+		return dst, nil
+	}
+	if opts.Reopen == nil {
+		if err := c.Compact(); err != nil {
+			return dst, fmt.Errorf("bulk: interim compaction: %w", err)
+		}
+		return dst, nil
+	}
+	// The hook compacts as well as reopens -- disk.Store.CompactAndReopen is one
+	// call and doing the compaction here first would do it twice.
+	next, err := opts.Reopen(dst)
+	if err != nil {
+		return dst, fmt.Errorf("bulk: reopen after interim compaction: %w", err)
+	}
+	if next == nil {
+		return dst, fmt.Errorf("bulk: Options.Reopen returned no destination")
+	}
+	return next, nil
 }
 
 // header reads the declarations off a source that reports them. A source that

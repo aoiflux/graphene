@@ -308,9 +308,10 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 		return err
 	}
 
-	var started time.Time
+	var started, stageStart time.Time
 	if s.metricsOn() {
 		started = time.Now()
+		stageStart = started
 	}
 
 	plan, err := s.compactPin()
@@ -322,6 +323,21 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 		return err
 	}
 	defer s.compactRelease()
+
+	// The pin is emitted here rather than after the budget gate below, so a
+	// compaction the gate refuses still reports what the pin holds. That is the
+	// one moment an operator most needs the figure -- a refusal says the store
+	// is too large to compact within the budget, and this says how much of that
+	// is the delta the pin just copied.
+	//
+	// It does mean a refused compaction emits one stage metric and no
+	// MetricCompaction. That is correct rather than untidy: no compaction
+	// happened, so there is no compaction to record, and the stage gauges are
+	// not an error rate.
+	s.recordCompactStage(store.MetricCompactPin, stageStart, nil)
+	if s.metricsOn() {
+		stageStart = time.Now()
+	}
 
 	// The memory gate, and this is the only place it can be. Before the pin there
 	// are no counts to model from; after the build there is nothing left to
@@ -348,8 +364,18 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 	// because every way the commit can end leaves this the last word on a
 	// mapping the index did not take.
 	defer plan.releasePendingBase()
+	// The build is the stage that holds the most and the stage that runs
+	// longest, and it is the one whose figures nothing reported before this.
+	s.recordCompactStage(store.MetricCompactBuild, stageStart, err)
+	if s.metricsOn() {
+		stageStart = time.Now()
+	}
 	if err == nil {
 		err = s.compactCommit(plan, newCSR, tmpPath)
+		// Inside the branch: a commit that did not run has no duration and no
+		// figures worth a reading, and emitting one would put a stage in the
+		// record that never happened.
+		s.recordCompactStage(store.MetricCompactCommit, stageStart, err)
 	}
 	if err == nil {
 		s.warnIDHeadroom()

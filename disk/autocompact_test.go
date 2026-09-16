@@ -2,7 +2,7 @@ package disk
 
 // The background compactor's lifecycle.
 //
-// The trigger itself is four comparisons in CompactionPolicy.Evaluate, which is
+// The trigger itself is five comparisons in CompactionPolicy.Evaluate, which is
 // tested where it lives. What is new and worth testing is that a goroutine now
 // exists at all: that it fires, that Close waits for it rather than closing the
 // files underneath it, and that Close stays idempotent.

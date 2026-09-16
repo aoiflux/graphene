@@ -145,6 +145,39 @@ const (
 	//
 	// Appended at the end, per MetricIDHeadroomLow's note.
 	MetricDeltaOverBudget
+
+	// MetricCompactPin, MetricCompactBuild and MetricCompactCommit are the three
+	// stages of one compaction, emitted as each finishes. MetricCompaction still
+	// reports the whole, and these say where inside it the memory went.
+	//
+	// They exist because the peak of a compaction was known only as a single
+	// figure for the whole operation -- measured at roughly 2.6x the modelled
+	// heap during a rebuild (docs/MEMORY_MODEL.md section 9.8) -- and "2.6x"
+	// spread over three stages is not something an engineer can act on. The pin
+	// copies the delta under the lock, the build materialises and serialises a
+	// whole new image with no lock held, and the commit splices and publishes.
+	// They hold very different amounts and only one of them can be made smaller
+	// without changing what a compaction guarantees.
+	//
+	// Count is the modelled resident total, Examined is the process's anonymous
+	// bytes and Bytes is its peak resident, all read at the moment the stage
+	// ended. The peak never resets, so the stage whose Bytes exceeds the
+	// previous stage's is the stage that moved the high-water mark -- which is
+	// the question these were added to answer.
+	//
+	// A stage that failed still emits, with Err set: a compaction that ran out
+	// of memory in the build is precisely the event worth having a measurement
+	// of, and one that reported nothing because it failed would be missing its
+	// most useful emission.
+	//
+	// The figures come from the operating system where it will answer and are
+	// zero where it will not -- darwin reports only a peak, and platforms
+	// outside linux, windows and darwin report nothing. A zero here means "not
+	// measurable", never "no memory held"; see StorageStats.ResidentSource for
+	// the same distinction in polled form.
+	MetricCompactPin
+	MetricCompactBuild
+	MetricCompactCommit
 )
 
 // String names the kind, for a sink that labels its output.
@@ -176,6 +209,12 @@ func (k MetricKind) String() string {
 		return "index-fallback"
 	case MetricDeltaOverBudget:
 		return "delta-over-budget"
+	case MetricCompactPin:
+		return "compact-pin"
+	case MetricCompactBuild:
+		return "compact-build"
+	case MetricCompactCommit:
+		return "compact-commit"
 	default:
 		return "unknown"
 	}
@@ -198,6 +237,9 @@ func (k MetricKind) String() string {
 //	backup           files copied             —                        bytes copied
 //	refresh          epochs advanced          —                        log bytes applied
 //	id-headroom-low  highest ID issued        the ID ceiling           -
+//	compact-pin      modelled resident bytes  process anonymous bytes  process peak resident
+//	compact-build    modelled resident bytes  process anonymous bytes  process peak resident
+//	compact-commit   modelled resident bytes  process anonymous bytes  process peak resident
 //
 // Duration is wall-clock for the operation, measured around the work rather than
 // around the whole call, and is zero for the two snapshot kinds. Err is non-nil

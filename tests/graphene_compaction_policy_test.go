@@ -3,6 +3,7 @@ package graphene_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aoiflux/graphene"
@@ -155,6 +156,10 @@ func TestCompactionPolicy_Rules(t *testing.T) {
 		policy store.CompactionPolicy
 		stats  store.StorageStats
 		want   bool
+
+		// reason, when set, is a substring the fired rule's explanation must
+		// contain -- which rule fired, not merely that one did.
+		reason string
 	}{
 		{
 			name:   "zero policy never fires",
@@ -217,6 +222,60 @@ func TestCompactionPolicy_Rules(t *testing.T) {
 			want:   false,
 		},
 		{
+			name:   "resident bytes fire where the delta rules cannot",
+			policy: store.CompactionPolicy{MaxResidentBytes: 1 << 20},
+			stats:  store.StorageStats{DeltaNodes: 3, DeltaBytes: 4096, EstimatedResidentBytes: 1 << 20},
+			want:   true,
+		},
+		{
+			// The case the rule exists for, stated as data: a store whose delta
+			// is small and whose property index is not. All four of the older
+			// rules are quiet here, because none of them can see the index.
+			name: "a small delta over a large index fires nothing but the resident rule",
+			policy: store.CompactionPolicy{
+				MaxDeltaRecords: 100_000, MaxDeltaBytes: 128 << 20,
+				MaxWALBytes: 256 << 20, MaxDeltaRatio: 0.5,
+			},
+			stats: store.StorageStats{
+				DeltaNodes: 10, CSRNodes: 1_000_000, WALBytes: 4096, DeltaBytes: 4096,
+				PropertyNodeEntries: 13_000_000, EstimatedResidentBytes: 3 << 30,
+			},
+			want: false,
+		},
+		{
+			name: "the same stats with the resident rule set",
+			policy: store.CompactionPolicy{
+				MaxDeltaRecords: 100_000, MaxDeltaBytes: 128 << 20,
+				MaxWALBytes: 256 << 20, MaxDeltaRatio: 0.5,
+				MaxResidentBytes: 1 << 30,
+			},
+			stats: store.StorageStats{
+				DeltaNodes: 10, CSRNodes: 1_000_000, WALBytes: 4096, DeltaBytes: 4096,
+				PropertyNodeEntries: 13_000_000, EstimatedResidentBytes: 3 << 30,
+			},
+			want: true,
+		},
+		{
+			// Zero must read as "cannot say", the position MaxDeltaBytes takes.
+			name:   "a backend that cannot estimate never fires it",
+			policy: store.CompactionPolicy{MaxResidentBytes: 1},
+			stats:  store.StorageStats{DeltaNodes: 1 << 20},
+			want:   false,
+		},
+		{
+			// Precedence: where a delta rule and the resident rule would both
+			// fire, the reason names the delta, because that is what grew.
+			name: "a delta rule takes precedence in the reason",
+			policy: store.CompactionPolicy{
+				MaxDeltaBytes: 1 << 20, MaxResidentBytes: 1 << 20,
+			},
+			stats: store.StorageStats{
+				DeltaNodes: 3, DeltaBytes: 1 << 20, EstimatedResidentBytes: 1 << 30,
+			},
+			want:   true,
+			reason: "delta records hold",
+		},
+		{
 			name:   "below every limit stays quiet",
 			policy: store.DefaultCompactionPolicy(),
 			stats:  store.StorageStats{DeltaNodes: 10, CSRNodes: 1000, WALBytes: 4096},
@@ -233,6 +292,9 @@ func TestCompactionPolicy_Rules(t *testing.T) {
 			}
 			if !got && why != "" {
 				t.Fatalf("did not fire but gave a reason: %q", why)
+			}
+			if tc.reason != "" && !strings.Contains(why, tc.reason) {
+				t.Fatalf("reason is %q, want one containing %q", why, tc.reason)
 			}
 		})
 	}
@@ -557,5 +619,92 @@ func TestDeltaSoftLimit_ZeroIsSilent(t *testing.T) {
 	}
 	if n := sk.count(store.MetricDeltaOverBudget); n != 0 {
 		t.Fatalf("emitted %d budget events with no budget set", n)
+	}
+}
+
+// --- The resident rule, and the term the other four cannot see ---
+
+// The resident rule fires on a store every other rule is quiet about.
+//
+// This is the case the four older rules were always going to miss, and the
+// reason MaxResidentBytes exists: the property index is not in DeltaBytes, is
+// not in the record counts, and is not in the log once a compaction has folded
+// the writes into the image. A store can therefore sit far past a memory ceiling
+// with all four rules reporting nothing to do.
+//
+// Pinned against a real store rather than a StorageStats literal, for the reason
+// the byte rule's test gives: a literal would pass with nothing wired between
+// the index's accounting and the policy.
+func TestCompactionPolicy_ResidentRuleCatchesWhatTheOthersCannot(t *testing.T) {
+	g := openDisk(t)
+
+	ids, err := g.AddNodes(blobNodes(64, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Index a great many entries against a handful of records. Every write here
+	// grows the property index and none of them grows the delta.
+	const keysPerNode = 64
+	props := make(map[string][]byte, keysPerNode)
+	for i := range ids {
+		clear(props)
+		for k := 0; k < keysPerNode; k++ {
+			props[string(rune('a'+k%26))+string(rune('a'+k/26))] =
+				[]byte{byte(i), byte(k), byte(i >> 8)}
+		}
+		if err := g.IndexNodeProperties(ids[i], props); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Fold the records into the image so the delta and the log are both small,
+	// which is what leaves the four older rules with nothing to fire on.
+	if err := g.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, ok := g.StorageStats()
+	if !ok {
+		t.Fatal("disk backend should report storage stats")
+	}
+	if s.EstimatedResidentBytes <= 0 {
+		t.Fatalf("backend reports %d estimated resident bytes; this test needs a backend that estimates",
+			s.EstimatedResidentBytes)
+	}
+	if s.PropertyNodeEntries < 1000 {
+		t.Fatalf("fixture is not the shape this tests: %d indexed entries", s.PropertyNodeEntries)
+	}
+
+	// The four older rules, set where nothing in this store reaches them.
+	blind := store.CompactionPolicy{
+		MaxDeltaRecords: 10_000,
+		MaxDeltaBytes:   64 << 20,
+		MaxWALBytes:     256 << 20,
+		MaxDeltaRatio:   0.5,
+	}
+	if due, why := g.ShouldCompact(blind); due {
+		t.Fatalf("an older rule fired on a store holding %d bytes in %d delta records: %s",
+			s.EstimatedResidentBytes, s.DeltaNodes+s.DeltaEdges, why)
+	}
+
+	// The same policy with the fifth rule set to what the store is holding.
+	seeing := blind
+	seeing.MaxResidentBytes = s.EstimatedResidentBytes
+	due, why := g.ShouldCompact(seeing)
+	if !due {
+		t.Fatalf("backend holds %d estimated bytes against a %d limit and no compaction was advised",
+			s.EstimatedResidentBytes, seeing.MaxResidentBytes)
+	}
+	if why == "" {
+		t.Fatal("advice given with no reason")
+	}
+
+	// And it is quiet under a ceiling the store is genuinely inside, so what
+	// fired above was the comparison rather than the rule's mere presence.
+	roomy := blind
+	roomy.MaxResidentBytes = s.EstimatedResidentBytes * 4
+	if due, why := g.ShouldCompact(roomy); due {
+		t.Fatalf("fired against a limit four times what the store holds: %s", why)
 	}
 }

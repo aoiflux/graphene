@@ -39,8 +39,8 @@ import (
 // defaultAutoCompactInterval is how often the policy is evaluated when a caller
 // enables auto-compaction without saying.
 //
-// Evaluation is a read lock and four comparisons, so the interval is not chosen
-// to make it cheap — it is chosen to bound how far past a threshold a store can
+// Evaluation is a read lock, five comparisons and the O(1) resident estimate
+// the fifth one reads, so the interval is not chosen to make it cheap — it is chosen to bound how far past a threshold a store can
 // drift before anything notices. Thirty seconds is short against the growth
 // rates the default policy trips on and long enough that an idle store spends
 // no measurable time awake.

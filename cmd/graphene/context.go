@@ -137,6 +137,29 @@ func (c *Context) Graph() *graphene.Graph {
 	return c.graph
 }
 
+// ReopenGraph compacts and reopens the graph, and installs the new handle.
+//
+// A compaction writes a new image and then goes on serving the records it wrote
+// out of the heap, because a base is attached on the load path and a compaction
+// is not one. A long import therefore ratchets: once per record written, for the
+// life of the handle. Reopening is what gives those bytes back, and it is the
+// difference between an import that holds a ceiling and one that does not --
+// docs/MEMORY_MODEL.md section 9.8 measured a rebuild that died holding 661.8
+// MiB it had already written to disk.
+//
+// The handle is swapped in place because the framework's closer reads the field.
+// On any error the old handle may already be closed, so the caller must stop:
+// graphene.Graph.CompactAndReopen says which failures leave it usable and this
+// deliberately does not try to tell them apart.
+func (c *Context) ReopenGraph() error {
+	g, err := c.Graph().CompactAndReopenCtx(c.Ctx)
+	if err != nil {
+		return err
+	}
+	c.graph = g
+	return nil
+}
+
 // open acquires whatever the command declared, and returns the closer.
 //
 // Every path goes through OpenWithOptions rather than the four convenience
@@ -178,7 +201,11 @@ func (c *Context) open(mode OpenMode) (func(), error) {
 			return nil, err
 		}
 		c.graph = g
-		return func() { _ = g.Close() }, nil
+		// Reads the field rather than closing the handle captured here, so a
+		// command that replaces the graph mid-run closes the one it finished
+		// with. ReopenGraph is the only thing that replaces it, and without this
+		// it would close a handle already closed and leak the one in use.
+		return func() { _ = c.graph.Close() }, nil
 	}
 	return func() {}, nil
 }

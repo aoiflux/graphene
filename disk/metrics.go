@@ -54,3 +54,41 @@ func (s *Store) sinceIfOn(started time.Time) time.Duration {
 	}
 	return time.Since(started)
 }
+
+// recordCompactStage emits one of the three per-stage compaction metrics.
+//
+// Called with no store lock held, from CompactCtx, at each point a stage
+// returns. EstimateResident takes the read lock itself and releases it before
+// the sink is called, which keeps the rule store/metrics.go states: a sink is
+// caller code and must not run under the store lock.
+//
+// The cost when a sink is attached is one read-lock hold of an O(1) estimate and
+// one read of the process's memory counters, three times per compaction. That is
+// nothing beside a build, which is where every second of a compaction goes, and
+// it is skipped entirely when nothing is listening.
+//
+// err is carried through rather than short-circuiting on it: a stage that failed
+// is the emission most worth having, because a compaction that ran out of memory
+// in the build is exactly the event these were added to attribute.
+func (s *Store) recordCompactStage(kind store.MetricKind, started time.Time, err error) {
+	if !s.metricsOn() {
+		return
+	}
+	duration := s.sinceIfOn(started)
+	est := s.EstimateResident()
+
+	// Zero where the platform will not answer. store.MetricCompactPin documents
+	// that a zero here means "not measurable" and never "no memory held"; there
+	// is nothing useful to substitute, and substituting the modelled figure
+	// would quietly turn a measurement into the model it exists to check.
+	mem, _ := readSysMemory()
+
+	s.record(store.Metric{
+		Kind:     kind,
+		Duration: duration,
+		Count:    est.Total,
+		Examined: int64(mem.Anon),
+		Bytes:    int64(mem.Peak),
+		Err:      err,
+	})
+}

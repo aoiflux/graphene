@@ -280,6 +280,12 @@ type record struct {
 // destination supports it. Property entries are not batched: IndexNodeProperty
 // takes one entry, and on the disk backend it is a single unbatched WAL append
 // either way, so buffering them would add memory and remove nothing.
+//
+// A batch is committed when it reaches Options.BatchSize records or
+// Options.MaxBatchBytes bytes, whichever comes first, and Options.Compact is
+// evaluated after every commit. dst is reassigned rather than fixed because
+// Options.Reopen may hand back a different destination -- every closure below
+// reads the variable, so a swap reaches all of them.
 func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 	var sum Summary
 
@@ -294,13 +300,16 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 
 	ids := newIDMap()
 	size := opts.batchSize()
+	maxBytes := opts.MaxBatchBytes
 
 	// pendingNodes holds the exported records alongside the values handed to the
 	// store, because the store rewrites ID in place and the map needs both.
 	var pendingNodes []*store.Node
 	var pendingNodeIDs []store.NodeID
+	var pendingNodeBytes int64
 	var pendingEdges []*store.Edge
 	var pendingEdgeIDs []store.EdgeID
+	var pendingEdgeBytes int64
 
 	flushNodes := func() error {
 		if len(pendingNodes) == 0 {
@@ -316,7 +325,9 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 		sum.Nodes += int64(len(pendingNodes))
 		pendingNodes = pendingNodes[:0]
 		pendingNodeIDs = pendingNodeIDs[:0]
-		return nil
+		pendingNodeBytes = 0
+		dst, err = maybeCompact(dst, opts)
+		return err
 	}
 	flushEdges := func() error {
 		if len(pendingEdges) == 0 {
@@ -332,7 +343,9 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 		sum.Edges += int64(len(pendingEdges))
 		pendingEdges = pendingEdges[:0]
 		pendingEdgeIDs = pendingEdgeIDs[:0]
-		return nil
+		pendingEdgeBytes = 0
+		dst, err = maybeCompact(dst, opts)
+		return err
 	}
 
 	var trailer Trailer
@@ -353,7 +366,8 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 			rec.node.ID = 0
 			pendingNodes = append(pendingNodes, rec.node)
 			pendingNodeIDs = append(pendingNodeIDs, exported)
-			if len(pendingNodes) >= size {
+			pendingNodeBytes += nodeBatchBytes(rec.node)
+			if len(pendingNodes) >= size || (maxBytes > 0 && pendingNodeBytes >= maxBytes) {
 				if err := flushNodes(); err != nil {
 					return sum, err
 				}
@@ -380,7 +394,8 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 			rec.edge.Dst = dstID
 			pendingEdges = append(pendingEdges, rec.edge)
 			pendingEdgeIDs = append(pendingEdgeIDs, exported)
-			if len(pendingEdges) >= size {
+			pendingEdgeBytes += edgeBatchBytes(rec.edge)
+			if len(pendingEdges) >= size || (maxBytes > 0 && pendingEdgeBytes >= maxBytes) {
 				if err := flushEdges(); err != nil {
 					return sum, err
 				}

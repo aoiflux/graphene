@@ -33,6 +33,7 @@ import (
 	"github.com/aoiflux/graphene"
 	"github.com/aoiflux/graphene/bulk"
 	"github.com/aoiflux/graphene/disk"
+	"github.com/aoiflux/graphene/store"
 )
 
 // --- backup create ---
@@ -215,11 +216,40 @@ func exportSource(g *graphene.Graph) (bulk.Source, func() error) {
 // --- import graph ---
 
 type importOpts struct {
-	format  string
-	from    string
-	batch   int
-	compact bool
+	format     string
+	from       string
+	batch      int
+	batchBytes int64
+	boundMiB   int64
+	compact    bool
 }
+
+// What the import bounds itself by when nobody says otherwise.
+//
+// An import with no bound accumulates the whole dump -- records in the delta,
+// entries in the property index -- until something folds it into an image, so
+// its peak follows the size of the dump rather than the size of the machine.
+// docs/MEMORY_MODEL.md section 9.8 measured that shape dying at 1,200,000
+// records while holding 1,843.0 MiB under a 2 GiB ceiling, and it died at
+// exactly the library's shipped 128 MiB delta bound. The arm that passed was
+// 32 MiB *with a reopen after every interim compaction*, at 880.7 MiB and 57.0%
+// headroom: the reopen is not an optimisation, it is the half that gives back
+// the payload a compaction goes on holding.
+//
+// So the tool takes the passing configuration and store.DefaultCompactionPolicy
+// keeps the compatible one. A caller embedding the library gets what they had;
+// an operator running this command against a dump larger than memory gets a
+// store instead of a fatal error. -bound 0 restores the unbounded behaviour for
+// whoever has measured that it is faster on a dump that fits.
+//
+// The byte cap is a second unit rather than a smaller -batch: -batch counts
+// records, and a thousand records is a few hundred kilobytes of small nodes or
+// a gigabyte of large ones. A dump is precisely where the operator does not
+// know which they have, because they are importing it to find out.
+const (
+	defaultImportBoundMiB   = 32
+	defaultImportBatchBytes = 8 << 20
+)
 
 var importGraph = cmd(Command{
 	Group: "import", Name: "graph", Aliases: []string{"import"},
@@ -235,6 +265,10 @@ var importGraph = cmd(Command{
 		fs.StringVar(&o.from, "from", "",
 			"file (jsonl, dump) or directory (csv) to read (required)")
 		fs.IntVar(&o.batch, "batch", 0, "records committed together (0 = default)")
+		fs.Int64Var(&o.batchBytes, "batch-bytes", defaultImportBatchBytes,
+			"bytes of records committed together, whichever limit is reached first (0 = no byte cap)")
+		fs.Int64Var(&o.boundMiB, "bound", defaultImportBoundMiB,
+			"MiB of delta after which the import compacts and reopens mid-import (0 = never)")
 		fs.BoolVar(&o.compact, "compact", true,
 			"compact once at the end, so the first open of the result is fast")
 	},
@@ -254,7 +288,30 @@ func runImportGraph(cx *Context, o *importOpts) (Result, error) {
 	}
 
 	g := cx.Graph()
-	opts := bulk.Options{BatchSize: o.batch}
+	opts := bulk.Options{BatchSize: o.batch, MaxBatchBytes: o.batchBytes}
+	interim := 0
+	if o.boundMiB > 0 {
+		// The other four rules come from the library default so that -bound
+		// changes one thing and only one thing. A schedule watching bytes alone
+		// would never fire on a dump of small nodes -- MaxDeltaRecords is what
+		// covers that shape -- and a store with no image yet fails the ratio
+		// rule by construction, which is why the default sets both.
+		opts.Compact = store.DefaultCompactionPolicy()
+		opts.Compact.MaxDeltaBytes = o.boundMiB << 20
+		// Compacts and reopens in one call, and installs the new handle on the
+		// Context, so the closer the framework is holding and the `g` below both
+		// end up on the handle the import finished with rather than one this
+		// hook closed. Returning the new store is what the rest of the dump is
+		// written to; see bulk.Options.Reopen for why bulk cannot do this
+		// itself.
+		opts.Reopen = func(bulk.Dest) (bulk.Dest, error) {
+			if err := cx.ReopenGraph(); err != nil {
+				return nil, err
+			}
+			interim++
+			return cx.Graph().GraphStore, nil
+		}
+	}
 	var sum bulk.Summary
 	var err error
 
@@ -274,6 +331,9 @@ func runImportGraph(cx *Context, o *importOpts) (Result, error) {
 		}
 		closeSrc()
 	}
+	// Any interim reopen replaced the handle, so the one opened at the top of
+	// this function may be closed. Everything below reads the current one.
+	g = cx.Graph()
 	if err != nil {
 		// Said plainly, because it is the one thing an operator has to act on:
 		// an import is not a transaction and cannot be, so what is in the
@@ -293,6 +353,13 @@ func runImportGraph(cx *Context, o *importOpts) (Result, error) {
 	s.Add("edge properties", Int(int64(sum.EdgeProperties)))
 	if sum.Declarations > 0 {
 		s.Add("index declarations re-declared", Int(int64(sum.Declarations)))
+	}
+	if interim > 0 {
+		// Reported because it is the difference between an import that held a
+		// ceiling and one that happened to fit, and because each one is a whole
+		// rewrite of the image: an operator watching this climb is watching the
+		// bound they chose decide how much the import writes.
+		s.Add("interim compactions", Int(int64(interim)))
 	}
 	r.Notice("IDs were reassigned: the imported graph is isomorphic to the original, not identical")
 

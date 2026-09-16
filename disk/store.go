@@ -201,6 +201,22 @@ type Store struct {
 	// budget.go.
 	memBudget int64
 
+	// memBudgetSource names the instrument a discovered budget came from, and is
+	// empty when the caller stated one or when nothing was discovered.
+	//
+	// Kept because a figure the caller did not choose has to be explicable. A
+	// store refusing a compaction against a budget nobody set, with nothing
+	// saying where it came from, is the kind of refusal an operator cannot act
+	// on. StorageStats.MemoryBudgetSource is where it surfaces.
+	memBudgetSource string
+
+	// batchCaps is Options.MaxBatchBytes and MaxBatchRecords resolved against the
+	// budget, the way compactBufs is Options.Compact resolved. Set once at Open,
+	// and read on every batch write with no lock: the fields never change after
+	// Open, so the check can run before the lock is taken, which is where a
+	// refusal has to happen if it is to burn no identifiers.
+	batchCaps batchCaps
+
 	// compactBufs is Options.Compact divided into the four sizes a mapped-index
 	// compaction is built with. Resolved once at Open, for the reason memBudget
 	// is kept: the store compacts on a timer and has to know months later. A
@@ -435,6 +451,14 @@ func (s *Store) StorageStats() store.StorageStats {
 	}
 	st.ImageMode, _ = s.imageHolding()
 	st.IndexMode = s.indexHolding()
+
+	// The budget in force and where it came from. Both are set once at Open and
+	// never change, so they cost two field reads; they are here rather than only
+	// on Options because a caller that did not construct the store -- an
+	// operator reading stats, a test asserting a discovered figure -- has no
+	// other way to see which of the two a refusal would be measured against.
+	st.MemoryBudgetBytes = s.memBudget
+	st.MemoryBudgetSource = s.memBudgetSource
 	st.ImageVersion = s.imageVersion
 	st.IndexOnDisk = s.imageIndexOnDisk
 
@@ -983,6 +1007,83 @@ type Options struct {
 	// store.
 	MemoryBudget int64
 
+	// DiscoverMemoryBudget asks the engine to read the memory ceiling this
+	// process is already running under and derive MemoryBudget from it, when
+	// MemoryBudget is not set. Off by default.
+	//
+	// # Why this is a flag and not the meaning of zero
+	//
+	// Zero MemoryBudget is documented above as unlimited and has been since the
+	// option existed. Quietly redefining it would change the behaviour of every
+	// deployment that never set it -- a store that opened yesterday might refuse
+	// to open today because the engine discovered a figure nobody asked it to
+	// look for. That is the same silent reinterpretation of a shipped default
+	// that was refused for what MaxDeltaBytes counts, and it is refused here for
+	// the same reason.
+	//
+	// # An explicit budget always wins
+	//
+	// A MemoryBudget the caller set is used exactly as given, and this flag then
+	// does nothing -- it can never raise a stated figure, and it can never
+	// lower one either. Discovery is for the caller who does not know what
+	// environment the program will run in, not a second opinion about one who
+	// does.
+	//
+	// # What is discovered, and what fraction of it is taken
+	//
+	// A cgroup v2 or v1 memory limit on linux, a Job Object memory limit on
+	// windows, and on either platform the machine's size when there is no limit;
+	// on darwin the machine's size alone, because no per-process ceiling there
+	// constrains the class this engine cares about. StorageStats.MemoryBudgetSource
+	// names which of those answered, and reports "" on a platform that answered
+	// nothing -- where this flag leaves MemoryBudget at zero rather than
+	// inventing a figure.
+	//
+	// Only a fraction of the discovered ceiling is taken, and a smaller fraction
+	// of a machine than of a limit. The reason is the last paragraph of
+	// MemoryBudget above: the figure is a whole-store one and nothing here knows
+	// what else the program has allocated, so a budget set to the container's
+	// limit is a budget with no room for the program using the store. A budget
+	// derived from a limit is therefore always strictly below it.
+	DiscoverMemoryBudget bool
+
+	// MaxBatchBytes and MaxBatchRecords cap a single AddNodesBatch or
+	// AddEdgesBatch. A batch over either is refused with an error wrapping
+	// ErrBatchTooLarge and carrying both figures; see BatchTooLargeError.
+	//
+	// # Why two dimensions
+	//
+	// A byte cap does not bound ten million empty nodes -- each is 80 bytes of
+	// structure carrying no payload, so the byte figure stays small while the
+	// allocation does not. A record cap does not bound ten records carrying a
+	// gigabyte each. Whichever is reached first refuses the batch.
+	//
+	// MaxBatchBytes is counted the way the delta counts the same records, so it
+	// and MaxDeltaBytes are in the same units.
+	//
+	// # Zero derives from MemoryBudget, or caps nothing
+	//
+	// Left at zero, each is derived from the memory budget in force -- including
+	// one DiscoverMemoryBudget found, so a store that discovered a 2 GiB cgroup
+	// limit refuses batches a store on a 64 GiB machine accepts, with no figure
+	// written down by either caller. That derivation is Badger's: its batch caps
+	// come out of its memory configuration rather than sitting beside it, so a
+	// caller who turns memory down gets smaller batches without a second
+	// decision and the two settings cannot be put into disagreement.
+	//
+	// With no budget at all, zero caps nothing and these calls behave exactly as
+	// they did before the option existed. An upgrade does not start refusing
+	// batches that a program has always passed.
+	//
+	// # It refuses; it does not split
+	//
+	// AddNodes documents that either every node is added or none is, and
+	// splitting an oversized batch here would break that for every caller
+	// relying on it. The error names both caps and the figures measured, which
+	// is what a caller needs to split by the one that actually bound.
+	MaxBatchBytes   int64
+	MaxBatchRecords int
+
 	// Compact sizes the intermediates a compaction holds while it builds. The
 	// zero value is every prior version's behaviour; see CompactOptions, which
 	// says what the one figure covers and what it deliberately does not.
@@ -1265,6 +1366,22 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := opts.Compact.validate(); err != nil {
 		return nil, fmt.Errorf("disk.Open: %w", err)
 	}
+	// The batch caps are the same kind of arithmetic-only refusal, and belong
+	// beside it: a cap no batch could ever satisfy is a store nothing can write
+	// to, and finding that out on the first write is finding it out too late.
+	if err := validateBatchCaps(opts); err != nil {
+		return nil, fmt.Errorf("disk.Open: %w", err)
+	}
+
+	// Discovery next, and before anything reads opts.MemoryBudget -- the Open
+	// budget check below, the store field it is kept in, and openOpts, which a
+	// reopen after a compaction is built from. Resolving it once here is what
+	// makes a discovered budget as stable across a store's life as a stated one.
+	//
+	// It reads a file on linux and calls the kernel on windows, so it is not
+	// free; it happens once per Open, only when asked for, and an Open is
+	// already a log replay.
+	opts, budgetSource := resolveMemoryBudget(opts)
 
 	// Creating the directory is a write, so a read-only open does not do it. A
 	// missing directory is then a real error rather than an empty store, which
@@ -1372,6 +1489,8 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		idHeadroomWarn:       opts.IDHeadroomWarn,
 		deltaSoftLimit:       opts.DeltaSoftLimit,
 		memBudget:            opts.MemoryBudget,
+		memBudgetSource:      budgetSource,
+		batchCaps:            batchCapsFor(opts),
 		compactBufs:          compactBuffersFor(opts.Compact.MaxWorkingBytes),
 		imageMode:            opts.ImageMode,
 		indexMode:            opts.IndexMode,
@@ -1616,6 +1735,15 @@ func (s *Store) AddNodesBatch(nodes []*store.Node) ([]store.NodeID, error) {
 	if err := s.mustWrite(); err != nil {
 		return nil, err
 	}
+	// The batch caps come first, for the same reason the label check below is
+	// here and not inside the loop that takes identifiers: a refusal must burn
+	// nothing. They are ahead of the label check because they are the cheaper
+	// question on the batch that most needs refusing — an oversized batch stops
+	// at a cap's worth of records rather than walking the whole slice.
+	if err := s.batchCaps.checkNodes("AddNodesBatch", nodes); err != nil {
+		return nil, err
+	}
+
 	// Labels are validated before the lock, and before any ID is taken. A
 	// rejection partway through the loop below would burn the IDs of the prefix
 	// it had already reached — permitted by the ID invariant, but pointless for
@@ -1778,6 +1906,12 @@ func (s *Store) AddEdge(e *store.Edge) (store.EdgeID, error) {
 // On error, successfully written prefixes are committed and returned.
 func (s *Store) AddEdgesBatch(edges []*store.Edge) ([]store.EdgeID, error) {
 	if err := s.mustWrite(); err != nil {
+		return nil, err
+	}
+	// The caps first, and outside the lock for the same reason the label check
+	// is: the size of the argument is a property of the argument. See
+	// AddNodesBatch.
+	if err := s.batchCaps.checkEdges("AddEdgesBatch", edges); err != nil {
 		return nil, err
 	}
 	// Labels first, outside the lock: unlike endpoint validity, an empty label

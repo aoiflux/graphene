@@ -1321,6 +1321,29 @@ type StorageStats struct {
 	// to.
 	IndexMode string
 
+	// MemoryBudgetBytes is the memory budget in force, and MemoryBudgetSource
+	// names where it came from. Zero and "" from a backend with no budget.
+	//
+	// The pair exists because a budget can now arrive two ways and a refusal has
+	// to be explicable either way. A figure the caller passed reports the figure
+	// and an empty source; a figure derived from the environment reports the
+	// instrument that produced it -- "cgroup v2 memory.max", "Job Object
+	// JOB_OBJECT_LIMIT_JOB_MEMORY", "/proc/meminfo MemTotal" and so on. An
+	// operator looking at a store that refused a compaction against a number
+	// nobody in their configuration wrote down can then see which file or call
+	// the number came out of.
+	//
+	// A source with a zero budget is impossible; a budget with an empty source
+	// means the caller set it. Asking for discovery on a platform that cannot
+	// answer reports both zero and "", which is the honest reading of "nothing
+	// was discovered" rather than a fabricated ceiling.
+	//
+	// The derived figure is always strictly below the ceiling it came from, for
+	// the reason disk.Options.MemoryBudget gives: nothing here knows what else
+	// the program has allocated.
+	MemoryBudgetBytes  int64
+	MemoryBudgetSource string
+
 	// Adjacency names whether the backend has built its image's adjacency
 	// arrays: "built", or "deferred" while it has not.
 	//
@@ -1409,6 +1432,37 @@ type CompactionPolicy struct {
 	// compacted image — the rule that catches a small store churning heavily,
 	// which MaxDeltaRecords alone would miss.
 	MaxDeltaRatio float64
+
+	// MaxResidentBytes fires when the backend's estimated retained heap reaches
+	// this figure.
+	//
+	// The other four rules watch the delta and the log. This one watches
+	// everything the backend models -- StorageStats.EstimatedResidentBytes, which
+	// sums the record arrays, the label postings, the adjacency, the delta and
+	// the property index including composites. It is the only rule that sees the
+	// index, and on a write-heavy ingest the index is the term that grows fastest
+	// relative to what MaxDeltaBytes counts: at one measured shape a delta
+	// reporting 338 bytes per record was holding 1,893, because the property
+	// entries those same writes created are not in DeltaBytes and never were.
+	//
+	// It is additive. It does not change what MaxDeltaBytes counts, and a caller
+	// who sets both gets whichever fires first.
+	//
+	// # It is a floor, not a budget
+	//
+	// EstimatedResidentBytes is retained heap, and the process charges more than
+	// that. docs/MEMORY_MODEL.md section 9.8 measured the gap during a rebuild at
+	// roughly 2.6x the modelled figure, and section 6.4's ratio across three runs
+	// of one identical store ran 1.19x to 1.54x at rest. So a caller with a 2 GiB
+	// ceiling does not set this to 2 GiB. They set it to the ceiling divided by
+	// the ratio their own workload shows, and they measure that ratio rather than
+	// taking one from here: it depends on the shape of the records, on GOGC, and
+	// on which phase the store is in.
+	//
+	// Zero from a backend that cannot estimate, so there the rule never fires
+	// rather than firing always -- the position MaxDeltaBytes takes for the same
+	// reason.
+	MaxResidentBytes int64
 }
 
 // DefaultCompactionPolicy returns a starting point, not a tuned
@@ -1458,7 +1512,7 @@ func DefaultCompactionPolicy() CompactionPolicy {
 // Evaluate reports whether stats breach the policy, and which rule fired.
 //
 // The reason is part of the result rather than something the caller reconstructs:
-// "compact now" is not actionable on its own, and the three rules fire for
+// "compact now" is not actionable on its own, and the five rules fire for
 // genuinely different reasons.
 func (p CompactionPolicy) Evaluate(s StorageStats) (bool, string) {
 	delta := s.DeltaRecords()
@@ -1470,6 +1524,14 @@ func (p CompactionPolicy) Evaluate(s StorageStats) (bool, string) {
 	if p.MaxDeltaBytes > 0 && s.DeltaBytes >= p.MaxDeltaBytes {
 		return true, fmt.Sprintf("delta records hold %d bytes, at or past the %d limit",
 			s.DeltaBytes, p.MaxDeltaBytes)
+	}
+	// Before the log and the ratio, which are proxies, and after the two delta
+	// rules, which are the ones a caller tuned deliberately. Where both a delta
+	// rule and this one would fire, the delta reason names what grew; where only
+	// this one fires, nothing else would have.
+	if p.MaxResidentBytes > 0 && s.EstimatedResidentBytes >= p.MaxResidentBytes {
+		return true, fmt.Sprintf("backend holds an estimated %d bytes, at or past the %d limit",
+			s.EstimatedResidentBytes, p.MaxResidentBytes)
 	}
 	if p.MaxWALBytes > 0 && s.WALBytes >= p.MaxWALBytes {
 		return true, fmt.Sprintf("write-ahead log is %d bytes, at or past the %d limit",
