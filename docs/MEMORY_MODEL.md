@@ -817,6 +817,20 @@ question, not the warm figure.
 **The composites are still resident**, exactly as the caution below says, and are now
 the largest remaining term. Nothing has measured a store that declares many of them.
 
+> **Superseded, v0.8.0 — both of these were measured, and one of them moved.** The cold
+> question has an answer and a caveat. `tests/coldlookup_test.go` reads an image whose
+> pages have been made non-resident and reports, at 1,400,000 nodes against the
+> 1,689.1 MiB image, an index point lookup at **4.8–6.1×** its resident cost and a record
+> point read at **20.6–26.1×** — so the mapped lookup's warm doubling is a small part of
+> what a read costs when its pages are not there, and the page the index touches amortises
+> across lookups where the payload page does not. The caveat is the instrument: the windows
+> arm trims the working set, which leaves the pages on the standby list a soft fault away,
+> so its column is headed *trimmed* and every ratio in it is a lower bound; only the linux
+> arm evicts for real. `docs/benchmarks.md` carries the table, and the sample-count effect
+> that makes a single ratio meaningless without it. The composite term was measured too —
+> **128.2 MiB of 237.8 at 1,400,000 nodes**, the largest single item in that column — and
+> §8.6 is where `GCPX` moves it out of the heap and into the image.
+
 **Verifying the mapped index costs nothing resident.** Worth stating here because it
 is the one operation that touches every entry in the index on purpose, and therefore
 the obvious place for the residency win to be handed straight back. It is not:

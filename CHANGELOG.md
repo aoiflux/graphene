@@ -596,9 +596,10 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 - **The figures, taken at 1,400,000 nodes against the 1,689.1 MiB image.** Trimmed
   against resident, three runs at 20,000 samples: record point read **20.6–26.1×**,
-  index point lookup **4.8–6.1×**, projection batch **5.0–5.9×**, bounded batch
-  read **16.5–21.1×**. All four are lower bounds, because trimmed pages are a soft
-  fault away and not a seek away. `docs/benchmarks.md` carries the table.
+  index point lookup **4.8–6.1×**, projection batch **4.58–5.21×** ascending and
+  **3.62–5.70×** shuffled, bounded batch read **16.5–21.1×**. Every one of them is a
+  lower bound, because trimmed pages are a soft fault away and not a seek away.
+  `docs/benchmarks.md` carries the table.
 
 - **The ratio depends on how many samples you take, which is a property of the
   instrument and not of the store.** The same arm reports the index point lookup
