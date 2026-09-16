@@ -406,10 +406,17 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 
 	// A copy, not the master: the sequence writes, deletes and compacts, and a
 	// master left rebuilt would hand the next run a different store under the
-	// same shape marker.
-	dir := rssMutableFixtureDir(t, rssNodes, rssBlob)
+	// same shape marker. The read-only arm writes nothing, so it reads the
+	// master directly -- and it must be an else, not an overwrite. Taking the
+	// copy first and then discarding it charged the read-only arm a full copy of
+	// the fixture for nothing, which is invisible at 200,000 nodes and fatal at
+	// 1,800,000: an 18.4 GiB copy into the system temp directory, on a volume
+	// that does not have 18.4 GiB.
+	var dir string
 	if ceilingReadOnly {
 		dir = rssFixtureDir(t, rssNodes, rssBlob)
+	} else {
+		dir = rssMutableFixtureDir(t, rssNodes, rssBlob)
 	}
 	diskMiB := float64(rssStoreBytes(dir)) / bytesPerMiB
 

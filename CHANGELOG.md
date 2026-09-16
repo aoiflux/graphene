@@ -285,6 +285,130 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   trade, stated so a caller can apply it to their own ceiling. The default is
   unchanged here; moving it is a measurement, not an edit.
 
+### What a read costs when its pages are not resident
+
+- **Six statements across the tree declined to measure the cold path, all giving
+  the same reason: there is no way to drop the page cache from a Go test on
+  windows.** Four trade-offs rest on that unmeasured case — the residual probe's
+  2.8x warm regression, the property join's 1.17x on unsorted values, the bounded
+  batch API's whole rationale, and the mapped point lookup's doubling. They lean
+  the same way, and the deployment this release is sized for is the one where the
+  page cache is under pressure. The reason was half wrong, and the wrong half was
+  the framing: the constraint is windows, not Go, and it does not hold on linux.
+
+- **`tests/coldlookup_test.go`, behind the `stress` tag, measures four reads
+  against an image whose pages have been made non-resident** — a record point
+  read, an index point lookup, a projection batch, and a bounded batch read —
+  reporting each one's cold pass beside a warm pass taken immediately after, in
+  the same process, over the same ids.
+
+- **The two platforms are not measuring the same thing, and the column says so.**
+  On linux the image is evicted with `posix_fadvise(POSIX_FADV_DONTNEED)` through
+  a raw `syscall.Syscall6`, with the store closed, because DONTNEED does not
+  discard pages a mapping holds; the column is headed **evicted** and the next
+  touch is a disk read. On windows the working set is trimmed with
+  `EmptyWorkingSet` through `syscall.NewLazyDLL`, which moves the pages to the
+  standby list, where the next touch is a soft fault of hundreds of nanoseconds
+  rather than a seek of hundreds of microseconds; that column is headed
+  **trimmed**, and it is a lower bound on the cold cost, not the cold cost.
+  Labelling it otherwise would produce a number that later had to be retracted.
+  `FILE_FLAG_NO_BUFFERING` and `SetSystemFileCacheSize` were both considered and
+  are both rejected in the file, with the reason. The zero-dependency invariant
+  survives either route: `go.mod` is 44 bytes and a test asserts it, so
+  `golang.org/x/sys` is not available and the kernel is reached directly.
+
+- **The windows arm fails rather than reports when the trim does nothing.** It
+  reads the process working set before and after the call and refuses to continue
+  if it did not fall, because `EmptyWorkingSet` returns success without doing
+  anything under conditions a test cannot see. A rig that answers from a cache is
+  not a rig, and that failure mode looks exactly like the right answer.
+
+- The five live claims that the cold case could not be measured are superseded in
+  place, in `docs/benchmarks.md` and `docs/TECHNICAL_DETAILS.md`.
+  `BenchmarkRSS_ResidualRoutePages` keeps its page-count proxy and says why: a
+  page count is stable across machines in a way a latency is not, and it runs on
+  every platform rather than on two.
+
+### The fixture builder can build a store larger than the machine's RAM
+
+- **The ceiling harness could not build the fixture the ceiling job wants to
+  measure.** A twenty-gigabyte store built in one pass holds its whole delta and
+  then its whole compaction output, so the build peaks far above anything the read
+  arm will ever hold, and the process dies before there is a store to measure.
+  The limit is the builder's, not the store's.
+
+- **`GRAPHENE_RSS_BUILD_CHUNK` builds in passes, and closes the store between
+  them.** Each pass writes its chunk, compacts, closes and reopens. Closing is the
+  point, not the compaction: §9.4 of `docs/MEMORY_MODEL.md` measures a compaction
+  leaving its own output resident until the handle is reopened — 3,838 MiB after
+  compacting against 1,078 after reopening — because `AttachBase` runs on the load
+  path and nowhere else. Redeclaring a key on reopen is a no-op, so the schema
+  survives the cycle unchanged. A 19 GiB fixture builds while anonymous memory
+  holds near 4.2 GiB.
+
+- **Build progress reports the store's size on disk and the process's anonymous
+  and total resident bytes at every chunk boundary**, so a build that is going to
+  fail says so in the first minute rather than in the fortieth.
+
+- **The fixture's shape marker now carries the image's format version.** A cached
+  fixture whose format predates the reader measures the wrong engine and reports a
+  plausible number for it — the same bug class as a cached `go test` result, and
+  the same tell: nothing looks wrong. The CI fixture cache is keyed on that
+  marker, so a format change misses the cache rather than silently measuring the
+  old one.
+
+### An 18.4 GiB store opens and reads inside a 2 GiB limit, with three quarters of it unused
+
+The memory model has always been measured at shapes that sit near the ceiling — 1.65 GiB on
+disk against a 2 GiB limit — which leaves the question a consumer actually asks unanswered:
+what happens when the store is much bigger than the machine's budget, not slightly smaller?
+
+A second fixture answers it. 1,800,000 nodes carrying 10 KiB of blob each, the same schema
+the rest of the document uses (8 unique keys, 5 ordered, 2 composite), 19,787,551,529 bytes
+of `graphene.csr` and 23,400,000 node index entries. Opened read-only under the same 2 GiB
+Job Object the ceiling harness has been using all along, in a fresh process, with the limit
+read back from the kernel before the run is allowed to claim anything.
+
+**It charges 527.2 MiB of the 2,048 MiB limit and finishes with 74.3% headroom.** The
+process's peak working set is 7,598.2 MiB and that is not a contradiction: 7,071.2 MiB of it
+is file-backed, the mapped image's pages, which the kernel may drop and re-fault at will and
+which a commit-charge limit never sees. The figure a deployment has to budget for is the
+527.2, and the distinction between the two is the entire reason §9.1 measures with a Job
+Object rather than reading RSS.
+
+**The terms do not care how big the blobs are.** Divided by node count, this fixture and the
+1,400,000-node one agree to two decimal places across a twentyfold difference in blob size:
+record arrays 56.10 against 56.02 bytes a node, label postings 7.98 against 8.01, adjacency
+16.02 against 16.03, composites 96.00 against 96.02. The payload row is the one that
+matters: twenty times the blob bytes — 17.6 GiB against 0.66 — moves it from 2.7 MiB to 3.4.
+Records are not in the heap, a `Properties` slice addresses the mapping, and what is
+retained is a slice header. **The ceiling binds on node count and schema, not on bytes on
+disk**, and the sizing rule is ~178 bytes of modelled heap a node with a peak charged figure
+of ~300-310.
+
+**A prediction stated in advance was wrong by 10.4%, and the correction is worth more than
+the prediction.** Before the run the charged figure was modelled from two points as 58.7 MiB
+fixed plus 244 bytes a node, predicting 477.6 MiB against a measured 527.2. The shape of the
+claim held; the coefficients did not. The error was the intercept — fitting an affine line
+across two fixtures that differ in blob size invented 58.7 MiB of fixed cost for a model that
+has almost none, and the slope absorbed the shortfall. Every term above is proportional to
+node count, so there is no intercept to find and the per-node figure is the one to quote.
+
+Two gates in the release read off the same line. **Composites are 53.9% of modelled heap at
+both shapes** — 164.8 MiB of 305.8 and 128.2 of 237.8, the same fraction to a tenth of a
+point — which is the strongest evidence yet for putting the composite index in the image, and
+confirms `residentBytesPerCompositeEntry = 48` twice at scale. **Label postings are 8 bytes a
+node, 2.6% of the charged figure and half the adjacency term**, where `MEMORY_MODEL` §6.7 had
+asserted without measuring that they were the larger of the two; deferring them behind a mode
+would move a measured 2.6% and would move it onto `NodesByType` rather than remove it. That
+open question is now answered with a reason not to build the option.
+
+`MEMORY_MODEL.md` §9.7 carries the phase table and both fixtures term by term. §9.3's
+1,400,000-node figures are marked superseded in place rather than replaced: the new reading
+is 320.3 MiB settled and 397.8 charged against 560.8 and 613.9, but the old arm ran on linux
+under a cgroup and the new one on windows under a Job Object, and the composite coefficient
+moved between them, so the two are not a clean before-and-after and the document says so.
+
 ## v0.7.0 "Bookshelf" — the store stops carrying what it can read in place
 
 ### Indexed values can be served without the records that carry them

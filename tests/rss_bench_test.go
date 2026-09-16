@@ -424,6 +424,18 @@ func rssBuildFixtureChunked(b testing.TB, dir string, nodes, blob, chunk int) {
 	// wrote short is the failure this builder can have and the single-shot one
 	// cannot, and it would otherwise be recorded under a shape marker claiming
 	// the full count.
+	//
+	// The format version comes off the same handle, through the StorageStats
+	// field this release added, and deliberately not through disk.InspectCSR.
+	// InspectCSR deserialises the whole image on purpose -- "the full parse is
+	// what validates the file, so its bounds checks are the report" -- which is
+	// the right trade for an operator inspecting a store they are worried about
+	// and the wrong one here, because it asks for the image in the heap and this
+	// builder exists precisely for images larger than the machine has RAM. An
+	// 18.4 GiB fixture built to completion, every node on disk, and then died in
+	// this check: VirtualAlloc of 3,864,764,416 bytes, growing a slice inside
+	// readCSRPropertiesInto. A verification step that cannot run at the size the
+	// thing it verifies was built for is not a verification step.
 	g, err := graphene.Open(dir)
 	if err != nil {
 		b.Fatalf("reopen to verify: %v", err)
@@ -432,21 +444,20 @@ func rssBuildFixtureChunked(b testing.TB, dir string, nodes, blob, chunk int) {
 	if err != nil {
 		b.Fatalf("NodeCount to verify: %v", err)
 	}
+	st, ok := g.StorageStats()
+	if !ok {
+		b.Fatalf("StorageStats to read the image version: the backend does not answer")
+	}
 	if err := g.Close(); err != nil {
 		b.Fatalf("close after verify: %v", err)
 	}
 	if got != uint64(nodes) {
 		b.Fatalf("the chunked build wrote %d nodes where the shape says %d", got, nodes)
 	}
-
-	info, err := disk.InspectCSR(dir)
-	if err != nil {
-		b.Fatalf("InspectCSR after build: %v", err)
-	}
-	if info.Version != disk.CSRVersionCurrent {
+	if st.ImageVersion != disk.CSRVersionCurrent {
 		b.Fatalf("the build wrote a v%d image where this engine writes v%d: the "+
 			"fixture would be marked with a format it does not carry",
-			info.Version, disk.CSRVersionCurrent)
+			st.ImageVersion, disk.CSRVersionCurrent)
 	}
 }
 

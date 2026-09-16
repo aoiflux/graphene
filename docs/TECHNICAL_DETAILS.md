@@ -4840,7 +4840,16 @@ cache misses the sequential arm never pays, and the price of promising not to pe
 the caller's slice. The unsorted case is expected to win *cold*, where a search per
 value is eighteen page faults rather than eighteen cache misses, and that has not been
 measured: there is no way to drop the page cache from a Go test on Windows. It is an
-open measurement, not a claim. The documented advice — supply ascending values — is
+open measurement, not a claim.
+
+> **Superseded, v0.8.0.** The reason is narrower than it was written. A Go test can
+> evict a file on linux — `posix_fadvise(POSIX_FADV_DONTNEED)` through
+> `syscall.Syscall6`, in `tests/coldlookup_linux_test.go` — and it is only *windows*
+> that cannot make a file cold from user mode without privilege, where the available
+> instrument trims the working set to the standby list and the arm is headed `trimmed`
+> for that reason. `tests/coldlookup_test.go` runs this join as `projection batch`. The
+> measurement is open in the sense of not yet taken at this shape, not in the sense of
+> being unreachable. The documented advice — supply ascending values — is
 what the numbers actually support today.
 
 **The ordering itself.** `[]batchKey{prefix uint32, at int32}`, eight bytes per value,
@@ -4929,7 +4938,11 @@ they are in cache, and the build it is weighed against walks twenty thousand val
 and sorts what matches. The model's unit is *a read of the image*, which is right on
 an image that has not been read and pessimistic on one that has. There is no way to
 drop the page cache from a Go test on Windows, so the page column is the proxy: the
-same count of four-kilobyte reads, charged as faults here and as seeks there. On an
+same count of four-kilobyte reads, charged as faults here and as seeks there.
+(**Superseded, v0.8.0:** on linux there is — `posix_fadvise(POSIX_FADV_DONTNEED)`, in
+`tests/coldlookup_test.go`, which runs this path as its `index point lookup` arm. On
+windows the constraint stands, and the arm there is headed `trimmed` rather than
+`evicted` because a trimmed page is a soft fault away and not a seek away.) On an
 NVMe image 5.58 MiB of random four-kilobyte reads is some hundreds of milliseconds
 against 1.1; on SATA it is seconds.
 

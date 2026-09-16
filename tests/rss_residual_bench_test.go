@@ -173,8 +173,15 @@ func BenchmarkResidual_WideCandidates_Disk(b *testing.B) {
 // The figure is how much of the mapped image the residual pass pulls into the
 // working set. On an image already in the page cache that is a cheap fault; on
 // one that is not it is a read of a four-kilobyte page from the disk, and the
-// count is the same either way. It is the only proxy available here for the cold
-// cost, because there is no way to drop the page cache from a Go test on Windows.
+// count is the same either way. It is a proxy for the cold cost, and it was for a
+// long time the only one available here.
+//
+// It is no longer the only one. TestColdLookup in coldlookup_test.go measures this
+// path directly against an image whose pages have been dropped -- genuinely, with
+// posix_fadvise(POSIX_FADV_DONTNEED), on linux; trimmed to the standby list and
+// labelled as such on windows, which cannot evict from user mode without privilege.
+// This benchmark stays, because a page count is stable across machines in a way a
+// latency is not, and because it runs on every platform rather than two.
 func BenchmarkRSS_ResidualRoutePages(b *testing.B) {
 	dir := residualRouteFixture(b)
 

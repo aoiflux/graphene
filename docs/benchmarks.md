@@ -2927,6 +2927,18 @@ KiB reads is some hundreds of milliseconds on NVMe and seconds on SATA, against 
 way to drop the page cache from a Go test on Windows, which is the same gap the property
 batch's cold arm left open in the section below.
 
+> **Superseded, v0.8.0 — the reason above is half wrong, and the wrong half is the
+> framing.** A Go test can reach the kernel: `tests/coldlookup_test.go` drops a file's
+> clean page-cache pages on linux with `posix_fadvise(POSIX_FADV_DONTNEED)` through
+> `syscall.Syscall6`, and does it without leaving the zero-dependency invariant, exactly
+> as the ceiling harness next door already reached kernel32. What is true is narrower
+> than what was written: *windows* cannot make a file cold from user mode without
+> privilege. `EmptyWorkingSet` moves the pages to the standby list, where the next touch
+> is a soft fault of a few hundred nanoseconds and not a disk read of a few hundred
+> microseconds — so the windows arm is headed `trimmed` and is a lower bound on the cold
+> cost, not the cold cost. The figures above stay a proxy until the linux arm has run
+> against this shape; the point is that there is now an arm to run.
+
 ### What did not move
 
 No format change. `QueryPlan.Residuals[i].Probe` reports the decision and has always
@@ -3008,6 +3020,11 @@ expected to arrive cold, where a search per value is eighteen page faults rather
 eighteen cache misses and the sort's 108 ns disappears beside them. **That has not
 been measured here** — there is no way to drop the page cache from a Go test on
 Windows — and it is recorded as an open measurement rather than claimed.
+
+> **Superseded, v0.8.0.** The measurement is no longer closed off: `tests/coldlookup_test.go`
+> runs this join as its `projection batch` arm against an evicted image. See the note under
+> "the cold cost" above for what each platform's column actually achieves — the linux arm
+> answers this question, the windows arm bounds it from below.
 
 ### What it holds
 

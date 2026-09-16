@@ -926,10 +926,50 @@ first delete plus a branch on every read until then; a process that does not
 never pays it at all. That is the whole of what the option does, and there is no
 third outcome hiding behind an index someone has not written yet.
 
-**What it does not cover.** The label postings (`nodesByLabel`, `edgesByLabel`) are
-also derived, also anonymous, also built at open, and also unread by a property-only
-pass. They are not deferred here. At 2M edges they are the larger term of the two,
-and they are the next thing to look at if this direction is worth continuing.
+**What it does not cover, and why that is now a decision rather than a deferral.**
+The label postings (`nodesByLabel`, `edgesByLabel`) are also derived, also
+anonymous, also built at open — and at every compaction, inside `buildSeq` — and
+also unread by a property-only pass. Deferring them would be a near-exact
+structural clone of what `Options.Adjacency` already does: `buildSeq` takes the
+mode parameter already and gates adjacency three lines earlier. The option was not
+built. The reason is a measurement, and it is not the one this section expected.
+
+> **Retracted: "at 2M edges they are the larger term of the two."** That sentence
+> stood here as an assertion with nothing behind it. §9.7 measures both terms at two
+> shapes under a real ceiling, and it is backwards. The postings are **8.0 bytes a
+> node** and adjacency is **16.0** — so the postings are *half* the term they were
+> said to exceed: 10.7 MiB against 21.4 at 1,400,000 nodes, 13.7 against 28.8 at
+> 1,800,000. The two readings agree to a hundredth of a byte across a twentyfold
+> difference in blob size, so this is the coefficient and not an artefact of a
+> shape.
+
+**What deferring them would buy, and why the size alone does not settle it.** 10.7
+MiB is 4.5% of the 237.8 MiB the model accounts for at the consumer shape and 2.6%
+of the 397.8 MiB actually charged against the 2 GiB ceiling. The gate this release
+set was "under about 2% of the total and it is disproportionate", and 2.6% is on
+the wrong side of that line by a whisker. The honest reading is that the number is
+marginal: it neither clears the bar nor fails it cleanly, and anyone who wanted to
+build the option could quote the 4.5% and be arguing in good faith.
+
+**What settles it is that the cost is moved rather than removed.** `NodesByType`
+and `CountNodesByType` read these postings. Adjacency earns its option because a
+property-only process genuinely never asks the question — it opens, reads
+properties, closes, and the arrays were pure waste. A label query is not like that.
+It is an ordinary read on the ordinary path, so a process that defers the postings
+and then runs one `NodesByType` builds all of them at that query, having also paid
+a branch on every read until then. The asymmetry that makes `Options.Adjacency`
+worth its complexity is much weaker over a term half the size, and the retraction
+above removes the one argument — that the postings were the *larger* of the two —
+that made them look like the better target of the pair.
+
+Against that: a new mode type, an `Options` field, a `StorageStats` answer field, a
+fallback rule and their tests, and one more dimension on the
+`imageMappingAllowedFor` × `indexBaseAllowedFor` × adjacency matrix that is already
+the hardest thing in this engine to reason about. **So the open question above is
+closed: do not build it.** Not because the term is negligible, but because it is
+half of what this section claimed, and because deferring it relocates the build
+onto a query rather than retiring it. That is a measured reason to stop, which is
+worth more than the option would have been.
 
 **Where the rest of the edge cost is.** `[]rawEdge` is 80 bytes per edge — 160 MiB at
 2M edges, an order above the adjacency arrays — and it is a record array, not derived
@@ -1399,6 +1439,23 @@ Read the first three rows and the last three as two different results, because t
 
 ### 9.3 The read path fits, and §8.6's projection was right
 
+> **Superseded in part, and not by a clean comparison.** §9.7 re-runs this arm on the same
+> fixture under v0.8.0 and reads **320.3 MiB settled anonymous and 397.8 MiB charged, 80.6%
+> headroom** — against the 560.8 and 613.9 below. Two things changed at once and this
+> document will not pretend to separate them. The figures below were taken **on linux under
+> a cgroup**; §9.7's were taken **on windows under a Job Object**, and the two kernels
+> retain freed anonymous pages differently. The composite coefficient also moved in between,
+> from 160 to 48 bytes an entry (§8.4), which alone accounts for 299 MiB of the modelled
+> 537.1 → 237.8. **The figures below are kept because they are the linux reading and there
+> is no newer one**; what is retracted is the sentence after next.
+>
+> **"§8.6's projection was accurate to 24 MiB" no longer holds** — it was accurate against a
+> composite term the engine has since corrected. The projection to compare against today is
+> §8.6's own corrected ~238 MiB, and the engine's estimate at this shape now reports
+> **237.8 MiB**, which is accurate to 0.2. The conclusion is unchanged and better supported
+> than it was; only the arithmetic behind it moved.
+
+
 **Opening a 1.65 GiB store and reading it costs 561 MiB of anonymous memory.** Under a real
 2 GiB ceiling the same arm charges 613.9 MiB against the limit and finishes with **70.0%
 headroom**. Enumerating all 1,400,000 identifiers adds 11.0 MiB, which is the 10.7 MiB of
@@ -1576,6 +1633,107 @@ GRAPHENE_CEILING_BUILD=1 GRAPHENE_RSS_DIR=/var/tmp/graphene-200k \
     GRAPHENE_RSS_NODES=200000 go test ./tests/ -tags=stress -run TestCeilingFixture -v
 GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_DELTA_MIB=16 GRAPHENE_RSS_DIR=/var/tmp/graphene-200k \
     GRAPHENE_RSS_NODES=200000 go test ./tests/ -tags=stress -run TestCeiling_Consumer -v
+```
+
+### 9.7 Twenty gigabytes under two, and what the terms do when the blobs get fat
+
+The shape all of the above was taken at keeps the store near the ceiling: 1.65 GiB on disk
+against a 2 GiB limit. That leaves the interesting question unasked. **What happens when the
+store is an order of magnitude larger than the limit?**
+
+A second fixture answers it: 1,800,000 nodes at 10,240 bytes of blob each, the same schema
+(8 unique, 5 ordered, 2 composite), **19,787,551,529 bytes — 18.4 GiB — of `graphene.csr`**,
+23,400,000 node index entries. Read-only arm, same 2 GiB Job Object, one fresh process.
+
+Both columns below are **windows under a Job Object**, taken minutes apart on the same
+engine, so the comparison between them is clean in the way §9.3's is not.
+
+**It fits, with three quarters of the ceiling unused.**
+
+| | 1,400,000 × 512 B | 1,800,000 × 10 KiB |
+|---|---:|---:|
+| image on disk | 1,689.1 MiB | **18,870.9 MiB** |
+| charged against the 2 GiB ceiling, peak | 397.8 MiB | **527.2 MiB** |
+| headroom | 80.6% | **74.3%** |
+| modelled heap | 237.8 MiB | 305.8 MiB |
+| process peak working set | 1,139.4 MiB | 7,598.2 MiB |
+
+The fat arm, phase by phase:
+
+| phase | anon | file-backed | RSS | peak | wall | note |
+|---|---:|---:|---:|---:|---:|---|
+| open | 436.9 | 7,071.2 | 7,508.1 | 7,597.9 | 35.481s | image mapped, index mapped, adjacency built |
+| scan | 437.2 | 7,071.3 | 7,508.6 | — | 0.017s | 10 rows |
+| enumerate | 451.0 | 7,071.4 | 7,522.4 | 7,577.3 | 0.053s | 1,800,000 ids |
+
+**7,598 MiB resident is not 7,598 MiB used, and the split is the whole point.** 7,071 of
+those MiB are file-backed: the mapped image's pages, which the kernel is free to drop and
+re-fault. The Job Object charges committed private bytes, so it never sees them. A reader
+who took RSS for "memory used" here would report the page cache as if it were the program's
+and conclude a 20 GB store needs 8 GB of RAM, when the process is holding 527 MiB it cannot
+give back. §9.1's choice of instrument is what makes the two columns above different
+numbers rather than the same number twice.
+
+#### The terms do not care how big the blobs are
+
+Divide each term by the node count and the two fixtures agree to two decimal places, across
+a twentyfold difference in blob size:
+
+| term | 1.4M × 512 B | 1.8M × 10 KiB |
+|---|---:|---:|
+| record arrays | 56.02 B/node | 56.10 B/node |
+| record payloads | 2.02 | 1.98 |
+| label postings | 8.01 | 7.98 |
+| adjacency | 16.03 | 16.02 |
+| composites | 96.02 | 96.00 |
+| **modelled heap** | **178.1** | **178.1** |
+| charged, peak | 297.9 | 307.1 |
+
+**The payload row is the result.** Twenty times the blob bytes — 0.66 GiB of payload against
+17.6 GiB — moves the payload term from 2.7 MiB to 3.4 MiB. It does not scale with the blobs
+because the records are not in the heap: a `Properties` slice addresses the mapping, and
+what the heap holds is the slice header. This is the mapped image's contract paying off at
+the size it was designed for, and it is why **the ceiling binds on node count and schema,
+not on bytes on disk.**
+
+So the sizing rule this document has been circling is simply:
+
+> **~178 bytes of modelled heap per node**, plus the schema's per-entry index cost, and a
+> peak charged figure of **~300–310 B/node**. Blob size sets the file and the page cache;
+> it does not set the ceiling.
+
+**A prediction stated in advance was wrong, and this is the correction.** Before the fat arm
+ran, the charged figure was modelled from two points as *58.7 MiB fixed + 244 B/node*,
+predicting **477.6 MiB**. The measurement is **527.2** — light by 49.6 MiB, 10.4%. The shape
+of the claim held; the coefficients did not. The error is the intercept: fitting an affine
+line across two fixtures that differ in blob size put 58.7 MiB of fixed cost into a model
+that has almost none, and the slope absorbed the deficit. With both arms on the current
+engine there is no meaningful intercept to find — every term above is proportional to node
+count — and the figure to quote is the per-node one.
+
+#### What this settles for the release
+
+- **Composites are 53.9% of modelled heap at both shapes** — 128.2 of 237.8 MiB and 164.8
+  of 305.8 MiB, the same fraction to a tenth of a point, at 96 B/node for two declared
+  composites. That is §8.4's `residentBytesPerCompositeEntry = 48` confirmed twice at scale,
+  and it is the strongest argument in the document for putting the composite index on disk.
+  Against the *charged* figure it is 32.2% and 31.3%.
+- **Label postings are 8 B/node, 4.5% of heap and 2.6–2.7% of the charged figure.** §6.7
+  called them "the larger term of the two" without measuring; they are half the adjacency
+  term. Deferring them behind a mode would move a measured 2.6% of the number that matters,
+  and would move it onto `NodesByType` rather than removing it. §6.7's open question is
+  answered, and the answer is not to build the option.
+- **The mapped property index is 985.5 MiB at 1.4M and 1,267.0 MiB at 1.8M, against 0.0 MiB
+  of heap.** `IndexMapped` is doing exactly what it shipped to do, and §9.7 is the first
+  place both halves of that trade appear in one line.
+
+```sh
+GRAPHENE_RSS_DIR=/path/to/fat GRAPHENE_RSS_NODES=1800000 GRAPHENE_RSS_BLOB=10240 \
+  GRAPHENE_RSS_BUILD_CHUNK=100000 go test ./tests/ -tags=stress -run='^$' \
+  -bench='BenchmarkRSS_Open$' -benchtime=1x -timeout=180m
+GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_READONLY=1 GRAPHENE_RSS_DIR=/path/to/fat \
+  GRAPHENE_RSS_NODES=1800000 GRAPHENE_RSS_BLOB=10240 \
+  go test ./tests/ -tags=stress -count=1 -run '^TestCeiling_Consumer' -v
 ```
 
 ## Reproducing these figures
