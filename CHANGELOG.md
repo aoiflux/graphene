@@ -3,7 +3,7 @@
 Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 `git log` for those.
 
-## Unreleased — v0.8.0
+## v0.8.0 "Bookshelf_v2" — the rebuild fits, and the composites move onto the shelf
 
 ### A whole-layer rebuild fits under 2 GiB, and the knob was not what did it
 

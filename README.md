@@ -752,7 +752,7 @@ arm64, static and reproducible:
 
 - Release notes, including breaking changes: [CHANGELOG.md](CHANGELOG.md)
 - Latest release at a glance, with diagrams:
-  [RELEASE_v0.6.0.md](docs/RELEASE_v0.6.0.md)
+  [RELEASE_v0.8.0.md](docs/RELEASE_v0.8.0.md)
 - Easy usage guide: [USER_GUIDE.md](docs/USER_GUIDE.md)
 - Complete API reference: [API_REFERENCE.md](docs/API_REFERENCE.md)
 - Deep technical architecture and LLD:
