@@ -133,24 +133,29 @@ func TestCompact_AdoptsTheIndexItJustWrote(t *testing.T) {
 	collectAdoptAnswers(t, s, n).diff(t, before, "after the compaction")
 }
 
-// The gate. A commit that lands between the pin and the drain means the image
-// cannot hold everything the index does -- entries registered after the stream
-// are not in it, and entries naming an entity committed after the pin were
-// filtered out of it on purpose -- so the adoption does not happen and the store
-// keeps answering from the shards.
+// The case the whole bound exists for: a compaction that ran while something was
+// writing adopts its output anyway, and the writes are still there.
 //
-// Without the gate this test does not merely regress memory: the entry
-// registered during the build is dropped from a live store.
-func TestCompact_DoesNotAdoptWhenTheLogGrewDuringTheBuild(t *testing.T) {
+// This used to be the gate's test -- a commit between the pin and the drain meant
+// the image could not hold everything the index did, so the adoption was skipped
+// and the store went on answering from the shards. That was correct and it was
+// also the whole of the memory result during an ingest, because an ingest is a
+// compaction with writes landing during it. The capture is what replaced it.
+//
+// The answer is asserted before the mode, deliberately. The memory result is what
+// this is for; a wrong answer is what it costs to get it wrong, and a test that
+// reports the mode first hides the cost behind the symptom.
+func TestCompact_AdoptsWhenTheLogGrewDuringTheBuild(t *testing.T) {
 	s, _ := openFresh(t)
 	defer s.Close()
 	requireAdoptable(t, s)
 
 	const n = 20
 	payloadFixture(t, s, n)
+	before := collectAdoptAnswers(t, s, n)
 
 	var during store.NodeID
-	s.afterPinHook = func() {
+	compactWithWrites(t, s, func() {
 		var err error
 		if during, err = s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}}); err != nil {
 			t.Errorf("AddNode during the build: %v", err)
@@ -159,16 +164,8 @@ func TestCompact_DoesNotAdoptWhenTheLogGrewDuringTheBuild(t *testing.T) {
 		if err := s.IndexNodeProperty(during, "path", []byte("/during")); err != nil {
 			t.Errorf("index path during the build: %v", err)
 		}
-	}
-	if err := s.Compact(); err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
-	s.afterPinHook = nil
+	})
 
-	// The answer first and the mode second, in that order deliberately. The
-	// memory result is what this gate is for; the wrong answer is what it costs
-	// to get it wrong, and a test that reports the mode first hides the cost
-	// behind the symptom.
 	ids, err := s.NodesByProperty("path", []byte("/during"))
 	if err != nil {
 		t.Fatalf("NodesByProperty: %v", err)
@@ -177,9 +174,141 @@ func TestCompact_DoesNotAdoptWhenTheLogGrewDuringTheBuild(t *testing.T) {
 		t.Fatalf("the entry registered during the build answers %v, want [%d]: "+
 			"the shards were emptied over an image that does not hold it", ids, during)
 	}
+	// And the rest of the index came through the swap unchanged, which is the
+	// half a test looking only at the new entry would not notice going missing.
+	collectAdoptAnswers(t, s, n).diff(t, before, "after a compaction under writes")
+
+	if got := s.indexHolding(); got != IndexMapped.String() {
+		t.Fatalf("a compaction under writes is held as %q, want %q: the capture "+
+			"exists so that this one does not have to give up its memory", got, IndexMapped.String())
+	}
+}
+
+// The direction a second set of shards does not reach, and the reason the tail is
+// a log of calls.
+//
+// An entity deleted during the build is in the image with all of its properties,
+// because it was alive when the records were pinned. What hides it is a retraction
+// against the base -- and SwapBase installs a base whose retraction sets start
+// empty, correctly, because an id retracted from the *old* base is simply absent
+// from one written after it. That reasoning does not hold for a delete that
+// happened after the pin, and forgetting it brings a deleted entity's properties
+// back from the dead until the next reopen.
+func TestCompact_AdoptionDoesNotResurrectADeleteFromTheBuild(t *testing.T) {
+	s, _ := openFresh(t)
+	defer s.Close()
+	requireAdoptable(t, s)
+
+	const n = 20
+	ids := payloadFixture(t, s, n)
+	gone := ids[3]
+
+	compactWithWrites(t, s, func() {
+		if err := s.DeleteNode(gone); err != nil {
+			t.Errorf("DeleteNode during the build: %v", err)
+		}
+	})
+
+	// Both keys, because they hash to different shards and a retraction that
+	// only reached one of them is a bug this would otherwise not see.
+	for _, q := range []struct{ key, value string }{
+		{"path", "/n/0003"},
+		{"kind", "kind-3"},
+	} {
+		got, err := s.NodesByProperty(q.key, []byte(q.value))
+		if err != nil {
+			t.Fatalf("NodesByProperty(%s=%s): %v", q.key, q.value, err)
+		}
+		if slices.Contains(got, gone) {
+			t.Errorf("%s=%s answers %v, which still holds node %d: it was deleted during "+
+				"the build and the image carries the entry the delete was meant to hide",
+				q.key, q.value, got, gone)
+		}
+	}
+	if got := s.indexHolding(); got != IndexMapped.String() {
+		t.Skipf("this compaction did not adopt its output (%q); the retraction is untested here", got)
+	}
+}
+
+// A capture that runs out of room declines the adoption rather than replaying
+// half a log. The floor is the behaviour the tail gate had: correct, and larger.
+func TestCompact_AnOverflowingCaptureDeclinesTheAdoption(t *testing.T) {
+	s, _ := openFresh(t)
+	defer s.Close()
+	requireAdoptable(t, s)
+
+	const n = 20
+	payloadFixture(t, s, n)
+	before := collectAdoptAnswers(t, s, n)
+
+	var during store.NodeID
+	compactWithWrites(t, s, func() {
+		// Re-opened at a size that cannot hold one operation, which is the
+		// smallest thing that makes the drop certain rather than a function of
+		// how many writes this hook happens to get through.
+		s.propIdx.CaptureTail(0)
+		var err error
+		if during, err = s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}}); err != nil {
+			t.Errorf("AddNode during the build: %v", err)
+			return
+		}
+		if err := s.IndexNodeProperty(during, "path", []byte("/during")); err != nil {
+			t.Errorf("index path during the build: %v", err)
+		}
+	})
+
+	ids, err := s.NodesByProperty("path", []byte("/during"))
+	if err != nil {
+		t.Fatalf("NodesByProperty: %v", err)
+	}
+	if !slices.Equal(ids, []store.NodeID{during}) {
+		t.Fatalf("the entry registered during the build answers %v, want [%d]: "+
+			"a dropped capture must leave the shards holding it", ids, during)
+	}
+	collectAdoptAnswers(t, s, n).diff(t, before, "after a dropped capture")
 	if got := s.indexHolding(); got != IndexResident.String() {
-		t.Fatalf("a compaction that could not write everything the index holds adopted "+
-			"its output anyway: the index is held as %q", got)
+		t.Fatalf("a compaction whose capture was dropped adopted its output anyway: "+
+			"the index is held as %q", got)
+	}
+}
+
+// A declaration is schema, not a mutation, so no capture records it -- and the
+// key lists went into the image at the pin. A key declared during the build is
+// therefore absent from the image's GORD, and swapping onto that base would leave
+// a declared ordered key the base cannot answer for.
+//
+// This was already true of the tail gate it replaces: a declaration is not
+// journaled to the log, so a quiet build that only declared something passed
+// tail == 0 and adopted anyway. The check is new; the exposure is not.
+func TestCompact_ADeclarationDuringTheBuildDeclinesTheAdoption(t *testing.T) {
+	s, _ := openFresh(t)
+	defer s.Close()
+	requireAdoptable(t, s)
+
+	const n = 20
+	payloadFixture(t, s, n)
+
+	compactWithWrites(t, s, func() {
+		if err := s.DeclareOrderedNodeProperty("kind"); err != nil {
+			t.Errorf("DeclareOrderedNodeProperty during the build: %v", err)
+		}
+	})
+
+	if got := s.indexHolding(); got != IndexResident.String() {
+		t.Errorf("a key declared during the build did not stop the adoption: "+
+			"the index is held as %q over an image whose GORD does not name it", got)
+	}
+	// The declaration is what has to go on working, and over every entry rather
+	// than the ones a particular shard happens to hold.
+	got, ok := s.propIdx.NodesMatchingOrdered(nil, store.PropertyFilter{
+		Key: "kind", Op: store.PropertyOpGreaterThanOrEqual, Value: []byte("kind-0"),
+	})
+	if !ok {
+		t.Fatalf("kind stopped being an ordered key")
+	}
+	if len(got) != n {
+		t.Errorf("the ordered index over kind answers %d ids, want %d: "+
+			"the declaration survived and its entries did not", len(got), n)
 	}
 }
 
@@ -299,5 +428,49 @@ func TestCompact_AdoptionDropsTheResidentIndex(t *testing.T) {
 		t.Errorf("the index held %d bytes before the compaction and %d after; "+
 			"a compaction that adopts its own output has to give the entries back",
 			before, after)
+	}
+}
+
+// The same figure under writes, which is the case the memory result was missing.
+//
+// A compaction during an ingest used to give nothing back at all, so this number
+// did not move and the bound on a bulk import was a bound on the delta with the
+// index climbing underneath it. What is asserted is the direction and the floor
+// together: the index falls, and it does not fall to nothing, because the writes
+// that landed during the build are entries the shards still legitimately hold.
+func TestCompact_AdoptionUnderWritesDropsTheResidentIndex(t *testing.T) {
+	s, _ := openFresh(t)
+	defer s.Close()
+	requireAdoptable(t, s)
+
+	payloadFixture(t, s, 200)
+	before := s.propIdx.ResidentBytes()
+
+	compactWithWrites(t, s, func() {
+		for i := range 5 {
+			id, err := s.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
+			if err != nil {
+				t.Errorf("AddNode during the build: %v", err)
+				return
+			}
+			if err := s.IndexNodeProperty(id, "path", []byte(fmt.Sprintf("/during/%d", i))); err != nil {
+				t.Errorf("index path during the build: %v", err)
+				return
+			}
+		}
+	})
+	if got := s.indexHolding(); got != IndexMapped.String() {
+		t.Fatalf("a compaction under writes is held as %q; the capture is what makes "+
+			"this the case the figure below is about", got)
+	}
+
+	after := s.propIdx.ResidentBytes()
+	if after >= before {
+		t.Errorf("the index held %d bytes before a compaction under writes and %d after; "+
+			"the entries the image now carries were not given back", before, after)
+	}
+	if after == 0 {
+		t.Errorf("the index reports nothing resident, but five entries landed during " +
+			"the build and the image cannot be carrying them")
 	}
 }

@@ -213,6 +213,16 @@ type compactPlan struct {
 	// plan does not unmap an image the index is now reading.
 	adopted bool
 
+	// idxTail is the index's mutation log, opened at the pin and replayed over
+	// pendingBase at the commit. It is what lets a compaction adopt its own
+	// output while writes are landing -- see index/tail.go for the design and
+	// adoptCompactedIndex for the checks it has to pass first.
+	//
+	// Nil when this compaction was never going to adopt anything: no capture is
+	// opened for a store that does not map its images or writes GIDX, because
+	// the only thing a recording would buy there is the memory it costs.
+	idxTail *index.Tail
+
 	// indexMode is which encoding of that index the image will carry: GPIX and
 	// GPIR under IndexMapped, GIDX under IndexResident.
 	//
@@ -634,13 +644,44 @@ func (s *Store) compactPin() (*compactPlan, error) {
 
 	plan.stepHook = s.compactStepHook
 
+	// Opened inside the same lock hold that pinned the records above, which is
+	// what makes the two halves describe one instant: everything in the image is
+	// at or before this epoch, everything in the log is after it, and the tail is
+	// exactly the index mutations that belong to the second half.
+	//
+	// Skipped where the adoption could not happen anyway. A store writing GIDX,
+	// or one that cannot map, throws pendingBase away and would throw this away
+	// with it -- so recording would be paying for a log nothing reads.
+	if plan.mapImages && plan.indexMode == IndexMapped {
+		plan.idxTail = s.propIdx.CaptureTail(maxIndexTailBytes)
+	}
+
 	s.compacting = true
 	return plan, nil
 }
 
+// maxIndexTailBytes is how much of an index mutation log a compaction will hold
+// before it gives up on adopting its own output.
+//
+// The figure is a guess with a known shape rather than a measurement, and it is
+// a constant rather than an option for that reason: index.TailOpBytes per
+// mutation, so this is roughly 350,000 writes landing inside one build before the
+// capture is dropped and the compaction falls back to the behaviour it had before
+// captures existed. That is a great many for a build measured in milliseconds and
+// not many for a whole-layer rebuild under a firehose, which is precisely the
+// case docs/PLAN_BOUNDED_INGEST.md item 0c is going to measure. When it does,
+// this becomes an Options field with a floor, the way MaxWorkingBytes did.
+const maxIndexTailBytes = 16 << 20
+
 // compactRelease clears the in-progress flag however the compaction ended.
+//
+// It also closes the index capture, which matters on every path that did not
+// reach the commit: a recording nobody stops goes on charging the store for
+// mutations no compaction will ever replay, for the life of the process. The
+// commit stops it too, and this is idempotent, so both can do the obvious thing.
 func (s *Store) compactRelease() {
 	s.mu.Lock()
+	s.propIdx.StopCapture()
 	s.compacting = false
 	s.mu.Unlock()
 }
@@ -1225,23 +1266,31 @@ func (p *compactPlan) tailBytes(endOff int64) int64 { return endOff - p.walOff }
 // engine is sized for, the index was 68% of the gap between a store that had
 // just compacted and the same store reopened.
 //
-// # Why it is gated on the tail, and not attempted otherwise
+// # What the image cannot hold, and what is done about it
 //
 // index.SwapBase requires a base holding exactly what the index answers with, and
-// what makes that true here is that nothing landed between the pin and the drain.
-// Two things go wrong when something did, and they go wrong in opposite
-// directions. An entry registered after the build streamed the index is in the
-// shards and not in the image, so emptying the shards would lose it until the
-// next open. And the stream filters itself against the records the build placed,
-// so an entry naming an entity committed after the pin was skipped on purpose --
-// the image cannot hold an entry for a record it does not have.
+// an image written while the store is being written to is not that. Three things
+// go wrong, in three directions. An entry registered after the build streamed the
+// index is in the shards and not in the image. The stream filters itself against
+// the records the build placed, so an entry naming an entity committed after the
+// pin was skipped on purpose -- the image cannot hold an entry for a record it
+// does not have. And an entity *deleted* after the pin is in the image with all
+// its properties, because it was alive when the records were pinned, while the
+// retraction that hides it lives in a set index.SwapBase starts empty.
 //
-// Both are exactly "the log grew", because every index mutation is journaled
-// before it is applied and both of those are mutations. So the gate is the tail,
-// and a compaction that ran under load takes the old path and gives nothing back
-// until the next quiet one. That is a floor of "no worse than before" rather than
-// a partial fix, which is the right shape for a step that is an optimisation
-// sitting after a commit that has already happened.
+// This used to be gated on the log not having grown, which excluded all three at
+// once and gave nothing back to any compaction that ran under load -- which is
+// every compaction during a bulk ingest, the workload the whole bound exists for.
+// The gate is now the capture: the index records every mutation it applies across
+// the build, and SwapBase replays that log over the base it installs. The first
+// two directions are registrations and come back as registrations; the third is a
+// call to RemoveNode and comes back as one, against the base now installed. See
+// index/tail.go for why it is a log of calls rather than a second set of shards.
+//
+// What is left of the old gate is the fallbacks below. A capture that hit its
+// memory limit, an index that is not the one the plan pinned, and a declaration
+// made during the build all take the path this had before -- the store answers
+// from the shards, correct and larger, until the next quiet compaction.
 //
 // # Why no failure here fails the compaction
 //
@@ -1258,15 +1307,24 @@ func (s *Store) adoptCompactedIndex(p *compactPlan, tail int64) {
 	if p.pendingErr != nil {
 		s.recordIndexFallback(p.pendingErr)
 	}
-	if p.pendingBase == nil || tail > 0 {
+	// Stopped here and not earlier, because everything above this in the commit
+	// runs under the same lock hold and none of it mutates the index -- so this
+	// is the first instant at which no further mutation can be missed, and the
+	// last at which the log can still be handed to the swap.
+	t := s.propIdx.StopCapture()
+	if p.pendingBase == nil {
 		// Whatever was prepared is unmapped by the release in CompactCtx.
+		return
+	}
+	if why := p.tailUsable(s, t, tail); why != nil {
+		s.recordIndexFallback(why)
 		return
 	}
 	// Noted before the swap, so the mapping is held by the store before anything
 	// reads through it. The reverse order has a window in which the only
 	// reference to the mapping is one the collector does not trace.
 	s.noteIndexImage(p.pendingMap, p.pendingBase)
-	if err := s.propIdx.SwapBase(p.pendingBase); err != nil {
+	if err := s.propIdx.SwapBase(p.pendingBase, t); err != nil {
 		// Unreachable: SwapBase refuses only a nil base. Reported rather than
 		// ignored because an unreachable branch that goes quiet is one nobody
 		// finds out about when it stops being unreachable.
@@ -1279,6 +1337,80 @@ func (s *Store) adoptCompactedIndex(p *compactPlan, tail int64) {
 	// finds nothing is the normal case and costs a walk of a list with one
 	// entry in it.
 	s.sweepIndexImages()
+}
+
+// tailUsable reports why the tail cannot be replayed over the new base, or nil
+// when it can. Caller holds s.mu exclusively.
+//
+// Each of these is a reason the base plus the tail would not be what the index
+// answers with, which is index.SwapBase's whole precondition. None of them is an
+// error: they all mean this compaction does not give its index memory back, and
+// a later one will.
+func (p *compactPlan) tailUsable(s *Store, t *index.Tail, tail int64) error {
+	if s.propIdx != p.propIdx {
+		// Unreachable on a writer -- view.idx says the pointer never changes
+		// after Open and only a live reader's Refresh replaces it, and a live
+		// reader does not compact. Checked because the tail was recorded on one
+		// object and is about to be replayed into another, and an assumption that
+		// stops holding silently here loses index entries.
+		return errors.New("compact: the index moved out from under the compaction")
+	}
+	if t == nil {
+		if tail == 0 {
+			// No capture was opened and nothing landed, so there is nothing to
+			// replay and nothing was missed. This is the quiet compaction the
+			// adoption always worked for.
+			return nil
+		}
+		return errors.New("compact: writes landed during a build that was not recording the index")
+	}
+	if !t.Complete() {
+		return fmt.Errorf("compact: the index recorded more than %d bytes of mutations during the build",
+			maxIndexTailBytes)
+	}
+	// Declarations are the one kind of index change the capture does not record,
+	// and deliberately: a declaration is schema, it is not journaled to the log,
+	// and it is not a mutation any replay could put back. It is also the one that
+	// makes the *image* wrong rather than the index -- the ordered and composite
+	// key lists were read into the payload at the pin, so a key declared during
+	// the build is absent from the image's GORD and GCMP. Swapping onto that base
+	// leaves a declared key the base cannot answer for, and only the tail's own
+	// entries in the delta's ordered structure.
+	//
+	// This is not new with the capture. A declaration during an otherwise quiet
+	// build passes the old tail == 0 gate too, and has done since adoption
+	// existed.
+	return declarationsMoved(p, s)
+}
+
+// declarationsMoved reports a key declared ordered or composite between the pin
+// and the commit. Caller holds s.mu exclusively.
+//
+// Compared against the payload rather than a second copy taken at the pin,
+// because the payload *is* what the image was written from: the question is
+// whether the file on disk describes the declarations the index now has, and the
+// list that went into the file is the only honest thing to ask it of.
+func declarationsMoved(p *compactPlan, s *Store) error {
+	same := func(what string, was, now []string) error {
+		if slices.Equal(was, now) {
+			return nil
+		}
+		return fmt.Errorf("compact: %s keys were declared during the build (%d at the pin, %d now)",
+			what, len(was), len(now))
+	}
+	if err := same("ordered node", p.payload.OrderedNodeKeys, s.propIdx.OrderedNodeKeys()); err != nil {
+		return err
+	}
+	if err := same("ordered edge", p.payload.OrderedEdgeKeys, s.propIdx.OrderedEdgeKeys()); err != nil {
+		return err
+	}
+	if len(p.payload.CompositeNodeKeys) != len(s.propIdx.CompositeNodeKeys()) {
+		return errors.New("compact: a composite node key was declared during the build")
+	}
+	if len(p.payload.CompositeEdgeKeys) != len(s.propIdx.CompositeEdgeKeys()) {
+		return errors.New("compact: a composite edge key was declared during the build")
+	}
+	return nil
 }
 
 // retireLog empties or rotates the log now that the image holds its records.

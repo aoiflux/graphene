@@ -13,7 +13,7 @@
 > | 1c | auto-splitting writer, separate API, non-atomic | **done** - `AddNodesInBatches`/`AddEdgesInBatches` on the store and on `Graph` |
 > | 1d | discover the environment's ceiling (cgroup / job object / sysctl) | **done** - `Options.DiscoverMemoryBudget`, reported via `StorageStats.MemoryBudgetSource` |
 > | 1e | `CompactionPolicy.MaxResidentBytes` | **done** - fifth rule, between the delta rules and the WAL proxy |
-> | 1f | index adoption gate: split shards at the pin | todo |
+> | 1f | index adoption gate under concurrent writes | **done** - not the shard split the plan named: `index.Tail` records the mutations and `SwapBase` replays them, because a shard split cannot carry a retraction. 0c to turn `maxIndexTailBytes` into an option |
 > | 1g | `bulk` gets byte-sized batches and a compaction schedule | **done** - `Options.MaxBatchBytes`/`Compact`/`Reopen`; `import graph` bounded by default at `-bound 32` with a reopen through `Context.ReopenGraph` |
 > | 2a-2d | bound the resident class (gated on 0b) | todo |
 > | 3a-3e | the documentation | todo |

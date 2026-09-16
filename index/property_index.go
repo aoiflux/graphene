@@ -74,6 +74,12 @@ type PropertyIndex struct {
 	// retracted; see retract.go for the design and union.go for the merges. A
 	// store with no base pays one atomic load and a branch per read path.
 	baseRef atomic.Pointer[baseState]
+
+	// tail is the mutation log a compaction opens across its build, or nil. Read
+	// on every mutation path and written only by CaptureTail and StopCapture, so
+	// a store that is not compacting pays one atomic load per mutation and
+	// nothing else. See tail.go for what it is for and what it costs.
+	tail atomic.Pointer[Tail]
 }
 
 // propertyShards must be a power of two so the hash can be masked.
@@ -397,6 +403,10 @@ func (p *PropertyIndex) IndexNode(id store.NodeID, key string, value []byte) {
 		s, hasBase := p.nodeBase()
 		p.nodeComposites.registered(id, key, vk, s, hasBase)
 	}
+	// Last, so what is recorded is a mutation that finished. The interned vk is
+	// what goes in rather than a second copy of value -- the shard is holding
+	// that string already, which is the whole of why recording is cheap.
+	p.capture(tailNodeReg, uint64(id), key, vk)
 }
 
 // IndexEdge records that edgeID has property key=value. Re-registering an
@@ -416,6 +426,7 @@ func (p *PropertyIndex) IndexEdge(id store.EdgeID, key string, value []byte) {
 		s, hasBase := p.edgeBase()
 		p.edgeComposites.registered(id, key, vk, s, hasBase)
 	}
+	p.capture(tailEdgeReg, uint64(id), key, vk)
 }
 
 // RemoveNode drops every indexed entry for the given node id across all keys
@@ -444,6 +455,11 @@ func (p *PropertyIndex) RemoveNode(id store.NodeID) {
 	if p.compDeclared.Load() {
 		p.nodeComposites.removed(id)
 	}
+	// A removal carries no key and no value: what it did is drop everything this
+	// id had, and replaying it means calling this again. That is also why a
+	// retraction cannot be represented as a shard entry, which is the argument
+	// in tail.go for recording calls rather than their effects.
+	p.capture(tailNodeDel, uint64(id), "", "")
 }
 
 // RemoveEdge drops every indexed entry for the given edge id across all keys
@@ -467,6 +483,7 @@ func (p *PropertyIndex) RemoveEdge(id store.EdgeID) {
 	if p.compDeclared.Load() {
 		p.edgeComposites.removed(id)
 	}
+	p.capture(tailEdgeDel, uint64(id), "", "")
 }
 
 // NodesMatchingOrdered appends the IDs matching a range or prefix filter to dst,

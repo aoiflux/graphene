@@ -283,8 +283,8 @@ func (p *PropertyIndex) fillCompositesFromBase() {
 	}
 }
 
-// SwapBase replaces the base with one that already holds everything this index
-// holds, and empties the delta behind it.
+// SwapBase replaces the base with one that holds everything this index held when
+// the tail was opened, empties the delta behind it, and replays the tail on top.
 //
 // # What it is for
 //
@@ -302,15 +302,26 @@ func (p *PropertyIndex) fillCompositesFromBase() {
 //
 // # The precondition, which is the whole of the correctness argument
 //
-// b must hold exactly what this index currently answers with: base ∪ delta −
-// retracted, as of now. Not a superset and not a subset. The caller is a
-// compaction that has just written b from this index and has established that
-// nothing has been registered or retracted since -- see Store.compactCommit for
-// how that is established and what happens when it cannot be.
+// b ∪ t must hold exactly what this index currently answers with: base ∪ delta
+// − retracted, as of now. Not a superset and not a subset. The caller is a
+// compaction that has just written b from this index, and t is the log of every
+// mutation applied since the moment b was pinned -- see Store.compactCommit for
+// how the two are lined up and what happens when the tail cannot be trusted.
+//
+// t may be nil, and then the precondition is the stricter one this started with:
+// b alone holds everything, because nothing was registered or retracted while it
+// was being written.
 //
 // Everything else follows from it. The delta can be emptied because b holds every
-// entry it held. The new retraction sets start empty because an id retracted from
-// the old base is simply absent from b.
+// entry it held at the pin and t holds every entry added since. The new retraction
+// sets start empty because an id retracted from the old base is simply absent from
+// b -- and an id retracted *after* the pin is in t, which is the one direction a
+// base written before it cannot express, and the reason the tail is a log of calls
+// rather than a second set of shards. See tail.go.
+//
+// The caller must pass a tail it has checked is Complete. A dropped one is not an
+// error and is not detected here: it is a capture that gave up on its memory
+// limit, and what it means is that this call must not be made at all.
 //
 // # The composites, which b may or may not answer
 //
@@ -356,7 +367,16 @@ func (p *PropertyIndex) fillCompositesFromBase() {
 // landing in a shard this has already cleared is an entry b does not hold and the
 // delta no longer does. A compaction holds the store's write lock across this,
 // which is the same thing that makes the precondition above checkable at all.
-func (p *PropertyIndex) SwapBase(b Base) error {
+//
+// With a non-nil tail it must exclude readers too, and that is stronger than what
+// the reader argument above establishes. The ordering there makes install-then-
+// clear safe because a reader that missed the shard finds the entry in b. An entry
+// in the tail is in neither: it was registered after b was pinned, so b does not
+// carry it, and the clear has taken it out of the shards until the replay puts it
+// back. The window is real and the only thing that closes it is the caller's lock.
+// Store.compactCommit holds the store's lock exclusively and every read path takes
+// it shared -- Store.NodesByProperty is the shape -- so no query can be inside it.
+func (p *PropertyIndex) SwapBase(b Base, t *Tail) error {
 	if b == nil {
 		return errIndexf("index: SwapBase needs a base")
 	}
@@ -371,6 +391,10 @@ func (p *PropertyIndex) SwapBase(b Base) error {
 	if s, ok := p.edgeBase(); ok {
 		p.edgeComposites.resetCarried(s)
 	}
+	// Last, and after the composites have been reset rather than before, so a
+	// tuple the tail refiles is filed against the state the base just installed
+	// and not against one about to be emptied under it.
+	t.apply(p)
 	return nil
 }
 

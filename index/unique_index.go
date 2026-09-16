@@ -326,6 +326,9 @@ func (p *PropertyIndex) IndexNodeUnique(id store.NodeID, key string, value []byt
 		s, hasBase := p.nodeBase()
 		p.nodeComposites.registered(id, key, vk, s, hasBase)
 	}
+	// Only the accepted registrations, which is what the two returns above are
+	// for. A refused one left nothing behind and has nothing to replay.
+	p.capture(tailNodeReg, uint64(id), key, vk)
 	return nil
 }
 
@@ -355,5 +358,6 @@ func (p *PropertyIndex) IndexEdgeUnique(id store.EdgeID, key string, value []byt
 		s, hasBase := p.edgeBase()
 		p.edgeComposites.registered(id, key, vk, s, hasBase)
 	}
+	p.capture(tailEdgeReg, uint64(id), key, vk)
 	return nil
 }
