@@ -1332,3 +1332,66 @@ func (s *Store) rotateLog(newCSR *CSRGraph) error {
 	}
 	return nil
 }
+
+// CompactAndReopen compacts and then returns a fresh handle on the same
+// directory, opened with the same Options. The receiver is closed.
+//
+// # What it is for
+//
+// A compaction writes a new image and publishes a graph built in the heap. The
+// records it wrote are in the file; the ones this process is holding still
+// carry their own payload bytes, because AttachBase runs on the load path and a
+// compaction is not one. So the payload term does not fall at a compaction. In a
+// process that compacts once at the end of a long write that costs nothing worth
+// naming, and in one that compacts repeatedly it ratchets: once per record
+// written, for the life of the handle.
+//
+// Measured at 1,400,000 nodes under a real 2 GiB ceiling, rebuilding the whole
+// layer with the delta bounded at 32 MiB — see docs/MEMORY_MODEL.md section 9.8.
+// Compacting in place reached 1,350,000 of 1,400,000 records and died holding
+// 661.8 MiB of payload it had already written to disk. Reopening after each
+// interim compaction held the payload term at 1.9 MiB and finished.
+//
+// # What it costs
+//
+// A reopen, which is an open: the image is mapped and its header and directory
+// parsed, in time proportional to the image rather than to what changed. It is
+// not free and it is not a thing to do after every commit. It is the thing to do
+// after a compaction, in a process whose peak matters.
+//
+// # What it does not do
+//
+// It does not make a slice taken before the call invalid. Rule A holds: bytes
+// read through the old handle stay readable for the life of that handle, and
+// this closes that handle, so the rule is that they stay readable until the
+// caller drops the value — which is the same rule, arrived at from the other
+// side. A caller holding a Properties slice across this call is holding bytes
+// whose mapping has been released. Copy before calling, as CloneNode does.
+//
+// On any error the store on disk is intact. If the compaction fails the receiver
+// is still open and usable; if the close or the reopen fails it is not, and the
+// directory can be opened again with Open.
+func (s *Store) CompactAndReopen() (*Store, error) {
+	return s.CompactAndReopenCtx(context.Background())
+}
+
+// CompactAndReopenCtx is CompactAndReopen with the compaction abandoned if ctx
+// is cancelled. The reopen is not cancellable: once the receiver is closed there
+// is no handle to return, so abandoning there would leave the caller with
+// nothing rather than with less.
+func (s *Store) CompactAndReopenCtx(ctx context.Context) (*Store, error) {
+	// Before anything is closed. A failed compaction leaves the caller exactly
+	// where they were, which is the only failure mode here that can be harmless.
+	if err := s.CompactCtx(ctx); err != nil {
+		return nil, err
+	}
+	dir, opts := s.dir, s.openOpts
+	if err := s.Close(); err != nil {
+		return nil, fmt.Errorf("CompactAndReopen: close: %w", err)
+	}
+	reopened, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		return nil, fmt.Errorf("CompactAndReopen: reopen %s: %w", dir, err)
+	}
+	return reopened, nil
+}

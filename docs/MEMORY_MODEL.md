@@ -1360,9 +1360,45 @@ unchanged and unstarted.
 summed into it, so a store can be asked what its own declarations cost instead of
 being compared against a projection taken on another shape. It is exact in its counts
 and free to read — the loop was already there, per declaration, and was summing itself
-away. That is what the arm at 1.4M will read the number off, and it is what a caller
-who declares composites should look at before concluding that a mapped index brought
-them under a ceiling.
+away. That is what the arm at 1.4M read the number off — 128.2 MiB, in the term-by-term
+line of every arm in section 9.8 — and it is what a caller who declares composites should
+look at before concluding that a mapped index brought them under a ceiling.
+
+#### The composite index on disk: deferred to v0.9.0, with what was settled written down
+
+This is the largest remaining term, and it is measured rather than projected now:
+**128.2 MiB of the 237.8 MiB a default configuration holds at 1,400,000 nodes — 53.9%**,
+and 164.8 of 305.8 at the 1,800,000-node shape, the same fraction to a tenth of a point
+across a twentyfold difference in blob size (§9.7). It is the largest single item in that
+column, ahead of record arrays at 74.8. `ResidentEstimate.Composite` reports it directly.
+
+It is not being built in v0.8.0. It is a release on its own: GPIX cost four implementation
+files and nine test files, and a `GCMP` written as an index rather than as declarations is
+the same shape. Two things that looked like blockers are not, and both are recorded here so
+that the work does not start by re-deriving them.
+
+**The format question is settled, and favourably.** `csrSectionComposite = "GCMP"` is
+already registered in `disk/csr_v8.go` as *optional, non-critical*, and
+`checkCriticalSections` skips non-critical sections it does not understand. `GORD` is the
+precedent and says so in the same file: a reader that skips it answers every query
+correctly and only pays the scan. So a v0.7.x reader meeting an image with a composite
+*index* in it skips the section and rebuilds composites at open exactly as it does today.
+**No version bump past v9, no stranded readers, no bidirectional migration** — which also
+means this does not break the release's no-breaking-changes claim whenever it lands.
+
+**The random-seed question is settled too.** `index/composite_index.go` seeds each table's
+`maphash` per table on purpose: property values are caller-supplied, and a fixed seed would
+let a caller choose values that collide. A hashed section cannot carry a per-process random
+seed. GPIX already met this and answered it by not hashing — it is **sorted and
+binary-searched**. GCMP should be GPIX's layout with a composite key tuple where GPIX has a
+value, and the seed problem does not arise.
+
+**What is not settled is whether it is worth a release.** At the shape this document is
+written against it is the biggest prize left. At the audited consumer's shape — 387,000
+records and two composites, one with no reader at all — it is worth roughly 32 MiB, which
+is an engine win rather than a win for the integrator who asked for the work. And with
+§9.8's acceptance now passing at 37.2% headroom, nothing is blocked on it.
+
 
 ## 9. Under a ceiling
 
@@ -1482,6 +1518,15 @@ row should be read against 561, not 1,113** — the program reaches it for the r
 room to spare, and by a wider margin than this document has been claiming.
 
 ### 9.4 The write path did not fit, and the delta was not the reason
+
+> **Superseded, v0.8.0 — the acceptance holds, and this section's title is the part that
+> did not survive.** The rebuild below fails because the process is holding the payload of
+> every record it has compacted, not because the delta is large; §9.8 measures a sweep of
+> eight `MaxDeltaBytes` values at this shape, none of which completes it, and then completes
+> it at **1,285.2 MiB of 2,048 — 37.2% headroom** by reopening after each interim
+> compaction. `Graph.CompactAndReopen` is that change. The 3,853 MiB and 6,644 MiB figures
+> below stand as what an in-place compaction costs and are left in place for that reason;
+> what is retracted is the conclusion that the write path does not fit.
 
 **Rebuilding the whole layer in one process holds 3,853 MiB and peaks at 6,644 MiB** —
 3.2× over the ceiling. That is the plan's end-to-end acceptance, and it does not hold.
@@ -1736,6 +1781,153 @@ GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_READONLY=1 GRAPHENE_RSS_DIR=/path/to/
   go test ./tests/ -tags=stress -count=1 -run '^TestCeiling_Consumer' -v
 ```
 
+### 9.8 The write path fits, and the knob was not what fixed it
+
+§9.4 left the release's end-to-end acceptance failed and unretested: a whole-layer rebuild
+at 1,400,000 nodes held 3,853 MiB and peaked at 6,644, against a 2,048 MiB ceiling. §9.6
+then closed the index half of it — `SwapBase` installs the base a compaction wrote — and
+measured that at 200,000 nodes, where bounding the delta went from worth 3.8% to worth 36%.
+The open question was whether `MaxDeltaBytes` closes the rest at the full shape.
+
+It does not. This section is the sweep that establishes it, and the change that does.
+
+**The read arm first, because it is the half that already held.** Under the same 2 GiB Job
+Object, opening the 1,689.1 MiB image and scanning it charges **396.2 MiB of 2,048 — 80.7%
+headroom** — and settles at 237.8 MiB of modelled heap: records 74.8, composites 128.2,
+adjacency 21.4, label postings 10.7, payload 2.7. The payload row is the point of the whole
+programme: 1,400,000 records of blob, and the heap holds 2.7 MiB of it, because a
+`Properties` slice addresses the mapping.
+
+#### The delta sweep: eight bounds, one shape, no pass
+
+Each arm is a fresh process under the same 2,048 MiB limit, running the consumer sequence —
+open, scan, enumerate, then delete all 1,400,000 nodes and write 1,400,000 back — with
+`CompactionPolicy.MaxDeltaBytes` as the only variable.
+
+| `MaxDeltaBytes` | interim compactions | records written before it died | anonymous at the last sample |
+|---|---:|---:|---:|
+| unbounded | 0 | 400,000 | 1,916.2 MiB |
+| 512 MiB | 0 | 400,000 | 1,924.9 MiB |
+| 256 MiB | 1 | 400,000 | 1,888.4 MiB |
+| 128 MiB | 3 | 750,000 | 1,855.8 MiB |
+| 64 MiB | 5 | 800,000 | 1,959.3 MiB |
+| **32 MiB** | 14 | **1,350,000** | 2,041.5 MiB |
+| **16 MiB** | 29 | **1,350,000** | 2,042.0 MiB |
+| 8 MiB | 29 | 1,250,000 | 1,980.2 MiB |
+
+Every arm died of `ERROR_COMMIT_LIMIT` inside the *rebuild* phase — not at the final
+compaction, and not in a sweep afterwards. The curve has a direction and an optimum: the
+tightest useful bound reaches 96.4% of the rebuild, and below 16 MiB it turns back down.
+**No value passes.**
+
+**Why a bound helps at all, and why it then stops helping.** There are two growing terms, and
+a compaction moves cost from one to the other rather than removing it.
+
+*Uncompacted*, the term that runs away is the resident property index over the new writes.
+At 400,000 records the unbounded arm holds **546.4 MiB of index against 295.0 MiB of delta**
+— the index is 1.85× the delta, and no `CompactionPolicy` rule counts it. A rebuild writes
+thirteen index entries a node, so this is the 18,200,000-entry figure §9.4 predicted,
+arriving four times sooner than the delta it is measured beside. The 512 MiB and 256 MiB
+bounds are simply above what the process can reach, so they behave as unbounded.
+
+*Compacted*, that term is folded into the image and the arm gets three times as far — and
+the record payloads stay in the heap. The 32 MiB arm's payload term climbs **49.0 MiB per
+100,000 records written and never resets**, reaching 637.2 MiB at the point it died; the
+16 MiB arm reached 661.8. Those are bytes the process has already written to the image and
+is still carrying. At the optimum, payload and records together are **83% of the modelled
+heap**.
+
+That is §9.4's post-compaction characteristic, at the shape that matters: a compaction
+publishes a graph it built in the heap, and `AttachBase` runs on the load path and nowhere
+else. Compacting more often does not shrink it, because it is proportional to records
+written rather than to compactions. It is outside the knob.
+
+#### What fixes it is an open, and the cost is one
+
+Reopening after each interim compaction is the same sequence with `GRAPHENE_CEILING_REOPEN=1`:
+
+| phase | anonMiB | fileMiB | rssMiB | peakMiB | wall | note |
+|---|---:|---:|---:|---:|---:|---|
+| open | 316.6 | 703.4 | 1020.0 | 1116.6 | 2.003s | image mapped, index mapped, adjacency built |
+| scan | 316.6 | 703.9 | 1020.5 | — | 0s | 10 rows |
+| enumerate | 327.4 | 704.0 | 1031.4 | 1043.2 | 39ms | 1,400,000 ids |
+| rebuild | 344.7 | 703.8 | 1048.5 | 2147.3 | 3m32.023s | 1,400,000 deleted, 1,400,000 written, 15 interim compactions and 15 reopens |
+| compact | 337.5 | 1226.6 | 1564.0 | 1731.2 | 13.926s | image heap, index mapped, adjacency built |
+| reopen | 332.5 | 704.1 | 1036.6 | 1517.8 | 2.44s | 1,400,000 nodes, image mapped, index mapped, adjacency built |
+
+**1,285.2 MiB of the 2,048 MiB ceiling, 762.8 MiB of headroom — 37.2%.** The acceptance §9.4
+records as failed by 3.2× passes, and the peak falls from 6,644 MiB to 1,285.2.
+
+The mechanism is visible term by term. Matched against the 32 MiB arm that did not reopen,
+at the same point in the same rebuild:
+
+| at 200,000 written, 32 MiB bound | compacting in place | reopening after each |
+|---|---:|---:|
+| payload, heap | 98.0 MiB | **0.4 MiB** |
+| property index, heap | 0.0 MiB | 0.0 MiB |
+| property index, mapped | 0.0 MiB | **140.9 MiB** |
+| modelled heap | 132.0 MiB | **34.3 MiB** |
+| anonymous | 872.6 MiB | **502.4 MiB** |
+
+A reopen restores *both* halves: the records address the image again, and the property index
+goes back to being read in place rather than rebuilt in the shards. The arm then holds flat
+rather than ratcheting — 502.4 MiB at 200,000 written, 419.6 at 450,000, 687.8 at 1,050,000
+— and settles at **238.0 MiB of modelled heap, against the read-only arm's 237.8**. Having
+rebuilt every record in the store, the process is holding what a fresh open holds.
+
+**It is also faster, which was not the argument for it.** The reopen arm completed the whole
+sequence in 242s. The 16 MiB arm spent 469s and did not finish, and the 8 MiB arm 363s and
+did not finish: 29 compactions against a heap that never stops growing cost more than 15
+against one that does not. A reopen is an open — the image mapped, the header and directory
+parsed, 2.44s on this store — so it is a thing to do after a compaction and not after a
+commit, and 15 of them are 5% of this rebuild's wall clock.
+
+#### The bound and the reopen are one setting, not two
+
+Reopening is not a substitute for bounding the delta. The same arm at a 128 MiB bound
+reopens five times instead of fifteen, and **fails at 1,200,000 of 1,400,000** holding
+1,843.0 MiB. It is a large improvement on the 750,000 that 128 MiB reaches without
+reopening, and it is still a failure.
+
+| 1,400,000-node rebuild | without reopen | with a reopen after each compaction |
+|---|---:|---:|
+| `MaxDeltaBytes` 128 MiB | 750,000 records | 1,200,000 records |
+| `MaxDeltaBytes` 32 MiB | 1,350,000 records | **all 1,400,000, 37.2% headroom** |
+
+The reason is that a reopen sheds what has accumulated *since the last one*, and between two
+reopens a 128 MiB bound lets the delta and the index over it grow four times as far. The
+configuration that fits is both: **bound the delta at 32 MiB and reopen after each of the
+fifteen compactions that produces.** Neither half alone reaches the end of this rebuild.
+
+#### The decision
+
+`Graph.CompactAndReopen` ships. It is §9.4's route (b): compact, close, return a fresh handle
+on the same directory with the same options.
+
+**Route (a) — re-mapping the compaction's output in place — is not shipped, and the sweep
+does not change that.** It is the contract change rather than a side effect of one: old
+records would address mapping N and new ones N+1, and retirement becomes reachability-based.
+`disk/mapping.go`'s header derives rule A rather than asserting it, and route (b) is rule A
+verbatim — the predecessor is closed, so nothing is retired out from under a live graph.
+
+**`DefaultCompactionPolicy` is unchanged.** The sweep's honest conclusion is that no
+`MaxDeltaBytes` completes this rebuild on its own, so there is no value on this curve to
+promote as a default; 128 MiB remains reasonable for the workloads it was chosen for, and
+moving it would change the compaction schedule of every deployment tuned against it for no
+measured benefit. A consumer on a bounded machine needs the pair, and the pair is documented
+at `CompactAndReopen` rather than buried in a default.
+
+#### What this does not establish
+
+The arms above are windows under a Job Object, which limits commit charge. The linux arm
+under a cgroup has not been rerun at this shape since §9.6. Only two bounds have been
+measured with a reopen, so where between 32 and 128 MiB the configuration stops fitting is
+not known. And the figure the process actually charges is roughly **2.6× the modelled heap**
+during a rebuild — 559.8 MiB modelled against 1,454.8 anonymous at one sample — where at
+rest the model is within a few percent. `EstimateResident` models retained heap; it does not
+model the allocator's working set, the collector's headroom, or a compaction's transients,
+and a caller sizing a rebuild against it is reading a floor rather than a budget.
+
 ## Reproducing these figures
 
 Every number above comes from `tests/rss_bench_test.go` behind the `stress` tag. The
@@ -1755,6 +1947,7 @@ fixture knobs:
 | `GRAPHENE_CEILING_BUILD` | build the ceiling fixture and measure nothing — the step that must run *outside* the limit |
 | `GRAPHENE_CEILING_READONLY` | stop the sequence after the scan: the consumer's aggregate process, and the arm that fits at the full shape |
 | `GRAPHENE_CEILING_DELTA_MIB` | bound the delta during the rebuild via `CompactionPolicy.MaxDeltaBytes`; unset rebuilds into one delta |
+| `GRAPHENE_CEILING_REOPEN` | reopen the store after every interim compaction — route (b) of §9.8, and meaningless without a delta bound to produce interim compactions |
 
 **Use `GRAPHENE_RSS_DIR` for anything that reports a peak.** Building a 1.4M-node
 fixture peaks near 9.4 GiB and `peakMiB` is a process-lifetime high-water mark, so a

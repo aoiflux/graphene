@@ -5,6 +5,121 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 
 ## Unreleased — v0.8.0
 
+### A whole-layer rebuild fits under 2 GiB, and the knob was not what did it
+
+- **v0.7.0's end-to-end acceptance failed and is now measured passing.**
+  `docs/MEMORY_MODEL.md` §9.4 recorded a rebuild of all 1,400,000 nodes of a
+  1,689 MiB store holding 3,853 MiB and peaking at 6,644 against a 2,048 MiB
+  ceiling — 3.2× over — and said the figures had not been taken again since the
+  index fix that shipped in the same release. Taken again, under a real 2 GiB Job
+  Object: **1,285.2 MiB charged, 762.8 MiB of headroom, 37.2%**, settling at
+  238.0 MiB of modelled heap against the read-only arm's 237.8. Having rebuilt
+  every record in the store, the process holds what a fresh open holds.
+
+- **The expected fix was the delta bound, and it is not.**
+  `CompactionPolicy.MaxDeltaBytes` was swept across eight values at the full
+  shape — unbounded, 512, 256, 128, 64, 32, 16 and 8 MiB — in a fresh process
+  each. Every one died inside the rebuild, and the curve has an optimum rather
+  than a direction: 32 and 16 MiB reach 1,350,000 of 1,400,000 records, 8 MiB
+  turns back down to 1,250,000, and the loose bounds never fire at all because
+  the process cannot reach them. §9.8 carries the table.
+
+- **There are two runaway terms and a compaction moves cost between them.**
+  Uncompacted, the term that grows is the resident property index over the new
+  writes — at 400,000 records it is **546.4 MiB against the delta's 295.0**,
+  1.85× larger, and no policy rule counts it. Compacted, that term folds into the
+  image and the arm gets three times as far, but the record payloads stay in the
+  heap: the payload term climbs 49.0 MiB per 100,000 records written and never
+  resets, reaching 637.2 MiB. At the optimum, payload and records are 83% of the
+  modelled heap. Those are bytes already written to the image and still carried,
+  because `AttachBase` runs on the load path and a compaction is not one.
+
+- **`Graph.CompactAndReopen` and `disk.Store.CompactAndReopen` compact and return
+  a fresh handle on the same directory with the same options; the receiver is
+  closed.** With a reopen after each of the fifteen interim compactions a 32 MiB
+  bound produces, the payload term holds at 2.7 MiB instead of climbing, the
+  property index goes back to being read in place — 140.9 MiB mapped where the
+  in-place arm had 0 mapped and the shards resident — and anonymous memory holds
+  flat across the rebuild instead of ratcheting: 502.4 MiB at 200,000 written,
+  419.6 at 450,000, 687.8 at 1,050,000.
+
+- **It is faster, which was not the argument for it.** The reopen arm finished the
+  whole sequence in 242s; the 16 MiB arm spent 469s without finishing and the
+  8 MiB arm 363s without finishing. Twenty-nine compactions against a heap that
+  never stops growing cost more than fifteen against one that does not. A reopen
+  is an open — 2.44s on this store, proportional to the image rather than to what
+  changed — so it belongs after a compaction and not after a commit.
+
+- **The bound and the reopen are one setting.** Reopening is not a substitute for
+  bounding the delta: the same arm at 128 MiB reopens five times instead of
+  fifteen and still fails, at 1,200,000 of 1,400,000. It is a large improvement on
+  the 750,000 that 128 MiB reaches without reopening, and it is still a failure.
+  A reopen sheds what accumulated since the last one, so how often it happens is
+  the setting that matters.
+
+- **`DefaultCompactionPolicy` is unchanged, and that is the measurement's
+  conclusion rather than a deferral.** The release was expected to move
+  `MaxDeltaBytes` off this curve. No value on the curve completes the rebuild on
+  its own, so there is no winner to promote; 128 MiB stays what it was, and
+  moving it would change the compaction schedule of every deployment tuned
+  against it for no measured benefit.
+
+- **The lifetime contract is unchanged.** `CompactAndReopen` is rule A verbatim —
+  the predecessor handle is closed, so nothing is retired out from under a live
+  graph — which is why it was preferred to re-mapping a compaction's output in
+  place. A `Properties` slice held across the call addresses a released mapping;
+  copy first, as `CloneNode` does. Three tests in
+  `tests/graphene_compact_reopen_test.go` assert that the payload term falls by
+  the blobs, that the receiver is closed and the returned handle holds the lock,
+  and that the in-memory backend hands back the same `Graph`.
+
+### The composite index on disk is deferred to v0.9.0, and what was settled is written down
+
+- **It is the largest remaining term and it is now measured rather than
+  projected**: 128.2 MiB of the 237.8 MiB a default configuration holds at
+  1,400,000 nodes — **53.9%** — and 164.8 of 305.8 at the 1,800,000-node shape,
+  the same fraction to a tenth of a point across a twentyfold difference in blob
+  size. Ahead of record arrays at 74.8 MiB. `ResidentEstimate.Composite` reports
+  it directly, so a store can be asked instead of compared against a projection.
+
+- **It is not being built here, because it is a release on its own.** GPIX cost
+  four implementation files and nine test files; a `GCMP` written as an index
+  rather than as declarations is the same shape.
+
+- **Two things that looked like blockers are not, and both are recorded in
+  `docs/MEMORY_MODEL.md` §8.6 so the work does not begin by re-deriving them.**
+  `csrSectionComposite = "GCMP"` is already registered *optional, non-critical*,
+  and `checkCriticalSections` skips non-critical sections it does not understand —
+  `GORD` is the precedent — so a v0.7.x reader would skip a composite index and
+  rebuild composites at open exactly as it does today. No version bump past v9, no
+  stranded readers, no bidirectional migration. And the per-table random `maphash`
+  seed, which exists because caller-supplied values could otherwise be chosen to
+  collide, is not a blocker either: GPIX met the same problem and answered it by
+  being sorted and binary-searched rather than hashed.
+
+- **What is genuinely unsettled is whether it is worth a release.** At the audited
+  consumer's shape — 387,000 records and two composites, one with no reader at all
+  — it is worth roughly 32 MiB, an engine win rather than a win for the integrator
+  who asked for this work. With the acceptance now passing at 37.2% headroom,
+  nothing is blocked on it.
+
+### The nightly gains a third arm, non-blocking
+
+- **`ceiling-linux` and `ceiling-windows` each gain a 1.4M-node rebuild arm** with
+  the delta bounded at 32 MiB and a reopen after each interim compaction — the
+  configuration §9.8 measures passing. The repo already keeps read and write arms
+  separate so that neither hides the other; this is the write arm at the full
+  shape rather than at 200,000.
+
+- **Both start `continue-on-error: true`, and the reason is not timidity.** The
+  figures were taken on windows under a Job Object, which bounds commit charge;
+  the linux arm runs under a cgroup, which bounds resident pages, and the two are
+  not the same instrument. A nightly that went red on a difference between
+  instruments would be switched off, and an arm nobody reads is worse than one
+  that is honest about being new. Neither has run on a hosted runner, which has
+  less commit and a slower disk than the machine the measurement was made on. Drop
+  the flag once each is green, not before.
+
 ### The mapped-bytes accounting was wrong, in both directions
 
 - **`ResidentEstimate.Mapped` and `StorageStats.ImageMappedBytes` reported zero
@@ -285,6 +400,35 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   trade, stated so a caller can apply it to their own ceiling. The default is
   unchanged here; moving it is a measurement, not an edit.
 
+### `MaxDeltaBytes` counts the records and not the map that holds them
+
+- **The rule that exists to be the memory rule under-reports what the delta
+  costs, and sharply so when the delta is mostly tombstones.**
+  `CompactionPolicy.MaxDeltaBytes` is evaluated against
+  `StorageStats.DeltaBytes`, which is `deltaLayer.bytes`: the version cells, the
+  records, and those records' labels and property blobs. The version maps that
+  hold the cells, the delta adjacency and the type postings are structure rather
+  than payload, and they are modelled in `disk.ResidentEstimate.Delta` instead.
+  Both halves say so where they are implemented. What was missing is that a
+  caller reading *"on a machine with a memory limit, this is the figure that runs
+  out"* is reading about the smaller of the two.
+
+- **Measured, deleting a 1,400,000-node store entry by entry under a 32 MiB
+  bound.** A tombstone contributes 24 bytes of counted cell and roughly 19
+  further bytes of map the rule cannot see. At 1,300,000 tombstones the rule saw
+  29.8 MiB and the store was holding 53.8 — **1.81×** — and no compaction fired
+  until the 1,400,000th, which is exactly where 24 bytes a tombstone crosses
+  32 MiB. The arithmetic and the measurement agree to a tenth of a MiB, so this
+  is a mismatch between two definitions and not an error in either.
+
+- **Nothing changes about when a store compacts.** The figure is correct for what
+  it says it counts, and moving it would silently change the compaction schedule
+  of every deployment that has tuned against it. What changes is the doc comment,
+  which now carries the factor, the measurement behind it and the remedy: size a
+  delete-heavy workload against `ResidentEstimate.Delta`, or halve the bound. The
+  gap is negligible whenever the delta carries blobs, because then the blobs
+  dominate and they are counted.
+
 ### What a read costs when its pages are not resident
 
 - **Six statements across the tree declined to measure the cold path, all giving
@@ -328,6 +472,38 @@ Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
   `BenchmarkRSS_ResidualRoutePages` keeps its page-count proxy and says why: a
   page count is stable across machines in a way a latency is not, and it runs on
   every platform rather than on two.
+
+- **The figures, taken at 1,400,000 nodes against the 1,689.1 MiB image.** Trimmed
+  against resident, three runs at 20,000 samples: record point read **20.6–26.1×**,
+  index point lookup **4.8–6.1×**, projection batch **5.0–5.9×**, bounded batch
+  read **16.5–21.1×**. All four are lower bounds, because trimmed pages are a soft
+  fault away and not a seek away. `docs/benchmarks.md` carries the table.
+
+- **The ratio depends on how many samples you take, which is a property of the
+  instrument and not of the store.** The same arm reports the index point lookup
+  at 285× on 2,000 samples, 16× on 8,000 and 5–6× on 20,000, while three runs at
+  20,000 agree within 20% of each other. A trimmed pass pays a fixed cost to fault
+  its structure back in and then a marginal cost per operation, and the harness
+  reports their sum over the sample count — so a small run measures the first
+  lookup into a cold store and a large one measures the thousandth. Both are real
+  questions; quoting one figure for both would have been an artefact. Use 20,000
+  or more for the marginal number.
+
+- **What the measurement settles.** The residual probe's 2.8× warm regression is
+  vindicated: trimmed, the index pages it reads amortise across lookups to
+  4.8–6.1× while the record payload pages a scan would touch do not amortise at
+  all and cost 20.6–26.1×, so the planner's cost model leans the way the
+  measurement does. The same argument carries the bounded batch API, and it makes
+  the mapped point lookup's warm doubling a small part of the real cost.
+
+- **What it does not settle, stated rather than glossed.** The batch join's 1.17×
+  on unsorted values is untouched — `projection batch` runs one ordering, and
+  separating them needs a second arm — so the advice to supply ascending values
+  still rests on the warm figures it always rested on. The bounded batch read's
+  cold pass lands at 19.1–19.5 ms against the harness's own 20 ms trust threshold
+  and was flagged in three runs of four; the flag is reported beside the figure
+  rather than argued away. And the linux arm, the one that evicts for real, has
+  not been run at this shape.
 
 ### The fixture builder can build a store larger than the machine's RAM
 

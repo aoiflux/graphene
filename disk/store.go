@@ -97,6 +97,18 @@ type Store struct {
 	// restart replayed the whole index.
 	propIdx *index.PropertyIndex
 
+	// openOpts is the Options this store was opened with, kept whole.
+	//
+	// The fields below decompose the ones this type reads on a hot path, and
+	// that is not a duplicate of this: those are what the store *uses*, and this
+	// is what it would have to be given again to be the same store. Only
+	// CompactAndReopen needs it, and it needs all of it -- the metrics sink, the
+	// observer, the anchor, the ledgers -- because a reopen that silently
+	// reconstructed Options from the fields it happened to keep would return a
+	// handle configured differently from the one it replaced, and nothing would
+	// say so.
+	openOpts Options
+
 	// imageMode is Options.ImageMode as given, resolved at the point of use so
 	// the zero value stays the documented default. See mapping.go.
 	imageMode ImageMode
@@ -1340,6 +1352,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 
 	s := &Store{
 		dir:      dir,
+		openOpts: opts,
 		wal:      wal,
 		lock:     lock,
 		readOnly: opts.ReadOnly,

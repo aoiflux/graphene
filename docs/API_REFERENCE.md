@@ -2393,6 +2393,57 @@ to half the log limit rather than to the same figure because every delta record 
 logged, so a byte limit equal to the log's would almost never be the rule that
 fired.
 
+### Compacting in a process whose peak matters
+
+A compaction writes a new image and then goes on serving the graph it built in
+the heap. The records it wrote are in the file; the ones the process holds still
+carry their own payload bytes, because the image is attached on the load path and
+a compaction is not one.
+
+A process that compacts once, at the end of an ingest, can ignore this. A process
+that compacts repeatedly cannot: the payload term climbs once per record written
+and never falls, however often it compacts. Rebuilding all 1,400,000 nodes of a
+1,689 MiB store under a 2 GiB ceiling, with the delta bounded at 32 MiB, the
+in-place loop reached 1,350,000 records and ran out of memory holding 661.8 MiB
+of payload it had already written to disk. No `MaxDeltaBytes` value finishes that
+rebuild; `docs/MEMORY_MODEL.md` §9.8 swept eight.
+
+`CompactAndReopen` compacts and hands back a fresh handle on the same directory,
+opened with the same options. **The receiver is closed** — assign over it:
+
+```go
+if due, _ := g.ShouldCompact(policy); due {
+    if g, err = g.CompactAndReopen(); err != nil {
+        return err
+    }
+}
+```
+
+With that in the loop the same rebuild finishes, peaking at **1,285.2 MiB of the
+2,048 MiB ceiling — 37.2% headroom** — and settling at what a fresh open holds. It
+is also faster than the in-place loop, because fifteen compactions against a heap
+that stops growing cost less than twenty-nine against one that does not.
+
+Two things to know before using it.
+
+**It is an open, so it costs like one** — the image mapped, the header and
+directory parsed, in time proportional to the image rather than to what changed;
+2.44s on the store above. Call it after a compaction, never after a commit.
+
+**The bound and the reopen are one setting.** Reopening does not replace bounding
+the delta: at a 128 MiB bound the same loop reopens five times instead of fifteen
+and still fails, at 1,200,000 of 1,400,000. A reopen sheds what accumulated since
+the last one, so how often it happens is what matters.
+
+**Slices do not survive it.** A `Properties` slice read through the old handle
+addresses a mapping the reopen releases. This is the same rule as everywhere else
+— bytes are valid for the life of the handle that produced them — arrived at from
+the other side, because this call ends that handle. `store.CloneNode` and
+`store.CloneEdge` are the way out. `CompactAndReopenCtx` takes a context, which
+cancels the compaction; the reopen is deliberately not cancellable, since
+abandoning after the close would leave you with no handle rather than a cheaper
+one. On the in-memory backend there is no image, so it returns the same `Graph`.
+
 ### Knowing when the delta is larger than you wanted
 
 If you compact on your own schedule, `Options.DeltaSoftLimit` tells you when that

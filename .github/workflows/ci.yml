@@ -295,6 +295,29 @@ jobs:
                 GRAPHENE_RSS_DIR=$SMALL GRAPHENE_RSS_NODES=200000 \
             /tmp/graphene.test -test.run '^TestCeiling_' -test.v -test.timeout 30m
 
+      # The third arm: the whole-layer rebuild at the full shape, which is the
+      # release's end-to-end acceptance and the one that failed for two releases.
+      # It passes with the delta bounded and a reopen after each interim
+      # compaction -- 1,285.2 MiB of 2,048 with 37.2% headroom, measured on
+      # windows; see docs/MEMORY_MODEL.md section 9.8, which also has the sweep
+      # showing that no delta bound alone completes it.
+      #
+      # continue-on-error until it has passed here. The figures above are from a
+      # Job Object, which bounds commit charge; this is a cgroup, which bounds
+      # resident pages, and the two are not the same instrument. A nightly that
+      # went red on a difference between instruments would be turned off, and an
+      # arm nobody reads is worse than one that is honest about being new. Drop
+      # the flag once this is green, not before.
+      - name: Rebuild 1.4M nodes under 2 GiB, reopening after each compaction
+        continue-on-error: true
+        run: |
+          sudo systemd-run --scope --quiet --uid=$(id -u) --gid=$(id -g) \
+            -p MemoryMax=2G -p MemorySwapMax=0 \
+            env GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_DELTA_MIB=32 \
+                GRAPHENE_CEILING_REOPEN=1 \
+                GRAPHENE_RSS_DIR=$BIG GRAPHENE_RSS_NODES=1400000 \
+            /tmp/graphene.test -test.run '^TestCeiling_' -test.v -test.timeout 60m
+
   # The same two arms on windows, where the harness applies its own Job Object
   # rather than being wrapped: a process may limit itself there without any
   # privilege, and there is no convenient way to do it from outside. The limit
@@ -357,6 +380,23 @@ jobs:
         run: |
           $env:GRAPHENE_RSS_DIR = "$env:RUNNER_TEMP\graphene-ceiling-small"
           go test ./tests/ -tags=stress -run '^TestCeiling_' -v -count=1 -timeout 30m
+
+      # The third arm. See the linux job for what it is and why it starts
+      # non-blocking; this is the platform the figures in section 9.8 were taken
+      # on, so it is the one expected to go green first. It stays
+      # continue-on-error until it has done so on a runner rather than on the
+      # machine the measurement was made on -- a hosted runner has less commit
+      # available and a slower disk, and neither has been tried.
+      - name: Rebuild 1.4M nodes under 2 GiB, reopening after each compaction
+        continue-on-error: true
+        env:
+          GRAPHENE_CEILING_MIB: "2048"
+          GRAPHENE_CEILING_DELTA_MIB: "32"
+          GRAPHENE_CEILING_REOPEN: "1"
+          GRAPHENE_RSS_NODES: "1400000"
+        run: |
+          $env:GRAPHENE_RSS_DIR = "$env:RUNNER_TEMP\graphene-ceiling-big"
+          go test ./tests/ -tags=stress -run '^TestCeiling_' -v -count=1 -timeout 60m
 
   # Cross-compiled release binaries. Runs on every push so a build break on a
   # platform nobody develops on is caught when it is introduced rather than on

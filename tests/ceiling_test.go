@@ -124,6 +124,25 @@ var (
 	// It also opens the master rather than a copy, because a reader does not
 	// write and there is no reason to duplicate 1.7 GiB to prove it.
 	ceilingReadOnly = os.Getenv("GRAPHENE_CEILING_READONLY") == "1"
+
+	// ceilingReopen reopens the store after every interim compaction.
+	//
+	// This is route (b) of the G2 decision, measured rather than argued. A
+	// compaction writes a new image and publishes a graph built in the heap: the
+	// records it wrote are in the file, but the ones this process is holding
+	// still carry their own payload bytes, because AttachBase runs on the load
+	// path and a compaction is not one. So the payload term does not fall at a
+	// compaction -- it ratchets, once per record written, for the life of the
+	// handle.
+	//
+	// Reopening is what makes the records address the file again. The delta
+	// sweep measured the cost of not doing it: at 1,400,000 nodes under a 32 MiB
+	// bound the arm reached 1,350,000 records and died holding 661.8 MiB of
+	// payload it had already written to disk.
+	//
+	// It is only meaningful with GRAPHENE_CEILING_DELTA_MIB set, because without
+	// a bound there are no interim compactions to reopen after.
+	ceilingReopen = os.Getenv("GRAPHENE_CEILING_REOPEN") == "1"
 )
 
 // ceilingRebuildChunk is how often the rebuild stops to ask whether the delta is
@@ -527,6 +546,7 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 		policy.MaxDeltaBytes = int64(ceilingDeltaMiB) << 20
 	}
 	interim := 0
+	reopened := 0
 	dueFor := ""
 	maybeCompact := func() {
 		if ceilingDeltaMiB <= 0 {
@@ -536,10 +556,26 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompactIfDue: %v", err)
 		}
-		if did {
-			interim++
-			dueFor = why
+		if !did {
+			return
 		}
+		interim++
+		dueFor = why
+		if !ceilingReopen {
+			return
+		}
+		// See ceilingReopen. Close before Open rather than opening a second
+		// handle: the store takes an exclusive lock, and the point of the
+		// exercise is to stop holding what the first handle holds.
+		if err := g.Close(); err != nil {
+			t.Fatalf("close for reopen after interim compaction %d: %v", interim, err)
+		}
+		reopenedGraph, err := graphene.Open(dir)
+		if err != nil {
+			t.Fatalf("reopen after interim compaction %d: %v", interim, err)
+		}
+		g = reopenedGraph
+		reopened++
 	}
 
 	run("rebuild", func() string {
@@ -575,6 +611,13 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 		}
 		if ceilingDeltaMiB <= 0 {
 			return fmt.Sprintf("%d deleted, %d written, delta unbounded", len(live), written)
+		}
+		if ceilingReopen {
+			// Both counts, not one: they are equal by construction, and printing
+			// the pair is how a reopen that silently did not happen would show.
+			return fmt.Sprintf("%d deleted, %d written, %d interim compactions and %d reopens, "+
+				"under a %d MiB delta bound (%s)",
+				len(live), written, interim, reopened, ceilingDeltaMiB, orUnknown(dueFor))
 		}
 		return fmt.Sprintf("%d deleted, %d written, %d interim compactions under a %d MiB delta bound (%s)",
 			len(live), written, interim, ceilingDeltaMiB, orUnknown(dueFor))

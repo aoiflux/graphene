@@ -301,6 +301,70 @@ func (g *Graph) CompactCtx(ctx context.Context) error {
 	return s.CompactCtx(ctx)
 }
 
+// CompactAndReopen compacts and returns a fresh Graph on the same directory,
+// opened with the same options. The receiver is closed and must not be used
+// again; the returned Graph replaces it.
+//
+//	g, err = g.CompactAndReopen()
+//
+// # Why a reopen rather than a compaction
+//
+// A compaction writes a new image and then goes on serving the graph it built in
+// the heap. The records it wrote are in the file, but the ones this process
+// holds still carry their own payload bytes, because the image is attached on
+// the load path and a compaction is not one. A process that compacts once does
+// not care. A process that compacts repeatedly — a rebuild that bounds its delta
+// so the delta itself fits — ratchets: the payload term climbs once per record
+// written and never falls, however often it compacts.
+//
+// Measured, rebuilding all 1,400,000 nodes of a 1,689 MiB store under a real
+// 2 GiB ceiling with the delta bounded at 32 MiB (docs/MEMORY_MODEL.md §9.8):
+// compacting in place reached 1,350,000 of 1,400,000 records and died holding
+// 661.8 MiB of payload already on disk. Reopening after each of the 15 interim
+// compactions held the payload at 2.7 MiB, peaked at 1,285.2 MiB against the
+// 2,048 MiB limit — 37.2% headroom — and finished. No MaxDeltaBytes value
+// completes that rebuild without this; the sweep in §9.8 tried eight.
+//
+// # What it costs, and what it does not cost
+//
+// One open: the image mapped, its header and directory parsed, in time
+// proportional to the image and not to what changed — 2.44s on the store above.
+// Do it after a compaction, not after a commit.
+//
+// It does not weaken the slice lifetime rule. Bytes read through the old handle
+// are valid for the life of that handle, and this ends that handle, so a
+// Properties slice held across the call addresses a released mapping. Copy
+// first; CloneNode is the supported way.
+//
+// On a Graph that is not disk-backed this is Compact followed by returning the
+// same Graph: there is nothing mapped and nothing to reopen.
+func (g *Graph) CompactAndReopen() (*Graph, error) {
+	return g.CompactAndReopenCtx(context.Background())
+}
+
+// CompactAndReopenCtx is CompactAndReopen, with the compaction abandoned if ctx
+// is cancelled. The reopen is deliberately not cancellable: once the old handle
+// is closed, abandoning would leave the caller with no handle rather than with a
+// cheaper one.
+func (g *Graph) CompactAndReopenCtx(ctx context.Context) (*Graph, error) {
+	s, ok := g.GraphStore.(*disk.Store)
+	if !ok {
+		// The in-memory backend has no image, so there is nothing a reopen would
+		// release. Returning the receiver rather than a copy keeps the call site
+		// identical on both backends, which is the point of it being on Graph.
+		return g, nil
+	}
+	reopened, err := s.CompactAndReopenCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadSidecars(reopened); err != nil {
+		reopened.Close()
+		return nil, err
+	}
+	return &Graph{GraphStore: reopened}, nil
+}
+
 // --- Backup and restore ---
 
 // Backup writes a consistent copy of the store into dst, which must not already

@@ -3530,3 +3530,64 @@ Every write-path benchmark in this repository is behind the `stress` tag. The fi
 this A/B omitted the tag, compiled a test binary containing none of them, and reported
 `ok` for a run of nothing — which is worth knowing about, because a benchmark arm that
 silently measures nothing looks exactly like an arm that measured no difference.
+
+## What a read costs when its pages are not resident (2026-09-16)
+
+Taken at 1,400,000 nodes against the 1,689.1 MiB image, windows, `GRAPHENE_COLD_SAMPLES=20000`,
+three independent runs. The column is headed **trimmed** and not *cold*: `EmptyWorkingSet`
+moves the pages to the standby list, where the next touch is a soft fault of a few hundred
+nanoseconds rather than a seek of a few hundred microseconds. **Every ratio below is a lower
+bound on the cold cost.** The linux arm, which evicts for real with
+`posix_fadvise(POSIX_FADV_DONTNEED)`, has not been run at this shape.
+
+| operation | trimmed | resident | ratio |
+|---|---:|---:|---:|
+| record point read | 1.04–1.29 µs | 0.05 µs | 20.6–26.1× |
+| index point lookup | 2.53–3.00 µs | 0.48–0.52 µs | 4.8–6.1× |
+| projection batch | 4.76–5.68 µs | 0.95–0.99 µs | 5.0–5.9× |
+| bounded batch read | 0.95–1.23 µs | 0.05–0.07 µs | 16.5–21.1× |
+
+### The figure depends on how many samples you take, and that is the instrument's shape
+
+The same arm at 2,000 samples reports the index point lookup at **55.13 µs and 285×**; at
+8,000, 3.94 µs and 16×; at 20,000, 2.53–3.00 µs and 5–6×. Three runs at 20,000 agree within
+20% of each other, so this is not noise — it is that a trimmed pass pays a **fixed** cost to
+fault its structure back in and then a **marginal** cost per operation, and the harness
+reports their sum divided by the sample count.
+
+Both figures are real and they answer different questions. *What does the first lookup into
+a store nobody has touched cost?* — the fixed part, on the order of 100 ms of faults here.
+*What does the thousandth cost, once the index's own pages are back?* — the marginal part,
+the table above. A report that quotes one number for both is quoting an artefact of its
+sample count. **Use 20,000 or more for the marginal figure**, and read the `cold` total in
+the parenthesis for the fixed one.
+
+### What it decides, and what it does not
+
+**The residual probe's 2.8× warm regression is vindicated, which was the point of
+measuring.** The probe searches the reverse section instead of scanning records, touching
+6.6× less of the image for 2.8× the warm wall clock. Trimmed, the index pages it reads are
+shared across lookups and amortise to 4.8–6.1×, while the record payload pages a scan would
+touch do not amortise at all and cost 20.6–26.1×. The direction the planner's cost model
+assumes is the direction the measurement shows, and it shows it on a lower bound.
+
+**The bounded batch API's rationale holds on the same argument.** The bounded batch read is
+the cheapest arm in absolute terms when the pages are not resident — 0.95 µs against the
+record point read's 1.04 — and its 16.5–21.1× ratio says the bounding matters more when
+pages are away than when they are here, which is when a caller most needs it.
+
+**The mapped point lookup's warm doubling is a small part of the real cost.** A record point
+read costs 20.6–26.1× more trimmed than resident, so on a store whose pages are under
+pressure the mapping decision is worth far more than the doubling it costs warm.
+
+**The bounded batch read row is the least trustworthy of the four.** Its cold pass runs in
+19.1–19.5 ms, just under the 20 ms the harness refuses to trust, and it was flagged in three
+of the four runs. The figure is quoted because the flag is the honest thing to report
+alongside it, not because the flag can be argued away; at this fixture size that arm is at
+the edge of what the platform's clock resolves.
+
+**The batch join's 1.17× on unsorted values is not decided, and this arm cannot decide it.**
+`projection batch` runs one ordering. Separating sorted from unsorted needs a second arm,
+and until it exists the documented advice — supply ascending values — rests on the warm
+figures it always rested on.
+

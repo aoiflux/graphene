@@ -1384,6 +1384,22 @@ type CompactionPolicy struct {
 	// records, and their labels and property blobs. Zero from a backend that does
 	// not report DeltaBytes, so there the rule never fires rather than firing
 	// always.
+	//
+	// It counts the records and not what holds them. The version maps, the delta
+	// adjacency and the type postings are structure rather than payload; they are
+	// modelled in disk.ResidentEstimate.Delta and are deliberately absent from
+	// this figure -- see deltaLayer.bytes in disk/view.go, which says so and says
+	// why. The gap is negligible while the delta carries blobs, because the blobs
+	// dominate, and it is large when it does not: a tombstone is 24 bytes of
+	// counted cell and roughly 19 further bytes of map that this rule cannot see,
+	// so a delete-heavy delta costs about 1.8x what it reports.
+	//
+	// Measured, deleting a 1,400,000-node store entry by entry under a 32 MiB
+	// bound: at 1,300,000 tombstones the rule saw 29.8 MiB and the store was
+	// holding 53.8, and no compaction fired until the 1,400,000th. A caller who
+	// sets this to the memory they have available should expect to exceed it by
+	// that factor on a workload that mostly deletes, and should size such a
+	// workload against ResidentEstimate.Delta instead.
 	MaxDeltaBytes int64
 
 	// MaxWALBytes fires when the log grows past this size.
