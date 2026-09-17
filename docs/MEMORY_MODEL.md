@@ -2177,6 +2177,21 @@ charges page cache. **So the same ingest that has 83.6% headroom here would be c
 class during an ingest is large, it grows with the data, and only one of the two platforms
 gets it for free.
 
+**Since answered, and the mechanism is `Options.ResidentAdvice`** — `madvise` on linux and
+darwin, off by default. Measured on a smaller shape than this one (50,000 × 512 B, four
+interleaved rounds, `docs/benchmarks.md`): file-backed residency after a compaction falls
+**53.28 → 6.38 MiB, 88.0% less**, with the arms' ranges not touching and the anonymous
+column flat at 1.006. Two limits on that reading are worth carrying back here. It does not
+reduce what a compaction holds *while it runs* — the peak during the pass is unchanged at
+0.994, because the pass still reads the whole image — so the 336.1 MiB peak column above is
+not what this moves; **Phase 4 is**. And the trade is more major faults, of which only the
+residency half has been measured, which is why nothing about the default configuration in
+this table changes.
+
+Windows has no post-mapping advice at all. Its answer is `disk.LimitWorkingSet`, a hard
+working-set cap that trims rather than kills — and, as the paragraph above says, windows is
+the platform that was not being charged for this in the first place.
+
 #### The quadratic, measured
 
 | records | bytes written | amplification | B/node | compactions | mean image per compaction |
@@ -2234,6 +2249,101 @@ GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_INGEST_DIR=/path/to/empty \
   GRAPHENE_CEILING_DELTA_MIB=32 GRAPHENE_CEILING_REOPEN=1 \
   go test ./tests/ -tags=stress -count=1 -run TestCeiling_BulkIngest -v -timeout=180m
 ```
+
+### 9.10 `GOMEMLIMIT`, measured: it recovers the gap, never the live set
+
+§6.1 attributed 153 MiB to "the runtime — `GOGC`/`GOMEMLIMIT`, not code" and nothing has ever
+measured it. This is that measurement, taken on the arm §9.9 established as the one that holds:
+100,000 nodes × 3.2 KB ingested into an empty store, `MaxDeltaBytes` 32 MiB with a reopen after
+every interim compaction, under a real 2,048 MiB Job Object, one fresh process per setting from
+a pre-built test binary so the sweep measures the run and not the compile.
+
+| `GOMEMLIMIT` | peak anon | peak RSS | charged | headroom | ingest wall | amplification |
+|---|---:|---:|---:|---:|---:|---:|
+| unset | 251.8 MiB | 502.9 MiB | 252.7 MiB | 87.7% | 13.78 s | 6.53× |
+| 1024 MiB | 249.4 | 467.9 | 254.8 | 87.6% | 14.26 s | 6.53× |
+| 512 MiB | 233.0 | 469.7 | 233.0 | 88.6% | 14.26 s | 6.53× |
+| 256 MiB | 252.3 | 502.3 | 252.3 | 87.7% | 13.56 s | 6.53× |
+| **128 MiB** | **170.7** | **420.0** | **176.6** | **91.4%** | **13.92 s** | 6.53× |
+| 64 MiB | 159.2 | 412.8 | 159.7 | 92.2% | **20.87 s** | 6.53× |
+
+**Write amplification is 6.53× at every setting, to three significant figures.** That is the
+control: `GOMEMLIMIT` bounds what the process holds and changes nothing about what it writes, so
+a run where it had perturbed the compaction schedule would show here and does not. The settled
+anonymous figure after the ingest is likewise flat — 92.7 to 98.0 MiB across the six — because
+the store at rest is the store at rest whatever the runtime was told.
+
+#### Three of the six settings do nothing at all
+
+1024, 512 and 256 MiB are indistinguishable from unset: 233.0 to 254.8 MiB charged, against a
+run-to-run spread on this arm that is itself about twenty megabytes. **The limit only begins to
+act once it is below what the process was already charging**, and unset this arm charges 252.7.
+So the first setting that does anything is 128, and the threshold is bracketed in (128, 256] —
+which is a reading of where the Go runtime's own accounting sits, not a figure to copy.
+
+That bracket is the whole point, and it is much higher than the live data. The engine's model of
+what the ingest actually holds peaks at **43.4 MiB** — identical in all six runs, because the
+model is a function of the data and not of the runtime. The process charges 252.7 for it. The
+**209.3 MiB in between is the gap**, 5.8× the modelled figure, and it is garbage not yet
+collected plus arena the scavenger has not returned to the OS. It is exactly and only that gap
+`GOMEMLIMIT` can reach.
+
+#### What it recovers, and what it costs
+
+- **128 MiB recovers 76.1 MiB of the 209.3 MiB gap — 36% — for no measurable wall clock.**
+  13.92 s against the baseline's 13.78, which is inside the noise on this arm. Headroom goes from
+  87.7% to 91.4%. This is the setting worth having.
+- **64 MiB recovers 93.0 MiB — 44% — and costs 51% of the ingest's wall clock**, 20.87 s against
+  13.78. Half again the time for a further 17 MiB.
+
+That shape is the death spiral arriving on schedule rather than a surprise. `GOMEMLIMIT` is
+**soft**: it cannot shrink a live set, only collect harder around one, so as the limit approaches
+the live floor the collector runs more and more often to hold a line it can no longer move. The
+knee between the two rows above is where that begins. A setting below the live floor does not
+fail — it makes no progress, which is worse, because a refusal is visible and a spiral is not.
+
+#### Why the engine must not set it
+
+It is process-global, and this engine is a library embedded in someone else's process. Setting it
+from `Options` would mean a store deciding the collection policy for a program that has other
+allocations it knows nothing about — the same objection as `MemoryBudget` being a whole-store
+figure rather than a whole-process one, with the difference that a budget only ever refuses the
+store's own operations while `GOMEMLIMIT` reaches everything. **It is documented as a deployment
+knob and will not become an `Options` field.**
+
+Two further things follow from the numbers above.
+
+**It is not a substitute for the bound or the reopen.** The arm measured here already holds flat
+anonymous memory across a fourfold size range; `GOMEMLIMIT` trims a constant off the peak of an
+arm that was already flat. Applied to the *unbounded* arm of §9.9 it would reach nothing, because
+that arm's growth is live data — records the process is holding because a compaction has not
+folded them away and a reopen has not released them. The gap is not where that arm dies.
+
+**It is the only bound darwin will ever have.** `RLIMIT_AS` counts the mapped image, which is the
+class this programme deliberately moved memory *into*; `RLIMIT_RSS` is unenforced on every modern
+kernel; and darwin cannot report even current RSS without cgo. `GOMEMLIMIT` is identical on all
+three platforms, needs no privilege, and covers the Go-managed class and not mmap'd file pages —
+which on darwin is the only half anyone can act on at all.
+
+```sh
+# one process per setting; the binary is built once so the sweep measures the run
+go test ./tests/ -tags=stress -c -o /tmp/ceilbin
+GOMEMLIMIT=128MiB GRAPHENE_CEILING_MIB=2048 \
+  GRAPHENE_CEILING_INGEST_DIR=/path/to/empty \
+  GRAPHENE_RSS_NODES=100000 GRAPHENE_RSS_BLOB=3200 \
+  GRAPHENE_CEILING_DELTA_MIB=32 GRAPHENE_CEILING_REOPEN=1 \
+  /tmp/ceilbin -test.run TestCeiling_BulkIngest -test.v -test.count=1
+```
+
+#### What this does not establish
+
+One arm, one shape, one platform. The 36%-for-free figure is the recovery on an ingest whose live
+set is 43.4 MiB against a 2 GiB ceiling, and the fraction recovered depends on how much of the
+charge is gap — which is a property of the workload's allocation rate, not of the setting. A
+compaction-heavy phase holds a much larger live set (313.2 MiB modelled on the `compact` phase of
+this same run) and would have correspondingly less gap to give back. The knee will also move: it
+sits just below whatever the runtime is charging, so a setting measured here is not transferable
+to a different store, a different `GOGC`, or a different phase.
 
 ## Reproducing these figures
 

@@ -95,6 +95,23 @@ var (
 	// figure the test claims come from the same kernel object. Ignored when a
 	// budget is given, which is Options.DiscoverMemoryBudget's own rule.
 	ceilingIngestDiscover = os.Getenv("GRAPHENE_CEILING_DISCOVER") == "1"
+
+	// ceilingIngestAdvice turns on Options.ResidentAdvice, which is the arm that
+	// measures item 2a/2b rather than the anonymous bounds every other knob here
+	// is about.
+	//
+	// It is the file-backed column this changes, and that column is why the item
+	// exists: measured at 1,182 MiB during an ingest of 400,000 x 3.2 KB records,
+	// twelve times the anonymous class and linear in the store. An A/B of this
+	// flag against the same shape is what says whether telling the kernel what
+	// the engine is doing gets any of it back.
+	//
+	// Free against a windows Job Object, which charges commit and so never
+	// charged the mapping in the first place; charged against a linux cgroup,
+	// which counts page cache. So this knob is measured on linux and reports
+	// itself as a no-op on windows, where the platform gives no advice and the
+	// engine says so through store.MetricResidentAdvice.
+	ceilingIngestAdvice = os.Getenv("GRAPHENE_CEILING_ADVICE") == "1"
 )
 
 // ceilingIngestChunkMax is the coarsest the compaction check ever gets, and the
@@ -251,6 +268,7 @@ func TestCeiling_BulkIngestFitsUnderTheLimit(t *testing.T) {
 		Metrics:              store.MetricsFunc(counter.Record),
 		MemoryBudget:         int64(ceilingIngestBudgetMiB) << 20,
 		DiscoverMemoryBudget: ceilingIngestDiscover,
+		ResidentAdvice:       ceilingIngestAdvice,
 	}
 
 	var (

@@ -83,6 +83,32 @@ func TestSysMemoryFromCounters_ClampsCommitToTheWorkingSet(t *testing.T) {
 	if m.Resident < m.Anon {
 		t.Errorf("Resident %d below Anon %d would underflow a subtraction", m.Resident, m.Anon)
 	}
+	// A clamped reading has no split left in it: the subtraction yields zero, and
+	// zero file-backed bytes would be a claim about the store rather than about
+	// the instrument. Split=false is what stops a caller reading it as one.
+	if m.Split {
+		t.Error("a clamped reading still claims the classes were told apart")
+	}
+	if m.Source == "" {
+		t.Error("a clamped reading names no instrument")
+	}
+}
+
+// The clamp fires on equality too, and that is the common case rather than an
+// edge: a process that has committed exactly what it holds resident has told us
+// nothing about the file-backed share either.
+func TestSysMemoryFromCounters_EqualCommitAndWorkingSetIsNotASplit(t *testing.T) {
+	m := sysMemoryFromCounters(processMemoryCountersEx{
+		WorkingSetSize:     8 << 20,
+		PrivateUsage:       8 << 20,
+		PeakWorkingSetSize: 8 << 20,
+	})
+	if m.Split {
+		t.Error("commit equal to the working set leaves nothing to attribute to files")
+	}
+	if m.Anon != 8<<20 {
+		t.Errorf("Anon = %d, want the whole resident total %d", m.Anon, uint64(8)<<20)
+	}
 }
 
 func TestSysMemoryFromCounters_ReportsTheSplit(t *testing.T) {
@@ -92,7 +118,7 @@ func TestSysMemoryFromCounters_ReportsTheSplit(t *testing.T) {
 		PeakWorkingSetSize: 1024 << 20,
 	})
 	if !m.Split || !m.Current {
-		t.Fatalf("windows answers both halves: Split=%v Current=%v", m.Split, m.Current)
+		t.Fatalf("windows answers both halves when commit is below the working set: Split=%v Current=%v", m.Split, m.Current)
 	}
 	if m.Anon != 400<<20 || m.Resident != 900<<20 {
 		t.Errorf("Anon=%d Resident=%d, want %d and %d", m.Anon, m.Resident, uint64(400)<<20, uint64(900)<<20)
@@ -116,6 +142,11 @@ func TestReadSysMemory_AnswersOnThisMachine(t *testing.T) {
 	}
 	if m.Anon > m.Resident {
 		t.Errorf("Anon %d exceeds Resident %d after the clamp", m.Anon, m.Resident)
+	}
+	// Whichever way this process happens to sit, the two must agree: a reading
+	// that reports a split must have a subtraction left to make.
+	if m.Split && m.Anon >= m.Resident {
+		t.Errorf("Split reported with Anon %d not below Resident %d", m.Anon, m.Resident)
 	}
 	if m.Peak < m.Resident {
 		t.Errorf("Peak %d below the current Resident %d", m.Peak, m.Resident)

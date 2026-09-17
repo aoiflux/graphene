@@ -1030,10 +1030,16 @@ the last one, so how often it happens is the setting that matters — and what
 makes it happen is the delta bound. The same sequence at the default 128 MiB
 reopens five times instead of fifteen and still fails.
 
-**It is also faster**, which was not the argument for it: 242 s for the whole
-sequence against 469 s for an arm that never finished. Twenty-nine compactions
-against a heap that never stops growing cost more than fifteen against one that
-does not.
+**On a rebuild it is also faster**, which was not the argument for it: 242 s for
+the whole sequence against 469 s for an arm that never finished. Twenty-nine
+compactions against a heap that never stops growing cost more than fifteen
+against one that does not.
+
+**On an ingest it is slower, and increasingly so** — 1.8× at 100,000 records and
+3.0× at 200,000. Both are true, and the difference is what the two workloads
+start from. A rebuild that does not bound dies; an ingest that does not bound is
+faster right up until it dies. The wall clock follows the bytes written, which
+the next section puts a number on.
 
 ### What it costs on disk
 
@@ -1170,7 +1176,29 @@ you need to. A live reader should ask for both explicitly.
 | `CompactionPolicy.MaxWALBytes` | bytes | 256 MiB | anything resident. The log is on disk |
 | `CompactionPolicy.MaxDeltaRatio` | fraction | 0.5 | a large delta against a large image |
 | `CompactionPolicy.MaxResidentBytes` | bytes | 0 (off) | the allocator's working set, the collector's headroom, or a compaction's transients. `EstimatedResidentBytes` models *retained* heap, and a process charges roughly **2.6× it** during a rebuild. Read it as a floor, not a budget |
-| `GOMEMLIMIT` | bytes | unset | mapped file pages, which is the right exclusion. It is soft — it reclaims garbage and cannot shrink a live set. **Graphene never sets it**: it is process-global and this is a library in your process |
+| `GOMEMLIMIT` | bytes | unset | mapped file pages, which is the right exclusion — and the live set, which is most of what an unbounded ingest holds. It is soft: it reclaims garbage and cannot shrink live data. Measured below; **graphene never sets it**, because it is process-global and this is a library in your process |
+
+Everything in that table bounds the **anonymous** class — the one that OOM-kills.
+Two more bound the resident, file-backed one, which nothing above touches and which
+at an ingest is the larger of the two: 1,182 MiB against 98.2 MiB at 400,000 records.
+
+| bound | unit | default | does **not** cover |
+|---|---|---|---|
+| `Options.ResidentAdvice` | bool | false | windows, and anything outside linux and darwin — where it reports `MetricResidentAdvice` rather than silently doing nothing. It does **not** reduce what a compaction holds *while it runs* (measured at 0.994); it returns what the compaction was finished with, after the fact |
+| `disk.LimitWorkingSet` | bytes | not called | linux and darwin, which have no enforced per-process resident cap worth using. It is a **function, not an option**, because it caps the whole process — including whatever else is linked into it |
+
+`ResidentAdvice` is measured at **88.0% less file-backed residency after a
+compaction, 8.35×**, with the anonymous class flat and the Go heap unmoved. The
+trade is **more major faults**: a page dropped and then read again costs a fault,
+so a store that compacts and then serves reads out of those pages pays for all of
+them. Only the residency half of that has been measured, which is why it is off by
+default. Turn it on for a bulk ingest; think before turning it on for a store that
+serves reads. `docs/benchmarks.md` carries the table and the caveats.
+
+`LimitWorkingSet` **trims rather than kills**: the kernel takes pages out of the
+process instead of failing an allocation, so nothing dies and the program gets
+slower. It reads the cap back from the kernel and reports whether it is actually
+hard, because a cap that silently failed to apply is worse than no cap.
 
 ### The one thing none of them bound
 
@@ -1179,6 +1207,52 @@ it does not model what a rebuild peaks at, and the gap is a factor of about 2.6.
 If you are sizing against a hard ceiling, measure the rebuild rather than
 modelling it — `tests/ceiling_test.go` is the harness, and `docs/MEMORY_MODEL.md`
 §9 is what it has established so far.
+
+### `GOMEMLIMIT`, if you set it
+
+It is the one bound that is identical on linux, windows and darwin, needs no
+privilege, and covers exactly the right class — Go-managed heap, stacks and
+runtime metadata, and **not** mmap'd file pages. It is also the only bound darwin
+will ever have, since `RLIMIT_AS` counts the mapped image and `RLIMIT_RSS` is
+unenforced on every modern kernel.
+
+Swept on the ingest configuration above — 100,000 × 3.2 KB, delta bounded at
+32 MiB with a reopen, under a 2,048 MiB limit — it does this:
+
+| `GOMEMLIMIT` | charged | headroom | ingest wall |
+|---|---:|---:|---:|
+| unset | 252.7 MiB | 87.7% | 13.78 s |
+| 512 MiB | 233.0 | 88.6% | 14.26 s |
+| 256 MiB | 252.3 | 87.7% | 13.56 s |
+| **128 MiB** | **176.6** | **91.4%** | **13.92 s** |
+| 64 MiB | 159.7 | 92.2% | **20.87 s** |
+
+Three things to take from it.
+
+**Anything above what the process already charges does nothing.** 1024, 512 and
+256 MiB are indistinguishable from unset here, because this arm was charging
+252.7 to begin with. Measure what your process charges, then set the limit below
+it or do not bother.
+
+**The first setting that bites is close to free, and the next one is not.**
+128 MiB takes 76 MiB off the peak for wall clock inside the noise. 64 MiB takes a
+further 17 and costs **51% of the ingest's wall clock**. That is the soft limit
+doing what a soft limit does: it cannot shrink a live set, only collect harder
+around one, so as it approaches the live floor the collector runs more and more
+often to hold a line it can no longer move. Below the live floor it does not fail
+— it simply stops making progress, which is worse, because a refusal is visible
+and a spiral is not.
+
+**What it reaches is the gap, never the data.** The engine's model of what this
+ingest holds peaks at 43.4 MiB while the process charges 252.7; the 209 MiB in
+between is garbage not yet collected and arena not yet returned to the OS, and
+that is the entire budget `GOMEMLIMIT` has to work with. It will not rescue an
+unbounded ingest, whose growth is live records — bound the delta and reopen for
+that, as §10 describes, and treat this as a trim on top.
+
+`docs/MEMORY_MODEL.md` §9.10 has the full sweep and what it does not establish.
+**Graphene will never set this for you**: it is process-global and this is a
+library running inside your program.
 
 ## 12. Visualization
 

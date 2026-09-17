@@ -369,6 +369,12 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 		s.afterPinHook()
 	}
 
+	// The build is about to read every record the delta did not touch, which is
+	// one forward pass over the whole of the old image. Readahead is wanted for
+	// that and is not wanted for anything else this store does, so it is asked
+	// for here and taken back below. No-op unless Options.ResidentAdvice is set.
+	s.adviseImages(adviceSequential)
+
 	newCSR, tmpPath, err := plan.build(ctx, s.dir)
 	// After build, because build is what can create one, and before the commit,
 	// because every way the commit can end leaves this the last word on a
@@ -389,6 +395,29 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 	}
 	if err == nil {
 		s.warnIDHeadroom()
+
+		// The compaction is finished with the old image, and on a large store
+		// that pass has just made the whole of it resident. Dropping those pages
+		// is the point of the whole option: they are a cache of a file, the file
+		// is the truth, and a read of one that is wanted again faults it back.
+		//
+		// Nothing here invalidates anything. The graph the commit published
+		// still carries slice headers into this mapping for every record the
+		// delta did not touch, and those slices are still valid and still at the
+		// same address -- advice drops pages, not mappings. That is the whole
+		// distinction between this and unmapping, which disk/mapping.go records
+		// as impossible for exactly that reason.
+		//
+		// Then back to the access pattern the store actually has. A compaction
+		// is the only sequential pass a writer ever makes; everything else is a
+		// point lookup, and leaving the mapping advised sequential would have
+		// the kernel reading ahead for reads that never come.
+		//
+		// The drop is the record image alone and the hint is both mappings; see
+		// dropImagePages for why the index the commit just installed is exactly
+		// the thing not to give back.
+		s.dropImagePages()
+		s.adviseImages(adviceRandom)
 	}
 	if s.metricsOn() {
 		s.record(store.Metric{

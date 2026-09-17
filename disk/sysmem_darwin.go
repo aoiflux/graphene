@@ -46,6 +46,7 @@ func readSysMemory() (sysMemory, bool) {
 		// than letting a caller read that zero as "this process holds nothing".
 		Split:   false,
 		Current: false,
+		Source:  "getrusage ru_maxrss (peak only; the split needs Mach calls and cgo)",
 	}, true
 }
 

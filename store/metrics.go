@@ -173,11 +173,30 @@ const (
 	// The figures come from the operating system where it will answer and are
 	// zero where it will not -- darwin reports only a peak, and platforms
 	// outside linux, windows and darwin report nothing. A zero here means "not
-	// measurable", never "no memory held"; see StorageStats.ResidentSource for
-	// the same distinction in polled form.
+	// measurable", never "no memory held"; see StorageStats.Process and its
+	// Known, Split and Current flags for the same distinction in polled form.
 	MetricCompactPin
 	MetricCompactBuild
 	MetricCompactCommit
+
+	// MetricResidentAdvice is one piece of advice about a mapping that was asked
+	// for and not given. Count is the advice, Bytes is the mapping it was to
+	// apply to, and Err says what happened.
+	//
+	// Only failures are emitted. Advice that worked is the normal case and
+	// saying so on every compaction would drown the sink; advice that did not is
+	// the reportable event, because disk.Options.ResidentAdvice is then an
+	// option asked for and not held. A platform with no advice to give -- windows
+	// and everything outside linux and darwin -- reports through this on the
+	// first attempt rather than staying quiet, for the reason
+	// MetricIndexFallback's comment arrives at: what matters is what the caller
+	// is paying, not where the cause lies.
+	//
+	// Nothing fails when this fires. Advice is a hint, and a compaction that
+	// could not give one has still compacted.
+	//
+	// Appended at the end, per MetricIDHeadroomLow's note.
+	MetricResidentAdvice
 )
 
 // String names the kind, for a sink that labels its output.
@@ -215,6 +234,8 @@ func (k MetricKind) String() string {
 		return "compact-build"
 	case MetricCompactCommit:
 		return "compact-commit"
+	case MetricResidentAdvice:
+		return "resident-advice"
 	default:
 		return "unknown"
 	}
@@ -240,6 +261,7 @@ func (k MetricKind) String() string {
 //	compact-pin      modelled resident bytes  process anonymous bytes  process peak resident
 //	compact-build    modelled resident bytes  process anonymous bytes  process peak resident
 //	compact-commit   modelled resident bytes  process anonymous bytes  process peak resident
+//	resident-advice  the advice, as an enum   —                        mapping bytes it covered
 //
 // Duration is wall-clock for the operation, measured around the work rather than
 // around the whole call, and is zero for the two snapshot kinds. Err is non-nil

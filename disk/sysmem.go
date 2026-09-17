@@ -90,6 +90,18 @@ type sysMemory struct {
 	// current size needs Mach calls unreachable without cgo. A caller must not
 	// read a zero Resident on such a platform as "this process holds nothing".
 	Current bool
+
+	// Source names the instrument, the way sysCeiling.Source does for the other
+	// question. Empty exactly when nothing was read.
+	//
+	// It is not decoration. Anon means three different things across the three
+	// platforms -- RssAnon from the kernel's own accounting on linux, the commit
+	// charge on windows, nothing at all on darwin -- and a caller comparing a
+	// figure against a budget is entitled to know which. The same argument
+	// Options.DiscoverMemoryBudget makes for naming where a budget came from
+	// applies to naming where a measurement came from, and more strongly: a
+	// budget is at least a number someone chose.
+	Source string
 }
 
 // sysCeiling is the memory limit this process is running under, as the kernel

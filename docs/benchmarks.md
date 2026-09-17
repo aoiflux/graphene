@@ -3622,3 +3622,342 @@ the one that can size the readahead half**, and it has not been run at this shap
 null result here as "ordering does not matter cold" would be reading the instrument rather
 than the store.
 
+## What bounding an ingest costs the paths it did not change (2026-09-17)
+
+Phases 0, 1 and 3 add a size check ahead of two write calls, a mutation log a
+compaction opens across its build, a budget read at `Open`, and a fifth
+compaction rule. None of them is meant to be on a hot path. This is the check
+that none of them is, measured against **v0.8.0** — the tree extracted with
+`git archive v0.8.0`, built with the same toolchain, run on the same machine
+against the same fixture.
+
+The plan's list of paths that must not regress is
+`BenchmarkPointLookupNode_Disk`, `BenchmarkRSS_CompactIncremental`,
+`BenchmarkOpenWall_Defaults`, and the 1.4M read arm's 80.7% headroom.
+
+### The first attempt ran the arms back to back, and is not reported
+
+It is recorded because the shape of its error is worth keeping. Run
+sequentially — all of v0.8.0, then all of HEAD — the second arm came out
+**1.62–1.66× slower on `BulkWrite`** at n=1000 and n=10000 and **1.26× slower
+on `OpenWall_Defaults`**, while `PointLookupNode_Disk` and `BulkWrite` at n=100
+were flat.
+
+Three things say that is the machine and not the code. **Allocation is
+identical on every arm** — 4,045 and 40,111 allocs/op, and byte counts equal to
+the digit — so whatever changed was not work the code asked the allocator for.
+**No code path accounts for it**: the batch check short-circuits on `none()`
+before it reads the slice, `AutoCompact` is nil under these defaults so the
+fifth rule is never evaluated, and the tail is one atomic load per mutation
+when no capture is open. And **the benchmarks that moved are the ones that
+write**: a cached point lookup was flat, while the two write arms and the arm
+that opens a freshly written fixture all slowed.
+
+The last of those is the tell, and it has a cause specific to this machine.
+`O:` is a **file-backed virtual disk on ReFS**, not a raw NVMe namespace, and
+the first arm wrote gigabytes through it for ten minutes before the second
+started. A write-path-specific slowdown that tracks elapsed writing is the
+storage stack, and `docs/benchmarks.md` has made this mistake before: *"An
+earlier attempt ran the two suites back to back and the second came out ~25%
+slower across the board — including benchmarks the change never touched."*
+
+So the figures below are **interleaved** — four rounds alternating the two
+trees, one `-count=1` each, from binaries compiled up front so no round pays
+for a build, against one cached fixture per tree so no round pays to build one
+either. That spreads any drift evenly across both arms instead of loading it
+all onto whichever ran second. The ~25% resolution floor this document sets in
+"Two rounds discarded" applies here too.
+
+### The control that settles it
+
+`v0.8.0` was measured twice — the same binary, the same machine, the same
+fixture shape, once in each run. It should not have moved.
+
+| benchmark | sequential | interleaved | drift |
+|---|---:|---:|---:|
+| `PointLookupNode_Disk` | 29.41 ns | 44.99 ns | 1.53× |
+| `BulkWrite` n=100 | 164.7 µs | 285.0 µs | 1.73× |
+| `BulkWrite` n=1000 | 405.4 µs | 665.0 µs | 1.64× |
+| `BulkWrite` n=10000 | 2,583.7 µs | 4,145.8 µs | 1.60× |
+| `Ingest_AddNodes_Batch1000` | 661.0 µs | 843.7 µs | 1.28× |
+| `OpenWall_Defaults` | 14,401.9 µs | 22,768.2 µs | 1.58× |
+
+**Byte-identical code moved by 1.28–1.73×, which is more than the regression it
+appeared to show.** The two runs differ in `-benchtime` (2s against 1s, so the
+interleaved figures carry less warm-up) and in how long the storage stack had
+been written to. Neither is the code. A comparison whose own control drifts
+further than its signal cannot resolve that signal, and the sequential figures
+are reported above only so that nobody re-derives them and believes them.
+
+### Nothing moved
+
+Four interleaved rounds, medians across rounds, `-benchtime=1s -count=1` each.
+
+| benchmark | v0.8.0 | HEAD | ratio |
+|---|---:|---:|---:|
+| `PointLookupNode_Disk` | 44.99 ns | 41.98 ns | 0.93 |
+| `BulkWrite` n=100 | 285.0 µs | 281.0 µs | 0.99 |
+| `BulkWrite` n=1000 | 665.0 µs | 664.2 µs | **1.00** |
+| `BulkWrite` n=10000 | 4,145.8 µs | 4,178.5 µs | 1.01 |
+| `Ingest_AddNodes_Batch1000` | 843.7 µs | 848.6 µs | 1.01 |
+| `OpenWall_Defaults` | 22,768 µs | 21,610 µs | 0.95 |
+
+Every ratio is between 0.93 and 1.01, well inside the ~25% this document can
+resolve — and the two that read below 1.00 are noise rather than an improvement,
+because nothing in this work makes a point lookup or an open faster.
+
+**Allocation is the figure to trust here.** `BulkWrite` reports
+4,045 allocs/op at n=1000 and 40,111 at n=10000 on *both* trees, and
+`OpenWall_Defaults` reports 605–606 on both. The byte counts are not quite
+identical — 277,361–277,363 at n=1000, 2,714,239–2,714,286 at n=10000 —
+but those ranges span the two trees rather than separating them, and 47 bytes
+in 2.7 MB is 0.002%.
+
+Allocation counts are deterministic, so identical counts mean the changed code
+asked the allocator for nothing on these paths — which is the claim being
+checked, and it is checked without depending on a wall clock this machine
+cannot hold still.
+
+### Why these paths were free, in the code rather than the measurement
+
+The measurement agrees with what the diff says, which is the point of taking it.
+
+- **The batch caps cost one branch when there is no budget.** `checkNodes`
+  opens with `if c.none() || len(nodes) <= 1 { return nil }` and never reads the
+  slice. These benchmarks open with `disk.Options{}`, so `none()` is true and
+  the check is a predictable branch per call, not a walk per record.
+- **The fifth compaction rule is never evaluated.** `AutoCompact` is a nil
+  `*store.CompactionPolicy` by default, so no policy is polled and
+  `EstimatedResidentBytes` is not computed on any path these arms touch.
+- **The tail is one atomic load per mutation.** `PropertyIndex.tail` is an
+  `atomic.Pointer[Tail]` read by `capture` and written only by `CaptureTail` and
+  `StopCapture`. With no compaction running it is nil, and the mutation paths pay
+  a load and a branch.
+- **Budget discovery does not run.** `DiscoverMemoryBudget` is off by default, so
+  `resolveMemoryBudget` returns the options unchanged without reading a file or
+  calling the kernel. That is the flag's other justification: the cost of asking
+  is only paid by a caller who asked.
+
+### What a capture costs when one *is* open
+
+The paths above are free because nothing is capturing. The arm that measures the
+capture itself is `index.BenchmarkIndexNodeCapture{Off,On}` — the same
+registrations against the same index, differing only in whether a capture is
+open, so the gap is the recording and nothing else. Six runs each:
+
+| | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| capture off | 439.9–481.9 | 140–172 | **0** |
+| capture on | 456.7–513.4 | 187–213 | **0** |
+
+**+≈45 B/op against `index.TailOpBytes = 48`, and zero allocations on either
+side.** The byte figure landing just under the constant is the design working:
+`TailOpBytes` is an accounting figure deliberately set to `tailOp`'s width on a
+64-bit build, and `TestTail_ChargeIsNeverAnUndercharge` holds the inequality, so
+a capture charges itself slightly more than it holds and a bound errs towards
+declining. The wall clock is inside the run-to-run spread.
+
+**Zero allocs/op on the capturing arm is the whole of why this is affordable**,
+and it is what the fixed-block log buys. The first shape appended to one growing
+slice: Go grows a large slice by a quarter and copies it, so an append-only log
+allocated roughly five times what it ended up holding — **269 B of garbage per
+mutation against the 48 it keeps** — and put the registration path at 1.2–1.3×
+while a capture was open. In 1,024-op blocks no operation is ever copied, the
+figure compared against the limit is the figure actually held, and the cost
+disappears into the noise.
+
+### The compaction, which is where a capture is actually open
+
+`BenchmarkRSS_CompactIncremental` is the fourth name on the must-not-regress
+list and the one with something to find. The three arms above are free because
+nothing is capturing; this one is not, because `CompactCtx` opens a capture at
+plan time (`disk/compact.go:656`) and closes it at commit. Every compaction now
+runs with the tail installed.
+
+50,500 live records, a delta at one per cent of the live set, three interleaved
+rounds, medians.
+
+| metric | v0.8.0 | HEAD | ratio |
+|---|---:|---:|---:|
+| `compactPeakMiB` | 74.75 | 74.77 | **1.000** |
+| `compactAllocB` | 13,411,656 | 13,416,976 | 1.000 |
+| `compactAllocs` | 6,742 | 6,760 | 1.003 |
+| `compactDeltaMiB` | 31.75 | 31.66 | 0.997 |
+| `anonMiB` | 53.79 | 53.84 | 1.001 |
+| `rssMiB` | 62.46 | 62.46 | 1.000 |
+| `compactMs` | 731 | 722 | 0.988 |
+
+**Installing a capture across a whole compaction costs 18 allocations and
+5,320 bytes** — 0.27% and 0.04% — and moves the residency peak by 0.03%. The
+residency figures are the ones to read hardest here: this document exempts them
+from the ~25% timing floor because they are deterministic measurements of
+resident bytes, and they agree to the third digit.
+
+That is the quiet case, and it is the one worth stating precisely: **no
+concurrent writer means no mutation lands in the tail**, so what is measured is
+the machinery and not the recording. The cost of the recording is the +≈45 B per
+mutation above, paid only by mutations that actually arrive during a build. A
+compaction on a quiet store allocates a `Tail` and nothing else.
+
+The first round's v0.8.0 sample is an outlier on two metrics — 1,101 ms against
+724 and 731, and 7,476 allocs against 6,719 and 6,742 — and it is the first
+compaction either binary ran. It is left in the table's input and the median
+takes care of it, rather than being removed for being inconvenient.
+
+### What this does not cover
+
+**The headroom arm is not here.** The plan's fourth must-not-regress item is the
+1.4M read arm's 80.7% headroom, which is a ceiling-harness measurement rather
+than a benchmark; `docs/MEMORY_MODEL.md` §9 owns it and it has not been re-run
+against this tree.
+
+**Every arm above runs uncapped**, with `disk.Options{}` and therefore no budget,
+no derived caps and no policy. That is deliberate — it is the configuration an
+existing program gets on upgrade, and "nothing changes for a caller who changes
+nothing" is the claim being tested. What a *capped* store costs on the same paths
+is a different measurement and is not taken here.
+
+**One machine, one platform, one fixture shape.** And on a machine whose storage
+is a file-backed virtual disk, which the control above shows drifting by up to
+1.73× over an afternoon. The allocation figures are exact and portable; the wall
+clock is neither.
+
+### Reproducing
+
+```sh
+# The trees. v0.8.0 is extracted rather than checked out, so the working tree
+# is left alone.
+mkdir -p /tmp/g080 && git archive v0.8.0 | tar -x -C /tmp/g080
+
+# Both binaries up front, so no round pays for a build.
+(cd /tmp/g080 && go test ./tests/ -tags=stress -c -o /tmp/bin080)
+(cd . && go test ./tests/ -tags=stress -c -o /tmp/binhead)
+
+# Interleaved, one cached fixture per tree. Alternate the trees every round;
+# do not run one suite and then the other.
+for R in 1 2 3 4; do
+  for T in 080 head; do
+    GRAPHENE_RSS_DIR=/tmp/fx$T /tmp/bin$T -test.run XXX \
+      -test.bench 'BenchmarkPointLookupNode_Disk$|BenchmarkBulkWrite_AddNodes_Disk_NoSync$|BenchmarkIngest_AddNodes_Batch1000$|BenchmarkOpenWall_Defaults$' \
+      -test.benchmem -test.benchtime=1s -test.count=1
+  done
+done
+
+# The compaction arm, same interleaving, one iteration per sample.
+for R in 1 2 3; do
+  for T in 080 head; do
+    GRAPHENE_RSS_DIR=/tmp/fx$T /tmp/bin$T -test.run XXX \
+      -test.bench 'BenchmarkRSS_CompactIncremental$' \
+      -test.benchmem -test.benchtime=1x -test.count=1
+  done
+done
+
+# The capture's own cost, which needs no fixture and no stress tag.
+go test ./index/ -run XXX -bench 'BenchmarkIndexNodeCapture' -benchmem -count=6
+```
+
+## What telling the kernel about the mapping is worth (2026-09-17)
+
+`Options.ResidentAdvice` is the first thing in this programme aimed at the
+file-backed class rather than the anonymous one, so every figure above is the
+wrong one to judge it by. The anonymous column is the control here: a change that
+moved it would be a change doing something other than what it says.
+
+The motivating measurement is MEMORY_MODEL §9.9's: **1,182 MiB of file-backed
+residency during an ingest of 400,000 × 3.2 KB records, twelve times the anonymous
+class and linear in the store.** Free against a windows Job Object, which charges
+commit; charged against a linux cgroup v2 `memory.max`, which charges page cache.
+
+### Where this was run, which is not where the programme is measured
+
+Every other figure in this file is windows/amd64 on the `O:` VHD. This one cannot
+be: windows takes its access-pattern hint when a file is opened rather than against
+a live mapping, and has no equivalent of dropping a range, so the advice is a no-op
+there and the arm would report two identical columns.
+
+So the test binary was cross-compiled and run under **WSL2 (kernel
+6.18.33.2-microsoft-standard-WSL2) on the same machine**, with the store on the
+same `O:` volume reached through a 9p mount. That is a real kernel doing real
+`madvise`, and it is **not** a native filesystem: 9p's page-cache behaviour is its
+own, and the figures below should be read as "the mechanism works and by roughly
+this much" rather than as a number to plan a container against. No toolchain was
+installed to do it — `go test -c` produced the binary on the windows side.
+
+### The arm
+
+`BenchmarkRSS_AdviceCompaction`, 50,000 × 512 B, a delta of 1% of the live set,
+then one `Compact()`. Four rounds, arms interleaved, medians. The fixture is built
+once and copied per arm, so the two arms compact identical stores.
+
+| figure | advice off | advice on | on/off |
+|---|---:|---:|---:|
+| `fileMiB` after the compaction | 53.28 | **6.38** | **0.120** |
+| `anonMiB` after the compaction | 7.672 | 7.717 | 1.006 |
+| `rssMiB` after the compaction | 60.94 | 14.05 | 0.231 |
+| `beforeFileMiB` — after the writes, before compacting | 34.88 | 31.61 | 0.906 |
+| `compactPeakMiB` — the peak *during* the compaction | 79.87 | 79.37 | 0.994 |
+| `heapMiB` | 4.767 | 4.768 | 1.000 |
+| `compactAllocs` | 21,351 | 22,497 | 1.054 |
+
+**The file-backed column falls by 46.9 MiB, 88.0%, and the ranges do not touch.**
+Off spans 53.250–53.540 across four rounds and on spans 6.281–6.406 — no overlap,
+and each arm's own spread is under 0.3%. That is the kind of separation the
+footprint figures in this file have and the timing figures never do, and it is why
+this is reported from four rounds rather than from twenty.
+
+**The anonymous column did not move: 1.006, with the ranges overlapping.** So did
+the Go heap, identical to three digits. The option touched the class it claims to
+touch and no other, which is the assertion worth making because it is the one that
+could have been false.
+
+**`compactAllocs` is noise rather than a cost.** The ranges overlap heavily —
+21,218–23,528 off against 21,554–27,548 on — and advice is syscalls, not
+allocations. Nothing here should be read as the option costing 5%.
+
+### The two figures that say what it does *not* do
+
+**The peak during the compaction is unchanged: 79.87 against 79.37 MiB, 0.994.**
+The drop happens after the pass, so the pass still reads the whole image and still
+makes all of it resident while it does. This option returns what a compaction was
+finished with; it does not make a compaction hold less. **Phase 4 is what would do
+that**, and this measurement is an argument for it rather than a substitute.
+
+**`beforeFileMiB` falls 9.4% — 34.88 to 31.61 — and that half is 2a alone.** No
+page has been dropped at that point in the arm; the only thing in force is
+`MADV_RANDOM` over the mapping after the parse, suppressing readahead for a
+workload whose next page read is not the next page. It is the smaller half by a
+wide margin, and it is the half that costs nothing at all.
+
+### What is not measured here, and is claimed anyway
+
+The trade this option documents is *less resident memory, more major faults*, and
+**only the first half of that sentence has been measured.** A page dropped and
+then read again is a fault, a store that compacts and then serves reads out of the
+dropped pages pays for every one of them, and no arm here reads anything back
+after the compaction. The claim rests on what `MADV_DONTNEED` does rather than on
+a timing of this engine doing it.
+
+That is why the option is off by default. The residency win is measured and large;
+the cost is reasoned and unmeasured, and a default would be asserting the second
+half on the strength of the first.
+
+Also not covered: the shape that motivated the item. 50,000 × 512 B is a ~30 MiB
+image, and the 1,182 MiB figure is 400,000 × 3.2 KB. The ratio is expected to hold
+because the mechanism is per-page and the residency was already linear in the
+store, but expected is not measured.
+
+### Reproducing
+
+```sh
+# From a windows host with WSL2, no linux toolchain needed.
+GOOS=linux GOARCH=amd64 go test -c -tags=stress -o /tmp/stress.test ./tests/
+
+# On the linux side. The fixture is built once; without GRAPHENE_RSS_DIR every
+# arm rebuilds it and the two arms no longer compact identical stores.
+export GRAPHENE_RSS_NODES=50000 GRAPHENE_RSS_BLOB=512 GRAPHENE_RSS_DIR=/tmp/advfix
+for R in 1 2 3 4; do
+  for ARM in Off On; do
+    /tmp/stress.test -test.run='^$' -test.bench="RSS_AdviceCompaction/$ARM"       -test.benchtime=1x -test.count=1
+  done
+done
+```

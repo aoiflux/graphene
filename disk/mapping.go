@@ -369,6 +369,18 @@ func (s *Store) openImage(path string) (*imageSource, error) {
 		s.recordImageFallback(err)
 		return s.readImage(path)
 	}
+
+	// One forward pass over the whole file is about to happen -- the parse, and
+	// VerifyOnOpen's hash before it when that is on. That is the one access
+	// pattern in this engine that wants readahead, and noteImage takes it back
+	// once the pass is done. No-op unless Options.ResidentAdvice is set.
+	//
+	// Not through adviseImages: this mapping is not in the store's lists yet,
+	// and putting it there before the parse has succeeded would mean a failed
+	// load left it to be swept rather than discarded.
+	if s.residentAdvice {
+		s.noteAdvice(m.advise(adviceSequential), adviceSequential, m.bytes())
+	}
 	return &imageSource{data: m.data, m: m}, nil
 }
 
@@ -431,6 +443,14 @@ func (s *Store) noteImage(src *imageSource, csr *CSRGraph) {
 	}
 	src.m.attach(csr)
 	s.images = append(s.images, src.m)
+
+	// The sequential pass openImage asked for is over: this is called after the
+	// parse. Everything from here is point lookups into blobs, where readahead
+	// pulls in pages the next read will not want -- which is the residency this
+	// option exists to stop. No-op unless Options.ResidentAdvice is set.
+	if s.residentAdvice {
+		s.noteAdvice(src.m.advise(adviceRandom), adviceRandom, src.m.bytes())
+	}
 }
 
 // mappedIndexBase is an index base together with the fact that it was read out

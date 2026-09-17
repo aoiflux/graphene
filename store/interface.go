@@ -1100,6 +1100,87 @@ type ActorTransactor interface {
 	ApplyTransactionAs(ops []TxOp, ctx TxContext) error
 }
 
+// ProcessMemory is what the operating system says the whole process is holding,
+// as against what the store models for itself.
+//
+// # Why this is here at all when EstimatedResidentBytes exists
+//
+// They answer different questions and the gap between them is the finding.
+// EstimatedResidentBytes is retained heap, totalled from the structures
+// themselves; it is a floor, and a rebuild has been measured charging roughly
+// 2.6x it. A caller sizing a machine against the model alone is reading the
+// wrong number by a factor nobody can derive from the model. This is the other
+// half, read from the kernel, with no modelling in it.
+//
+// It is the whole process and not the store. A library cannot separate its own
+// pages from its host's, and pretending otherwise would be the more misleading
+// figure of the two. What it is good for is a delta -- read it before an ingest
+// and after, and the difference is the store's, whatever else the program is
+// doing.
+//
+// # The split, which is the point
+//
+// AnonBytes is the class that OOM-kills: the Go heap, its stacks and the
+// runtime's arenas. FileBytes is the mapped image's resident page cache, which
+// the kernel drops under pressure instead of killing the process. Reclaimable is
+// not free -- those pages are charged to a cgroup, and reclaiming them in the
+// middle of an ingest is a latency event inside the operation being bounded --
+// but the two are not the same risk and a single total hides that.
+//
+// The classes are also charged differently by the two instruments this engine is
+// measured against, which is a trap worth naming: a windows Job Object charges
+// commit, so a read-only file mapping costs it nothing, while a linux cgroup v2
+// memory.max charges page cache. The same store under the same load can pass one
+// and fail the other on this figure alone.
+//
+// # An unanswerable figure reads as unanswerable
+//
+// Source is empty exactly when nothing was read, and Known reports that. Split
+// and Current say which half of the reading is real: darwin supplies the peak
+// through getrusage and nothing else without cgo, so it reports Current false
+// with AnonBytes and FileBytes at zero, and a caller must not read those zeros
+// as "this process holds nothing". Where Split is false the platform could not
+// tell the classes apart and AnonBytes carries the whole resident total, which
+// over-reports the dangerous class rather than under-reporting it.
+type ProcessMemory struct {
+	// AnonBytes is resident anonymous memory, or the whole resident set where
+	// Split is false. On windows it is the commit charge, which overstates
+	// residency by whatever the runtime holds committed and untouched; Source
+	// says so.
+	AnonBytes uint64
+
+	// FileBytes is resident file-backed memory: on this engine, the pages of the
+	// mapped image and of a mapped property index. Zero where Split is false,
+	// which means "not separable" rather than "none".
+	FileBytes uint64
+
+	// PeakBytes is the high-water mark of the resident set for the life of the
+	// process. It never resets, so it answers "did we ever come close" and not
+	// "are we close now" -- and it is the one field darwin can answer.
+	PeakBytes uint64
+
+	// Split reports that AnonBytes and FileBytes are genuinely separate
+	// readings. False on a pre-4.5 linux kernel and on darwin.
+	Split bool
+
+	// Current reports that AnonBytes and FileBytes are readings at all, as
+	// against PeakBytes alone. False on darwin.
+	Current bool
+
+	// Source names the instrument -- "/proc/self/status RssAnon+RssFile",
+	// "K32GetProcessMemoryInfo WorkingSetSize/PrivateUsage (commit charge)",
+	// "getrusage ru_maxrss (peak only; ...)". Empty exactly when nothing was
+	// read, which is a platform with no reader and a store that did not ask.
+	Source string
+}
+
+// Known reports whether anything was read at all.
+//
+// The test is Source rather than a byte count, because every byte count in here
+// has a legitimate zero and none of them distinguishes "the platform checked and
+// the answer was none" from "the platform could not check".
+func (p ProcessMemory) Known() bool { return p.Source != "" }
+
 // StorageStats reports what a backend is currently holding, so an operator can
 // see when it needs attention.
 //
@@ -1172,6 +1253,19 @@ type StorageStats struct {
 	// Zero from a backend that cannot estimate. On the disk backend the terms are
 	// available individually; see disk.Store.EstimateResident.
 	EstimatedResidentBytes int64
+
+	// Process is what the operating system says the whole process holds, beside
+	// the modelled figure above. Read only when the backend was asked for it --
+	// on the disk backend, disk.Options.ReportProcessMemory -- and an all-zero
+	// value whose Known is false otherwise.
+	//
+	// Off unless asked because this field alone costs a kernel call, and
+	// StorageStats is polled: AutoCompact evaluates a policy against it on every
+	// tick and a bulk import evaluates one after every batch. Measured at
+	// roughly 800 ns and two allocations per read on windows 11, and a read and
+	// parse of /proc/self/status on linux. Neither is large, and neither belongs
+	// in a figure some callers poll thousands of times and never look at.
+	Process ProcessMemory
 
 	// WALBytes is the log's size on disk. It is bounded only by compaction, so
 	// it is also the best proxy for how long the next open will take.

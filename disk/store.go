@@ -210,6 +210,14 @@ type Store struct {
 	// on. StorageStats.MemoryBudgetSource is where it surfaces.
 	memBudgetSource string
 
+	// residentAdvice is Options.ResidentAdvice. Set once at Open and read without
+	// a lock, like the other Open-time settings beside it.
+	residentAdvice bool
+
+	// reportProcMem is Options.ReportProcessMemory. Set once at Open and read
+	// without a lock, like the other Open-time settings beside it.
+	reportProcMem bool
+
 	// batchCaps is Options.MaxBatchBytes and MaxBatchRecords resolved against the
 	// budget, the way compactBufs is Options.Compact resolved. Set once at Open,
 	// and read on every batch write with no lock: the fields never change after
@@ -423,6 +431,21 @@ func (s *Store) now() time.Time {
 // either side of a compaction. The WAL size is read outside that consistency
 // guarantee (see WAL.Size) and may lag by one record.
 func (s *Store) StorageStats() store.StorageStats {
+	st := s.collectStorageStats()
+
+	// The one field here that asks the operating system a question, and so the
+	// one taken after the lock has been dropped rather than under it. A kernel
+	// call is not bounded by anything this package controls, and holding a read
+	// lock across one would let a slow /proc read block a commit -- for a figure
+	// that is about the process rather than about the store and cannot be
+	// inconsistent with the rest of the struct in any way a caller could act on.
+	st.Process = s.processMemory()
+	return st
+}
+
+// collectStorageStats is StorageStats' locked half. It takes the read lock
+// itself rather than requiring it, which is why it is not named ...Locked.
+func (s *Store) collectStorageStats() store.StorageStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -495,6 +518,57 @@ func (s *Store) StorageStats() store.StorageStats {
 	st.NodeIDHeadroom = idHeadroom(st.HighestNodeID)
 	st.EdgeIDHeadroom = idHeadroom(st.HighestEdgeID)
 	return st
+}
+
+// processMemory reads the kernel's counters for the whole process, or reports
+// that nothing was read. No lock held; see StorageStats.
+//
+// The zero value is not a reading and does not pretend to be: store.ProcessMemory
+// .Known is false for it, which is the same "unanswerable is not zero" rule the
+// sysmem readers follow and MemoryBudgetSource follows for the other question.
+// A store that did not ask and a platform that cannot answer are deliberately
+// the same value here -- in both cases nothing was measured, and a caller that
+// needs to tell them apart is looking at its own Options.
+func (s *Store) processMemory() store.ProcessMemory {
+	if !s.reportProcMem {
+		return store.ProcessMemory{}
+	}
+	m, ok := readSysMemory()
+	if !ok {
+		return store.ProcessMemory{}
+	}
+	return processMemoryFrom(m)
+}
+
+// processMemoryFrom is the translation half, split out so the rules below can be
+// tested against a fabricated reading rather than against whatever the machine
+// running the tests happens to hold. sysMemoryFromCounters and parseProcStatus
+// are split for the same reason.
+func processMemoryFrom(m sysMemory) store.ProcessMemory {
+	// A reading with no instrument behind it is not a reading. Nothing in the
+	// tree produces one -- every reader that returns true names its source --
+	// but Known is the contract this type publishes, and a value that answered
+	// false to it while carrying figures would be the one shape a caller cannot
+	// defend against.
+	if m.Source == "" {
+		return store.ProcessMemory{}
+	}
+	p := store.ProcessMemory{
+		AnonBytes: m.Anon,
+		PeakBytes: m.Peak,
+		Split:     m.Split,
+		Current:   m.Current,
+		Source:    m.Source,
+	}
+	// The file-backed share is a subtraction rather than a reading on every
+	// platform that answers at all, and it is only meaningful where the two
+	// classes were told apart. Where they were not, sysMemory puts the whole
+	// total in both fields, so subtracting would yield zero and read as "no
+	// mapped pages" -- the one wrong answer available. Split is what says not to.
+	if m.Split && m.Resident > m.Anon {
+		p.FileBytes = m.Resident - m.Anon
+	}
+	return p
 }
 
 // noteDeltaBytesLocked records whether the delta has reached
@@ -1062,6 +1136,76 @@ type Options struct {
 	// derived from a limit is therefore always strictly below it.
 	DiscoverMemoryBudget bool
 
+	// ReportProcessMemory asks StorageStats to fill in StorageStats.Process --
+	// the resident anonymous and file-backed split as the kernel reports it, for
+	// the whole process. Off by default.
+	//
+	// # Why a flag rather than always
+	//
+	// StorageStats is polled. AutoCompact evaluates a CompactionPolicy against
+	// it on every tick, and bulk.Run evaluates one after every batch, which at a
+	// byte-bounded import is thousands of times. Reading the kernel's counters
+	// costs about 800 ns and two allocations on windows 11 and a read and parse
+	// of /proc/self/status on linux -- small, and still not something to add to
+	// a call that most callers make in a loop and never read this field of.
+	//
+	// The rest of StorageStats is assembled from figures the store already holds
+	// and is O(1) for exactly this reason. This is the only field in it that
+	// asks the operating system a question, so it is the only one with a switch.
+	//
+	// # What it does not do
+	//
+	// Nothing acts on it. It is not a second budget and it does not feed the
+	// batch caps or CompactionPolicy, both of which are deliberately driven by
+	// figures the engine can compute before it does the work rather than by one
+	// it can only observe afterwards. This is an instrument, and a caller that
+	// wants a bound is looking for MemoryBudget or CompactionPolicy.
+	//
+	// The figure is the process, not the store; store.ProcessMemory says why
+	// that is the honest reading and how to get a store-shaped number out of it.
+	ReportProcessMemory bool
+
+	// ResidentAdvice lets the engine tell the kernel how its mapped image is
+	// about to be used, and when it has finished with it. Off by default.
+	//
+	// It bounds the *resident* class rather than the anonymous one. A mapped
+	// image is file-backed page cache, which the kernel reclaims under pressure
+	// instead of killing the process -- so it is not the class the 2 GiB
+	// directive is about, and this option is not what holds that bound.
+	// MemoryBudget, the batch caps and CompactionPolicy are.
+	//
+	// What it is for is the other half of the same problem. Those pages are
+	// charged against a linux cgroup exactly as anonymous ones are, measured at
+	// 1,182 MiB during an ingest of 400,000 x 3.2 KB records -- twelve times the
+	// anonymous class, and linear in the store. A container sized to the
+	// anonymous figure goes into reclaim during the ingest, and reclaim inside a
+	// compaction is a latency event inside the operation that is already the
+	// peak.
+	//
+	// # The trade, stated once
+	//
+	// A page dropped and then read again is a major fault. Less resident memory,
+	// more faults. A store that compacts and then serves reads out of the pages
+	// the compaction dropped pays for all of them again, so this is worth having
+	// during a bulk ingest and is not obviously worth having on a read-serving
+	// store. That judgement is the caller's, which is why this is a switch and
+	// not a default.
+	//
+	// # Where it does and does not apply
+	//
+	// linux and darwin, through madvise. Windows takes its access-pattern hint
+	// when the file is opened rather than against a live mapping, and its answer
+	// to giving pages back is a working-set cap on the whole process; that is
+	// LimitWorkingSet, a function rather than an option precisely because its
+	// scope is the process. Setting this on a platform that cannot act on it
+	// reports store.MetricResidentAdvice rather than doing nothing quietly.
+	//
+	// It changes no contract. Advice drops pages, never the mapping, so a
+	// Properties or Labels slice a caller is holding stays valid and stays at
+	// the same address -- the distinction that makes this buildable where
+	// unmapping a replaced image was not. See disk/advise.go.
+	ResidentAdvice bool
+
 	// MaxBatchBytes and MaxBatchRecords cap a single AddNodesBatch or
 	// AddEdgesBatch. A batch over either is refused with an error wrapping
 	// ErrBatchTooLarge and carrying both figures; see BatchTooLargeError.
@@ -1505,6 +1649,8 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		deltaSoftLimit:       opts.DeltaSoftLimit,
 		memBudget:            opts.MemoryBudget,
 		memBudgetSource:      budgetSource,
+		reportProcMem:        opts.ReportProcessMemory,
+		residentAdvice:       opts.ResidentAdvice,
 		batchCaps:            batchCapsFor(opts),
 		compactBufs:          compactBuffersFor(opts.Compact.MaxWorkingBytes),
 		imageMode:            opts.ImageMode,

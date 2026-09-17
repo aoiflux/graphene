@@ -175,15 +175,26 @@ func TestZeroExternalDependencies(t *testing.T) {
 //     a struct mirroring a Windows layout and a size the kernel validates
 //     against it, so unsafe.Pointer and unsafe.Sizeof are how the call is
 //     expressible at all; the syscall package exposes none of the three.
+//   - disk/workingset_windows.go — GetProcessWorkingSetSizeEx, which reports
+//     the cap through three out-parameters. Reading back what the kernel
+//     actually installed is the point of the call rather than a nicety, and
+//     out-parameters are the only form it has.
+//   - disk/advise_darwin.go — madvise, which the standard library wraps on
+//     linux and not on darwin. The wrapper lives in golang.org/x/sys/unix and
+//     this module takes no dependency for a hint, so the syscall is spelled out
+//     and the mapping's address converted inline in the argument list, which is
+//     the one form go vet's unsafeptr check accepts as safe.
 //
 // An addition here is not forbidden; it is required to be deliberate. The
-// list is what makes a sixth file a review decision instead of an accident.
+// list is what makes the next file a review decision instead of an accident.
 var unsafeFiles = map[string]bool{
-	"disk/fileshare_windows.go": true,
-	"disk/lock_windows.go":      true,
-	"disk/mmap_windows.go":      true,
-	"disk/sysmem_windows.go":    true,
-	"index/property_index.go":   true,
+	"disk/advise_darwin.go":      true,
+	"disk/fileshare_windows.go":  true,
+	"disk/lock_windows.go":       true,
+	"disk/mmap_windows.go":       true,
+	"disk/sysmem_windows.go":     true,
+	"disk/workingset_windows.go": true,
+	"index/property_index.go":    true,
 }
 
 // TestUnsafeIsConfinedToKnownFiles walks every non-test Go file in the tree and

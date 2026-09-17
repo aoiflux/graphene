@@ -3,6 +3,351 @@
 Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 `git log` for those.
 
+## Unreleased (v0.9.0) — an ingest the engine bounds, and a ceiling it can find for itself
+
+The question this release answers is "what if I bulk-ingest ten million nodes?".
+v0.8.0 made a whole-layer *rebuild* fit under 2 GiB. An ingest is the other
+workload and nothing in the engine bounded it: `AddNodesBatch` took a slice of any
+length, `MemoryBudget` gated `Open` and `Compact` and nothing in between, and a
+`bulk` import accumulated an entire dump before anything folded it into an image.
+Worse, the configuration §9.8 measured passing was undocumented, and the one
+`USER_GUIDE.md` recommended was the arm that died.
+
+### Inputs the engine refuses, on two dimensions
+
+- **`disk.Options.MaxBatchBytes` and `MaxBatchRecords` cap one `AddNodesBatch` or
+  `AddEdgesBatch`, and a batch over either is refused with `disk.ErrBatchTooLarge`.**
+  The wrapped `*disk.BatchTooLargeError` carries both caps and both measured
+  figures, so a caller can split by the one that actually bound. Two dimensions
+  because neither bounds both shapes: a byte cap does not bound ten million empty
+  nodes at 80 bytes of structure each, and a record cap does not bound ten records
+  carrying a gigabyte apiece.
+
+- **The check runs before any identifier is taken and before the lock, and stops
+  at the first record that crosses.** A refusal burns nothing, and a batch ten
+  times over the limit is refused after reading a limit's worth of it — walking ten
+  million records to report how far over they are would do the work the refusal
+  exists to avoid. The figures reported are therefore *at least*, not totals.
+
+- **The caps derive from the memory budget rather than sitting beside it.** Left at
+  zero, `MaxBatchBytes` takes a fraction of the budget in force and `MaxBatchRecords`
+  comes out of that divided by the cost of one empty record. This is Badger's
+  arrangement and its reason: a caller who turns memory down gets smaller batches
+  without a second decision, and the two settings cannot be put into disagreement.
+  A byte cap below the cost of a single record is refused at `Open` with
+  `disk.ErrBatchCapUnusable`, not on the first write, where a configuration error
+  surfaces to nobody.
+
+- **With no budget at all, zero caps nothing.** An upgrade does not start refusing
+  batches a program has always passed.
+
+- **`AddNodesInBatches` / `AddEdgesInBatches` split instead of refusing, on the
+  store and on `Graph` — and they are not atomic.** That is the whole trade, and it
+  is why they are a separate call rather than a kinder `AddNodes`: `AddNodes`
+  documents that either every node is added or none is, and two commits are two
+  commits. A failure partway through returns the identifiers already committed
+  alongside the error, because stranding records the caller has no identifier for
+  is worse than a partial answer clearly labelled as one. Badger draws the line in
+  the same place, between `Txn` and `WriteBatch`, and says the same thing about it.
+
+### The engine can read the ceiling it is already under
+
+- **`disk.Options.DiscoverMemoryBudget` derives `MemoryBudget` from the
+  environment**: a cgroup v2 `memory.max` or v1 `memory.limit_in_bytes` on linux, a
+  Job Object memory limit on windows, machine size on either when there is no limit,
+  and `hw.memsize` alone on darwin, which enforces no ceiling over the class this
+  engine cares about. Before this, every bound was a figure the caller had to know
+  to supply.
+
+- **It is a flag and not a redefinition of zero.** Zero `MemoryBudget` has meant
+  unlimited since the option existed, and quietly changing that would mean a store
+  that opened yesterday refusing to open today against a figure nobody configured —
+  the same silent reinterpretation of a shipped default that was refused for what
+  `MaxDeltaBytes` counts. An explicitly set budget always wins and this flag then
+  does nothing; discovery can neither raise a stated figure nor lower one.
+
+- **Only a fraction of the discovered ceiling is taken** — 50% of an enforced
+  limit, 25% of machine size — because the budget is a whole-store figure and
+  nothing here knows what else the program has allocated. A derived budget is always
+  strictly below the ceiling it came from. Neither fraction is yet tuned against a
+  measurement, and both are deliberately conservative until one exists.
+
+- **`StorageStats.MemoryBudgetSource` names the instrument verbatim**, so an
+  operator looking at a store that refused a compaction against a number nobody
+  configured can see which file or call produced it. A budget with an empty source
+  means the caller set it. Asking for discovery on a platform that answered nothing
+  reports zero and `""` rather than inventing a ceiling.
+
+### A fifth compaction rule, which sees what the other four cannot
+
+- **`store.CompactionPolicy.MaxResidentBytes` fires on
+  `StorageStats.EstimatedResidentBytes`.** The four existing rules watch the delta
+  and the log; the property index those same writes created is in neither. At one
+  measured shape a delta reporting **338 bytes per record was holding 1,893**, and
+  rebuilding without compacting, at 400,000 records the resident property index was
+  **546.4 MiB against the delta's 295.0** — the term the byte rule cannot see was
+  1.85× the term it can.
+
+- **It is additive, not a replacement.** What `MaxDeltaBytes` counts is unchanged,
+  because moving it would silently retune every deployment already calibrated
+  against it. A caller who sets both gets whichever fires first. Off by default.
+
+- **It is a floor, not a budget**, and its doc comment says so: retained heap runs
+  well under what the process charges — roughly 2.6× during a rebuild, 1.19–1.54× at
+  rest. A caller with a 2 GiB ceiling does not set this to 2 GiB.
+
+### A compaction that ran while anything was writing now gives its memory back
+
+- **`adoptCompactedIndex` was gated on the WAL tail not having grown**, so a
+  compaction under concurrent writes adopted nothing — which is every compaction
+  during a bulk ingest, the one workload the bound exists for. `index.Tail` now
+  records the mutations applied across a build and `SwapBase` replays them over the
+  base it installs, so the precondition is met by reconstruction rather than by
+  waiting for a quiet moment.
+
+- **Not the shard split the plan named.** A retraction is a bit in
+  `baseState.nodeGone`, not a shard entry, so a second set of shards would resurrect
+  an entity deleted during the build. The log is fixed 1,024-op blocks rather than
+  one growing slice: a growing one cost 269 B of garbage per mutation against the 48
+  it keeps and put the registration path at 1.2–1.3×; in blocks the extra allocation
+  is exactly `TailOpBytes` and the wall clock is inside the noise.
+
+- **A latent bug closed alongside it.** A declaration takes the store lock but is
+  not journaled, so `tail == 0` never implied that no declaration had happened, and
+  one landing during a quiet build adopted onto an image whose GORD does not name
+  the key. Adoption is now gated on index identity, capture completeness, and the
+  declared key sets matching what went into the image.
+
+### An import is bounded by default at the command line, and unchanged in the library
+
+- **`bulk.Options` gains `MaxBatchBytes`, a `Compact` schedule and a `Reopen`
+  hook.** `BatchSize` counts records, which is the wrong unit as soon as records
+  vary in size — and a dump is precisely where the caller does not know which they
+  have, because they are importing it to find out. Both limits are enforced and
+  whichever is reached first flushes.
+
+- **`Reopen` is a callback and not a flag because the handle belongs to the
+  caller.** A compaction writes a new image and then goes on serving those records
+  out of the heap, since a base is attached on the load path and a compaction is not
+  one; reopening is what gives the bytes back. But reopening closes the handle, which
+  is the thing the caller will use afterwards, so the caller performs the reopen and
+  hands back what to write to next.
+
+- **`graphene import graph` now defaults to the configuration that was measured
+  passing**: `-bound 32` with a reopen after every interim compaction, where the
+  shipped 128 MiB delta default died at 1,200,000 records holding 1,843 MiB under a
+  2 GiB ceiling. `-bound 0` restores the unbounded behaviour for whoever has
+  measured that it is faster on a dump that fits. **`store.DefaultCompactionPolicy`
+  is unmoved** — an embedder gets exactly what they had.
+
+### What a bulk ingest costs, measured on both arms
+
+- **The quadratic is now a measurement rather than arithmetic in a plan.** The
+  ceiling harness gains `TestCeiling_BulkIngestFitsUnderTheLimit`, which fills an
+  empty store under a real limit and sums `MetricCompaction.Bytes` and
+  `MetricCommit.Bytes` — figures the engine already emitted and nobody added up.
+  `docs/MEMORY_MODEL.md` §9.9 carries the ladder.
+
+- **The two arms bracket the whole axis.** At the 3.2 KB records this programme
+  targets, unbounded holds memory *exactly* linear — 510.3 MiB at 100k, 1,010.0 at
+  200k, dead at 400k — and writes at a flat 1.81×. Bounded at 32 MiB with a reopen
+  holds **flat across a fourfold size range** (94.6, 76.3, 98.2 MiB) and pays 1.80×
+  more amplification per doubling, twice: 6.53× → 11.77× → 21.24×.
+
+- **So no setting of `MaxDeltaBytes` moves off that line**, it only moves your
+  position on it. A one-pass loader is the only thing that changes the curve's shape,
+  and that is now a measured conclusion rather than a projected one.
+
+- **Bounding is *slower* on an ingest** — 1.8× at 100k, 3.0× at 200k — because wall
+  clock follows bytes written. §9.8 found the exact opposite on a rebuild, and both
+  are true: a rebuild that does not bound dies, while an ingest that does not bound
+  is faster right up until it dies.
+
+- **The unbounded arm stops at 1,843.0 MiB**, the identical figure §9.8 recorded for
+  the 128 MiB rebuild arm at 1,200,000 records. The same wall, reached from two
+  directions.
+
+- **Per-stage attribution inside a compaction.** `MetricCompactPin`,
+  `MetricCompactBuild` and `MetricCompactCommit` fire at the three stage boundaries,
+  so "which stage peaked" no longer needs an external probe.
+
+### The instrument was reporting a structural zero as a measurement
+
+- **Windows estimates the anonymous/file split as `min(PrivateUsage, WorkingSetSize)`,
+  and `PrivateUsage` is commit charge.** The Go runtime over-commits enough that a
+  small process reports its entire working set as anonymous and **zero file-backed** —
+  which printed identically to a measured zero. `rssSample.AnonClamped` now records
+  that the estimate collapsed and the harness prints `n/a`, with a calibration test
+  holding the invariant both ways.
+
+- **That is what let the ingest's file-backed residency be trusted**: 251.6 → 572.9 →
+  1,182.0 MiB across the ladder, tracking the store at ~0.78× and reaching **12× the
+  anonymous class**. Free against a windows Job Object, which charges commit; charged
+  against a linux cgroup, which charges page cache. That asymmetry is the gate on the
+  resident-class work.
+
+- **Peak anonymous and peak total are tracked apart**, because they are not the same
+  instant — 242.7 against 477.8 MiB at 100k. Reading the file class as total-minus-anon
+  would be wrong twice over: different instants, and the total's own sample already
+  carries a `File` field for exactly that question.
+
+### The documented recipe was the failing one
+
+- **`USER_GUIDE.md` §10 is rewritten.** "Ingest everything, then `Compact()`" — the
+  shipped recommendation — is the arm that peaks at 6,644 MiB. It is replaced with the
+  bounded delta *plus* a reopen, both arms' figures, the write cost stated as a trade,
+  and the batch caps shown in use.
+
+- **A new §11, "Memory and capacity planning"**, with the per-node coefficients, the
+  index multiplier `held ≈ recordBytes × (1 + 107 × entries / recordBytes)`, three
+  worked shapes, and a table of every bound with its unit, default, and what it does
+  *not* cover. §§11–14 renumber to 12–15.
+
+- **`API_REFERENCE.md` gains the new surface with the trades in the text**: the batch
+  caps and their refusal, the splitting adders and their loss of atomicity, budget
+  discovery and its provenance, `MaxResidentBytes` as a floor, and the `bulk` schedule
+  with its `Reopen` hook.
+
+- **Two doc comments that were misleading are corrected.** `MaxDeltaBytes` now carries
+  the index multiplier beside the delete multiplier it already admitted — 5.6× against
+  1.8×. `AutoCompact` now states that it cannot reopen and therefore does not bound the
+  payload term, which is invisible to it by construction.
+
+### The mapped image stops being resident after a compaction has read it
+
+- **`Options.ResidentAdvice` tells the kernel what the engine is about to do**:
+  sequential over the parse at `Open` and over a compaction's read of the old image,
+  random for the point-lookup life in between, and *drop these pages* once a
+  compaction has finished with the image it copied forward. linux and darwin, through
+  `madvise`. Off by default.
+
+- **Measured on linux, interleaved, four rounds, 50,000 × 512 B:** file-backed
+  residency after a compaction falls **53.28 → 6.38 MiB — 88.0% less, 8.35× — with
+  the two arms' ranges not touching** (53.250–53.540 against 6.281–6.406). Total RSS
+  falls 60.94 → 14.05 MiB.
+
+- **The anonymous class did not move: 1.006, ranges overlapping**, and the Go heap is
+  identical to three digits. That is the control, and it is the assertion worth making
+  because it is the one that could have been false. `docs/benchmarks.md` carries the
+  table.
+
+- **It does not make a compaction hold less.** The peak *during* the compaction is
+  unchanged at 0.994 — the pass still reads the whole image and still makes all of it
+  resident while it does. This returns what the pass was finished with. Bounding the
+  transient itself is Phase 4, and this measurement is an argument for it rather than
+  a substitute.
+
+- **The trade is less resident memory for more major faults, and only the first half
+  is measured.** No arm reads anything back after the compaction, so the cost rests on
+  what `MADV_DONTNEED` does rather than on a timing of this engine doing it. That is
+  precisely why there is no default: a default would be asserting the second half on
+  the strength of the first.
+
+- **The drop is the record image alone.** The index mapping beside it is what
+  `SwapBase` has just installed and what the next query reads, so returning it would
+  pay the whole cost immediately to reclaim something the store is about to ask for
+  again. That is not the same trade; it is simply worse.
+
+- **It changes no contract, and that is the distinction that made it buildable.**
+  `disk/mapping.go` records at length why a compaction cannot *unmap* the image it
+  replaced — the graph it publishes carries slice headers into that image for every
+  record the delta did not touch. Advice drops pages, not mappings: no address moves,
+  no slice header is invalidated, and a read of a dropped page faults it back from the
+  file.
+
+- **darwin gets a raw `SYS_MADVISE`.** The standard library wraps `madvise` on linux
+  and not on darwin — the wrapper is in `golang.org/x/sys/unix` and this module takes
+  no dependency for a hint. `MADV_DONTNEED` rather than the `MADV_FREE` the plan named:
+  `MADV_FREE` is for anonymous memory, and "the contents may be discarded" is
+  meaningless for a read-only mapping whose contents are the file.
+
+- **A platform that cannot advise says so** through `store.MetricResidentAdvice`,
+  rather than leaving an option asked for and not held. Windows is that platform, and
+  its answer to this problem is `LimitWorkingSet` above.
+
+### The resident class is reported, and the report was hiding a zero
+
+- **`StorageStats.Process` carries what the kernel says the whole process holds**:
+  resident anonymous bytes, resident file-backed bytes, the peak, and the instrument
+  that answered. It sits beside `EstimatedResidentBytes`, which is modelled, retained
+  heap and a **floor** — a rebuild has been measured charging roughly 2.6× it.
+
+- **It is the process, not the store, and it says so.** A library cannot separate its
+  own pages from its host's, and a figure that claimed to would be the more misleading
+  of the two. It is useful as a difference: read it either side of an ingest.
+
+- **Off unless asked, behind `Options.ReportProcessMemory`.** `StorageStats` is polled
+  — `AutoCompact` evaluates a policy against it on a ticker and a bulk import after
+  every batch — and this is the only field in the struct that asks the operating
+  system a question. Measured at ~800 ns and two allocations per read on windows 11,
+  and a read and parse of `/proc/self/status` on linux. Everything else there is O(1)
+  by requirement.
+
+- **Building it found the windows reading collapsing to a structural zero.**
+  `sysMemoryFromCounters` clamped `PrivateUsage` (commit charge) to the working set so
+  a subtraction could not underflow, and then still reported `Split: true`. Whenever
+  commit met or exceeded the working set — **the common case for a freshly started
+  process, not an edge**: measured at 8.3 MiB against 8.3 MiB on an empty store — the
+  file-backed share came out as zero, which reads as "none of the mapped image is
+  resident". A clamped reading now reports `Split: false`, which already means "not
+  separable" on a pre-4.5 linux kernel and on darwin, and the source string says why.
+  This is the same defect `rssSample.AnonClamped` fixed in the harness, in the engine
+  this time.
+
+- **Unanswerable still does not read as zero.** `Known()` is false exactly when nothing
+  was read; `Current` is false where only a peak is real, which is darwin; `Split` is
+  false where the classes could not be told apart, and `AnonBytes` then carries the
+  whole resident total — over-reporting the class that OOM-kills rather than under-
+  reporting it.
+
+### A resident-set cap on windows, as a function and not an option
+
+- **`disk.LimitWorkingSet` and `disk.LimitWorkingSetFromCeiling`** install a hard
+  maximum working set through `SetProcessWorkingSetSizeEx`. It is the one mechanism in
+  this programme that **trims rather than kills**: the kernel takes pages out of the
+  process instead of failing an allocation, so nothing dies and the program gets
+  slower.
+
+- **A function rather than an `Options` field, deliberately.** It acts on the process,
+  so a second store opened with a different figure would silently move the first one's
+  ceiling. That is the same reasoning that keeps `GOMEMLIMIT` a deployment knob: a
+  library that re-sizes its host has substituted its own judgement for the caller's. A
+  host that wants the cap calls it once, itself.
+
+- **The limit is read back** through `GetProcessWorkingSetSizeEx`, and what is returned
+  is what the kernel says it holds rather than what was asked for — including whether
+  the maximum is actually hard. `tests/ceiling_test.go` refuses to report a pass under
+  a limit it did not confirm; a caller of this has the same right, and a cap that
+  silently failed to apply is worse than no cap.
+
+- **linux and darwin get `ErrWorkingSetUnsupported`, which is not an omission.**
+  `RLIMIT_RSS` is accepted and unenforced on every modern kernel, and `RLIMIT_AS`
+  counts the mapped image's address space — the class this programme deliberately
+  moved memory *into* — so a limit against it refuses a store that fits. What those
+  platforms have instead is advice, below, and a cgroup the operator sets from outside.
+
+### `GOMEMLIMIT` measured, and still not an `Options` field
+
+- **§6.1 attributed 153 MiB to "the runtime — `GOGC`/`GOMEMLIMIT`, not code" and nothing
+  had ever measured it.** Swept on the passing ingest arm, `docs/MEMORY_MODEL.md` §9.10:
+  **128 MiB takes 76 MiB off a 252.7 MiB peak — 36% of the gap between modelled heap and
+  charged bytes — for wall clock inside the noise.** 64 MiB takes a further 17 MiB and
+  costs **51% of the ingest's wall clock**, which is the soft limit's death spiral
+  arriving on schedule.
+
+- **Anything above what the process already charges does nothing at all.** 1024, 512 and
+  256 MiB were indistinguishable from unset on an arm charging 252.7 MiB, which places the
+  runtime's own accounting in (128, 256] — a reading, not a figure to copy.
+
+- **It reaches the gap and never the data.** The model of what this ingest holds peaks at
+  43.4 MiB against 252.7 charged; the 209 MiB in between is uncollected garbage and
+  unreturned arena, and that is the entire budget the knob has. Write amplification was
+  6.53× at every setting, confirming it changes nothing about what is written.
+
+- **It stays a deployment knob and will not become an `Options` field**, because it is
+  process-global and this engine is a library in someone else's process. It is also the
+  only bound darwin will ever have.
+
 ## v0.8.0 "Bookshelf_v2" — the rebuild fits, and the composites move onto the shelf
 
 ### A whole-layer rebuild fits under 2 GiB, and the knob was not what did it

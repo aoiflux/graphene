@@ -69,6 +69,7 @@ func parseProcStatus(raw []byte) sysMemory {
 		m.Anon = anon
 		m.Resident = anon + file
 		m.Split = true
+		m.Source = procSelfStatus + " RssAnon+RssFile"
 	case haveRSS:
 		// Pre-4.5, or a kernel that publishes the total and not the parts. Both
 		// fields carry the total: a caller comparing Anon against a budget then
@@ -76,8 +77,15 @@ func parseProcStatus(raw []byte) sysMemory {
 		// and Split says not to trust the difference between them.
 		m.Anon = rss
 		m.Resident = rss
+		m.Source = procSelfStatus + " VmRSS (kernel publishes no split)"
 	default:
 		m.Current = false
+	}
+	// VmHWM is published whether or not the split is, so a kernel that answered
+	// nothing current can still have answered the peak. Name the instrument for
+	// that case too rather than reporting a figure from nowhere.
+	if m.Source == "" && m.Peak > 0 {
+		m.Source = procSelfStatus + " VmHWM (peak only)"
 	}
 	return m
 }

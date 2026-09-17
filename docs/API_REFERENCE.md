@@ -331,6 +331,8 @@ The rest are sentinels, matched with `errors.Is`:
 | `store.ErrWriteConflict` | `Tx.Commit` | an upsert's key moved between buffering and commit; retry |
 | `store.ErrBudgetExceeded` | any `*Ctx` traversal or aggregate | the walk hit `MaxNodes`, `MaxEdges` or `MaxTime` (§12) |
 | `store.ErrTypeNameConflict` | `DeclareTypeNames`, `Open` on a store whose label table disagrees | two namings of one type value (§3) |
+| `disk.ErrBatchTooLarge` | `AddNodes`, `AddEdges` and their batch forms | the batch is over `MaxBatchBytes` or `MaxBatchRecords`; the wrapped `*disk.BatchTooLargeError` carries both caps and both figures (§5) |
+| `disk.ErrBatchCapUnusable` | `Open` | `MaxBatchBytes` is below the cost of one record, so no batch could ever be accepted |
 
 A uniqueness *declaration* that fails reports all of it at once:
 
@@ -380,6 +382,9 @@ func (g *Graph) AddEdge(e *store.Edge) (store.EdgeID, error)
 
 func (g *Graph) AddNodes(nodes []*store.Node) ([]store.NodeID, error)
 func (g *Graph) AddEdges(edges []*store.Edge) ([]store.EdgeID, error)
+
+func (g *Graph) AddNodesInBatches(nodes []*store.Node) ([]store.NodeID, error)  // not atomic
+func (g *Graph) AddEdgesInBatches(edges []*store.Edge) ([]store.EdgeID, error)  // not atomic
 ```
 
 - `AddNode` — assigns and returns a fresh `NodeID`. `n.Labels` must be non-empty,
@@ -398,6 +403,100 @@ caseID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeCase}}
 fileID, _ := g.AddNode(&store.Node{Labels: []store.NodeType{store.NodeTypeEvidenceFile}})
 eid, _   := g.AddEdge(&store.Edge{Src: fileID, Dst: caseID, Labels: []store.EdgeType{store.EdgeTypeBelongsTo}})
 ```
+
+### Batches the engine refuses, and the call that splits them
+
+```go
+s, err := disk.OpenWithOptions(dir, disk.Options{
+    MaxBatchBytes:   32 << 20,   // zero derives from the budget, or caps nothing
+    MaxBatchRecords: 50_000,     // zero derives from MaxBatchBytes
+})
+
+var big *disk.BatchTooLargeError
+if _, err := s.AddNodesBatch(nodes); errors.As(err, &big) {
+    log.Printf("%s: at least %d records / %d bytes, caps %d / %d",
+        big.Op, big.Records, big.Bytes, big.MaxRecords, big.MaxBytes)
+}
+```
+
+`AddNodes` allocates identifiers, record copies and a framed log batch
+proportional to the slice it is handed, so a ten-million-element slice is ten
+million records' worth of copies under one lock hold. Nothing bounded that before
+these two caps: they are the refusal. A batch over either comes back wrapping
+`disk.ErrBatchTooLarge`, carrying a `*disk.BatchTooLargeError` with both caps and
+both measured figures, so the caller can split by whichever one actually bound.
+
+**Two dimensions, because neither bounds both shapes.** A byte cap does not bound
+ten million empty nodes — 80 bytes of structure each and no payload, so the byte
+figure stays small while the allocation does not. A record cap does not bound ten
+records carrying a gigabyte apiece. Whichever is reached first refuses the batch.
+`MaxBatchBytes` is counted the way the delta counts the same records, so it and
+`CompactionPolicy.MaxDeltaBytes` are in the same units and can be reasoned about
+together.
+
+**The check runs before any identifier is taken and before the lock**, so a
+refusal burns nothing, and it stops at the first record that crosses — which is
+why `Records` and `Bytes` read *at least*. They are the figures at the point of
+refusal, not totals for the slice. A batch ten times over is refused after reading
+a limit's worth of it, which is the point: walking ten million records to report
+how far over they are would do the work the refusal exists to avoid.
+
+**Left at zero, each is derived from the memory budget in force** — including one
+`DiscoverMemoryBudget` found, so a store that discovered a 2 GiB cgroup limit
+refuses batches that a store on a 64 GiB machine accepts, with no figure written
+down by either caller. That is Badger's arrangement rather than an invention here:
+its batch caps come out of its memory configuration instead of sitting beside it,
+so turning memory down tightens batches without a second decision and the two
+settings cannot be put into disagreement. With no budget at all, zero caps nothing
+and these calls behave exactly as they did before the option existed — an upgrade
+does not start refusing batches a program has always passed.
+
+A byte cap below the cost of a single record is refused at `Open` with
+`disk.ErrBatchCapUnusable`, rather than on the first write: a configuration error
+that first surfaces on a background write surfaces to nobody.
+
+#### `AddNodesInBatches` — the split, and what it costs
+
+```go
+ids, err := g.AddNodesInBatches(nodes)   // as many commits as the caps require
+// ids holds every identifier assigned, in order -- including on error
+```
+
+**It is not atomic, and that is the whole trade.** Each chunk is its own commit. A
+failure partway through returns the identifiers already committed *alongside* the
+error, and those records are in the store: there is no rollback, and a crash
+mid-call leaves whatever had been committed. The committed prefix comes back
+rather than being dropped, because stranding records the caller has no identifier
+for is worse than a partial answer clearly labelled as one.
+
+This is a separate call rather than a kinder `AddNodes` because `AddNodes`
+documents the opposite guarantee — either every node is added or none is — and
+that is not a guarantee which can survive being split. Two commits are two
+commits. Badger draws the line in the same place and in the same terms: `Txn`
+refuses with `ErrTxnTooBig`, `WriteBatch` retries around the refusal by committing
+and starting a fresh transaction, and its documentation says plainly that
+`WriteBatch` is not transactional.
+
+It is not a stateful writer either, and could not be: a buffering writer cannot
+return an identifier from `AddNode`, because the record has not been written when
+the call returns — and an edge cannot name an endpoint still sitting in the
+buffer. Handing the whole slice over at once makes both problems disappear. The
+split happens inside, the identifiers come back in order, and an edge batch can
+reference nodes a previous call committed.
+
+`AddEdgesInBatches` is the same contract for edges. Endpoints must already exist,
+as they must for `AddEdges`; splitting does not relax that. An edge in a later
+chunk may name a node an earlier call committed, but nothing here creates one.
+
+> With no caps configured this is one call to `AddNodes` and is therefore atomic
+> after all. **Do not rely on that** — which you get depends on how the store was
+> opened, not on which call you made. The same applies on a backend with no batch
+> interface, where `Graph` falls back to `AddNodes`.
+
+What this bounds is everything the *engine* does with the slice: the copies, the
+framed log batch, and the delta growth between commits. The caller's own slice is
+still the caller's to bound. A source too large to hold at all belongs in
+`bulk.Options` (§13b), which streams it.
 
 ### 5.1 Transactions — `Begin` *(recommended for ingest)*
 
@@ -2250,6 +2349,73 @@ make one span a million records, and buffering to pretend otherwise would move
 the failure from "half imported" to "out of memory". Import into an empty store
 and discard the directory if it fails.
 
+### Bounding an import
+
+An import with no schedule accumulates the whole dump — records in the delta,
+entries in the property index — until something folds it into an image, so its
+peak follows the size of the dump rather than the size of a batch. That is fine
+for a dump that fits and it is the failure mode for one that does not.
+
+```go
+policy := store.DefaultCompactionPolicy()
+policy.MaxDeltaBytes = 32 << 20
+
+sum, err := bulk.ImportDump(r, g.GraphStore, bulk.Options{
+    MaxBatchBytes: 8 << 20,        // beside BatchSize, not instead of it
+    Compact:       policy,         // evaluated after every batch
+    Reopen: func(bulk.Dest) (bulk.Dest, error) {
+        var err error
+        if g, err = g.CompactAndReopen(); err != nil {
+            return nil, err
+        }
+        return g.GraphStore, nil
+    },
+})
+```
+
+**`MaxBatchBytes` is a second unit, not a smaller `BatchSize`.** `BatchSize`
+counts records, which is the wrong unit as soon as records vary in size: a
+thousand records is a few hundred kilobytes of small nodes and a gigabyte of
+large ones. A dump is precisely where the caller does not know which they have,
+because they are importing it to find out. Both limits are enforced and whichever
+is reached first flushes — a byte cap alone does not bound a million empty nodes,
+and a record cap alone does not bound ten records carrying a gigabyte each. The
+figure is counted as the destination counts it, near enough; this package is
+backend-agnostic and cannot ask the store what it will charge, so it is an
+estimate used to decide when to flush and never reported as a measurement.
+
+**`Compact` is the schedule, and `Reopen` is the half that actually gives memory
+back.** A compaction writes a new image and then goes on serving the records it
+wrote out of the heap, because a base is attached on the load path and a
+compaction is not one — so a long import ratchets, once per record written, for
+the life of the handle. `MEMORY_MODEL.md` §9.8 measured a rebuild that died
+holding 661.8 MiB it had already written to disk.
+
+`Reopen` is a callback rather than a flag because reopening closes the handle, and
+**the handle belongs to the caller**: it is the thing they will use after the
+import returns, and this package cannot reach it. So the caller performs the
+reopen and hands back what to write to next; `disk.Store.CompactAndReopen` is the
+call to make inside it. Returning an error stops the import, and returning a nil
+`Dest` is an error for the same reason — there would be nothing left to write to.
+
+The zero `Compact` policy never fires, which is what an import did before this
+existed. A destination that does not report `StorageStats` or offer `Compact`
+leaves the schedule silently inert; both bundled backends do both.
+
+**The CLI takes the passing configuration by default**, where the library keeps
+the compatible one:
+
+```
+graphene import graph <dir> -from dump.gz -bound 32 -batch-bytes 8388608
+```
+
+`-bound` is MiB of delta after which the import compacts *and reopens* mid-import,
+defaulting to 32; `-bound 0` restores the unbounded behaviour for whoever has
+measured that it is faster on a dump that fits. `-bound` moves one rule and only
+one: the other four come from `store.DefaultCompactionPolicy()`, because a
+schedule watching bytes alone would never fire on a dump of small nodes, and a
+store with no image yet fails the ratio rule by construction.
+
 ---
 
 ## 14. Persistence lifecycle
@@ -2381,17 +2547,52 @@ This starts a background goroutine, which `Close` cancels and waits for. Set the
 observer: a background compaction has no caller to return an error to, so without
 one a failing compaction fails silently and repeats.
 
-`store.DefaultCompactionPolicy()` is a starting point, not a tuned setting. Its
-four rules fire on delta records (100k), **delta bytes (128 MB)**, log size
-(256 MB), and the delta as a fraction of the image (50%). A zero field disables its
-rule, so a zero policy never fires.
+`store.DefaultCompactionPolicy()` is a starting point, not a tuned setting. Four of
+its five rules are set by default, firing on delta records (100k), **delta bytes
+(128 MB)**, log size (256 MB), and the delta as a fraction of the image (50%). A
+zero field disables its rule, so a zero policy never fires.
 
-`MaxDeltaBytes` is the memory rule and the other three are proxies for it: a
-hundred records carrying 64 MiB blobs and a hundred thousand carrying none are the
-same record count and four orders of magnitude apart in what they cost. It is set
-to half the log limit rather than to the same figure because every delta record was
-logged, so a byte limit equal to the log's would almost never be the rule that
+`MaxDeltaBytes` is the memory rule and the log and ratio rules are proxies for it:
+a hundred records carrying 64 MiB blobs and a hundred thousand carrying none are
+the same record count and four orders of magnitude apart in what they cost. It is
+set to half the log limit rather than to the same figure because every delta record
+was logged, so a byte limit equal to the log's would almost never be the rule that
 fired.
+
+#### `MaxResidentBytes` — the rule that sees the index
+
+The other four rules watch the delta and the log. **The property index those same
+writes created is in neither.** At one measured shape a delta reporting 338 bytes
+per record was holding 1,893 — the entries are not in `DeltaBytes` and never were —
+and rebuilding a store without compacting, at 400,000 records the resident property
+index was 546.4 MiB against the delta's 295.0. The term `MaxDeltaBytes` cannot see
+was 1.85 times the term it can.
+
+`MaxResidentBytes` fires on `StorageStats.EstimatedResidentBytes`, which sums the
+record arrays, the label postings, the adjacency, the delta *and* the property
+index including composites:
+
+```go
+policy := store.DefaultCompactionPolicy()
+policy.MaxResidentBytes = 700 << 20   // off by default: zero disables the rule
+```
+
+It is **additive**. It does not change what `MaxDeltaBytes` counts — moving that
+would silently retune every deployment already calibrated against it — and a caller
+who sets both gets whichever fires first. It is evaluated after the two delta rules
+and before the log and ratio proxies, so where both a delta rule and this one would
+fire the reason names what grew, and where only this one fires nothing else would
+have.
+
+**It is a floor, not a budget.** `EstimatedResidentBytes` is retained heap and the
+process charges more than that: `docs/MEMORY_MODEL.md` §9.8 measured the gap during
+a rebuild at roughly 2.6× the modelled figure, and §6.4's ratio across three runs of
+one identical store ran 1.19× to 1.54× at rest. A caller with a 2 GiB ceiling does
+not set this to 2 GiB. They set it to the ceiling divided by the ratio their own
+workload shows — and they measure that ratio rather than taking one from here, since
+it depends on the shape of the records, on `GOGC`, and on which phase the store is
+in. A backend that cannot estimate reports zero, so there the rule never fires
+rather than firing always.
 
 ### Compacting in a process whose peak matters
 
@@ -2713,6 +2914,59 @@ follows records and identifiers rather than bytes written. Measured against the
 image its own build produced, the model runs 1.00× on a dense identifier space, on
 a blob-carrying store and on a heap image, and up to 1.62× on a sparsified one.
 
+#### Letting the engine find the ceiling it is already under
+
+Every bound above is a figure the caller had to know to supply. `DiscoverMemoryBudget`
+asks the engine to read the one the process is already running under instead:
+
+```go
+s, err := disk.OpenWithOptions(dir, disk.Options{
+    DiscoverMemoryBudget: true,   // off by default
+})
+
+st, _ := s.Stats()
+log.Printf("budget %d B, from %s", st.MemoryBudgetBytes, st.MemoryBudgetSource)
+// -> budget 1073741824 B, from Job Object JOB_OBJECT_LIMIT_JOB_MEMORY
+```
+
+| platform | read, in order | enforced? |
+|---|---|---|
+| linux | cgroup v2 `memory.max`, else v1 `memory.limit_in_bytes`, else `/proc/meminfo` `MemTotal` | the two cgroup limits are; `MemTotal` is not |
+| windows | Job Object `JOB_OBJECT_LIMIT_JOB_MEMORY` or `…_PROCESS_MEMORY`, else `GlobalMemoryStatusEx` `ullTotalPhys` | the job limits are; total physical is not |
+| darwin | `sysctl hw.memsize` alone | no — darwin enforces no ceiling over the class this engine cares about |
+
+**It is a flag and not the meaning of zero.** Zero `MemoryBudget` is documented as
+unlimited and has been since the option existed; quietly redefining it would mean a
+store that opened yesterday refusing to open today, against a figure nobody in the
+configuration wrote down. That is the same silent reinterpretation of a shipped
+default refused for what `MaxDeltaBytes` counts, and it is refused here for the
+same reason.
+
+**An explicit budget always wins.** A `MemoryBudget` the caller set is used exactly
+as given and this flag then does nothing — it can never raise a stated figure, and
+it can never lower one either. Discovery is for the caller who does not know what
+environment the program will run in, not a second opinion about one who does.
+
+**Only a fraction of the discovered ceiling is taken**, and a smaller fraction of a
+machine (25%) than of a limit (50%). The reason is the last point above: the figure
+is a whole-store one and nothing here knows what else the program has allocated, so
+a budget set to the container's limit is a budget with no room for the program using
+the store. A derived budget is therefore always strictly below the ceiling it came
+from. Both fractions are deliberately conservative and neither is yet tuned against
+a measurement.
+
+`StorageStats.MemoryBudgetSource` names the instrument verbatim, so an operator
+looking at a store that refused a compaction against a number nobody configured can
+see which file or call produced it. **A budget with an empty source means the caller
+set it**; a source with a zero budget is impossible. Asking for discovery on a
+platform that answered nothing reports both zero and `""` — the honest reading of
+"nothing was discovered" rather than a fabricated ceiling — and leaves `MemoryBudget`
+at zero rather than inventing a figure.
+
+Discovery runs once, at `Open`, *before* the open is checked against the budget. So
+a caller who asked for it gets it on the very first operation rather than on the
+first compaction, and the batch caps of §5 derive from the discovered figure too.
+
 ### Sizing what a compaction holds
 
 ```go
@@ -2832,6 +3086,127 @@ One case where the estimate reads high, and it is bounded: a graph a compaction 
 published reports the payload its records *reference*, which after a compaction over
 a mapped image is page cache counted as heap. The next open corrects it. Over-reporting
 is the direction a figure a budget refuses on should be wrong in.
+
+### What the kernel says, as against what the store models
+
+Everything above is modelled: totalled from the structures themselves, in bounded
+time, and a **floor**. A rebuild has been measured charging roughly 2.6× it. The
+other half of the question is what the operating system thinks the process holds,
+and it is read rather than derived.
+
+```go
+s, err := disk.OpenWithOptions(dir, disk.Options{
+    ReportProcessMemory: true,   // off by default
+})
+
+p := s.StorageStats().Process
+if p.Known() {
+    log.Printf("anon %d B, file %d B, peak %d B (%s)",
+        p.AnonBytes, p.FileBytes, p.PeakBytes, p.Source)
+}
+```
+
+**It is the whole process, not the store.** A library cannot separate its own pages
+from its host's, and pretending otherwise would be the more misleading figure. What
+it is good for is a difference: read it before an ingest and after, and the movement
+is the store's whatever else the program is doing.
+
+**The split is the point.** `AnonBytes` is the class that OOM-kills — the Go heap,
+its stacks, the runtime's arenas. `FileBytes` is the mapped image's resident page
+cache, which the kernel drops under pressure instead of killing the process.
+Reclaimable is not free: those pages are charged to a cgroup exactly as anonymous
+ones are, and reclaiming them mid-ingest is a latency event inside the operation
+being bounded. The two classes are also charged differently by the two instruments
+this engine is measured against — **a windows Job Object charges commit, so a
+read-only file mapping costs it nothing, while a linux cgroup v2 `memory.max`
+charges page cache**. The same store under the same load can pass one and fail the
+other on this figure alone.
+
+**An unanswerable figure reads as unanswerable.** `Known()` is false exactly when
+nothing was read. `Split` and `Current` say which half of a reading is real:
+
+| platform | source | anon | file | peak |
+|---|---|---|---|---|
+| linux | `/proc/self/status` `RssAnon`+`RssFile` | yes | yes | yes |
+| linux, pre-4.5 | `/proc/self/status` `VmRSS` | total in `AnonBytes`, `Split=false` | — | yes |
+| windows | `K32GetProcessMemoryInfo` | commit charge | when commit is below the working set | yes |
+| darwin | `getrusage ru_maxrss` | — `Current=false` | — | yes |
+| other | — | — | — | — |
+
+Where `Split` is false the platform could not tell the classes apart and
+`AnonBytes` carries the whole resident total — over-reporting the dangerous class
+rather than under-reporting it. **A zero `FileBytes` with `Split=false` means "not
+separable", never "no mapped pages are resident".** On windows that is the common
+case rather than an edge: `PrivateUsage` is commit charge, so a process that has
+committed more than it holds resident has told you nothing about the file class,
+and the reading says so instead of reporting a zero somebody would believe.
+
+**It is off by default because `StorageStats` is polled.** `AutoCompact` evaluates
+a policy against it on every tick and a bulk import evaluates one after every
+batch; this is the only field in the struct that asks the operating system a
+question, measured at roughly 800 ns and two allocations per read on windows 11 and
+a read and parse of `/proc/self/status` on linux. Everything else there is O(1) by
+requirement.
+
+**Nothing acts on it.** It is not a second budget and it does not feed the batch
+caps or `CompactionPolicy`, both of which are driven by figures the engine can
+compute *before* it does the work rather than one it can only observe afterwards.
+
+### Bounding the resident class, which the budget does not
+
+`MemoryBudget`, the batch caps and `CompactionPolicy` all bound the anonymous
+class. Nothing above bounds the file-backed one, and at the shape this programme
+targets it is the larger of the two: **1,182 MiB during an ingest of 400,000 ×
+3.2 KB records, twelve times the anonymous class, and linear in the store.**
+
+Two mechanisms, split by platform because the platforms genuinely differ.
+
+```go
+// linux and darwin: ask the kernel, per store.
+s, err := disk.OpenWithOptions(dir, disk.Options{ResidentAdvice: true})
+
+// windows: cap the process, once, from the host.
+lim, err := disk.LimitWorkingSet(2 << 30)
+lim, err := disk.LimitWorkingSetFromCeiling()   // a fraction of what we run under
+```
+
+`ResidentAdvice` tells the kernel what the engine is about to do: sequential over
+the parse at `Open` and over a compaction's read of the old image, random for the
+point-lookup life between them, and *drop these pages* once a compaction has
+finished with the image it copied forward. **The trade in one sentence: less
+resident memory, more major faults.** A store that compacts and then serves reads
+out of the pages the compaction dropped pays for all of them again, so it is worth
+having during a bulk ingest and is not obviously worth having on a read-serving
+store — which is why it is a switch and not a default.
+
+It changes no contract. **Advice drops pages, never the mapping**, so a `Properties`
+or `Labels` slice a caller is holding stays valid and stays at the same address.
+That is the distinction that makes this buildable where unmapping a replaced image
+was not: a compaction's output carries slice headers into the previous image, so the
+mapping must outlive every generation built from it, and dropping its pages does not
+disturb that at all.
+
+The drop is the **record image alone**. The index mapping beside it is what
+`SwapBase` just installed and what the next query reads, so returning it would pay
+the whole cost immediately to reclaim something the store is about to ask for again.
+
+`LimitWorkingSet` is the windows half and it is a **function, not an option**,
+because `SetProcessWorkingSetSizeEx` acts on the process. A second store opened with
+a different figure would silently move the first one's ceiling, and a library that
+does that to its host has substituted its own judgement for the caller's — the same
+reasoning that keeps `GOMEMLIMIT` a deployment knob rather than an `Options` field.
+A host that wants it calls it once, itself, at startup. The cap is hard: the kernel
+trims pages out of the process rather than failing an allocation, so nothing dies
+and the program gets slower. **The limit is read back** through
+`GetProcessWorkingSetSizeEx` and what is returned is what the kernel says it holds,
+because a cap that silently failed to apply is worse than no cap at all.
+
+Asking for advice on a platform that cannot give it — windows, and everything
+outside linux and darwin — reports `store.MetricResidentAdvice` rather than doing
+nothing quietly. linux and darwin have no working-set cap worth reaching for, and
+`ErrWorkingSetUnsupported` says so: `RLIMIT_RSS` is unenforced on every modern
+kernel, and `RLIMIT_AS` counts the mapped image's address space, which is the class
+this programme deliberately moved memory *into*.
 
 ### Six other facts about the store, without reaching past the façade
 
@@ -3483,6 +3858,12 @@ commit is also the only unit that carries an actor and a signature (§22.4).
 Restoring a real number here needs a disk `AddNodeLoop` benchmark, which does not
 exist. Until it does, the guidance stands on durability and attribution, which
 are measured (§22.2) rather than asserted.
+
+**Batch, but not without a bound.** A batch costs memory proportional to its own
+size, under one lock hold, so "bigger is better" stops being true somewhere and
+nothing used to say where. `Options.MaxBatchBytes` and `MaxBatchRecords` are that
+limit, and `AddNodesInBatches` is the call that splits to it — at the cost of
+atomicity. §5 has both.
 
 ### 19.1 The fast-path matrix
 

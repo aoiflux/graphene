@@ -86,18 +86,49 @@ func readSysMemory() (sysMemory, bool) {
 func sysMemoryFromCounters(c processMemoryCountersEx) sysMemory {
 	resident := uint64(c.WorkingSetSize)
 	anon := uint64(c.PrivateUsage)
+
 	// Committed-but-paged-out private memory can push PrivateUsage past the whole
 	// working set. Clamp rather than let Resident-Anon underflow: "all of what is
 	// resident is private" is the honest reading of that state, and a caller
 	// subtracting to get the file-backed share must get zero rather than a number
 	// near 2^64.
-	anon = min(anon, resident)
+	//
+	// # And when the clamp fires, the split is gone rather than zero
+	//
+	// This is not a rare paged-out condition. Commit charge counts every page the
+	// runtime reserved and has not touched, so a process that has just started
+	// routinely charges more commit than it holds resident -- measured at 8.3 MiB
+	// against 8.3 MiB on a freshly opened empty store, where the clamp fires on
+	// every reading. A caller subtracting then gets zero file-backed bytes, and
+	// zero is a statement about the store: "nothing of the mapped image is
+	// resident". It is the one wrong answer available, and it is wrong in the
+	// direction that hides exactly what Phase 2 exists to bound.
+	//
+	// So a clamped reading says the classes could not be told apart. Split=false
+	// already means "not separable" everywhere else -- a pre-4.5 linux kernel
+	// reports it, darwin reports it -- and it is the truth here too. Anon still
+	// carries the whole resident total, which over-reports the class that
+	// OOM-kills rather than under-reporting it, which is the safe direction.
+	clamped := anon >= resident
+	if clamped {
+		anon = resident
+	}
+
+	source := "K32GetProcessMemoryInfo WorkingSetSize/PrivateUsage (commit charge)"
+	if clamped {
+		source += ", commit >= working set so the classes are not separable"
+	}
 	return sysMemory{
 		Anon:     anon,
 		Resident: resident,
 		Peak:     uint64(c.PeakWorkingSetSize),
-		Split:    true,
+		Split:    !clamped,
 		Current:  true,
+		// Named as the counter rather than as the call, because PrivateUsage is
+		// the commit charge and not resident private bytes -- the one place this
+		// platform's Anon means something different from linux's, and the place
+		// a caller comparing the two needs told.
+		Source: source,
 	}
 }
 
