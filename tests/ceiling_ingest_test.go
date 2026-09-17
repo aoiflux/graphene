@@ -52,6 +52,7 @@
 package graphene_test
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"sync"
@@ -112,6 +113,20 @@ var (
 	// itself as a no-op on windows, where the platform gives no advice and the
 	// engine says so through store.MetricResidentAdvice.
 	ceilingIngestAdvice = os.Getenv("GRAPHENE_CEILING_ADVICE") == "1"
+
+	// ceilingIngestBulkLoad replaces the ingest phase with one BulkLoad.
+	//
+	// This is the Phase 5 arm, and it builds the same store the same way: the
+	// same labels, the same blob sizes, the same thirteen indexed entries a
+	// record, under the same declarations. What differs is that the image is
+	// written once instead of once per delta window, which is the whole claim.
+	//
+	// The delta bound and the reopen switch do nothing in this arm, and the
+	// progress line says so rather than naming a bound that governed nothing. A
+	// bulk load holds no delta to bound; what it holds is the index sort, which
+	// Options.Compact.MaxWorkingBytes governs, and that is the knob to move if
+	// this is the arm under memory pressure.
+	ceilingIngestBulkLoad = os.Getenv("GRAPHENE_CEILING_BULKLOAD") == "1"
 )
 
 // ceilingIngestChunkMax is the coarsest the compaction check ever gets, and the
@@ -181,6 +196,21 @@ type ingestWrites struct {
 	Log         int64 // framed WAL bytes, summed over commits
 	Commits     int64
 	Compactions int64
+
+	// The last compaction's three stage boundaries, from item 0a: the process
+	// peak (Bytes) and anonymous resident (Examined) as each stage ended.
+	//
+	// The last one rather than every one, and that is what makes them useful
+	// here rather than a mean of ten different states. The process peak is
+	// monotone for the lifetime of the process, so the rise between two
+	// boundaries is what happened between them -- and for an arm that compacts
+	// once, which the bulk arm does, the rise from the pin to the build is
+	// exactly what the build held. For an arm that compacts ten times it is what
+	// the tenth one added on top of the nine before it, which is a different and
+	// much smaller question; the report says so rather than printing both under
+	// one heading.
+	PinPeak, BuildPeak, CommitPeak int64
+	PinAnon, BuildAnon, CommitAnon int64
 }
 
 // Total is what the device saw, which is the figure amplification is taken
@@ -209,6 +239,12 @@ func (c *ingestCounter) Record(m store.Metric) {
 	case store.MetricCompaction:
 		c.w.Image += m.Bytes
 		c.w.Compactions++
+	case store.MetricCompactPin:
+		c.w.PinPeak, c.w.PinAnon = m.Bytes, m.Examined
+	case store.MetricCompactBuild:
+		c.w.BuildPeak, c.w.BuildAnon = m.Bytes, m.Examined
+	case store.MetricCompactCommit:
+		c.w.CommitPeak, c.w.CommitAnon = m.Bytes, m.Examined
 	}
 }
 
@@ -294,8 +330,12 @@ func TestCeiling_BulkIngestFitsUnderTheLimit(t *testing.T) {
 		ceilingProgress("phase %s terms: %s", name, ceilingTerms(g))
 	}
 
-	ceilingProgress("ingest into %s: %d nodes, %d B blob, delta bound %d MiB, reopen %v",
-		dir, rssNodes, rssBlob, ceilingDeltaMiB, ceilingReopen)
+	if ceilingIngestBulkLoad {
+		ceilingProgress("bulk load into %s: %d nodes, %d B blob, one pass", dir, rssNodes, rssBlob)
+	} else {
+		ceilingProgress("ingest into %s: %d nodes, %d B blob, delta bound %d MiB, reopen %v",
+			dir, rssNodes, rssBlob, ceilingDeltaMiB, ceilingReopen)
+	}
 
 	run("create", func() string {
 		var err error
@@ -381,6 +421,11 @@ func TestCeiling_BulkIngestFitsUnderTheLimit(t *testing.T) {
 		chunk, float64(int64(chunk)*int64(rssBlob))/bytesPerMiB, ceilingDeltaMiB)
 
 	run("ingest", func() string {
+		if ceilingIngestBulkLoad {
+			loaded, n := ceilingBulkLoad(t, g)
+			g = loaded
+			return fmt.Sprintf("%d nodes in one pass, no delta and no interim compaction", n)
+		}
 		written := 0
 		for base := 0; base < rssNodes; base += chunk {
 			n := chunk
@@ -414,9 +459,18 @@ func TestCeiling_BulkIngestFitsUnderTheLimit(t *testing.T) {
 
 	beforeCompact, _ := g.StorageStats()
 	run("compact", func() string {
-		// Every arm pays this one, including the unbounded arm that has taken no
-		// other: a store left holding its whole delta is not a store anyone
-		// ships, and an ingest measured without it is measured half-finished.
+		// Except the bulk arm. A load ends with the image written and the delta
+		// empty, so a Compact() here would rewrite the whole image for nothing --
+		// and would put that rewrite into the write counter, which is the figure
+		// this arm exists to report. The phase is still recorded, so the two
+		// arms' phase tables line up and the zero is visible rather than absent.
+		if ceilingIngestBulkLoad {
+			return "nothing to compact: the load wrote the image"
+		}
+		// Every other arm pays this one, including the unbounded arm that has
+		// taken no other: a store left holding its whole delta is not a store
+		// anyone ships, and an ingest measured without it is measured
+		// half-finished.
 		if err := g.Compact(); err != nil {
 			t.Fatalf("Compact: %v", err)
 		}
@@ -459,6 +513,7 @@ func TestCeiling_BulkIngestFitsUnderTheLimit(t *testing.T) {
 	afterCompact, _ := g.StorageStats()
 	onDisk := rssStoreBytes(dir)
 	ceilingIngestWriteReport(t, counter.snapshot(), onDisk)
+	ceilingIngestStageReport(t, counter.snapshot())
 	ceilingReport(t, dir, float64(onDisk)/bytesPerMiB, phases, beforeCompact, afterCompact, ceilingTerms(g))
 }
 
@@ -492,12 +547,53 @@ func ceilingIngestWriteReport(t *testing.T, c ingestWrites, onDisk int64) {
 		t.Logf("mean image written per compaction: %.1f MiB",
 			float64(c.Image)/float64(c.Compactions)/bytesPerMiB)
 	}
-	if rssNodes > 0 {
-		// The figure to compare across sizes. At a fixed delta bound this grows
-		// linearly in N -- which is the quadratic, seen per node.
-		t.Logf("bytes written per node: %.0f B over %d nodes at a %d MiB delta bound",
-			float64(total)/float64(rssNodes), rssNodes, ceilingDeltaMiB)
+	if rssNodes == 0 {
+		return
 	}
+	// The figure to compare across sizes. At a fixed delta bound this grows
+	// linearly in N -- which is the quadratic, seen per node. A bulk load writes
+	// the image once whatever N is, so the same figure should be flat, and that
+	// is the comparison Phase 5 is settled by.
+	if ceilingIngestBulkLoad {
+		t.Logf("bytes written per node: %.0f B over %d nodes in one pass (no delta bound applies)",
+			float64(total)/float64(rssNodes), rssNodes)
+		return
+	}
+	t.Logf("bytes written per node: %.0f B over %d nodes at a %d MiB delta bound",
+		float64(total)/float64(rssNodes), rssNodes, ceilingDeltaMiB)
+}
+
+// ceilingIngestStageReport prints what the image write itself held.
+//
+// This is the figure the phase table cannot give. A bulk load closes and reopens
+// the store inside the call, so the ingest phase's peak is the load *plus* an
+// open of the image it just wrote -- and an open is linear in the store by
+// design. Item 0a's stage boundaries separate the two: the process peak is
+// monotone, so the rise from the pin to the build is what the build held and
+// nothing else, and that is the number that has to be flat across sizes if the
+// sort is really bounded by MaxWorkingBytes rather than by the data.
+//
+// Only reported for an arm that wrote one image. Over ten compactions the last
+// one's rise is what it added to a peak nine others had already raised, which is
+// a real figure and not this one.
+func ceilingIngestStageReport(t *testing.T, c ingestWrites) {
+	if c.PinPeak == 0 || c.BuildPeak == 0 {
+		t.Log("no stage metrics: this platform does not report process memory")
+		return
+	}
+	t.Logf("stage boundaries: pin %.1f MiB peak / %.1f MiB anon, build %.1f / %.1f, commit %.1f / %.1f",
+		float64(c.PinPeak)/bytesPerMiB, float64(c.PinAnon)/bytesPerMiB,
+		float64(c.BuildPeak)/bytesPerMiB, float64(c.BuildAnon)/bytesPerMiB,
+		float64(c.CommitPeak)/bytesPerMiB, float64(c.CommitAnon)/bytesPerMiB)
+	if c.Compactions != 1 {
+		t.Logf("stage rises not reported: %d image writes, so the last one's rise is what it "+
+			"added to a peak the others had already raised", c.Compactions)
+		return
+	}
+	build := float64(c.BuildPeak-c.PinPeak) / bytesPerMiB
+	commit := float64(c.CommitPeak-c.BuildPeak) / bytesPerMiB
+	t.Logf("the image write held %.3f MiB over the pin (%.1f B per node); the commit added %.3f MiB",
+		build, build*bytesPerMiB/float64(rssNodes), commit)
 }
 
 // ceilingIngestTarget resolves and validates the directory to ingest into.
@@ -528,4 +624,59 @@ func ceilingIngestTarget(t *testing.T) string {
 	// looking at afterwards -- and the emptiness check above is what stops the
 	// next run trusting it.
 	return ceilingIngestDir
+}
+
+// ceilingBulkLoad fills the store in one pass and returns the reopened handle.
+//
+// The records are the ingest arm's records: rssWriteNodes builds each node from
+// benchLabel, rssBlobSize and a big-endian index in the first eight bytes, and
+// indexes it with rssProps. This restates that rather than calling it, because
+// the shapes are different -- one adds through the store and the other yields
+// into an encoder -- and a fixture that agreed by accident would make the two
+// arms incomparable without anything saying so. The three things that have to
+// match are the label, the payload and the property map, and each is produced by
+// the same function here as there.
+//
+// No edges: the ingest arm writes none either, and an edge pass would be a
+// difference between the arms rather than a part of what is being measured.
+func ceilingBulkLoad(t *testing.T, g *graphene.Graph) (*graphene.Graph, int) {
+	t.Helper()
+
+	added := 0
+	loaded, err := g.BulkLoad(
+		func(w *graphene.BulkNodeWriter) error {
+			for i := 0; i < rssNodes; i++ {
+				payload := make([]byte, rssBlobSize(i, rssBlob))
+				binary.BigEndian.PutUint64(payload, uint64(i))
+				n := graphene.BulkNode{
+					Labels:     []store.NodeType{benchLabel(i)},
+					Properties: payload,
+				}
+				if !rssNoIndex {
+					props := rssProps(i)
+					n.Index = make([]graphene.BulkProperty, 0, len(props))
+					for key, value := range props {
+						n.Index = append(n.Index, graphene.BulkProperty{Key: key, Value: value})
+					}
+				}
+				if _, err := w.AddNode(n); err != nil {
+					return err
+				}
+				added++
+				if added%250_000 == 0 {
+					now := readRSS()
+					ceilingProgress("bulk load: %d/%d yielded, %.1f MiB anon / %.1f MiB total",
+						added, rssNodes, float64(now.Anon)/bytesPerMiB, float64(now.Total)/bytesPerMiB)
+				}
+			}
+			return nil
+		},
+		func(w *graphene.BulkEdgeWriter) error { return nil })
+	if err != nil {
+		t.Fatalf("BulkLoad: %v", err)
+	}
+	if added != rssNodes {
+		t.Fatalf("the load yielded %d nodes, want %d", added, rssNodes)
+	}
+	return loaded, added
 }

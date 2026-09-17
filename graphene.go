@@ -365,6 +365,86 @@ func (g *Graph) CompactAndReopenCtx(ctx context.Context) (*Graph, error) {
 	return &Graph{GraphStore: reopened}, nil
 }
 
+// --- Bulk load ---
+
+// The bulk-load input types, re-exported so a caller does not have to import
+// disk for them. Aliases rather than wrappers: a wrapper would be a second
+// definition of the same record and a conversion per record on the path whose
+// whole point is that it does not copy.
+type (
+	// BulkProperty is one indexed property of one record.
+	BulkProperty = disk.BulkProperty
+	// BulkNode is one node to load.
+	BulkNode = disk.BulkNode
+	// BulkEdge is one edge to load.
+	BulkEdge = disk.BulkEdge
+	// BulkNodeWriter takes nodes during a load's node pass.
+	BulkNodeWriter = disk.BulkNodeWriter
+	// BulkEdgeWriter takes edges during a load's edge pass.
+	BulkEdgeWriter = disk.BulkEdgeWriter
+)
+
+// BulkLoad writes a whole store in one forward pass and returns a fresh Graph on
+// it. The receiver is closed and must not be used again.
+//
+//	g, err = g.BulkLoad(addNodes, addEdges)
+//
+// # What it is for
+//
+// An ordinary ingest large enough to need bounding compacts every MaxDeltaBytes
+// worth of records, and every compaction rewrites the whole image. What gets
+// written therefore grows with the square of what is being loaded — measured at
+// 3.2 KB records, the amplification rises 6.53x, 11.77x, 21.24x across three
+// doublings, and at the ten-million-record shape this programme was opened by it
+// reaches terabytes. A bulk load writes the image once.
+//
+// # The three things it gives up
+//
+// It is atomic and not incremental: a crash means the load did not happen, and
+// there is nothing to resume from. The store is not readable while it runs. And
+// it needs an empty store — a Graph that already holds records is refused with
+// disk.ErrBulkLoadNotEmpty rather than merged into.
+//
+// Make the index declarations first. DeclareOrderedNodeProperty and the
+// composite declarations are read at the start of the load and the image is
+// written under them; declaring afterwards means the next compaction, not this
+// one.
+//
+// # How it is called
+//
+// addNodes is called once and must add every node. Every AddNode hands back the
+// identifier the record was given, which is how addEdges — called once,
+// afterwards — names its endpoints. So a load reads its source twice, and a
+// source it cannot read twice has to be staged first.
+//
+// Available when the Graph is backed by a directory. The in-memory backend has
+// no image to write once, so there is nothing here it could do that adding the
+// records would not.
+func (g *Graph) BulkLoad(addNodes func(*BulkNodeWriter) error, addEdges func(*BulkEdgeWriter) error) (*Graph, error) {
+	return g.BulkLoadCtx(context.Background(), addNodes, addEdges)
+}
+
+// BulkLoadCtx is BulkLoad, with the build abandoned if ctx is cancelled. The
+// commit and the reopen are deliberately not cancellable, for the reason
+// CompactAndReopenCtx gives.
+func (g *Graph) BulkLoadCtx(ctx context.Context,
+	addNodes func(*BulkNodeWriter) error, addEdges func(*BulkEdgeWriter) error) (*Graph, error) {
+
+	s, ok := g.GraphStore.(*disk.Store)
+	if !ok {
+		return nil, fmt.Errorf("BulkLoad: %T is not backed by a directory", g.GraphStore)
+	}
+	loaded, err := s.BulkLoadCtx(ctx, addNodes, addEdges)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadSidecars(loaded); err != nil {
+		loaded.Close()
+		return nil, err
+	}
+	return &Graph{GraphStore: loaded}, nil
+}
+
 // --- Backup and restore ---
 
 // Backup writes a consistent copy of the store into dst, which must not already

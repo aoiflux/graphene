@@ -412,6 +412,105 @@ Worse, the configuration §9.8 measured passing was undocumented, and the one
   allocation **1.00002**, allocations 0.999, wall clock 0.997, peak 1.006 — the
   encoder extraction cost the materialising path nothing.
 
+### An ingest that writes the image once
+
+- **`Graph.BulkLoad` fills an empty store in one forward pass and returns it
+  reopened.** The records stream straight into the image as the caller yields
+  them; the property index is built from an external sort of the triples going
+  past rather than from an index the load would have to hold; GPIX, GPIR, GCPX and
+  GIDX are written at the end, where the format already puts them.
+
+  The reason it exists is the one figure no `MaxDeltaBytes` value moves. A bounded
+  ingest compacts every window and every compaction rewrites the whole image, so
+  what gets written grows with the square of what is being loaded —
+  `docs/MEMORY_MODEL.md` §9.9 measured the amplification rising 6.53×, 11.77×,
+  21.24× across three doublings of a 3.2 KB-record ingest. The two arms there
+  bracket a whole axis and tightening the bound only moves along it: unbounded is
+  1.81× writes and linear memory, bounded is flat memory and 1.80× writes per
+  doubling. This is off the axis.
+
+  **Four interleaved rounds at 100,000 × 3.2 KB under a real 2,048 MiB Job Object,
+  against the bounded-plus-reopen arm the guide recommends: bytes written
+  2.42 → 0.37 GiB (6.53× fewer), charged peak 249.3 → 76.3 MiB, headroom 87.8% →
+  96.3%, wall clock 25.12 → 4.39 s.** No row's ranges touch. And what the image
+  write itself holds is flat across a **sixteenfold** size range — 10.305 to
+  12.680 MiB from 25,000 records to 400,000, measured through the stage
+  boundaries rather than a polled sampler, because the process peak is monotone and
+  the phase around it includes a reopen that is linear in the store by design.
+  Projected to ten million records: about 37 GiB written against on the order of
+  19 TiB.
+
+- **What it gives up is the first paragraph of its doc comment, not a footnote.**
+  It is atomic and not incremental — a crash means the load did not happen and
+  there is nothing to resume from. The store is not readable while it runs, and the
+  handle it was called on is closed. And it needs an empty store: one that already
+  holds records, or a delta, or even an index entry naming a record that was never
+  added, is refused with `disk.ErrBulkLoadNotEmpty` rather than merged into.
+  Merging with an existing image would be a concatenation on the record side and a
+  re-emission of the old index on the other, which is a second correctness surface;
+  the shape this exists for is a fresh load.
+
+- **Identifiers come back as the records go past.** `AddNode` returns the one the
+  record was given, which is how the edge pass names its endpoints — so a load
+  reads its source twice, and a source it cannot read twice has to be staged first.
+  There are two writer types rather than one because the image holds every node
+  record before every edge record: a caller who tries to add an edge during the
+  node pass should not compile.
+
+  The identifiers come from the store's own sequence counter and not from a count
+  of what has been yielded. Numbering them 1..N would have been correct — the store
+  was empty when the load was pinned — right up until a write landed during the
+  build and took one this load had already used.
+
+- **The one constraint a load has to enforce for itself is uniqueness**, and it is
+  enforced exactly. The incremental path asks the index whether anyone else holds
+  the value; a load has no index to ask, and a duplicate is exactly a value with
+  two identifiers filed under it — which the sort has already grouped. So it costs
+  one map lookup per key instead of one index probe per record, and it fails the
+  load while the image is still a temp file nobody has been told about.
+
+- **`index.EncodeCompositeTuple` and `index.CompositeName` are exported** so a load
+  can file composite tuples under the same bytes the index would. The encoding is
+  length-prefixed and therefore not order-preserving, and GCPX binary-searches it,
+  so a second implementation disagreeing by a byte would make that search bounded,
+  silent and wrong. There is one implementation and this is how a caller outside the
+  package reaches it.
+
+- **There is one encoder, reached three ways now.** `writeImage` gained a way to be
+  told its sequence high-water marks after the records rather than before, which is
+  the same thing the header counts already do for a source that cannot know them up
+  front. Nothing else in the format moved, and the proof is a test: the image a load
+  writes is byte-identical to the image an ordinary ingest of the same records
+  produces, in both index modes, over a fixture with two composites, a member
+  omitted from every tenth record, a key carrying two values on every seventh and a
+  triple repeated exactly on every fifth.
+
+- **A bulk load now reports itself.** It emitted no metric at all, which made the
+  one operation in the engine that writes a whole store the one operation invisible
+  to a `Metrics` sink — found by pointing the ingest harness at it and reading an
+  amplification of 0.00×. It emits `MetricCompaction` and the three stage gauges,
+  because that is what it is: an image write and a log retire. A store's compaction
+  count therefore includes its loads, which is stated where the counter is read.
+
+- **`graphene store import` is unchanged, deliberately.** It was bounded by
+  default in this same release (`-bound 32` with a reopen) and that is what a load
+  into a directory that may already hold a store needs. Routing it through
+  `BulkLoad` when the destination is empty is the obvious next step and is not
+  taken here: the importer remaps identifiers as it reads, and a load needs the
+  node pass to finish before the edge pass begins, so it is a change to how the
+  dump is read and not a switch at the destination. Named rather than left out
+  quietly, because it is where most of this is worth the most.
+
+- **Two defects the byte-identity test found, and two mutants that survived.** The
+  external merge handed out the run reader's own buffer, which the next advance
+  overwrote — so a spilled sort paired one entry's value with another's identifier.
+  And the two halves of the GPIX walk took two cursors over a sort that can only be
+  drained once, which silently dropped every edge property from the index; a second
+  cursor is now refused. Of the mutants, one showed the composite completeness test
+  is a short-circuit rather than the rule, and one showed that sorting composites by
+  name and by declaration slot cannot currently be told apart, because
+  `index.PropertyIndex` returns that list sorted. Both are written down.
+
 ## v0.8.0 "Bookshelf_v2" — the rebuild fits, and the composites move onto the shelf
 
 ### A whole-layer rebuild fits under 2 GiB, and the knob was not what did it

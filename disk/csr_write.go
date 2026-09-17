@@ -416,6 +416,18 @@ type imageInput struct {
 
 	nodeSeqHW, edgeSeqHW, commitSeqHW uint64
 	lastCompactUnixNano               int64
+
+	// seqHWAfterRecords, when set, supplies the node and edge sequence
+	// high-water marks once every record has been written, and the encoder
+	// patches the header with them in place of the two fields above.
+	//
+	// A graph knows both before the write, because it has been holding the
+	// counters all along. A source that *assigns* identifiers as it streams does
+	// not: the marks are then a consequence of the write rather than an input to
+	// it, exactly as the record counts are for such a source. They are patched in
+	// the same pass, ahead of the digest that covers the header, which is what
+	// the section table offset has always done.
+	seqHWAfterRecords func() (node, edge uint64)
 }
 
 // imageIdentity is what the encoder learned about the image it wrote.
@@ -574,7 +586,9 @@ func writeImage(dst io.ReadWriteSeeker, in imageInput, payload csrPayload) (imag
 	edgeCountPos := int64(iw.at())
 	iw.u64(uint64(max(edgeCount, 0)))
 	// Sequence high-water marks (version 5+).
+	nodeSeqPos := int64(iw.at())
 	iw.u64(in.nodeSeqHW)
+	edgeSeqPos := int64(iw.at())
 	iw.u64(in.edgeSeqHW)
 	// indexOffset (v6/v7). Written as 0 in v8: the property index is a section
 	// now. The field stays so the header prefix does not shift.
@@ -812,6 +826,19 @@ func writeImage(dst io.ReadWriteSeeker, in imageInput, payload csrPayload) (imag
 	if err := patchU64(sectionTableOffsetPos, sectionTableOffset); err != nil {
 		return out, err
 	}
+	// The sequence marks, for a source that assigns identifiers as it goes. A
+	// source that knew them wrote them above and is not patched: the bytes would
+	// be the same bytes.
+	if in.seqHWAfterRecords != nil {
+		nodeHW, edgeHW := in.seqHWAfterRecords()
+		if err := patchU64(nodeSeqPos, nodeHW); err != nil {
+			return out, err
+		}
+		if err := patchU64(edgeSeqPos, edgeHW); err != nil {
+			return out, err
+		}
+	}
+
 	// The header counts, for a source that could not supply them. A source that
 	// could is not patched at all: the bytes would be the same bytes, and a seek
 	// per compaction is worth avoiding for nothing gained.

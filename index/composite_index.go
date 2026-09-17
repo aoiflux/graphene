@@ -432,6 +432,27 @@ func encodeTuple(values []string) string {
 	return string(b)
 }
 
+// CompositeName is the stable identity of a declared composite, for a caller
+// outside this package that has to file tuples under the same name the index
+// would.
+//
+// Exported for the one such caller there is: a bulk load writes GCPX without
+// building an index, so it needs to agree with this package about which
+// composite a key tuple names. See EncodeCompositeTuple for why that agreement
+// is reached by calling rather than by re-deriving.
+func CompositeName(keys []string) string { return compositeName(keys) }
+
+// EncodeCompositeTuple renders one value per position as the bytes a composite
+// posting is filed under.
+//
+// This encoding is not order-preserving with respect to the values it encodes --
+// it is length-prefixed, so a longer value can sort before a shorter one that
+// precedes it alphabetically -- and GCPX binary-searches the tuples it holds. So
+// a second implementation of it that disagreed by a byte would make that search
+// bounded, silent and wrong. There is one implementation and this is how a caller
+// outside the package reaches it.
+func EncodeCompositeTuple(values []string) []byte { return []byte(encodeTuple(values)) }
+
 // slotAt returns the reference at one position of a row, or noValue.
 func (c *compositeIndex[T]) slotAt(row int32, pos int) int32 {
 	return c.slots[int(row)*len(c.keys)+pos]

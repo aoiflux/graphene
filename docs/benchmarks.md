@@ -4078,3 +4078,122 @@ commit, 50,000 × 512 B:
 The read path is not in this list because Phase 4 changed no line it executes: the
 whole of the change is in the image encoder, the compaction and the commit.
 
+## What writing the image once is worth (2026-09-17)
+
+An ingest large enough to need bounding compacts every `MaxDeltaBytes` worth of
+records, and every compaction rewrites the whole image. `docs/MEMORY_MODEL.md`
+§9.9 measured what that costs: the amplification rises 6.53×, 11.77×, 21.24×
+across three doublings of a 3.2 KB-record ingest, **1.80× per doubling, twice**.
+Phase 5 of `docs/PLAN_BOUNDED_INGEST.md` is `BulkLoad`, which writes it once.
+
+### The arm is a knob on the harness, not a second harness
+
+`TestCeiling_BulkIngestFitsUnderTheLimit` already builds an empty store under a
+real ceiling, declares the audited consumer's schema, and counts what the engine
+wrote by summing `MetricCompaction.Bytes` and `MetricCommit.Bytes`.
+`GRAPHENE_CEILING_BULKLOAD=1` replaces its ingest phase with one `BulkLoad` and
+changes nothing else: same labels, same blob sizes, same thirteen indexed entries
+a record, same declarations, same assertions at the end.
+
+The compact phase is skipped in that arm and recorded as having cost nothing. A
+`Compact()` after a load would rewrite the whole image for an empty delta and put
+that rewrite into the write counter, which is the figure the arm exists to report.
+
+**A gap the arm found before it measured anything.** `BulkLoad` emitted no metric
+at all, so the counter read 0.00 GiB and the amplification read 0.00×. That is not
+a harness problem: it is the one operation in the engine that writes a whole store,
+and it was invisible to every `Metrics` sink. It now emits `MetricCompaction` and
+the three stage gauges, which is what it is — an image write and a log retire —
+rather than a new kind nobody handles yet.
+
+### Four interleaved rounds, 100,000 × 3.2 KB, under a 2,048 MiB Job Object
+
+Arms alternated, never back to back. Medians, spreads beside them.
+
+| | bounded + reopen, 32 MiB | bulk load | ratio |
+|---|---:|---:|---:|
+| bytes written | 2.42 GiB | **0.37 GiB** | **0.153** |
+| amplification | 6.53× | **1.00×** | |
+| bytes per node | 25,942 | **3,971** | 0.153 |
+| image writes | 10 | 1 | |
+| charged peak | 249.3 MiB (239.7–258.0) | **76.3** (76.1–76.3) | **0.306** |
+| headroom | 87.8% | **96.3%** | |
+| process peak | 500.2 MiB (485.3–509.8) | 344.3 (344.2–344.6) | 0.688 |
+| wall clock | 25.12 s (24.77–25.67) | **4.39 s** (4.18–4.51) | **0.175** |
+
+No row's ranges touch. Bytes written was identical to the byte in all four rounds
+of both arms, which is what a count of emitted bytes should do and a timing should
+not — it is the one column here that needed no interleaving and got it anyway.
+
+This is the **smallest** of the three sizes §9.9 measured, which is where the
+incremental arm is at its best: its amplification grows with the record count and
+this one does not.
+
+### The memory is flat, and the phase table cannot say so
+
+`BulkLoad` closes and reopens the store inside the call, so the ingest phase's peak
+is the load plus an open of the image it just wrote — and an open is linear in the
+store by design. Reporting that as "what a bulk load holds" would charge the load
+for the reopen every caller wanted anyway.
+
+Item 0a's stage boundaries separate them, and this is the second time that
+instrument has answered a question the polled sampler could not: the process peak
+is monotone, so the rise from the pin to the build is what the build held.
+
+| records | B written per node | build rise | per node | commit rise |
+|---:|---:|---:|---:|---:|
+| 25,000 | 3,979 | 11.301 MiB | 474.0 B | 0.000 MiB |
+| 50,000 | 3,974 | **10.305** | 216.1 | 0.027 |
+| 100,000 | 3,971 | 11.637 | 122.0 | 0.000 |
+| 200,000 | 3,970 | 12.297 | 64.5 | 0.000 |
+| 400,000 | 3,970 | **12.680** | 33.2 | 0.027 |
+
+**Sixteen times the data, 1.23× the memory.** The per-node figure falls fourteenfold
+because the total is very nearly constant, which is what a sort bounded by
+`Options.Compact.MaxWorkingBytes` rather than by the store looks like from outside.
+
+### What was checked before any of it was believed
+
+The image a load writes is compared byte for byte against the image an ordinary
+ingest of the same records produces, in both index modes, with the compaction
+timestamp and the commit sequence neutralised — the second because an incremental
+ingest commits once per record and a load commits none, so it is a property of how
+the records arrived and not of what the image holds.
+
+Three mutants were run against that test. Two survived, and both were worth more
+than the one that failed:
+
+- **Filing a composite tuple for a record missing a member** changed nothing,
+  because the cross product over an empty position already produces no tuples. The
+  completeness test is a short-circuit and not the rule; the code now says so, and
+  the mutant that does kill the test is one that substitutes an empty value.
+- **Sorting composites by name instead of by declaration slot** changed nothing,
+  because `index.PropertyIndex` returns its composite list sorted by name, so the
+  two orders coincide. The sort is keyed by slot anyway — the slot *is* the walk
+  position, so it follows the encoder whatever that other package does — and the
+  fact that no test can currently tell the two apart is written down rather than
+  left looking like coverage.
+
+A third caught a real defect on its own: the merge handed out the run reader's own
+buffer, which the very next advance overwrote, so a spilled sort paired the value
+of one entry with the identifier of another. And the byte-identity test caught a
+second before any mutant did — the two halves of the GPIX walk took two cursors
+over a sort that can only be drained once, so every edge property silently vanished
+from the index. Taking a second cursor is now a refusal.
+
+### What it projects to, and how far that can be trusted
+
+Ten million records of 3.2 KB, each arm extrapolating its own fit: **~19.2 TiB**
+for the bounded incremental ingest against **37.0 GiB** for a bulk load, a factor
+of about 530. The bulk figure extrapolates a constant and is close to arithmetic;
+the incremental one extrapolates a slope and is the less safe of the two — and it
+is the larger, which is the direction that matters least.
+
+### What this does not establish
+
+No arm above 400,000 records: the session carried a 20 GiB hard ceiling on test
+writes and the incremental arm at 1M would have written on the order of 250 GiB on
+its own. Windows under a Job Object, so the charged column says nothing about what
+a linux cgroup would charge for the mapping. And nodes only — the ingest arm
+writes no edges, so neither does this one; the edge path is held by the
+byte-identity tests, which is correctness and not cost.

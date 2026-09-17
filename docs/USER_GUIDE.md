@@ -1070,8 +1070,110 @@ this shape would write on the order of a terabyte to store thirty gigabytes.
 
 So raise the bound as far as your memory ceiling allows rather than as far as it
 will go: memory is linear in the bound and writes are linear in its reciprocal.
-And if you are ingesting at that scale, the honest answer today is that graphene
-does not yet have a one-pass bulk loader — it is planned, and this table is why.
+And if you are filling an *empty* store at that scale, do not sit on this curve
+at all — the next section is the one-pass loader, and this table is why it exists.
+
+### The largest case: fill an empty store in one pass
+
+`BulkLoad` writes the image once. It is the right call when you are creating a
+store rather than adding to one — an import, a migration, a nightly rebuild into a
+fresh directory — and it is the only thing here that takes the amplification above
+off the table instead of moving along it.
+
+```go
+g, err := graphene.Open(dir)
+if err != nil {
+    return err
+}
+// Declare first. The image is written under whatever is declared when the load
+// starts; declaring afterwards means the next compaction, not this one.
+if err := g.DeclareUniqueProperty("sha256"); err != nil {
+    return err
+}
+if err := g.DeclareCompositeProperties([]string{"tool", "case_id"}); err != nil {
+    return err
+}
+
+ids := make([]store.NodeID, 0, len(records))
+g, err = g.BulkLoad(
+    func(w *graphene.BulkNodeWriter) error {
+        for _, r := range records {
+            id, err := w.AddNode(graphene.BulkNode{
+                Labels:     []store.NodeType{store.NodeTypeMicroArtefact},
+                Properties: r.Blob,
+                Index: []graphene.BulkProperty{
+                    {Key: "sha256", Value: r.Digest},
+                    {Key: "tool", Value: r.Tool},
+                },
+            })
+            if err != nil {
+                return err
+            }
+            ids = append(ids, id)
+        }
+        return nil
+    },
+    func(w *graphene.BulkEdgeWriter) error {
+        for _, e := range edges {
+            if _, err := w.AddEdge(graphene.BulkEdge{
+                Src:    ids[e.From],
+                Dst:    ids[e.To],
+                Labels: []store.EdgeType{store.EdgeTypeContains},
+            }); err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+if err != nil {
+    return err
+}
+defer g.Close() // the handle you passed in is already closed
+```
+
+Two passes, because the image holds every node record before every edge record.
+`AddNode` hands back the identifier as it goes, which is how the edge pass names
+its endpoints — so a load reads its source twice, and a source you cannot read
+twice (a pipe, a one-shot decoder) has to be staged first.
+
+**Measured against the bounded-plus-reopen recipe above**, same store, same schema,
+same 3.2 KB records, four interleaved rounds under a real 2 GiB ceiling:
+
+| 100,000 records | bounded + reopen | `BulkLoad` |
+|---|---:|---:|
+| bytes written | 2.42 GiB | **0.37 GiB** |
+| amplification | 6.5× | **1.0×** |
+| peak charged | 249.3 MiB | **76.3 MiB** |
+| headroom under 2 GiB | 87.8% | **96.3%** |
+| wall clock | 25.1 s | **4.4 s** |
+
+And what the write itself holds is flat: 10.3 to 12.7 MiB across a sixteenfold
+range of record counts, because the index sort spills to a file in the store's own
+directory rather than growing. `Options.Compact.MaxWorkingBytes` is the figure that
+sizes it — the same one that sizes a compaction's intermediates, so you do not meet
+a second knob.
+
+**Three things it gives up, and you should decide about them before you reach for
+it.**
+
+*It is atomic and not incremental.* A crash during a load means the load did not
+happen. There is no partial store and nothing to resume from — you start again.
+That is the standard bulk-load contract and it is what buys the single pass.
+
+*The store is not readable while it runs*, and the handle you called it on is
+closed. It hands back a new one, exactly as `CompactAndReopen` does, and for the
+same reason: the records it wrote were never registered with the index the old
+handle holds. A `Properties` slice taken before the call addresses a released
+mapping afterwards — copy first, with `store.CloneNode`.
+
+*It needs an empty store.* A store holding records, a delta, or even an index entry
+naming a record that was never added is refused with `disk.ErrBulkLoadNotEmpty`.
+Load into a fresh directory; to replace an existing store, load into a new one and
+swap.
+
+Everything else the incremental path checks, a load checks too, including unique
+keys: two records loaded under one value for a declared unique property fail the
+load, before anything is installed.
 
 ### Let the engine refuse what it cannot afford
 
@@ -1178,9 +1280,9 @@ you need to. A live reader should ask for both explicitly.
 | `Options.MaxBatchBytes` | bytes | 2% of the budget, else uncapped | a single record. A batch of one is always admitted, because these cap how many records share a commit, not how large a record may be |
 | `Options.MaxBatchRecords` | count | `MaxBatchBytes` ÷ 80, else uncapped | the same |
 | `Options.DeltaSoftLimit` | bytes | 0 | anything. It reports — `StorageStats.DeltaOverBudget` and one metric per crossing — and never acts |
-| `Options.Compact.MaxWorkingBytes` | bytes | 4,325,376 (floor 524,288) | everything a compaction holds except the four sort intermediates. Raising it is measured to buy nothing; the floor saves 3.32 MiB for 12–42% of the compaction's wall clock |
+| `Options.Compact.MaxWorkingBytes` | bytes | 4,325,376 (floor 524,288) | everything a compaction holds except the four sort intermediates. Raising it is measured to buy nothing; the floor saves 3.32 MiB for 12–42% of the compaction's wall clock. It also sizes a `BulkLoad`'s index sort, which is the whole of what a load holds — flat at 10.3–12.7 MiB across a sixteenfold size range |
 | `CompactionPolicy.MaxDeltaRecords` | count | 100,000 | how large those records are |
-| `CompactionPolicy.MaxDeltaBytes` | bytes | 128 MiB | the property index — see the multiplier above. **The default does not hold a large ingest**; §10 has the figure that does |
+| `CompactionPolicy.MaxDeltaBytes` | bytes | 128 MiB | the property index — see the multiplier above. **The default does not hold a large ingest**; §10 has the figure that does, and a load into an empty store should not be on this axis at all |
 | `CompactionPolicy.MaxWALBytes` | bytes | 256 MiB | anything resident. The log is on disk |
 | `CompactionPolicy.MaxDeltaRatio` | fraction | 0.5 | a large delta against a large image |
 | `CompactionPolicy.MaxResidentBytes` | bytes | 0 (off) | the allocator's working set, the collector's headroom, or a compaction's transients. `EstimatedResidentBytes` models *retained* heap, and a process charges roughly **2.6× it** during a rebuild. Read it as a floor, not a budget |

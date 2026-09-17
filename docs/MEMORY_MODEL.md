@@ -2271,6 +2271,11 @@ doubling, and tightening the bound moves along that line rather than off it. A o
 load writes the data once at flat memory; that is the only thing that changes the shape of the
 curve rather than the position on it.
 
+**Built and measured; see §9.11.** At the 100,000-record arm above it writes 0.37 GiB against
+2.42, holds 76.3 MiB charged against 249.3, and finishes in 4.39 s against 25.12 — and its
+bytes per node are flat across a sixteenfold size range where this table's grow by 1.80× per
+doubling.
+
 #### What this does not establish
 
 The three arms are windows under a Job Object. **The anon/file split was not measurable at
@@ -2282,12 +2287,128 @@ as unmeasured rather than as zero — the 256-byte arms print `n/a` in the file 
 would measure the split exactly, and has not been run at this shape.
 
 The largest arm is 400,000 records. 1M and 2M are what the plan asks for, and the cost of
-taking them is the table above: about 805 GiB written between the two.
+taking them is the table above: about 805 GiB written between the two. Still outstanding — the
+session that added §9.11 carried a 20 GiB ceiling on test writes, which the 1M arm alone
+exceeds by an order of magnitude.
 
 ```sh
 GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_INGEST_DIR=/path/to/empty \
   GRAPHENE_RSS_NODES=400000 GRAPHENE_RSS_BLOB=3200 \
   GRAPHENE_CEILING_DELTA_MIB=32 GRAPHENE_CEILING_REOPEN=1 \
+  go test ./tests/ -tags=stress -count=1 -run TestCeiling_BulkIngest -v -timeout=180m
+```
+
+### 9.11 One pass, and the quadratic stops being a curve to sit on
+
+§9.9 ends by saying the two ingest arms bracket a whole axis: unbounded is 1.81× writes and
+linear memory, bounded is flat memory and 1.80× writes per doubling, and no value of
+`MaxDeltaBytes` is off that line. `BulkLoad` is off it. It writes the image once, in one
+forward pass, and builds the property index from an external sort of the triples as the
+records stream past rather than from an index it would have to hold.
+
+The arm is the same `TestCeiling_BulkIngestFitsUnderTheLimit` with `GRAPHENE_CEILING_BULKLOAD=1`:
+the same store, the same 8 unique + 5 ordered + 2 composite schema, the same 3.2 KB records,
+under the same real 2,048 MiB Job Object, counted by the same `MetricCompaction.Bytes` sum.
+
+#### Four interleaved rounds at 100,000 × 3.2 KB
+
+Medians, with each round's spread beside them. The arms were alternated, never run back to
+back; `docs/benchmarks.md` records twice what happens otherwise.
+
+| | bounded + reopen | bulk load | ratio |
+|---|---:|---:|---:|
+| bytes written | **2.42 GiB** | **0.37 GiB** | **0.153** |
+| amplification | 6.53× | **1.00×** | |
+| bytes per node | 25,942 | **3,971** | 0.153 |
+| image writes | 10 | 1 | |
+| charged peak | 249.3 MiB (239.7–258.0) | **76.3 MiB** (76.1–76.3) | **0.306** |
+| headroom under 2 GiB | 87.8% | **96.3%** | |
+| process peak RSS | 500.2 MiB (485.3–509.8) | 344.3 MiB (344.2–344.6) | 0.688 |
+| wall clock | 25.12 s (24.77–25.67) | **4.39 s** (4.18–4.51) | **0.175** |
+
+The ranges do not touch on any row. Bytes written is identical to the byte in every round on
+both arms, because it is a count of what the engine emitted and not a timing.
+
+**6.53× fewer bytes, 3.27× less charged, 5.7× faster**, at the smallest of the three sizes
+§9.9 measured — which is the size where the incremental arm is at its *best*, because
+amplification grows with the record count and this one does not.
+
+#### The memory is flat across sixteenfold
+
+The phase table cannot settle this. `BulkLoad` closes and reopens the store inside the call,
+so the ingest phase's peak is the load *plus* an open of the image it just wrote, and an open
+is linear in the store by design. Item 0a's stage boundaries separate them: the process peak
+is monotone for the lifetime of the process, so the rise from the pin to the build is what the
+build held and nothing else.
+
+| records | bytes written per node | the image write held over the pin | per node | the commit added |
+|---:|---:|---:|---:|---:|
+| 25,000 | 3,979 | 11.301 MiB | 474.0 B | 0.000 MiB |
+| 50,000 | 3,974 | **10.305** | 216.1 | 0.027 |
+| 100,000 | 3,971 | 11.637 | 122.0 | 0.000 |
+| 200,000 | 3,970 | 12.297 | 64.5 | 0.000 |
+| 400,000 | 3,970 | **12.680** | 33.2 | 0.027 |
+
+**Sixteen times the data, 1.23× the memory** — 10.305 to 12.680 MiB, and the per-node figure
+falls by a factor of fourteen because the total is very nearly a constant. That is what
+"bounded by `MaxWorkingBytes` rather than by the store" means, measured rather than argued:
+the sort spills to a file in the store's own directory when its chunk is full, and the chunk
+is the figure a caller set.
+
+Bytes written per node is flat to 0.2% over the same range. The incremental arm's, at the
+three sizes it was measured at, is 25,942 → 46,747 → 84,301.
+
+The charged peak for the whole sequence does grow — 59.8, 63.9, 76.3, 102.1, 154.9 MiB across
+those five sizes — and that growth is the *reopened store*, not the load: 2.6× for 16× the
+data, which is §9.7's at-rest coefficients and nothing this phase changed. The process peak
+grows with it (95.2 → 1,340.8 MiB) and is almost entirely the mapping, which a Job Object does
+not charge.
+
+#### What it projects to at the shape that opened this programme
+
+Ten million records of 3.2 KB. Extrapolating each arm's own measured fit:
+
+| | bytes written | basis |
+|---|---:|---|
+| bounded + reopen, 32 MiB | ~**19.2 TiB** | 84,301 B/node at 400,000, growing 1.80× per doubling |
+| bulk load | **37.0 GiB** | 3,970 B/node, flat across a sixteenfold range |
+
+A factor of about **530**. The bulk figure is an extrapolation of a constant and the
+incremental one an extrapolation of a slope, so they are not equally safe: the first is close
+to arithmetic, the second is the more uncertain and is the larger number, which is the
+direction that matters least.
+
+#### What it costs, and what it is not
+
+It is atomic and not incremental — a crash means the load did not happen — the store is not
+readable while it runs, and it needs an empty store. Those are stated first in the API and
+first in the file, because they are the price of the single pass rather than gaps in it.
+
+The one constraint it has to enforce for itself is uniqueness. The incremental path asks the
+index whether anyone else holds a value; a load has no index to ask, and checks instead where
+the postings are read — a duplicate is exactly a value with two identifiers filed under it,
+and the sort has already grouped by value. So the check is exact, and it costs one map lookup
+per key rather than one index probe per record.
+
+#### What this does not establish
+
+**No arm above 400,000 records.** The session this was measured in carried a 20 GiB hard
+ceiling on test writes, and the incremental arm at 1M alone would have written on the order of
+250 GiB. So the 1M and 2M figures item 0c asks for are still outstanding, and the 530× above
+is a projection rather than a reading.
+
+**Windows, under a Job Object.** §9.9's caveat carries over unchanged: a Job Object charges
+committed private bytes, so the charged column here says nothing about what a linux cgroup
+would charge for the mapping. A linux arm would measure the split exactly and has not been run.
+
+**Nodes only.** The ingest arm writes no edges, so neither does the bulk arm — an edge pass
+would be a difference between them rather than part of what is being compared. The edge path
+is covered by the byte-identity tests in `disk/bulk_load_test.go`, which is correctness and
+not cost.
+
+```sh
+GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_INGEST_DIR=/path/to/empty \
+  GRAPHENE_RSS_NODES=400000 GRAPHENE_RSS_BLOB=3200 GRAPHENE_CEILING_BULKLOAD=1 \
   go test ./tests/ -tags=stress -count=1 -run TestCeiling_BulkIngest -v -timeout=180m
 ```
 

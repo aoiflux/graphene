@@ -23,6 +23,7 @@ import (
 4. [Errors](#4-errors)
 5. [Create](#5-create)
 5.1. [Transactions — `Begin`](#51-transactions--begin) ← recommended for ingest
+5.2. [`BulkLoad`](#52-filling-an-empty-store-in-one-pass--bulkload) ← filling an empty store
 6. [Read](#6-read)
 6a. [Snapshots — consistent reads](#6a-snapshots--consistent-reads)
 7. [Mutation](#7-mutation)  ← update / delete
@@ -799,6 +800,115 @@ goroutines may each hold their own transaction.
 `Atomic()` reports false only for third-party backends that do not implement
 `store.Transactor`; both bundled backends return true. Such a backend still
 works, committing via the batch APIs, but without cross-boundary atomicity.
+
+---
+
+### 5.2 Filling an empty store in one pass — `BulkLoad`
+
+```go
+func (g *Graph) BulkLoad(addNodes func(*BulkNodeWriter) error,
+                         addEdges func(*BulkEdgeWriter) error) (*Graph, error)
+func (g *Graph) BulkLoadCtx(ctx context.Context,
+                            addNodes func(*BulkNodeWriter) error,
+                            addEdges func(*BulkEdgeWriter) error) (*Graph, error)
+
+func (w *BulkNodeWriter) AddNode(n BulkNode) (store.NodeID, error)
+func (w *BulkEdgeWriter) AddEdge(e BulkEdge) (store.EdgeID, error)
+
+type BulkNode struct {
+    Labels     []store.NodeType
+    Properties []byte
+    Index      []BulkProperty
+}
+type BulkEdge struct {
+    Src, Dst   store.NodeID
+    Labels     []store.EdgeType
+    Weight     float32
+    Properties []byte
+    Index      []BulkProperty
+}
+type BulkProperty struct {
+    Key   string
+    Value []byte
+}
+
+var disk.ErrBulkLoadNotEmpty = errors.New("graphene: BulkLoad needs an empty store")
+```
+
+Writes a whole store in one forward pass and returns a fresh `*Graph` on it. Use
+it when you are **creating** a store rather than adding to one.
+
+**Why it exists.** An ingest large enough to need a bounded delta compacts every
+window, and every compaction rewrites the whole image, so bytes written grow with
+the square of what is being loaded. Measured at 3.2 KB records, the amplification
+rises 6.53×, 11.77×, 21.24× across three doublings. `BulkLoad` writes the image
+once: **1.00× at every size measured, and 3,970 bytes per record flat across a
+sixteenfold range.**
+
+**Four things to decide before using it.**
+
+*It is atomic and not incremental.* A crash means the load did not happen. There is
+no partial store and nothing to resume from.
+
+*It needs an empty store.* One that holds records, a delta, or even an index entry
+naming a record that was never added is refused with `disk.ErrBulkLoadNotEmpty`.
+Load into a fresh directory; to replace an existing store, load into a new one and
+swap.
+
+*The receiver is closed.* On success and on failure. The returned `*Graph` replaces
+it, exactly as `CompactAndReopen` does — and for the same reason, a `Properties`
+slice taken before the call addresses a released mapping afterwards. Copy first,
+with `store.CloneNode`.
+
+*Your source is read twice.* `addNodes` runs first and must add every node;
+`addEdges` runs afterwards and must add every edge. `AddNode` returns the
+identifier as it goes, which is how the edge pass names its endpoints. There are
+two writer types because the image holds every node record before every edge
+record, so a caller who tries to add an edge during the node pass does not compile.
+
+**Declare first.** `DeclareOrderedProperty`, `DeclareUniqueProperty` and
+`DeclareCompositeProperties` are read when the load starts and the image is written
+under them. Declaring afterwards means the next compaction, not this one.
+
+**What it still checks.** Labels, property key names, and — exactly — unique keys:
+two records loaded under one value for a declared unique property fail the load
+before anything is installed. The incremental path asks the index whether anyone
+else holds a value; a load has no index to ask and checks instead that no value
+ends up with two identifiers filed under it.
+
+**What it holds.** `Options.Compact.MaxWorkingBytes` sizes the index sort, which is
+the whole of what a load holds beyond a record at a time — the same figure that
+sizes a compaction's intermediates, so there is no second knob. The sort spills to a
+file in the store's own directory when its chunk is full.
+
+**What it reports.** `MetricCompaction` and the three compaction stage gauges,
+because an image write and a log retire is what it is. A store's compaction count
+therefore includes its loads.
+
+Available when the graph is backed by a directory; the in-memory backend has no
+image to write once, and returns an error.
+
+```go
+g, err = g.BulkLoad(
+    func(w *graphene.BulkNodeWriter) error {
+        for _, r := range records {
+            id, err := w.AddNode(graphene.BulkNode{
+                Labels:     []store.NodeType{store.NodeTypeMicroArtefact},
+                Properties: r.Blob,
+                Index:      []graphene.BulkProperty{{Key: "sha256", Value: r.Digest}},
+            })
+            if err != nil {
+                return err
+            }
+            ids = append(ids, id)
+        }
+        return nil
+    },
+    func(w *graphene.BulkEdgeWriter) error { return nil })
+```
+
+`USER_GUIDE.md` §10 has the worked lifecycle and the A/B against a bounded ingest;
+`docs/MEMORY_MODEL.md` §9.11 has the figures.
 
 ---
 
