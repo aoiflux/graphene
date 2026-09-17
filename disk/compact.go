@@ -311,6 +311,30 @@ func (s *Store) Compact() error {
 // a compromise: the build is where the seconds are. The commit is an fsync, two
 // renames and a pass over the delta.
 func (s *Store) CompactCtx(ctx context.Context) error {
+	return s.compact(ctx, compactMaterialise)
+}
+
+// compactMode picks which of the two builds a compaction runs.
+//
+// They differ in one thing and share everything else: the pin, the budget gate,
+// the stage metrics, the advice around the read, and every rule about when a
+// refusal is not a failure. That is why this is a parameter rather than a second
+// copy of CompactCtx -- the reasoning in the comments below is the part that
+// must not be duplicated, because a duplicate is a copy that can drift.
+type compactMode uint8
+
+const (
+	// compactMaterialise builds the CSRGraph, writes it and publishes it. This
+	// is Compact(), and it is what a store that stays open needs.
+	compactMaterialise compactMode = iota
+
+	// compactStreaming writes the image straight from the merge and publishes
+	// nothing. Only CompactAndReopenCtx may ask for it; see compact_stream.go
+	// for what it leaves standing and why that is consistent.
+	compactStreaming
+)
+
+func (s *Store) compact(ctx context.Context, mode compactMode) error {
 	if err := s.mustWrite(); err != nil {
 		return err
 	}
@@ -375,10 +399,27 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 	// for here and taken back below. No-op unless Options.ResidentAdvice is set.
 	s.adviseImages(adviceSequential)
 
-	newCSR, tmpPath, err := plan.build(ctx, s.dir)
+	// The one difference between the two modes. A streaming build returns the
+	// image's identity directly; a materialising one returns the graph and the
+	// identity is read off it afterwards, which is the same three figures from
+	// the same image.
+	var (
+		newCSR  *CSRGraph
+		img     imageIdentity
+		tmpPath string
+	)
+	if mode == compactStreaming {
+		img, tmpPath, err = plan.buildStream(ctx, s.dir)
+	} else {
+		newCSR, tmpPath, err = plan.build(ctx, s.dir)
+		if err == nil {
+			img = newCSR.identity()
+		}
+	}
 	// After build, because build is what can create one, and before the commit,
 	// because every way the commit can end leaves this the last word on a
-	// mapping the index did not take.
+	// mapping the index did not take. A streaming build prepares none, and this
+	// is a no-op for it.
 	defer plan.releasePendingBase()
 	// The build is the stage that holds the most and the stage that runs
 	// longest, and it is the one whose figures nothing reported before this.
@@ -387,7 +428,11 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 		stageStart = time.Now()
 	}
 	if err == nil {
-		err = s.compactCommit(plan, newCSR, tmpPath)
+		if mode == compactStreaming {
+			err = s.compactStreamCommit(plan, img, tmpPath)
+		} else {
+			err = s.compactCommit(plan, newCSR, tmpPath)
+		}
 		// Inside the branch: a commit that did not run has no duration and no
 		// figures worth a reading, and emitting one would put a stage in the
 		// record that never happened.
@@ -423,7 +468,11 @@ func (s *Store) CompactCtx(ctx context.Context) error {
 		s.record(store.Metric{
 			Kind:     store.MetricCompaction,
 			Duration: time.Since(started),
-			Count:    int64(compactedRecords(newCSR)),
+			// Zero for a compaction that did not produce an image: a build
+			// cancelled part way leaves the identity at its zero value, and a
+			// metric reporting no records for it is more honest than one
+			// reporting the plan's intent as though it had happened.
+			Count:    int64(img.nodeCount + img.edgeCount),
 			Examined: plan.examined,
 			Bytes:    s.imageBytes(),
 			Err:      err,
@@ -475,17 +524,6 @@ func (s *Store) warnIDHeadroom() {
 			})
 		}
 	}
-}
-
-// compactedRecords describes the image a compaction produced,
-// and answer nothing when it produced none — a build cancelled part way returns
-// a nil CSR, and a metric reporting zero records for it is more honest than one
-// reporting the plan's intent as though it had happened.
-func compactedRecords(csr *CSRGraph) int {
-	if csr == nil {
-		return 0
-	}
-	return csr.NodeCount() + csr.EdgeCount()
 }
 
 // imageBytes is the compacted image's size on disk, or zero if it cannot be
@@ -813,6 +851,62 @@ func (p *compactPlan) edgeSeq() iter.Seq[rawEdge] {
 	}
 }
 
+// imageMembers answers whether the image a compaction is writing holds a record.
+//
+// The property-index filter is the only thing a compaction needs this for, and
+// until Phase 4 the only thing that could answer it was the new CSRGraph -- so
+// the filter took one, and a compaction that wanted to skip building a graph
+// could not skip building it. There are two answers now and they cost
+// differently:
+//
+//   - *CSRGraph answers in one page-table probe, because it has already placed
+//     every record in a slot. That is what a materialising compaction uses, and
+//     nothing about it has changed.
+//
+//   - *compactPlan answers from the merge's own inputs, in a binary search of
+//     the delta's identifiers and, for the ones it has no opinion about, a probe
+//     of the pinned image. That is O(log d) where the graph was O(1), against a
+//     d bounded by MaxDeltaBytes rather than by the store -- and it needs no
+//     graph at all, which is 118 bytes per node and 142 per edge not held.
+//
+// Both answer the same question about the same image. buildStream's byte
+// identity test is what holds them to it.
+type imageMembers interface {
+	containsNode(store.NodeID) bool
+	containsEdge(store.EdgeID) bool
+}
+
+// containsNode reports whether the image this plan describes will hold the node,
+// without building it.
+//
+// The merge is the definition and this follows it exactly: nodeSeq yields every
+// record in deltaNodes, and every record in the pinned image whose identifier
+// the delta has no opinion about. So an identifier the delta knows resolves
+// entirely within the delta -- present in deltaNodes means an update or an
+// insert, absent means a tombstone -- and one it does not know resolves against
+// the image. Both slices are ascending by the time a build walks them; sortDelta
+// is what puts them that way and runs before anything here is called.
+func (p *compactPlan) containsNode(id store.NodeID) bool {
+	if _, known := slices.BinarySearch(p.deltaKnownNodes, id); known {
+		_, live := slices.BinarySearchFunc(p.deltaNodes, id, func(r nodeRecord, want store.NodeID) int {
+			return cmp.Compare(r.ID, want)
+		})
+		return live
+	}
+	return p.csr != nil && p.csr.containsNode(id)
+}
+
+// containsEdge is containsNode for edges.
+func (p *compactPlan) containsEdge(id store.EdgeID) bool {
+	if _, known := slices.BinarySearch(p.deltaKnownEdges, id); known {
+		_, live := slices.BinarySearchFunc(p.deltaEdges, id, func(r rawEdge, want store.EdgeID) int {
+			return cmp.Compare(r.ID, want)
+		})
+		return live
+	}
+	return p.csr != nil && p.csr.containsEdge(id)
+}
+
 // nodePropSeq yields the property-index entries the new image will carry: every
 // entry the live index holds for a node the image holds, in the (key, value, id)
 // order the format's byte-determinism contract requires.
@@ -821,8 +915,9 @@ func (p *compactPlan) edgeSeq() iter.Seq[rawEdge] {
 // entry registered for a node committed after the pin -- a node this image does
 // not contain. Writing it would put a posting into the image naming nothing,
 // which is exactly the orphan invariant 15.5 forbids, and it would stay that way
-// until the log replayed. csr.containsNode is one page-table probe against the
-// image the entries are being written for, so the section cannot contain one.
+// until the log replayed. members.containsNode answers for the image the entries
+// are being written for, so the section cannot contain one; see imageMembers for
+// the two things that can answer it and what each one costs.
 //
 // The other direction needs no filter: an entry the stream misses because its
 // key was already walked is in the log tail, and replay registers it.
@@ -833,10 +928,10 @@ func (p *compactPlan) edgeSeq() iter.Seq[rawEdge] {
 // which is the allocation this item removes, one per entry.
 //
 // Re-runnable, as csrPayload requires: each walk re-enters the index.
-func (p *compactPlan) nodePropSeq(csr *CSRGraph) iter.Seq[index.NodePropEntry] {
+func (p *compactPlan) nodePropSeq(members imageMembers) iter.Seq[index.NodePropEntry] {
 	return func(yield func(index.NodePropEntry) bool) {
 		p.propIdx.ForEachNodeProperty(func(id store.NodeID, key string, value []byte) bool {
-			if !csr.containsNode(id) {
+			if !members.containsNode(id) {
 				return true
 			}
 			return yield(index.NodePropEntry{ID: id, Key: key, Value: value})
@@ -845,10 +940,10 @@ func (p *compactPlan) nodePropSeq(csr *CSRGraph) iter.Seq[index.NodePropEntry] {
 }
 
 // edgePropSeq is nodePropSeq for edge properties.
-func (p *compactPlan) edgePropSeq(csr *CSRGraph) iter.Seq[index.EdgePropEntry] {
+func (p *compactPlan) edgePropSeq(members imageMembers) iter.Seq[index.EdgePropEntry] {
 	return func(yield func(index.EdgePropEntry) bool) {
 		p.propIdx.ForEachEdgeProperty(func(id store.EdgeID, key string, value []byte) bool {
-			if !csr.containsEdge(id) {
+			if !members.containsEdge(id) {
 				return true
 			}
 			return yield(index.EdgePropEntry{ID: id, Key: key, Value: value})
@@ -871,7 +966,7 @@ func (p *compactPlan) edgePropSeq(csr *CSRGraph) iter.Seq[index.EdgePropEntry] {
 //
 // Two buffers rather than one because the encoder walks node keys and edge keys
 // in sequence today and nothing in the format requires it to keep doing so.
-func (p *compactPlan) mappedIndexSource(csr *CSRGraph, dir string) *gpixSource {
+func (p *compactPlan) mappedIndexSource(members imageMembers, dir string) *gpixSource {
 	nodeWalk := p.propIdx.NodeValueWalker()
 	edgeWalk := p.propIdx.EdgeValueWalker()
 	var nodeIDs, edgeIDs []uint64
@@ -882,7 +977,7 @@ func (p *compactPlan) mappedIndexSource(csr *CSRGraph, dir string) *gpixSource {
 			nodeWalk(key, func(value []byte, ids []store.NodeID) bool {
 				nodeIDs = nodeIDs[:0]
 				for _, id := range ids {
-					if csr.containsNode(id) {
+					if members.containsNode(id) {
 						nodeIDs = append(nodeIDs, uint64(id))
 					}
 				}
@@ -900,7 +995,7 @@ func (p *compactPlan) mappedIndexSource(csr *CSRGraph, dir string) *gpixSource {
 			edgeWalk(key, func(value []byte, ids []store.EdgeID) bool {
 				edgeIDs = edgeIDs[:0]
 				for _, id := range ids {
-					if csr.containsEdge(id) {
+					if members.containsEdge(id) {
 						edgeIDs = append(edgeIDs, uint64(id))
 					}
 				}
@@ -946,7 +1041,7 @@ func (p *compactPlan) mappedIndexSource(csr *CSRGraph, dir string) *gpixSource {
 // The tuple bytes are opaque here in both directions -- index encodes them, GCPX
 // stores them, index decodes them -- which is what keeps one encoder in the
 // codebase. See index.CompositeBase.
-func (p *compactPlan) mappedCompositeSource(csr *CSRGraph, dir string) *gcpxSource {
+func (p *compactPlan) mappedCompositeSource(members imageMembers, dir string) *gcpxSource {
 	nodes := p.propIdx.CompositeNodeKeys()
 	edges := p.propIdx.CompositeEdgeKeys()
 	if len(nodes) == 0 && len(edges) == 0 {
@@ -966,12 +1061,12 @@ func (p *compactPlan) mappedCompositeSource(csr *CSRGraph, dir string) *gcpxSour
 					live = live[:0]
 					for _, id := range ids {
 						if kind == gcpxKindNode {
-							if csr.containsNode(store.NodeID(id)) {
+							if members.containsNode(store.NodeID(id)) {
 								live = append(live, id)
 							}
 							continue
 						}
-						if csr.containsEdge(store.EdgeID(id)) {
+						if members.containsEdge(store.EdgeID(id)) {
 							live = append(live, id)
 						}
 					}
@@ -1184,64 +1279,21 @@ func removeTmpImage(tmpPath string) {
 	_ = os.Remove(tmpPath)
 }
 
-// compactCommit installs the built image and retires the log behind it.
+// compactCommit installs the built image and publishes the graph that produced
+// it.
+//
+// The install is installImage, which is shared with the streaming compaction.
+// What is left here is the half that decides what this handle serves from
+// memory: the new graph under the delta that survived it, the delta figure the
+// soft limit watches, the applied epoch, and where the index is read from.
 func (s *Store) compactCommit(p *compactPlan, newCSR *CSRGraph, tmpPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Flush the log and take its end offset, then rename. The offset is the end
-	// of every record the log held, which is what the retire branches below need
-	// in order to tell the image's records from the tail's.
-	//
-	// Neither the *checkpoint marker* nor the fsync happens here; both belong to
-	// the branch. The marker says "replay stops at this point", and one branch
-	// keeps the log and goes on appending to it — writing it up front stranded
-	// every record committed after any compaction that took that branch. The
-	// fsync follows the marker for the two branches that write one, and is
-	// explicit in the third, which keeps a compaction at one fsync rather than
-	// two.
-	if err := s.fireCompactStep(compactStepDrainWAL); err != nil {
-		removeTmpImage(tmpPath)
-		return err
-	}
-	endOff, err := s.wal.drainedEnd()
+	endOff, err := s.installImage(p, newCSR.identity(), tmpPath)
 	if err != nil {
-		// Nothing has been installed, so the built image is now unreachable.
-		// Same reasoning as in build: an image-sized file left behind by a
-		// failure whose likeliest cause is a full disk.
-		removeTmpImage(tmpPath)
-		return fmt.Errorf("compact: wal flush: %w", err)
-	}
-
-	csrPath := filepath.Join(s.dir, csrFileName)
-	if err := s.fireCompactStep(compactStepRename); err != nil {
-		removeTmpImage(tmpPath)
 		return err
 	}
-	if err := os.Rename(tmpPath, csrPath); err != nil {
-		removeTmpImage(tmpPath)
-		return fmt.Errorf("compact: rename CSR: %w", err)
-	}
-	// Past this point the temp name no longer exists: the rename consumed it.
-	// Every later failure in this function leaves the *new* image installed and
-	// the log un-retired, which is the case the open path recovers by replay.
-	// And the rename itself. os.Rename is atomic with respect to a concurrent
-	// reader — either name resolves to one whole file or the other — but that
-	// is a different property from surviving a power loss, which needs the
-	// directory's own entries flushed. Before the WAL is retired below, because
-	// the log is what recovers the store if this fails.
-	if err := s.fireCompactStep(compactStepSyncDir); err != nil {
-		return err
-	}
-	if err := syncDir(s.dir); err != nil {
-		return fmt.Errorf("compact: %w", err)
-	}
-
-	if err := s.retireLog(p, newCSR, endOff); err != nil {
-		return err
-	}
-
-	s.lastCompact = p.compactedAt
 
 	// Swap in the new image under the delta that survived it. Both halves change
 	// together because they are one value; the old view is left exactly as it
@@ -1270,6 +1322,74 @@ func (s *Store) compactCommit(p *compactPlan, newCSR *CSRGraph, tmpPath string) 
 	s.adoptCompactedIndex(p, p.tailBytes(endOff))
 
 	return nil
+}
+
+// installImage puts the built image in place and retires the log behind it.
+//
+// This is the half of a commit that decides what is on disk, and it is the whole
+// of what a streaming compaction can do -- see compact_stream.go, which has no
+// graph to publish and therefore ends here. Everything after it in compactCommit
+// decides what this handle serves from memory, which is a different question and
+// one a store that is about to be reopened does not have.
+//
+// Called with s.mu held. Returns the offset the log drain reached, which is what
+// tells the image's records from the tail's.
+func (s *Store) installImage(p *compactPlan, img imageIdentity, tmpPath string) (int64, error) {
+
+	// Flush the log and take its end offset, then rename. The offset is the end
+	// of every record the log held, which is what the retire branches below need
+	// in order to tell the image's records from the tail's.
+	//
+	// Neither the *checkpoint marker* nor the fsync happens here; both belong to
+	// the branch. The marker says "replay stops at this point", and one branch
+	// keeps the log and goes on appending to it — writing it up front stranded
+	// every record committed after any compaction that took that branch. The
+	// fsync follows the marker for the two branches that write one, and is
+	// explicit in the third, which keeps a compaction at one fsync rather than
+	// two.
+	if err := s.fireCompactStep(compactStepDrainWAL); err != nil {
+		removeTmpImage(tmpPath)
+		return 0, err
+	}
+	endOff, err := s.wal.drainedEnd()
+	if err != nil {
+		// Nothing has been installed, so the built image is now unreachable.
+		// Same reasoning as in build: an image-sized file left behind by a
+		// failure whose likeliest cause is a full disk.
+		removeTmpImage(tmpPath)
+		return 0, fmt.Errorf("compact: wal flush: %w", err)
+	}
+
+	csrPath := filepath.Join(s.dir, csrFileName)
+	if err := s.fireCompactStep(compactStepRename); err != nil {
+		removeTmpImage(tmpPath)
+		return 0, err
+	}
+	if err := os.Rename(tmpPath, csrPath); err != nil {
+		removeTmpImage(tmpPath)
+		return 0, fmt.Errorf("compact: rename CSR: %w", err)
+	}
+	// Past this point the temp name no longer exists: the rename consumed it.
+	// Every later failure in this function leaves the *new* image installed and
+	// the log un-retired, which is the case the open path recovers by replay.
+	// And the rename itself. os.Rename is atomic with respect to a concurrent
+	// reader — either name resolves to one whole file or the other — but that
+	// is a different property from surviving a power loss, which needs the
+	// directory's own entries flushed. Before the WAL is retired below, because
+	// the log is what recovers the store if this fails.
+	if err := s.fireCompactStep(compactStepSyncDir); err != nil {
+		return 0, err
+	}
+	if err := syncDir(s.dir); err != nil {
+		return 0, fmt.Errorf("compact: %w", err)
+	}
+
+	if err := s.retireLog(p, img, endOff); err != nil {
+		return 0, err
+	}
+
+	s.lastCompact = p.compactedAt
+	return endOff, nil
 }
 
 // tailBytes is how much landed in the log between the pin and the drain.
@@ -1456,7 +1576,7 @@ func declarationsMoved(p *compactPlan, s *Store) error {
 // deliberately writes none. A marker means "replay stops here", which is only
 // true of a log about to be retired; left in a log that keeps being appended
 // to, it silently discards every record written after this compaction.
-func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error {
+func (s *Store) retireLog(p *compactPlan, img imageIdentity, endOff int64) error {
 	tail := p.tailBytes(endOff)
 
 	switch {
@@ -1473,7 +1593,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 			return fmt.Errorf("compact: wal checkpoint: %w", err)
 		}
 		if s.retention.Keeps() {
-			return s.rotateLog(newCSR)
+			return s.rotateLog(img)
 		}
 		if err := s.wal.Truncate(); err != nil {
 			return fmt.Errorf("compact: wal truncate: %w", err)
@@ -1485,7 +1605,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 		s.keyTimeline = nil
 		if aerr := s.recordAudit(AuditCompact, s.attestActorID,
 			fmt.Sprintf("log discarded; %d nodes, %d edges; snapshot %x",
-				newCSR.NodeCount(), newCSR.EdgeCount(), newCSR.roots.Snapshot[:8])); aerr != nil {
+				img.nodeCount, img.edgeCount, img.roots.Snapshot[:8])); aerr != nil {
 			return fmt.Errorf("compact: %w", aerr)
 		}
 		return nil
@@ -1515,7 +1635,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 		s.keyTimeline = append([]KeyTransition(nil), s.keyTimeline[p.keyTimelineLen:]...)
 		if aerr := s.recordAudit(AuditCompact, s.attestActorID,
 			fmt.Sprintf("log rebuilt over %d bytes committed during the build; %d nodes, %d edges; snapshot %x",
-				tail, newCSR.NodeCount(), newCSR.EdgeCount(), newCSR.roots.Snapshot[:8])); aerr != nil {
+				tail, img.nodeCount, img.edgeCount, img.roots.Snapshot[:8])); aerr != nil {
 			return fmt.Errorf("compact: %w", aerr)
 		}
 		return nil
@@ -1552,7 +1672,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 		}
 		if aerr := s.recordAudit(AuditCompact, s.attestActorID,
 			fmt.Sprintf("log kept, %d bytes committed during the build could not be carried; %d nodes, %d edges; snapshot %x",
-				tail, newCSR.NodeCount(), newCSR.EdgeCount(), newCSR.roots.Snapshot[:8])); aerr != nil {
+				tail, img.nodeCount, img.edgeCount, img.roots.Snapshot[:8])); aerr != nil {
 			return fmt.Errorf("compact: %w", aerr)
 		}
 		return nil
@@ -1564,7 +1684,7 @@ func (s *Store) retireLog(p *compactPlan, newCSR *CSRGraph, endOff int64) error 
 // With retention configured the log is kept rather than truncated. The
 // distinction is what a caller asked for, not what the engine thinks best — how
 // long evidence is held is not the engine's decision.
-func (s *Store) rotateLog(newCSR *CSRGraph) error {
+func (s *Store) rotateLog(img imageIdentity) error {
 	seg, err := s.wal.Rotate(s.dir, s.segmentSeq)
 	if err != nil {
 		return fmt.Errorf("compact: wal rotate: %w", err)
@@ -1589,7 +1709,7 @@ func (s *Store) rotateLog(newCSR *CSRGraph) error {
 
 	if aerr := s.recordAudit(AuditCompact, s.attestActorID,
 		fmt.Sprintf("retired segment %d; %d nodes, %d edges; snapshot %x",
-			seg.Sequence, newCSR.NodeCount(), newCSR.EdgeCount(), newCSR.roots.Snapshot[:8])); aerr != nil {
+			seg.Sequence, img.nodeCount, img.edgeCount, img.roots.Snapshot[:8])); aerr != nil {
 		return fmt.Errorf("compact: %w", aerr)
 	}
 	return nil
@@ -1644,7 +1764,13 @@ func (s *Store) CompactAndReopen() (*Store, error) {
 func (s *Store) CompactAndReopenCtx(ctx context.Context) (*Store, error) {
 	// Before anything is closed. A failed compaction leaves the caller exactly
 	// where they were, which is the only failure mode here that can be harmless.
-	if err := s.CompactCtx(ctx); err != nil {
+	//
+	// And the streaming build, which is the whole reason this is not just
+	// CompactCtx: the graph a compaction publishes is thrown away by the Close
+	// two lines down, so this path does not build one. What that leaves the
+	// receiver holding, and why it is still consistent if the reopen below
+	// fails, is compact_stream.go's file comment.
+	if err := s.compact(ctx, compactStreaming); err != nil {
 		return nil, err
 	}
 	dir, opts := s.dir, s.openOpts

@@ -348,6 +348,70 @@ Worse, the configuration §9.8 measured passing was undocumented, and the one
   process-global and this engine is a library in someone else's process. It is also the
   only bound darwin will ever have.
 
+### A compaction that is going to reopen does not build the graph it throws away
+
+- **`CompactAndReopen` no longer builds a `CSRGraph`.** It compacted, published the
+  graph it had just built, closed the store and opened the directory again — so the
+  largest thing a compaction holds was constructed, written, published and then
+  dropped by the `Close` on the next line. The merged record sequence now goes
+  straight into the image encoder.
+
+- **The stage metrics are what said it was worth doing.** `MetricCompactPin`,
+  `MetricCompactBuild` and `MetricCompactCommit` carry the process's peak, which is
+  monotone, so the rise between two boundaries is exactly what happened between them.
+  At 400,000 records the build raises it by **197.9 MiB and the commit by 0.035** —
+  0.018% of the build's figure. That is Phase 0a being used for the decision it was
+  added for, rather than for a number in an appendix.
+
+- **47.47 MB less allocated per compaction, which is 117.4 B per record.** Four
+  interleaved rounds at 400,000 × 512 B, medians: total allocation
+  **144.844 MB → 97.379 MB, a ratio of 0.672**, with the arms' ranges not touching.
+  The model in `docs/PLAN_BOUNDED_INGEST.md` predicts ~118 B per node for the graph;
+  the measurement lands on 117.4, which is the term and nothing else.
+
+- **The anonymous peak during a compaction falls 23.1%**, 157.8 → 121.4 MiB, ranges
+  again not touching. This is the figure `Options.ResidentAdvice` explicitly did not
+  move — it was flat at 0.994, and that is recorded — because advice changes what is
+  held *after* a pass and this changes what is held *during* one. The whole working
+  set peak falls 7.3%, which is the same bytes against a much larger denominator.
+
+- **Wall clock is not resolvable and was not left at that.** The medians differ by
+  1.119, but the materialising arm's own four rounds span 4,446–5,418 ms, a 1.22×
+  swing, so the difference is inside the instrument — `docs/benchmarks.md` puts the
+  resolution of this dataset at roughly 25%. A CPU profile bounds what the change
+  could have cost: the new membership test is **1.26% of samples**, against 28.4% in
+  Windows file IO and ~21% in SHA-256, which are identical work in both arms.
+
+- **The image is byte-identical, and that is a test rather than a claim.** Both paths
+  share one encoder — a second one would be a second definition of the format — and
+  `TestCompactStream_WritesTheSameImageAsTheMaterialisingPath` compares the two over a
+  fixture with an image *and* a delta, updates, deletes and a declared composite, in
+  **both index modes**, plus an empty store and a compaction with nothing in the delta.
+  The test was checked against mutants: breaking the membership oracle moves 13,040
+  bytes, and corrupting the patched header count by one makes the reopen refuse the
+  image outright.
+
+- **Two things made it possible without a graph.** The header counts a streaming build
+  cannot know before it starts writing are **patched after the flush**, which is what
+  the section table offset and both GIDX counts have always done. And the
+  property-index filter's liveness question is answered by the plan instead of the new
+  image: `deltaNodes` is a subset of `deltaKnownNodes`, so an identifier the delta
+  knows resolves inside the delta and one it does not resolves against the pinned
+  image. See `imageMembers` for what each answer costs.
+
+- **What the receiver holds afterwards is stated rather than discovered.** The
+  streaming commit installs the image and stops: there is no graph to publish, so the
+  handle keeps the pinned image plus the whole delta — the same records, because the
+  merge that wrote the image is the merge of exactly those two. Reads are correct,
+  writes land in the delta and the fresh log, and the reopen reads image-plus-replay.
+  What is lost is the memory the splice would have released and the index base the
+  commit would have adopted, and the reopen on the next line takes both back.
+
+- **`Compact()` is unchanged, and was measured to be.** A store that stays open has to
+  publish what it built. Four interleaved rounds against the previous commit:
+  allocation **1.00002**, allocations 0.999, wall clock 0.997, peak 1.006 — the
+  encoder extraction cost the materialising path nothing.
+
 ## v0.8.0 "Bookshelf_v2" — the rebuild fits, and the composites move onto the shelf
 
 ### A whole-layer rebuild fits under 2 GiB, and the knob was not what did it

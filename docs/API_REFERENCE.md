@@ -2625,6 +2625,23 @@ With that in the loop the same rebuild finishes, peaking at **1,285.2 MiB of the
 is also faster than the in-place loop, because fifteen compactions against a heap
 that stops growing cost less than twenty-nine against one that does not.
 
+**It compacts differently from `Compact()`, and more cheaply.** Because the
+handle is about to be closed, this path does not build the in-memory graph a
+compaction normally publishes — it streams the merged records straight into the
+image. That is **117.4 bytes a record** not allocated and **23.1% off the
+anonymous peak** during the compaction (157.8 → 121.4 MiB at 400,000 × 512 B,
+four interleaved rounds; `docs/benchmarks.md`). The image is byte-identical to
+the one `Compact()` writes, which is a test rather than an intention. Wall clock
+is unchanged as far as this machine can resolve.
+
+One consequence is worth stating because it is observable if you look: between
+the commit and the reopen, the old handle still reports the delta it had before
+the compaction, because nothing was published over it. Reads through it are
+correct — the image holds exactly what the old image and that delta held between
+them — and the reopen on the next line is what makes the figures right again. You
+will only see it if you call `StorageStats` on a handle you have already asked to
+be replaced.
+
 Two things to know before using it.
 
 **It is an open, so it costs like one** — the image mapped, the header and

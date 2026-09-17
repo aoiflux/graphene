@@ -495,7 +495,7 @@ and the profile of the first compaction shows `cloneBytes` at 102 MiB flat.
 
 ```
 transient  ≈  512 B (mean blob) × delta records          <- the compaction policy bounds this
-            + 118 B × live nodes + 142 B × live edges    <- the new graph, unavoidable
+            + 118 B × live nodes + 142 B × live edges    <- the new graph; see 4.2b
             +  16 B × live records                       <- image write and streamed payload
 ```
 
@@ -513,6 +513,34 @@ One term in it is an operator's decision and the rest are not. A store that is n
 compacted accumulates an unbounded delta, and the compaction that finally runs pays for
 all of it at once — which is why `CompactionPolicy.MaxDeltaBytes` (Phase 6) is a memory
 control and not only a disk one.
+
+### 4.2b The second term is not unavoidable on the path that reopens
+
+The model above called the graph term unavoidable, and for `Compact()` it is: a store
+that stays open serves reads from a view, a view holds a `CSRGraph`, and after a
+compaction that graph has to be the new image or the store is serving the old one.
+
+`CompactAndReopen` is different and always was. It is `CompactCtx`, `Close`,
+`OpenWithOptions` — so the graph it builds is published and then dropped by the
+close on the next line, and the store reads the image back off disk. Since
+2026-09-17 that path builds no graph: the merged record sequence goes straight into
+the image encoder. See `disk/compact_stream.go`.
+
+**The term was measured on its way out, and it is the term.** Four interleaved
+rounds at 400,000 × 512 B: allocation across the compaction falls
+**144.844 MB → 97.379 MB**, which over 404,000 records is **117.4 B a record**
+against the 118 B this model predicts. The anonymous peak during the compaction
+falls 157.8 → 121.4 MiB, a ratio of 0.769. `docs/benchmarks.md` carries the
+arms, the ranges and the discarded first attempt.
+
+**What replaces the graph is not a smaller copy of it.** Two things only: the header
+counts are patched after the flush, as the section table offset and both GIDX counts
+already were, and the property-index liveness filter is answered from the merge's own
+inputs rather than from the built image. Neither is proportional to the store.
+
+So the third term is a floor for the reopening path now, not the second. What that
+path still holds during a compaction is the delta the policy bounds, the index
+intermediates of 4.2a, and the image write's own buffer.
 
 ### 4.2a The fourth term: a constant, and the only one an operator sets directly
 
@@ -2187,6 +2215,19 @@ reduce what a compaction holds *while it runs* — the peak during the pass is u
 not what this moves; **Phase 4 is**. And the trade is more major faults, of which only the
 residency half has been measured, which is why nothing about the default configuration in
 this table changes.
+
+**Phase 4 has since taken its half**, and the two are additive because they move different
+things at different moments: advice changes what is held *after* a pass, and this changes
+what is held *during* one. `CompactAndReopen` builds no `CSRGraph`, which takes
+**117.4 B a record** out of the compaction's allocation and **23.1%** off its anonymous
+peak (157.8 → 121.4 MiB, four interleaved rounds at 400,000 × 512 B). That is the
+column this paragraph said advice did not reach.
+
+It reaches it on the *reopening* arm only. `Compact()` on a store that stays open still
+builds the graph it publishes, and is measurably unchanged — allocation 1.00002 against
+the previous commit. So the peak column above improves for the configuration
+`USER_GUIDE.md` §10 recommends, which is the bounded delta **plus a reopen**, and does not
+improve for the one it advises against.
 
 Windows has no post-mapping advice at all. Its answer is `disk.LimitWorkingSet`, a hard
 working-set cap that trims rather than kills — and, as the paragraph above says, windows is

@@ -3961,3 +3961,120 @@ for R in 1 2 3 4; do
   done
 done
 ```
+
+## What not building the graph is worth (2026-09-17)
+
+`CompactAndReopen` compacted, published the graph it had just built, closed the
+store and opened the directory again. The graph was therefore constructed,
+serialised, published and dropped by the `Close` on the next line — and it is the
+largest thing a compaction holds, at roughly 118 bytes a node and 142 an edge.
+Phase 4 of `docs/PLAN_BOUNDED_INGEST.md` takes it out.
+
+### The gate came first, and it is a measurement
+
+The plan makes Phase 4 conditional on 0a confirming that the term peaks, so that
+was run before a line was written. The three stage metrics carry the process's
+peak, which is **monotone**: it never falls, so the rise between two boundaries is
+exactly what happened between them, with none of the variance a polled sample
+carries.
+
+`BenchmarkRSS_CompactStages`, 400,000 × 512 B on the cached fixture, one
+`Compact()`:
+
+| stage boundary | process peak | rise | current anon |
+|---|---:|---:|---:|
+| pin | 290.2 MiB | — | 101.3 |
+| build | 488.1 | **+197.9** | 158.3 |
+| commit | 488.1 | **+0.035** | 158.4 |
+
+The build is the stage; the commit contributes 0.018% of its figure. The
+anonymous half rises 57.0 MiB over 404,000 records, **148 B a record**, against the
+model's ~118 B a node for the graph.
+
+**The first run of this was thrown away** and is recorded here rather than
+deleted: it built the 400,000-node fixture in the same process, and
+`PeakWorkingSetSize` is monotone for the whole process, so all three boundaries
+read 2,151 MiB and every rise was zero. The fixture has to be cached for the peak
+to mean anything, which is the same reason `GRAPHENE_RSS_DIR` exists.
+
+### The arm, and why it needs no switch in the engine
+
+"Compact, then close and reopen" is what `CompactAndReopenCtx` was, line for line:
+`CompactCtx`, `Close`, `OpenWithOptions`. So `BenchmarkRSS_CompactStream` writes
+the materialising arm out longhand and calls the method for the streaming one, and
+the only thing that differs is which build ran. There is no option and no test
+hook — nothing in the engine exists in order to be measured.
+
+400,000 × 512 B, a delta of 1% of the live set, four rounds, arms interleaved,
+medians.
+
+| figure | materialise | stream | stream/materialise |
+|---|---:|---:|---:|
+| `compactAllocB` — bytes allocated | 144.844 MB | **97.379 MB** | **0.672** |
+| `compactPeakAnonMiB` — anonymous peak during | 157.8 | **121.4** | **0.769** |
+| `compactPeakMiB` — working set peak during | 488.3 | 452.7 | 0.927 |
+| `compactRiseMiB` — peak above the settled figure | 227.5 | 190.4 | 0.837 |
+| `compactAllocs` — allocation count | 19,301 | 20,012 | 1.037 |
+| `compactMs` | 4,778 | 5,346 | 1.119 |
+
+The allocation figure is the one to trust: `TotalAlloc` across the call is exact
+and attributable where a polled residency peak is a floor on the truth. **47.47 MB
+less over 404,000 records is 117.4 B a record**, and the model predicts ~118 B a
+node. That is the term and nothing else.
+
+The ranges do not touch on allocation
+(144.808–144.894 against 97.331–97.390), on the anonymous peak
+(153.1–159.8 against 120.8–121.5), or on the working set peak. `compactAllocs`
+overlaps heavily and is noise.
+
+### The wall clock is not resolvable, and that was checked rather than assumed
+
+The medians differ by 1.119. The materialising arm's own four rounds span
+4,446–5,418 ms — a **1.22× swing within one arm** — so the difference between
+the arms is smaller than the spread inside one of them. This file puts the
+resolution of this dataset at roughly 25%, and this is well inside it.
+
+That is a reason to say "not resolvable", not a reason to stop looking. A CPU
+profile of the streaming arm bounds what the change could have added:
+
+| | share of samples |
+|---|---:|
+| `runtime.cgocall` (windows file IO) | 28.4% |
+| SHA-256 (Merkle leaves and the image digest) | ~21% |
+| `slices.BinarySearch[...NodeID]` — the new membership test | **1.26%** |
+
+The two large terms are identical work in both arms. The oracle Phase 4 introduced
+is 1.26%, which cannot produce a 12% difference.
+
+### The first A/B was wrong, and it is here because it was wrong
+
+It sampled `g.CompactAndReopen()` for the streaming arm and `g.Compact()` alone for
+the materialising one, with that arm's reopen outside the sampled region. A reopen
+parses the whole image it has just written, which is the largest allocation either
+arm makes, so the instrument read a **1.38× allocation regression that was
+entirely a reopen being inside one window and outside the other**.
+
+Compact-and-reopen is the unit a caller asks for, so it is the unit measured, and
+both arms now do the same close and the same open. This is not the first A/B in this file
+to be discarded for the instrument rather than the code, and it is kept for the
+same reason the others are: a measurement that was wrong is evidence about the
+measuring.
+
+### What did not move, measured rather than argued
+
+`Compact()` is unchanged by design — a store that stays open has to publish what
+it built — and the encoder extraction had to cost it nothing.
+`BenchmarkRSS_CompactIncremental`, four rounds interleaved against the previous
+commit, 50,000 × 512 B:
+
+| figure | Phase 4 | previous commit | ratio |
+|---|---:|---:|---:|
+| `compactAllocB` | 13,398,800 | 13,398,584 | **1.00002** |
+| `compactAllocBPerRecord` | 265.3 | 265.4 | 1.000 |
+| `compactAllocs` | 6,468 | 6,472 | 0.999 |
+| `compactMs` | 590 | 591.5 | 0.997 |
+| `compactPeakMiB` | 81.13 | 80.68 | 1.006 |
+
+The read path is not in this list because Phase 4 changed no line it executes: the
+whole of the change is in the image encoder, the compaction and the commit.
+

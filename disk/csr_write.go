@@ -381,6 +381,70 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 	return m.buf, nil
 }
 
+// countUnknown is what an imageSource passes for a header count it cannot
+// supply before the records are written.
+const countUnknown = -1
+
+// imageInput is everything the encoder needs to know about what it is writing.
+//
+// It exists because a compaction that is going to reopen the store has no use
+// for the graph it builds. CompactAndReopen builds a CSRGraph, writes it, closes
+// the store and reads the image back -- and that graph costs roughly 118 bytes
+// per node and 142 per edge, held live for the whole write, which measured as
+// the stage that raises a compaction's peak by 197.9 MiB at 400,000 records
+// while the commit after it raises it by 0.035. So the encoder was given a way
+// to be pointed at a merged record sequence instead; see
+// docs/PLAN_BOUNDED_INGEST.md Phase 4.
+//
+// Every field here was a read off the receiver in the body below. Nothing else
+// was: the rest of what the encoder did with a graph was write it back
+// afterwards, which is imageIdentity.
+type imageInput struct {
+	// nodes and edges are walked once each, in ascending identifier order --
+	// which is the order the records go down, the order the Merkle leaves are
+	// hashed in, and the order every reader since v2 has assumed. A sequence
+	// that yields out of order produces a file no reader will accept, and
+	// nothing here checks it: the two callers are a CSRGraph's own arena walk
+	// and a merge of two ascending inputs.
+	nodes iter.Seq[nodeRecord]
+	edges iter.Seq[rawEdge]
+
+	// nodeCount and edgeCount are written into the header, which goes down
+	// before the first record does. countUnknown means the source cannot say
+	// yet and the encoder will patch the header once it has counted.
+	nodeCount, edgeCount int
+
+	nodeSeqHW, edgeSeqHW, commitSeqHW uint64
+	lastCompactUnixNano               int64
+}
+
+// imageIdentity is what the encoder learned about the image it wrote.
+//
+// An image's identity is a property of the image, so it comes out of the write
+// rather than going into it: the Merkle roots are folded as the leaves go down,
+// and the attestation signs those roots. A CSRGraph gets them put back on it,
+// which is what serialising one has always done. A streaming build has no graph
+// to put them on and takes them as a return value -- the commit needs the
+// snapshot root for its audit record and the counts for its metric, and those
+// are the whole of what it needed the graph for.
+//
+// The wrote* flags say which fields the encoder actually produced. A section
+// the payload did not ask for leaves its field zero, and zero is not the same
+// as "none" for a caller holding a graph that was parsed from a file.
+type imageIdentity struct {
+	roots       SnapshotRoots
+	tombstones  []Tombstone
+	attestation Attestation
+
+	wroteRoots       bool
+	wroteTombstones  bool
+	wroteAttestation bool
+
+	// nodeCount and edgeCount are what the encoder counted on the way past,
+	// which is the figure in the header whether the source declared it or not.
+	nodeCount, edgeCount int
+}
+
 // SerialiseTo writes the image into dst, which must be empty and is written
 // from offset zero.
 //
@@ -394,9 +458,80 @@ func (g *CSRGraph) SerialiseWithPayload(payload csrPayload) ([]byte, error) {
 // is a property of the image, and the CSRGraph that produced it is the one
 // object that can report it afterwards.
 func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error {
+	id, err := writeImage(dst, g.imageInput(), payload)
+	if err != nil {
+		return err
+	}
+	// The write-backs this call has always done, and each one only where the
+	// encoder actually wrote the section.
+	//
+	// The conditions are carried out of the encoder as flags rather than
+	// re-tested here, and that is not fastidiousness: a graph parsed from a file
+	// carries the roots, tombstones and attestation that file held, and
+	// re-serialising it without WithSnapshotRoots must leave them alone rather
+	// than overwrite them with the zero value the encoder never wrote. Two
+	// copies of that condition could drift; one cannot.
+	if id.wroteTombstones {
+		g.tombstones = id.tombstones
+	}
+	if id.wroteRoots {
+		g.roots = id.roots
+	}
+	if id.wroteAttestation {
+		g.attestation = id.attestation
+	}
+	return nil
+}
+
+// imageInput is a CSRGraph in the terms the encoder needs it.
+func (g *CSRGraph) imageInput() imageInput {
+	return imageInput{
+		nodes:               g.Nodes(),
+		edges:               g.Edges(),
+		nodeCount:           g.NodeCount(),
+		edgeCount:           g.EdgeCount(),
+		nodeSeqHW:           g.nodeSeqHW,
+		edgeSeqHW:           g.edgeSeqHW,
+		commitSeqHW:         g.commitSeqHW,
+		lastCompactUnixNano: g.lastCompactUnixNano,
+	}
+}
+
+// identity is what this graph would tell a commit about the image it produced.
+//
+// A materialising compaction serialises a graph and then commits it, so the
+// figures the commit reports -- the counts for its metric, the snapshot root for
+// its audit record -- come off the graph afterwards rather than out of the
+// write. A streaming one has the same figures returned to it directly. The two
+// paths report the same three things from the same image, which is the point of
+// the type being shared rather than each path growing its own.
+func (g *CSRGraph) identity() imageIdentity {
+	return imageIdentity{
+		roots:       g.roots,
+		tombstones:  g.tombstones,
+		attestation: g.attestation,
+		nodeCount:   g.NodeCount(),
+		edgeCount:   g.EdgeCount(),
+	}
+}
+
+// writeImage is the encoder, and it is the only one.
+//
+// It was the body of SerialiseTo until Phase 4 of docs/PLAN_BOUNDED_INGEST.md
+// needed an image written from a merged record sequence rather than from a
+// graph. Everything the old body read off its receiver was a count, a
+// high-water mark, or a field it wrote back when it had finished — so what it
+// needs is imageSource, and what it produces is imageIdentity.
+//
+// A second encoder was the alternative and was never a real one. Two
+// implementations that agree today are a format with two definitions, and the
+// test that holds the streaming path to a byte-identical image would then be
+// comparing two guesses rather than one encoder reached two ways.
+func writeImage(dst io.ReadWriteSeeker, in imageInput, payload csrPayload) (imageIdentity, error) {
+	var out imageIdentity
 	payload = payload.withPropStreams()
 	if _, err := dst.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("serialise: seek to start: %w", err)
+		return out, fmt.Errorf("serialise: seek to start: %w", err)
 	}
 	// One buffer for the whole serialisation: the writer fills it on the way
 	// out and the digest pass reads through it afterwards.
@@ -414,28 +549,39 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 		roots = newSnapshotRootStream(snapshotBodyVersion)
 	}
 
-	// Count valid nodes and edges. Build maintains both counters, so the header
-	// counts cost nothing to produce and cannot disagree with the record stream
-	// written below: the same liveness test decides both.
-	nodeCount := g.NodeCount()
-	edgeCount := g.EdgeCount()
+	// The header's counts. A graph maintains both counters, so they cost nothing
+	// to produce and cannot disagree with the record stream written below: the
+	// same liveness test decides both.
+	//
+	// A merged sequence has no such counter, and counting it would mean a pass
+	// over the whole of it before the first byte went down — on a store this
+	// exists to bound, a second read of the image. So countUnknown writes a zero
+	// and the real figure is patched in after the flush, which is what the
+	// section table offset and both GIDX counts have always done. The records
+	// between are the same bytes either way: nothing in the stream is positioned
+	// relative to the count.
+	nodeCount, edgeCount := in.nodeCount, in.edgeCount
+	countsKnown := nodeCount != countUnknown && edgeCount != countUnknown
+	var wroteNodes, wroteEdges int
 
 	// Header. The first 46 bytes keep their v6 meaning and position; v8 appends
 	// to them rather than rearranging, so a reader can identify a file and read
 	// its counts before it understands anything else. See csr_v8.go.
 	iw.str("GCSR")
 	iw.u16(payload.imageVersion())
-	iw.u64(uint64(nodeCount))
-	iw.u64(uint64(edgeCount))
+	nodeCountPos := int64(iw.at())
+	iw.u64(uint64(max(nodeCount, 0)))
+	edgeCountPos := int64(iw.at())
+	iw.u64(uint64(max(edgeCount, 0)))
 	// Sequence high-water marks (version 5+).
-	iw.u64(g.nodeSeqHW)
-	iw.u64(g.edgeSeqHW)
+	iw.u64(in.nodeSeqHW)
+	iw.u64(in.edgeSeqHW)
 	// indexOffset (v6/v7). Written as 0 in v8: the property index is a section
 	// now. The field stays so the header prefix does not shift.
 	iw.u64(0)
 	// v8 additions.
-	iw.u64(g.commitSeqHW)
-	iw.u64(uint64(g.lastCompactUnixNano))
+	iw.u64(in.commitSeqHW)
+	iw.u64(uint64(in.lastCompactUnixNano))
 	sectionTableOffsetPos := int64(iw.at())
 	iw.u64(0) // patched once the directory is placed
 	digestPos := int64(iw.at())
@@ -445,7 +591,8 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	// Nodes (variable-length labels), ascending by ID - the order Nodes yields,
 	// the order the Merkle leaves are hashed in, and the order every reader
 	// since v2 has assumed.
-	for n := range g.Nodes() {
+	for n := range in.nodes {
+		wroteNodes++
 		iw.u64(uint64(n.ID))
 		iw.u8(byte(len(n.Labels)))
 		for _, lbl := range n.Labels {
@@ -459,7 +606,8 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	}
 
 	// Edges (variable-length labels), ascending by ID for the same reasons.
-	for e := range g.Edges() {
+	for e := range in.edges {
+		wroteEdges++
 		iw.u64(uint64(e.ID))
 		iw.u64(uint64(e.Src))
 		iw.u64(uint64(e.Dst))
@@ -502,7 +650,7 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	if src := payload.MappedIndex; src != nil {
 		var err error
 		if sections, err = writeMappedIndexSections(iw, sections, *src, roots); err != nil {
-			return err
+			return out, err
 		}
 	} else {
 		indexOffset := iw.at()
@@ -575,7 +723,7 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	if src := payload.Composites; src != nil {
 		cpxOffset := iw.at()
 		if _, err := writeGCPX(iw, cpxOffset, *src); err != nil {
-			return err
+			return out, err
 		}
 		sections = append(sections, csrSection{
 			// OPTIONAL, unlike GPIX, and the difference is a fallback that really
@@ -591,7 +739,7 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 
 	// Tombstones go down before the roots, because the roots commit to them.
 	if payload.WithSnapshotRoots && len(payload.Tombstones) > 0 {
-		g.tombstones = payload.Tombstones
+		out.tombstones, out.wroteTombstones = payload.Tombstones, true
 		tsOffset := iw.at()
 		iw.bytes(appendTombstoneSection(nil, payload.Tombstones))
 		sections = append(sections, csrSection{
@@ -607,9 +755,9 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	}
 
 	if payload.WithSnapshotRoots {
-		g.roots = roots.finish(payload.Tombstones, payload.PrevSnapshotRoot)
+		out.roots, out.wroteRoots = roots.finish(payload.Tombstones, payload.PrevSnapshotRoot), true
 		rootOffset := iw.at()
-		iw.bytes(appendSnapshotSection(nil, g.roots))
+		iw.bytes(appendSnapshotSection(nil, out.roots))
 		sections = append(sections, csrSection{
 			// CRITICAL. This section is the file's integrity evidence, so a build
 			// that cannot interpret it must refuse rather than open the file and
@@ -625,11 +773,11 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	// roots exist.
 	if payload.WithSnapshotRoots && payload.Signer != nil {
 		att, err := signAttestation(payload.Signer, payload.AttestActorID,
-			payload.AttestUnixNano, g.roots.Snapshot, payload.PrevAttestation)
+			payload.AttestUnixNano, out.roots.Snapshot, payload.PrevAttestation)
 		if err != nil {
-			return err
+			return out, err
 		}
-		g.attestation = att
+		out.attestation, out.wroteAttestation = att, true
 		attOffset := iw.at()
 		iw.bytes(appendAttestationSection(nil, att))
 		sections = append(sections, csrSection{
@@ -646,7 +794,7 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	iw.bytes(appendSectionDirectory(nil, sections))
 
 	if err := iw.flush(); err != nil {
-		return fmt.Errorf("serialise: %w", err)
+		return out, fmt.Errorf("serialise: %w", err)
 	}
 
 	// Every field written above as zeros, patched now that its value is known.
@@ -655,23 +803,43 @@ func (g *CSRGraph) SerialiseTo(dst io.ReadWriteSeeker, payload csrPayload) error
 	}
 	if nodePropsCountPos >= 0 {
 		if err := patchU64(nodePropsCountPos, nodePropCount); err != nil {
-			return err
+			return out, err
 		}
 		if err := patchU64(edgePropsCountPos, edgePropCount); err != nil {
-			return err
+			return out, err
 		}
 	}
 	if err := patchU64(sectionTableOffsetPos, sectionTableOffset); err != nil {
-		return err
+		return out, err
+	}
+	// The header counts, for a source that could not supply them. A source that
+	// could is not patched at all: the bytes would be the same bytes, and a seek
+	// per compaction is worth avoiding for nothing gained.
+	out.nodeCount, out.edgeCount = wroteNodes, wroteEdges
+	if !countsKnown {
+		if err := patchU64(nodeCountPos, uint64(wroteNodes)); err != nil {
+			return out, err
+		}
+		if err := patchU64(edgeCountPos, uint64(wroteEdges)); err != nil {
+			return out, err
+		}
+	} else if wroteNodes != nodeCount || wroteEdges != edgeCount {
+		// The source declared a count and then yielded a different number of
+		// records. The header would name one figure and the stream hold another,
+		// which is a file every reader would parse and none would parse
+		// correctly — so it is refused here, where the file is still a temp name
+		// nobody has been told about.
+		return out, fmt.Errorf("serialise: source declared %d nodes and %d edges but wrote %d and %d",
+			nodeCount, edgeCount, wroteNodes, wroteEdges)
 	}
 
 	// Digest last: it covers the finished image with its own field zeroed, so
 	// everything above — header, records, sections, directory — is inside it.
 	digest, err := digestOf(dst, buf)
 	if err != nil {
-		return err
+		return out, err
 	}
-	return patchAt(dst, digestPos, digest[:])
+	return out, patchAt(dst, digestPos, digest[:])
 }
 
 // patchAt overwrites len(p) bytes at off.

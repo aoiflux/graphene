@@ -1016,6 +1016,14 @@ if err := g.Compact(); err != nil { // the final fold
 return g.Close()
 ```
 
+**The reopen also makes the compaction itself cheaper**, which was not why it is
+here. Because `CompactAndReopen` is going to close the handle, it does not build
+the in-memory graph a compaction normally publishes — it writes the merged
+records straight out. That is **117.4 bytes a record** not allocated and **23.1%
+off the anonymous peak while the compaction runs**, measured over four interleaved
+rounds and recorded in `docs/benchmarks.md`. The image is byte-identical to the one
+`Compact()` writes. Nothing in this recipe changes for it; it is the same call.
+
 **Why the bound alone is not enough.** A compaction writes a new image, but the
 records this process is *holding* still carry their own payload bytes, because
 `AttachBase` — the step that makes a record address the mapped file instead of
