@@ -14,6 +14,7 @@ import (
 	"iter"
 	"slices"
 
+	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -122,6 +123,34 @@ func (sn *snapshot) ForEachEdgeProperty(fn func(id store.EdgeID, key string, val
 		}
 		return fn(id, key, value)
 	})
+}
+
+// NodePropertyEntries implements store.PropertyEntryGrouper for a snapshot. See
+// disk/scan.go for why the entries are filtered against the frozen records.
+func (sn *snapshot) NodePropertyEntries(id store.NodeID) []store.PropertyEntry {
+	s, err := sn.live()
+	if err != nil {
+		return nil
+	}
+	if !s.NodeExists(id) {
+		return nil
+	}
+	return index.CopyEntries(s.propIdx.NodeEntriesOf(id))
+}
+
+// EdgePropertyEntries implements store.PropertyEntryGrouper for a snapshot.
+func (sn *snapshot) EdgePropertyEntries(id store.EdgeID) []store.PropertyEntry {
+	s, err := sn.live()
+	if err != nil {
+		return nil
+	}
+	s.mu.RLock()
+	the := s.edgeExistsLocked(id)
+	s.mu.RUnlock()
+	if !the {
+		return nil
+	}
+	return index.CopyEntries(s.propIdx.EdgeEntriesOf(id))
 }
 
 // --- Declarations ---

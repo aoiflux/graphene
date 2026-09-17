@@ -2144,3 +2144,13 @@ func (s *Store) ForEachNodeProperty(fn func(id store.NodeID, key string, value [
 func (s *Store) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value []byte) bool) {
 	s.propIdx.ForEachEdgeProperty(fn)
 }
+
+// NodePropertyEntries implements store.PropertyEntryGrouper.
+func (s *Store) NodePropertyEntries(id store.NodeID) []store.PropertyEntry {
+	return index.CopyEntries(s.propIdx.NodeEntriesOf(id))
+}
+
+// EdgePropertyEntries implements store.PropertyEntryGrouper.
+func (s *Store) EdgePropertyEntries(id store.EdgeID) []store.PropertyEntry {
+	return index.CopyEntries(s.propIdx.EdgeEntriesOf(id))
+}

@@ -15,6 +15,15 @@ package bulk
 //	["GDMP"][format:2]
 //	then, repeated: [type:1][length:4][payload:length][crc32:4]
 //
+// # What Format 2 added
+//
+// A node or edge payload ends with an entry list -- [count:4] then, repeated,
+// [keyLen:2][key][valueLen:4][value] -- and the header payload ends with an
+// [inline:1] flag. The list is always present in a Format 2 record and is empty
+// when the dump does not use it, so parsing is one shape rather than two; the
+// flag in the header is what says whether the dump uses it at all. See
+// bulk.Format for why the entries moved.
+//
 // The CRC covers the type, the length and the payload — the same three the WAL
 // covers, for the same reason. A checksum over the payload alone leaves the
 // framing itself unprotected, so a corrupted length is read as a valid length
@@ -94,6 +103,10 @@ type dumpEncoder struct {
 	buf  []byte // reused payload scratch
 	rec  []byte // reused frame scratch
 	done bool
+
+	// inline is taken from the header the walk hands over, so the encoder and
+	// the dump it writes cannot disagree about which shape it is.
+	inline bool
 }
 
 func (e *dumpEncoder) frame(t uint8, payload []byte) error {
@@ -132,12 +145,36 @@ func (e *dumpEncoder) header(h Header) error {
 		return fmt.Errorf("bulk: write dump: %w", err)
 	}
 
+	e.inline = h.InlineEntries
 	e.buf = e.buf[:0]
 	e.buf = appendStrings(e.buf, h.OrderedNodeKeys)
 	e.buf = appendStrings(e.buf, h.OrderedEdgeKeys)
 	e.buf = appendTuples(e.buf, h.CompositeNodeKeys)
 	e.buf = appendTuples(e.buf, h.CompositeEdgeKeys)
+	e.buf = append(e.buf, boolByte(h.InlineEntries))
 	return e.frame(dumpHeader, e.buf)
+}
+
+func boolByte(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// appendEntries writes a record's index entries.
+//
+// Always called on a Format 2 record, with nil for a record that carries none,
+// so every payload has the same shape and the decoder has one path. Order is
+// the source's -- store.PropertyEntryGrouper sorts by key then value -- which is
+// what keeps two dumps of one unchanged graph byte-identical.
+func appendEntries(dst []byte, entries []store.PropertyEntry) []byte {
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(entries)))
+	for _, p := range entries {
+		dst = appendString16(dst, p.Key)
+		dst = appendBytes32(dst, p.Value)
+	}
+	return dst
 }
 
 func appendStrings(dst []byte, ss []string) []byte {
@@ -156,7 +193,10 @@ func appendTuples(dst []byte, ts [][]string) []byte {
 	return dst
 }
 
-func (e *dumpEncoder) node(n *store.Node) error {
+func (e *dumpEncoder) node(n *store.Node) error { return e.nodeWith(n, nil) }
+
+// nodeWith implements inlineEncoder.
+func (e *dumpEncoder) nodeWith(n *store.Node, entries []store.PropertyEntry) error {
 	e.buf = e.buf[:0]
 	e.buf = binary.BigEndian.AppendUint64(e.buf, uint64(n.ID))
 	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(len(n.Labels)))
@@ -164,10 +204,14 @@ func (e *dumpEncoder) node(n *store.Node) error {
 		e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(l))
 	}
 	e.buf = appendBytes32(e.buf, n.Properties)
+	e.buf = appendEntries(e.buf, entries)
 	return e.frame(dumpNode, e.buf)
 }
 
-func (e *dumpEncoder) edge(ed *store.Edge) error {
+func (e *dumpEncoder) edge(ed *store.Edge) error { return e.edgeWith(ed, nil) }
+
+// edgeWith implements inlineEncoder.
+func (e *dumpEncoder) edgeWith(ed *store.Edge, entries []store.PropertyEntry) error {
 	e.buf = e.buf[:0]
 	e.buf = binary.BigEndian.AppendUint64(e.buf, uint64(ed.ID))
 	e.buf = binary.BigEndian.AppendUint64(e.buf, uint64(ed.Src))
@@ -178,6 +222,7 @@ func (e *dumpEncoder) edge(ed *store.Edge) error {
 		e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(l))
 	}
 	e.buf = appendBytes32(e.buf, ed.Properties)
+	e.buf = appendEntries(e.buf, entries)
 	return e.frame(dumpEdge, e.buf)
 }
 
@@ -301,8 +346,55 @@ func (d *dumpDecoder) header() (Header, error) {
 	if h.CompositeEdgeKeys, err = rd.tuples(); err != nil {
 		return Header{}, err
 	}
+	// Format 1 header payloads end here. The flag is read only for a format
+	// that has one, so an older dump is not made to look truncated by a field
+	// it was written before.
+	if d.format >= 2 {
+		f, err := rd.u8()
+		if err != nil {
+			return Header{}, fmt.Errorf("bulk: dump header has no inline-entries flag: %w", err)
+		}
+		h.InlineEntries = f != 0
+	}
 	d.hdr = payload
 	return h, nil
+}
+
+// entries reads a Format 2 record's inline entry list.
+//
+// Every length is bounded against the bytes actually left in the payload before
+// anything is sized by it, which is the rule the file comment sets for reading a
+// dump this package did not write: the count is checked against the smallest an
+// entry can be, so a corrupted count refuses instead of allocating.
+func (d *dumpDecoder) entries(rd *cursor) ([]store.PropertyEntry, error) {
+	if d.format < 2 {
+		return nil, nil
+	}
+	n, err := rd.u32()
+	if err != nil {
+		return nil, fmt.Errorf("bulk: dump record %d has no entry count: %w", d.n, err)
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	// The cheapest entry is a two-byte key length and a four-byte value length.
+	if min := int(n) * 6; min > rd.left() {
+		return nil, fmt.Errorf("bulk: dump record %d declares %d entries in %d bytes",
+			d.n, n, rd.left())
+	}
+	out := make([]store.PropertyEntry, n)
+	for i := range out {
+		key, err := rd.string16()
+		if err != nil {
+			return nil, fmt.Errorf("bulk: dump record %d entry %d: %w", d.n, i, err)
+		}
+		value, err := rd.bytes32()
+		if err != nil {
+			return nil, fmt.Errorf("bulk: dump record %d entry %d: %w", d.n, i, err)
+		}
+		out[i] = store.PropertyEntry{Key: key, Value: value}
+	}
+	return out, nil
 }
 
 func (d *dumpDecoder) next() (record, error) {
@@ -325,7 +417,11 @@ func (d *dumpDecoder) next() (record, error) {
 		if err != nil {
 			return record{}, err
 		}
-		return record{kind: recNode, node: &store.Node{
+		entries, err := d.entries(rd)
+		if err != nil {
+			return record{}, err
+		}
+		return record{kind: recNode, entries: entries, node: &store.Node{
 			ID:         store.NodeID(id),
 			Labels:     nodeLabelsIn(labels),
 			Properties: props,
@@ -356,7 +452,11 @@ func (d *dumpDecoder) next() (record, error) {
 		if err != nil {
 			return record{}, err
 		}
-		return record{kind: recEdge, edge: &store.Edge{
+		entries, err := d.entries(rd)
+		if err != nil {
+			return record{}, err
+		}
+		return record{kind: recEdge, entries: entries, edge: &store.Edge{
 			ID:         store.EdgeID(id),
 			Src:        store.NodeID(src),
 			Dst:        store.NodeID(dstID),
@@ -425,6 +525,16 @@ func (c *cursor) take(n int) ([]byte, error) {
 	out := c.b[c.off : c.off+n]
 	c.off += n
 	return out, nil
+}
+
+func (c *cursor) left() int { return len(c.b) - c.off }
+
+func (c *cursor) u8() (uint8, error) {
+	b, err := c.take(1)
+	if err != nil {
+		return 0, err
+	}
+	return b[0], nil
 }
 
 func (c *cursor) u16() (uint16, error) {

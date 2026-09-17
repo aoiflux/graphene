@@ -557,6 +557,23 @@ func (g *Graph) DeclareOrderedProperty(key string) error {
 	return d.DeclareOrderedNodeProperty(key)
 }
 
+// DeclareOrderedNodeProperty is DeclareOrderedProperty under the name
+// store.OrderedIndexDeclarer uses.
+//
+// Two names for one call, which is a cost worth paying once. The façade drops
+// the Node because on a Graph the unqualified word means a node and the edge
+// form says so; the interface cannot, because it names both halves. Without this
+// a *Graph does not satisfy OrderedIndexDeclarer, and the failure is silent:
+// bulk.ImportDump takes its destination as an interface and applies whatever
+// declarations it satisfies, so `bulk.ImportDump(r, g, opts)` -- the obvious
+// call -- would import every record and quietly drop every ordered and composite
+// declaration the dump carried, leaving a store that answers correctly and
+// scans where it should seek. Same defect ForEachNodeProperty was written out to
+// avoid, one interface along.
+func (g *Graph) DeclareOrderedNodeProperty(key string) error {
+	return g.DeclareOrderedProperty(key)
+}
+
 // DeclareOrderedEdgeProperty is DeclareOrderedProperty for edge properties.
 func (g *Graph) DeclareOrderedEdgeProperty(key string) error {
 	d, ok := g.GraphStore.(store.OrderedIndexDeclarer)
@@ -869,6 +886,13 @@ func (g *Graph) DeclareCompositeProperties(keys []string) error {
 		return nil
 	}
 	return d.DeclareCompositeNodeProperties(keys)
+}
+
+// DeclareCompositeNodeProperties is DeclareCompositeProperties under the name
+// store.CompositeIndexDeclarer uses. See DeclareOrderedNodeProperty for why both
+// names exist.
+func (g *Graph) DeclareCompositeNodeProperties(keys []string) error {
+	return g.DeclareCompositeProperties(keys)
 }
 
 // DeclareCompositeEdgeProperties is DeclareCompositeProperties for edge
@@ -1275,4 +1299,23 @@ func (g *Graph) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value [
 	if pe, ok := g.GraphStore.(store.PropertyEnumerator); ok {
 		pe.ForEachEdgeProperty(fn)
 	}
+}
+
+// NodePropertyEntries implements store.PropertyEntryGrouper, written out for the
+// same reason ForEachNodeProperty is: an embedded interface promotes only its
+// own method set, and a Graph that silently failed the assertion would export a
+// Format 2 dump with every record's entries missing.
+func (g *Graph) NodePropertyEntries(id store.NodeID) []store.PropertyEntry {
+	if pg, ok := g.GraphStore.(store.PropertyEntryGrouper); ok {
+		return pg.NodePropertyEntries(id)
+	}
+	return nil
+}
+
+// EdgePropertyEntries implements store.PropertyEntryGrouper.
+func (g *Graph) EdgePropertyEntries(id store.EdgeID) []store.PropertyEntry {
+	if pg, ok := g.GraphStore.(store.PropertyEntryGrouper); ok {
+		return pg.EdgePropertyEntries(id)
+	}
+	return nil
 }

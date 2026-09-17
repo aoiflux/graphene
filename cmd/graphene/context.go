@@ -160,6 +160,17 @@ func (c *Context) ReopenGraph() error {
 	return nil
 }
 
+// AdoptGraph installs a handle the caller already holds, for the calls that
+// return one instead of reopening in place.
+//
+// graphene.Graph.BulkLoad and ImportDumpBulk both close the receiver and hand
+// back a fresh handle, so a command that used one and did not do this would
+// leave the framework's closer holding the handle that was already closed --
+// and the Result would be rendered from a graph nobody could read. Same field
+// and same reason as ReopenGraph; only the way the new handle was obtained
+// differs.
+func (c *Context) AdoptGraph(g *graphene.Graph) { c.graph = g }
+
 // open acquires whatever the command declared, and returns the closer.
 //
 // Every path goes through OpenWithOptions rather than the four convenience

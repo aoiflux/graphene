@@ -2459,6 +2459,94 @@ make one span a million records, and buffering to pretend otherwise would move
 the failure from "half imported" to "out of memory". Import into an empty store
 and discard the directory if it fails.
 
+That last sentence has an exception, and it is the fast path below.
+
+### Importing into an empty store in one pass
+
+```go
+func (g *Graph) ImportDumpBulk(open func() (io.ReadCloser, error),
+    opts BulkImportOptions) (*Graph, bulk.Summary, error)
+func (g *Graph) ImportDumpBulkCtx(ctx context.Context,
+    open func() (io.ReadCloser, error), opts BulkImportOptions) (*Graph, bulk.Summary, error)
+
+type BulkImportOptions struct {
+    SkipDeclarations bool
+    SkipProperties   bool
+}
+```
+
+`bulk.ImportDump` writes records as it reads them, which is right for a
+destination that may already hold a store and wrong for one that does not: every
+`MaxDeltaBytes` worth of records is folded in by a compaction that rewrites the
+whole image, so what an import writes grows with the square of what it is
+importing. This writes the image **once**. Measured on one dump imported both
+ways at 3.2 KB a record: **0.75 to 0.16, 2.02 to 0.32 and 6.85 to 0.64 GiB** at
+fifty, one hundred and two hundred thousand records. The incremental arm's writes
+grow 2.69x then 3.39x per doubling; this one's grow 2.00x then 2.00x.
+
+It inherits `BulkLoad`'s contract in full -- atomic and not incremental, the
+store unreadable while it runs, an empty store required -- plus two requirements
+of its own:
+
+- **The dump must be Format 2 with inline entries.** A load takes a record's
+  index entries *with* the record, and Format 1 keeps them in a key-major section
+  after the records. Refused with `graphene.ErrDumpNotBulkLoadable` **at the
+  header, before anything is written**, and the receiver survives the refusal so
+  `bulk.ImportDump` can be called on the same file.
+- **The source is a function that opens, not a reader**, because the dump is read
+  twice: once for the nodes, once for the edges. A file can be re-opened; a pipe
+  must be staged to one first.
+
+The receiver is closed and the returned `*Graph` is the one to use, exactly as
+with `BulkLoad`. Memory is bounded by the external sort plus **eight bytes per
+node** for identifier remapping -- against `map[NodeID]NodeID` at roughly seven
+times that, which is what the incremental importer needs.
+
+`BulkImportOptions` is deliberately not `bulk.Options`: the batch size, the byte
+cap, the compaction schedule and the reopen hook all describe how often a growing
+delta is folded into an image, and a one-pass load never has one.
+
+### The dump format: what version 2 changed
+
+`bulk.Format` is **2**; `bulk.MinReadableFormat` is **1**, and every version in
+between is read. A record may carry its own index entries inline, and
+`bulk.Header.InlineEntries` reports whether a given dump does. The separate
+property section is still legal and still read, so **2 is a superset of 1** and
+every Format 1 dump imports unchanged.
+
+Only `graphene_dump` carries entries inline. CSV and JSONL are tabular and
+line-oriented; they write Format 2 headers with `InlineEntries` false, which
+truthfully describes a dump whose records do not use the field.
+
+The export side needs `store.PropertyEntryGrouper` -- one entity's entries,
+sorted by key then value and deduplicated -- which both backends and both their
+snapshots implement:
+
+```go
+type PropertyEntryGrouper interface {
+    NodePropertyEntries(id NodeID) []PropertyEntry
+    EdgePropertyEntries(id EdgeID) []PropertyEntry
+}
+```
+
+A source that does not implement it still exports, as Format 2 with
+`InlineEntries` false, and such a dump simply cannot drive a one-pass load.
+
+For reading a dump directly, `bulk.OpenDumpScan` yields one pass over a stream:
+
+```go
+func bulk.OpenDumpScan(r io.Reader) (*bulk.DumpScan, error)
+func (d *DumpScan) Header() Header
+func (d *DumpScan) Nodes(fn func(*store.Node, []store.PropertyEntry) error) error
+func (d *DumpScan) Edges(fn func(*store.Edge, []store.PropertyEntry) error) error
+func (d *DumpScan) Trailer() (Trailer, error)
+func bulk.ApplyDeclarations(dst any, h Header) int
+```
+
+`Nodes`, `Edges` and `Trailer` consume the part of the stream they name, in that
+order, at most once each. Skipping one is allowed and costs the decode of the
+records it passes over.
+
 ### Bounding an import
 
 An import with no schedule accumulates the whole dump — records in the delta,

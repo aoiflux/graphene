@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -471,4 +472,18 @@ func (s *Store) ForEachNodeProperty(fn func(id store.NodeID, key string, value [
 // ForEachEdgeProperty implements store.PropertyEnumerator.
 func (s *Store) ForEachEdgeProperty(fn func(id store.EdgeID, key string, value []byte) bool) {
 	s.propIdx.ForEachEdgeProperty(fn)
+}
+
+// NodePropertyEntries implements store.PropertyEntryGrouper.
+//
+// Read straight off the index for the same reason ForEachNodeProperty is: the
+// index is not versioned, so this is the entry set now and a caller wanting it
+// paired with the records then takes a Snapshot.
+func (s *Store) NodePropertyEntries(id store.NodeID) []store.PropertyEntry {
+	return index.CopyEntries(s.propIdx.NodeEntriesOf(id))
+}
+
+// EdgePropertyEntries implements store.PropertyEntryGrouper.
+func (s *Store) EdgePropertyEntries(id store.EdgeID) []store.PropertyEntry {
+	return index.CopyEntries(s.propIdx.EdgeEntriesOf(id))
 }

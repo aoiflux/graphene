@@ -21,6 +21,7 @@ import (
 	"iter"
 	"slices"
 
+	"github.com/aoiflux/graphene/index"
 	"github.com/aoiflux/graphene/store"
 )
 
@@ -320,6 +321,35 @@ func (sn *snapshot) ForEachEdgeProperty(fn func(id store.EdgeID, key string, val
 		}
 		return fn(id, key, value)
 	})
+}
+
+// NodePropertyEntries implements store.PropertyEntryGrouper for a snapshot.
+//
+// An entry naming a node this snapshot cannot see is dropped, which is the rule
+// ForEachNodeProperty follows and is what makes a snapshot usable as a
+// bulk.Source: every entry it reports belongs to a record it also exports. A
+// Format 2 export asks this once per record it is already writing, so the
+// liveness of the record is settled before the question is put -- the filter is
+// here for the caller that asks about something else.
+func (sn *snapshot) NodePropertyEntries(id store.NodeID) []store.PropertyEntry {
+	if _, _, err := sn.use(); err != nil {
+		return nil
+	}
+	if !sn.NodeExists(id) {
+		return nil
+	}
+	return index.CopyEntries(sn.s.propIdx.NodeEntriesOf(id))
+}
+
+// EdgePropertyEntries implements store.PropertyEntryGrouper for a snapshot.
+func (sn *snapshot) EdgePropertyEntries(id store.EdgeID) []store.PropertyEntry {
+	if _, _, err := sn.use(); err != nil {
+		return nil
+	}
+	if !sn.edgeExists(id) {
+		return nil
+	}
+	return index.CopyEntries(sn.s.propIdx.EdgeEntriesOf(id))
 }
 
 // edgeExists is NodeExists for edges. There is no exported form because

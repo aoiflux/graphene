@@ -102,6 +102,14 @@ type encoder interface {
 func walk(src Source, enc encoder, opts Options) (Summary, error) {
 	var sum Summary
 
+	// Inline needs both ends and is not a preference: an encoder with nowhere to
+	// put a nested list, or a source that cannot group its entries by entity,
+	// writes the Format 1 shape inside a Format 2 envelope. The header says
+	// which happened, so no reader has to infer it.
+	inl, _ := enc.(inlineEncoder)
+	grp, _ := src.(store.PropertyEntryGrouper)
+	inline := inl != nil && grp != nil && !opts.SkipProperties
+
 	ordNodes, ordEdges, compNodes, compEdges := declarationsOf(src)
 	h := Header{
 		Format:            Format,
@@ -109,6 +117,7 @@ func walk(src Source, enc encoder, opts Options) (Summary, error) {
 		OrderedEdgeKeys:   ordEdges,
 		CompositeNodeKeys: compNodes,
 		CompositeEdgeKeys: compEdges,
+		InlineEntries:     inline,
 	}
 	if err := enc.header(h); err != nil {
 		return sum, err
@@ -126,7 +135,13 @@ func walk(src Source, enc encoder, opts Options) (Summary, error) {
 			}
 			return fmt.Errorf("bulk: read node %d: %w", id, err)
 		}
-		if err := enc.node(n); err != nil {
+		if inline {
+			e := grp.NodePropertyEntries(id)
+			if err := inl.nodeWith(n, e); err != nil {
+				return err
+			}
+			sum.NodeProperties += int64(len(e))
+		} else if err := enc.node(n); err != nil {
 			return err
 		}
 		sum.Nodes++
@@ -143,7 +158,13 @@ func walk(src Source, enc encoder, opts Options) (Summary, error) {
 			}
 			return fmt.Errorf("bulk: read edge %d: %w", id, err)
 		}
-		if err := enc.edge(e); err != nil {
+		if inline {
+			en := grp.EdgePropertyEntries(id)
+			if err := inl.edgeWith(e, en); err != nil {
+				return err
+			}
+			sum.EdgeProperties += int64(len(en))
+		} else if err := enc.edge(e); err != nil {
 			return err
 		}
 		sum.Edges++
@@ -152,7 +173,7 @@ func walk(src Source, enc encoder, opts Options) (Summary, error) {
 		return sum, err
 	}
 
-	if !opts.SkipProperties {
+	if !opts.SkipProperties && !inline {
 		// A source that cannot enumerate its property entries is refused, not
 		// quietly exported without them. Silently dropping them is the exact
 		// failure this package's doc comment is about — a dump that restores a
@@ -265,6 +286,10 @@ type record struct {
 	node *store.Node
 	edge *store.Edge
 
+	// entries are the index entries a Format 2 record carries inline. Nil on a
+	// Format 1 record, whose entries arrive later as recNodeProp/recEdgeProp.
+	entries []store.PropertyEntry
+
 	// id is the *exported* id a property entry names, before mapping.
 	nodeID store.NodeID
 	edgeID store.EdgeID
@@ -311,6 +336,44 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 	var pendingEdgeIDs []store.EdgeID
 	var pendingEdgeBytes int64
 
+	// A Format 2 record's entries wait with it, because they are filed against
+	// the identifier the destination assigns and that is not known until the
+	// batch commits. One slice per pending record rather than a flat list: an
+	// entry has to find its own record's new identifier, and pairing by position
+	// is what the ID map does for a Format 1 dump one record at a time.
+	var pendingNodeEntries [][]store.PropertyEntry
+	var pendingEdgeEntries [][]store.PropertyEntry
+
+	// indexEntries files one committed record's inline entries.
+	//
+	// Counted even when they are skipped, because the trailer counts what the
+	// export wrote and Options.SkipProperties changes what an import applies,
+	// not what the dump contained. The Format 1 path does the same.
+	indexNodeEntries := func(id store.NodeID, entries []store.PropertyEntry) error {
+		sum.NodeProperties += int64(len(entries))
+		if opts.SkipProperties {
+			return nil
+		}
+		for _, p := range entries {
+			if err := dst.IndexNodeProperty(id, p.Key, p.Value); err != nil {
+				return fmt.Errorf("bulk: index node property %q: %w", p.Key, err)
+			}
+		}
+		return nil
+	}
+	indexEdgeEntries := func(id store.EdgeID, entries []store.PropertyEntry) error {
+		sum.EdgeProperties += int64(len(entries))
+		if opts.SkipProperties {
+			return nil
+		}
+		for _, p := range entries {
+			if err := dst.IndexEdgeProperty(id, p.Key, p.Value); err != nil {
+				return fmt.Errorf("bulk: index edge property %q: %w", p.Key, err)
+			}
+		}
+		return nil
+	}
+
 	flushNodes := func() error {
 		if len(pendingNodes) == 0 {
 			return nil
@@ -322,9 +385,20 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 		for i, old := range pendingNodeIDs {
 			ids.nodes[old] = newIDs[i]
 		}
+		// Before the schedule runs, so a compaction fired by this batch folds in
+		// the entries this batch created rather than leaving them for the next.
+		for i, e := range pendingNodeEntries {
+			if len(e) == 0 {
+				continue
+			}
+			if err := indexNodeEntries(newIDs[i], e); err != nil {
+				return err
+			}
+		}
 		sum.Nodes += int64(len(pendingNodes))
 		pendingNodes = pendingNodes[:0]
 		pendingNodeIDs = pendingNodeIDs[:0]
+		pendingNodeEntries = pendingNodeEntries[:0]
 		pendingNodeBytes = 0
 		dst, err = maybeCompact(dst, opts)
 		return err
@@ -340,9 +414,18 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 		for i, old := range pendingEdgeIDs {
 			ids.edges[old] = newIDs[i]
 		}
+		for i, e := range pendingEdgeEntries {
+			if len(e) == 0 {
+				continue
+			}
+			if err := indexEdgeEntries(newIDs[i], e); err != nil {
+				return err
+			}
+		}
 		sum.Edges += int64(len(pendingEdges))
 		pendingEdges = pendingEdges[:0]
 		pendingEdgeIDs = pendingEdgeIDs[:0]
+		pendingEdgeEntries = pendingEdgeEntries[:0]
 		pendingEdgeBytes = 0
 		dst, err = maybeCompact(dst, opts)
 		return err
@@ -366,6 +449,7 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 			rec.node.ID = 0
 			pendingNodes = append(pendingNodes, rec.node)
 			pendingNodeIDs = append(pendingNodeIDs, exported)
+			pendingNodeEntries = append(pendingNodeEntries, rec.entries)
 			pendingNodeBytes += nodeBatchBytes(rec.node)
 			if len(pendingNodes) >= size || (maxBytes > 0 && pendingNodeBytes >= maxBytes) {
 				if err := flushNodes(); err != nil {
@@ -394,6 +478,7 @@ func load(dec decoder, dst Dest, opts Options) (Summary, error) {
 			rec.edge.Dst = dstID
 			pendingEdges = append(pendingEdges, rec.edge)
 			pendingEdgeIDs = append(pendingEdgeIDs, exported)
+			pendingEdgeEntries = append(pendingEdgeEntries, rec.entries)
 			pendingEdgeBytes += edgeBatchBytes(rec.edge)
 			if len(pendingEdges) >= size || (maxBytes > 0 && pendingEdgeBytes >= maxBytes) {
 				if err := flushEdges(); err != nil {

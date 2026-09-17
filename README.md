@@ -758,6 +758,14 @@ arm64, static and reproducible:
 - Deep technical architecture and LLD:
   [TECHNICAL_DETAILS.md](docs/TECHNICAL_DETAILS.md)
 - Benchmark methodology and results: [benchmarks.md](docs/benchmarks.md)
+- **Running inside a memory ceiling, without giving up the speed:**
+  [MEMORY_AND_PERFORMANCE.md](docs/MEMORY_AND_PERFORMANCE.md) — the operational
+  guide. One configuration that holds 2 GiB, the four classes of memory and which
+  knob moves which, every bound in one table with what it does *not* cover, and
+  the decision that matters more than all of them: **if the destination is empty,
+  load rather than ingest.** Measured at 200,000 records of 3.2 KB, that one
+  choice is **0.64 GiB written against 6.85**, and the gap widens with every
+  doubling. Start here; go to MEMORY_MODEL.md for the evidence behind a figure.
 - How much memory the engine holds, what holds it, and which of those terms a
   configuration can change: [MEMORY_MODEL.md](docs/MEMORY_MODEL.md) — read this
   before sizing a machine for a store. §8 is the worked table: what `ImageMode`,

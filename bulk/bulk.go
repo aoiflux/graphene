@@ -46,6 +46,24 @@
 // have to buffer the whole graph to make sense of it. Every exporter here
 // writes that order; every importer checks it and refuses a stream that does
 // not, rather than half-loading one.
+//
+// # Why this rule is what keeps an import off disk.Store.BulkLoad
+//
+// A bulk load writes a whole store in one forward pass and would be the right
+// engine for an import into an empty directory. It cannot be driven from a dump,
+// and the reason is this section rather than anything in the loader: a load takes
+// a record's index entries *with* the record, and the property section here is
+// written in (key, value, id) order, which index.PropertyIndex.ForEachNodeProperty
+// states as a contract. So one record's entries are scattered across the whole
+// section, one per key, and gathering them means holding every triple — the memory
+// a load exists not to spend. Composites are worse: they are built per record from
+// that record's whole property set, so re-ordering a scattered stream does not
+// reconstruct one.
+//
+// Closing that gap is a Format 2 carrying each record's entries inline, which
+// index.NodeEntriesOf already produces on the export side, plus reading the dump
+// twice so the node pass can finish before the edge pass begins. It is a format
+// change, not a switch at the destination, and it is not made here.
 package bulk
 
 import (
@@ -55,9 +73,36 @@ import (
 	"github.com/aoiflux/graphene/store"
 )
 
-// Format is the dump format version. It appears in every header, and an
-// importer refuses anything it does not recognise rather than guessing.
-const Format = 1
+// Format is the dump format version written by an export. It appears in every
+// header, and an importer refuses anything it does not recognise rather than
+// guessing.
+//
+// # 2: a record can carry its own index entries
+//
+// Format 1 put every indexed property entry in a section of its own, after all
+// the records, in the (key, value, id) order PropertyEnumerator walks. That is
+// the right order for a streamed export and the wrong one for a streamed import
+// into an empty store: disk.Store.BulkLoad takes a record's entries *with* the
+// record, so reassembling them from a key-major section means holding every
+// triple, which is the memory a one-pass load exists not to spend.
+//
+// Format 2 lets a record carry its entries inline. The separate section is still
+// legal and still read, so 2 is a superset of 1 rather than a replacement, and
+// Header.InlineEntries says which shape a given dump actually used -- known
+// before the first record, so a load that needs the inline shape refuses at the
+// header instead of half way through.
+//
+// Only graphene_dump carries entries inline. CSV and JSONL are tabular and
+// line-oriented and a nested entry list fits neither; they write Format 2 in
+// their headers with InlineEntries false, which is a truthful description of a
+// dump whose records simply do not use the new field.
+const Format = 2
+
+// MinReadableFormat is the oldest dump this build reads. Every format from here
+// to Format is accepted, because a dump is a backup shape as well as a transfer
+// shape and refusing to read one this project wrote is a data-loss bug rather
+// than a compatibility policy.
+const MinReadableFormat = 1
 
 // ErrUnsupportedFormat is returned when a dump names a format this build cannot
 // read. It names both numbers, because "unsupported" without them sends an
@@ -85,6 +130,19 @@ type Header struct {
 	OrderedEdgeKeys   []string   `json:"orderedEdgeKeys,omitempty"`
 	CompositeNodeKeys [][]string `json:"compositeNodeKeys,omitempty"`
 	CompositeEdgeKeys [][]string `json:"compositeEdgeKeys,omitempty"`
+
+	// InlineEntries reports that every record in this dump carries its own
+	// index entries and that there is no separate property section.
+	//
+	// It is in the header rather than inferred from the records because the one
+	// caller that needs to know is the one that cannot recover from finding out
+	// late: a bulk load into an empty store commits nothing until the whole
+	// stream has been read, so "this dump is not the shape I need" has to be
+	// answerable before the first record rather than after the last.
+	//
+	// False on a Format 1 dump, on every CSV and JSONL dump, and on a Format 2
+	// dump whose source could not group its entries by entity.
+	InlineEntries bool `json:"inlineEntries,omitempty"`
 }
 
 // Trailer closes a dump with what it actually contained.
@@ -261,6 +319,19 @@ type compactor interface {
 	Compact() error
 }
 
+// inlineEncoder is the optional half of Format 2: an encoder that can take a
+// record together with the entries it is indexed under.
+//
+// Optional, and asserted for rather than added to encoder, for the reason the
+// format constant gives -- CSV and JSONL have nowhere sensible to put a nested
+// list, and making them carry a method that returns an error would be spelling
+// "not supported" twice. Same shape as nodeBatcher and compactor above: a
+// capability the walk uses when both ends have it.
+type inlineEncoder interface {
+	nodeWith(n *store.Node, entries []store.PropertyEntry) error
+	edgeWith(e *store.Edge, entries []store.PropertyEntry) error
+}
+
 // nodeBatchBytes estimates what a batch of nodes holds.
 //
 // The constant is the disk backend's empty-record cost -- a version cell and a
@@ -351,42 +422,14 @@ func applyDeclarations(dst Dest, h Header, opts Options) int {
 	if opts.SkipDeclarations {
 		return 0
 	}
-	applied := 0
-	if d, ok := dst.(store.OrderedIndexDeclarer); ok {
-		for _, k := range h.OrderedNodeKeys {
-			if err := d.DeclareOrderedNodeProperty(k); err == nil {
-				applied++
-			}
-		}
-		for _, k := range h.OrderedEdgeKeys {
-			if err := d.DeclareOrderedEdgeProperty(k); err == nil {
-				applied++
-			}
-		}
-	}
-	if d, ok := dst.(store.CompositeIndexDeclarer); ok {
-		for _, keys := range h.CompositeNodeKeys {
-			// A tuple this build will not accept is skipped, not fatal — the
-			// same rule the GCMP section follows on open, and for the same
-			// reason: a reader ignoring a declaration still answers every query
-			// correctly.
-			if err := d.DeclareCompositeNodeProperties(keys); err == nil {
-				applied++
-			}
-		}
-		for _, keys := range h.CompositeEdgeKeys {
-			if err := d.DeclareCompositeEdgeProperties(keys); err == nil {
-				applied++
-			}
-		}
-	}
-	return applied
+	return ApplyDeclarations(dst, h)
 }
 
 // checkFormat rejects a dump this build cannot read.
 func checkFormat(got int) error {
-	if got != Format {
-		return fmt.Errorf("%w: dump is format %d, this build reads %d", ErrUnsupportedFormat, got, Format)
+	if got < MinReadableFormat || got > Format {
+		return fmt.Errorf("%w: dump is format %d, this build reads %d to %d",
+			ErrUnsupportedFormat, got, MinReadableFormat, Format)
 	}
 	return nil
 }

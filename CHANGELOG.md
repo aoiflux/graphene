@@ -13,6 +13,95 @@ length, `MemoryBudget` gated `Open` and `Compact` and nothing in between, and a
 Worse, the configuration §9.8 measured passing was undocumented, and the one
 `USER_GUIDE.md` recommended was the arm that died.
 
+### A dump format that can drive the one-pass loader, and an import that does
+
+- **`bulk.Format` is 2, and a record can carry its own index entries.** Format 1
+  put every indexed property entry in a section of its own, after all the records,
+  in the `(key, value, id)` order `PropertyEnumerator` walks. That is the right
+  order for a streamed export and the wrong one for a streamed load: `BulkLoad`
+  takes a record's entries *with* the record, so reassembling them from a
+  key-major section means holding every triple — the memory a one-pass load exists
+  not to spend. Composites make it sharper still, because one is computed from a
+  record's whole entry set and no re-ordering of a scattered stream reconstructs
+  it. Format 2 is a **superset**: the separate section is still legal and still
+  read, so every Format 1 dump imports unchanged, and `Header.InlineEntries` says
+  which shape a given dump used. In the header rather than inferred from the
+  records, because the caller who needs to know is the one that cannot recover
+  from finding out late — a load commits nothing until the whole stream has been
+  read, so "this is not the shape I need" has to be answerable first.
+
+- **`store.PropertyEntryGrouper` is where the entries come from.** One entity's
+  entries, sorted and deduplicated, against `PropertyEnumerator`'s walk of all of
+  them. Implemented on both backends and on both their snapshots — the snapshot
+  half matters, because `export graph` exports from one and without it every
+  Format 2 dump the CLI wrote would have declared `InlineEntries` false and
+  silently given up the fast path it exists to enable.
+
+- **`Graph.ImportDumpBulk` fills an empty store from a dump in one forward pass.**
+  Measured on one dump imported both ways, 3.2 KB records with four index entries
+  each, against the bounded-incremental arm the guide recommends at `-bound 32`:
+
+  | records | incremental | one-pass | peak anon | wall |
+  |---:|---|---|---|---|
+  | 50,000 | 0.75 GiB | **0.16** | 169.1 → **93.3 MiB** | 3.27 → **1.44 s** |
+  | 100,000 | 2.02 | **0.32** | 202.2 → **118.9** | 8.04 → **2.54** |
+  | 200,000 | 6.85 | **0.64** | 214.7 → **157.5** | 25.92 → **5.91** |
+
+  The rows are not the result; the ratio between them is. **The incremental arm's
+  writes grow 2.69× then 3.39× per doubling, and the one-pass arm's grow 2.00×
+  then 2.00×** — exactly linear, twice. Write amplification 5.0× → 6.5× → 11.0×
+  against a flat 1.07× → 1.03× → 1.03×.
+
+- **The peak is the part worth reading carefully, and it is stated as a trade
+  rather than a win.** The one-pass arm is lower at all three sizes and *rising
+  faster*, because the incremental arm's peak is held flat by the bound it was
+  given. So one path is bounded by a figure you choose and pays for it in writes;
+  the other is bounded by the graph. On three points the trends would meet
+  somewhere above a few hundred thousand records, and that crossover is an
+  extrapolation and is labelled as one rather than quoted as a figure.
+
+- **The dump is read twice and the source is therefore a function that opens, not
+  a reader.** A load asks for every node and then, separately, for every edge. A
+  file can be re-opened; a pipe cannot, and a piped dump has to be staged first.
+  The eight bytes per node that map the exported identifiers onto the assigned
+  ones are the one term here that grows with the graph — a sorted column and a
+  consecutive one, searched, rather than the `map[NodeID]NodeID` the incremental
+  importer needs, which is roughly seven times the size. A load raced by a writer
+  taking an identifier from the same counter leaves a gap in the consecutive
+  column, and that is detected and carried rather than assumed away.
+
+- **`graphene store import` takes the one-pass path by default** for `-format
+  dump`, and reports `mode one-pass` so it is visible without reading a manual.
+  **Naming `-batch`, `-batch-bytes`, `-bound` or `-compact` selects the
+  incremental path**, because those flags are only meaningful there: `-bound` is
+  how an operator holds a ceiling, and a run that quietly took a different route
+  would look like the bound had been honoured. Asking for both is refused with a
+  message naming the flag that clashed and both ways out of it, rather than
+  resolved by a precedence rule nobody would remember.
+
+- **The two import paths produce byte-identical images**, compared as the bytes
+  with the one volatile header field blanked — the compaction timestamp, which the
+  image's own digest excludes for the same reason. That is the standard a bulk
+  load was already held to against an ordinary ingest, applied one level up over a
+  dump.
+
+- **A defect found on the way: a `*graphene.Graph` did not satisfy
+  `store.OrderedIndexDeclarer` or `store.CompositeIndexDeclarer`.** The façade
+  spells them `DeclareOrderedProperty` and `DeclareCompositeProperties`; the
+  interfaces name both halves and so spell them `...NodeProperty`. An embedded
+  interface promotes only its own method set, so `bulk.ImportDump(r, g, opts)` —
+  the obvious call — imported every record and quietly dropped every ordered and
+  composite declaration the dump carried, leaving a store that answered correctly
+  and scanned where it should have sought. The same defect `ForEachNodeProperty`
+  was written out to avoid, one interface along. Both names now exist.
+
+- **New: `docs/MEMORY_AND_PERFORMANCE.md`**, the operational guide for running
+  inside a ceiling — one configuration that holds 2 GiB, the four classes of
+  memory and which knob moves which, every bound in one table with what it does
+  *not* cover, three worked shapes, and how to verify it where you run rather than
+  taking the document's word for it. Its snippets are compiled and executed by a
+  test, so an API it names cannot quietly stop existing.
+
 ### Inputs the engine refuses, on two dimensions
 
 - **`disk.Options.MaxBatchBytes` and `MaxBatchRecords` cap one `AddNodesBatch` or
@@ -577,14 +666,26 @@ Worse, the configuration §9.8 measured passing was undocumented, and the one
   because that is what it is: an image write and a log retire. A store's compaction
   count therefore includes its loads, which is stated where the counter is read.
 
-- **`graphene store import` is unchanged, deliberately.** It was bounded by
-  default in this same release (`-bound 32` with a reopen) and that is what a load
-  into a directory that may already hold a store needs. Routing it through
-  `BulkLoad` when the destination is empty is the obvious next step and is not
-  taken here: the importer remaps identifiers as it reads, and a load needs the
-  node pass to finish before the edge pass begins, so it is a change to how the
-  dump is read and not a switch at the destination. Named rather than left out
-  quietly, because it is where most of this is worth the most.
+- **`graphene store import` is unchanged, and routing it through `BulkLoad` is not
+  the small change it looks like.** It was bounded by default in this same release
+  (`-bound 32` with a reopen) and that is what a load into a directory that may
+  already hold a store needs. The empty-destination fast path is where most of this
+  would be worth the most, and it is named rather than left out quietly — but two
+  things stand in the way and only one of them is small. The importer remaps
+  identifiers as it reads and a load needs the node pass to finish before the edge
+  pass begins, so a dump has to be read twice: surmountable for a file, not for a
+  stream. The other is the dump format itself. `BulkLoad` takes a record's index
+  entries *with* the record, and a dump writes its property section in
+  `(key, value, id)` order — which `PropertyIndex.ForEachNodeProperty` states as a
+  contract and not an implementation detail, because two dumps of one unchanged
+  graph that disagree about that order are two different dumps. A record's entries
+  are therefore spread across the whole section, one per key. Feeding them to a load
+  means either buffering every triple, which is the memory a load exists not to
+  spend, or a dump format 2 carrying each record's entries inline — which
+  `index.NodeEntriesOf` can already produce on the export side. Composites make the
+  point sharper: they are built per record from that record's whole property set, so
+  no amount of re-ordering a scattered stream reconstructs one. It is a format
+  change and a release of its own, not a switch at the destination.
 
 - **Two defects the byte-identity test found, and two mutants that survived.** The
   external merge handed out the run reader's own buffer, which the next advance

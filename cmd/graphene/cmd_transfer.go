@@ -222,6 +222,51 @@ type importOpts struct {
 	batchBytes int64
 	boundMiB   int64
 	compact    bool
+	onePass    bool
+
+	// fs is the command's own flag set, kept so the handler can ask which flags
+	// the caller actually named rather than comparing values against defaults.
+	// A caller who writes -bound 32 means it even though 32 is the default, and
+	// a routing decision that could not tell the two apart would ignore them.
+	fs *flag.FlagSet
+}
+
+// incrementalFlag names the first flag the caller gave that only the
+// incremental importer honours, or "" if they gave none.
+//
+// The one-pass loader has no delta to bound, no batch to size and nothing to
+// compact afterwards, so these four flags describe work it does not do. Silently
+// ignoring a figure someone typed is the failure worth avoiding here: -bound is
+// how an operator holds a ceiling, and an import that took a different path and
+// said nothing would look like the bound had been honoured.
+func (o *importOpts) incrementalFlag() string {
+	if o.fs == nil {
+		return ""
+	}
+	name := ""
+	o.fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "batch", "batch-bytes", "bound", "compact":
+			if name == "" {
+				name = f.Name
+			}
+		}
+	})
+	return name
+}
+
+// wantsOnePass reports whether -one-pass was named explicitly.
+func (o *importOpts) wantsOnePass() bool {
+	if o.fs == nil {
+		return false
+	}
+	named := false
+	o.fs.Visit(func(f *flag.Flag) {
+		if f.Name == "one-pass" {
+			named = true
+		}
+	})
+	return named
 }
 
 // What the import bounds itself by when nobody says otherwise.
@@ -261,6 +306,7 @@ var importGraph = cmd(Command{
 	Before: func(cx *Context) error { return mustBeEmpty(cx.Target) },
 },
 	func(fs *flag.FlagSet, o *importOpts) {
+		o.fs = fs
 		fs.StringVar(&o.format, "format", "jsonl", "jsonl | dump | csv")
 		fs.StringVar(&o.from, "from", "",
 			"file (jsonl, dump) or directory (csv) to read (required)")
@@ -271,6 +317,9 @@ var importGraph = cmd(Command{
 			"MiB of delta after which the import compacts and reopens mid-import (0 = never)")
 		fs.BoolVar(&o.compact, "compact", true,
 			"compact once at the end, so the first open of the result is fast")
+		fs.BoolVar(&o.onePass, "one-pass", true,
+			"build the image in a single pass where the dump allows it (-format dump); "+
+				"-batch, -batch-bytes, -bound and -compact do not apply to it")
 	},
 	runImportGraph)
 
@@ -314,6 +363,31 @@ func runImportGraph(cx *Context, o *importOpts) (Result, error) {
 	}
 	var sum bulk.Summary
 	var err error
+
+	// The one-pass loader first, where it applies. The destination is empty --
+	// the Before hook established that and this subcommand is the only one that
+	// creates a store -- so the only remaining question is whether the dump
+	// carries each record's index entries, which its header answers.
+	//
+	// A caller who named one of the incremental flags gets the incremental path,
+	// because those flags are only meaningful there. Naming both is a
+	// contradiction rather than a precedence question, and is refused.
+	incFlag := o.incrementalFlag()
+	if o.onePass && o.wantsOnePass() && incFlag != "" {
+		return r, Usagef("-one-pass and -%s cannot both be given: "+
+			"a one-pass load has no delta to bound, no batch to size and nothing to compact "+
+			"afterwards. Drop -%s for the single-pass build, or -one-pass=false for the "+
+			"bounded incremental one", incFlag, incFlag)
+	}
+	if o.onePass && incFlag == "" && o.format == "dump" {
+		done, res, err := runImportOnePass(cx, o)
+		if err != nil {
+			return res, err
+		}
+		if done {
+			return res, nil
+		}
+	}
 
 	var compressed bool
 	if o.format == "csv" {
@@ -374,6 +448,84 @@ func runImportGraph(cx *Context, o *importOpts) (Result, error) {
 		s.Add("compacted", Bool(true))
 	}
 	return r, nil
+}
+
+// runImportOnePass builds the store with graphene.ImportDumpBulk.
+//
+// Reports done=false when the dump cannot drive a one-pass load, which leaves
+// the caller to run the incremental importer over the same file. That is a
+// fallback rather than a failure and it is the one place this command chooses
+// silently between two very different amounts of writing, so which path ran is
+// in the output either way.
+//
+// # Why the source is a function
+//
+// A load asks for every node and then, separately, for every edge, so the dump
+// is read twice. openDump is called again for the second pass rather than
+// rewound, because a gzipped dump is read through a decompressor that cannot
+// seek, and re-opening handles both shapes with one rule.
+//
+// That also means a dump arriving on a pipe cannot take this path. -from names a
+// file, so it always can; if that ever changes, the open below fails on the
+// second call and the load fails with it, which is the right answer rather than
+// a silent half-import.
+func runImportOnePass(cx *Context, o *importOpts) (bool, Result, error) {
+	var r Result
+
+	compressed := false
+	open := func() (io.ReadCloser, error) {
+		src, closeSrc, gz, err := openDump(o.from)
+		if err != nil {
+			return nil, err
+		}
+		compressed = gz
+		return readCloser{Reader: src, close: closeSrc}, nil
+	}
+
+	loaded, sum, err := cx.Graph().ImportDumpBulkCtx(cx.Ctx, open, graphene.BulkImportOptions{})
+	if errors.Is(err, graphene.ErrDumpNotBulkLoadable) {
+		// The receiver survives this refusal by contract, so the incremental
+		// path can run on the handle the framework already holds.
+		return false, r, nil
+	}
+	if err != nil {
+		// Unlike the incremental path, there is no partial graph to warn about:
+		// a load commits or it does not, so the directory is as it was found.
+		return true, r, fmt.Errorf("%w\n  nothing was written; %s is as it was", err, cx.Target)
+	}
+	cx.AdoptGraph(loaded)
+
+	s := r.Section("")
+	s.Add("into", Str(cx.Target))
+	if compressed {
+		s.Add("compressed", Str("gzip"))
+	}
+	s.Add("nodes", Int(int64(sum.Nodes)))
+	s.Add("edges", Int(int64(sum.Edges)))
+	s.Add("node properties", Int(int64(sum.NodeProperties)))
+	s.Add("edge properties", Int(int64(sum.EdgeProperties)))
+	if sum.Declarations > 0 {
+		s.Add("index declarations re-declared", Int(int64(sum.Declarations)))
+	}
+	// The figure an operator is here for. An incremental import of the same dump
+	// rewrites the whole image once per -bound worth of records; this writes it
+	// once, and reporting the mode is how the difference is visible without
+	// reading the manual.
+	s.Add("mode", Str("one-pass"))
+	s.Add("compacted", Bool(true))
+	r.Notice("IDs were reassigned: the imported graph is isomorphic to the original, not identical")
+	return true, r, nil
+}
+
+// readCloser adapts openDump's reader-plus-closer pair to an io.ReadCloser.
+type readCloser struct {
+	io.Reader
+	close func()
+}
+
+func (r readCloser) Close() error {
+	r.close()
+	return nil
 }
 
 // openDump opens a dump for reading and transparently decompresses a gzipped

@@ -770,6 +770,42 @@ type PropertyEnumerator interface {
 	ForEachEdgeProperty(fn func(id EdgeID, key string, value []byte) bool)
 }
 
+// PropertyEntry is one (key, value) pair an entity is indexed under.
+type PropertyEntry struct {
+	Key   string
+	Value []byte
+}
+
+// PropertyEntryGrouper reports the index entries one entity carries, rather
+// than every entry in the store.
+//
+// PropertyEnumerator walks the same triples and is the wrong shape for two
+// callers. It yields them in (key, value, id) order -- which is a contract and
+// not an accident, because two dumps of one unchanged graph that disagree about
+// that order are two different dumps -- so one entity's entries are spread
+// across the whole walk, one per key. Anything that needs a record and its
+// entries *together* would have to hold every triple to reassemble them, which
+// on a large store is the memory the caller was trying not to spend.
+//
+// That is what kept a dump off the one-pass bulk loader: the loader takes a
+// record's entries with the record. bulk.Format 2 carries them inline for the
+// same reason, and this is where it gets them.
+//
+// The returned slice and its values are the caller's: implementations copy,
+// because the natural source is a mapping that a compaction can unmap.
+type PropertyEntryGrouper interface {
+	// NodePropertyEntries returns every entry registered for id, sorted by key
+	// then value, deduplicated. An entity with no entries returns nil rather
+	// than an empty slice, and an entity that does not exist does too -- the
+	// property index is not versioned and an entry can outlive its record, so
+	// "no entries" and "no record" are not the same question and this answers
+	// only the first.
+	NodePropertyEntries(id NodeID) []PropertyEntry
+
+	// EdgePropertyEntries is NodePropertyEntries for edges.
+	EdgePropertyEntries(id EdgeID) []PropertyEntry
+}
+
 // AdjacencyReader is an optional extension for allocation-free traversal.
 //
 // Neighbours and EdgesOf each allocate a result slice (and Neighbours a dedupe

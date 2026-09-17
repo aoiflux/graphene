@@ -1772,6 +1772,25 @@ func (p *PropertyIndex) EdgeEntriesOf(id store.EdgeID) []PropEntry {
 	return out
 }
 
+// CopyEntries converts to the store-level type, copying every value.
+//
+// The copy is the point. A PropEntry's value can alias the property index's
+// mapping -- appendEntriesOf reads the base section in place -- and a compaction
+// unmaps that, so an entry handed to a caller who outlives the compaction is a
+// slice into memory the process no longer owns. Everything inside this package
+// consumes entries before releasing the lock; store.PropertyEntryGrouper says
+// the slice is the caller's, and this is where that becomes true.
+func CopyEntries(e []PropEntry) []store.PropertyEntry {
+	if len(e) == 0 {
+		return nil
+	}
+	out := make([]store.PropertyEntry, len(e))
+	for i, p := range e {
+		out[i] = store.PropertyEntry{Key: p.Key, Value: bytes.Clone(p.Value)}
+	}
+	return out
+}
+
 func sortPropEntries(e []PropEntry) {
 	slices.SortFunc(e, func(a, b PropEntry) int {
 		if c := strings.Compare(a.Key, b.Key); c != 0 {
