@@ -136,19 +136,59 @@ type batchCaps struct {
 	bytes   int64
 }
 
-// The derivation, and both figures are provisional.
+// The derivation, and what a batch at the cap actually holds.
 //
-// batchBudgetPercent is what fraction of the memory budget one batch may hold.
-// Badger's equivalent is 15% of MemTableSize, but MemTableSize is a write buffer
-// and MemoryBudget is the whole store, so the same fraction of a much larger
-// figure would be far too loose. Two percent of a 2 GiB budget is about 41 MiB,
-// which is generous for a batch and small enough that a batch is never the term
-// that decides whether a store fits.
+// batchBudgetPercent is what fraction of the memory budget one batch may be
+// charged. Badger's equivalent is 15% of MemTableSize, but MemTableSize is a
+// write buffer and MemoryBudget is the whole store, so the same fraction of a
+// much larger figure would be far too loose.
 //
-// It has not been tuned against a measurement. Phase 0c of
-// docs/PLAN_BOUNDED_INGEST.md is what picks the final figure, and until it does
-// this is a bound chosen to be obviously safe rather than one chosen to be
-// right.
+// # The figure is charged bytes, and charged is not held
+//
+// This is the one thing to know before setting MaxBatchBytes by hand. The cap is
+// in the delta's own accounting -- nodeVersionBytes, the same units MaxDeltaBytes
+// counts in -- and a call that is charged that much holds several times it. The
+// two are different questions and until item 0c of docs/PLAN_BOUNDED_INGEST.md
+// nothing had measured the distance between them.
+//
+// Measured by BenchmarkBatchCapRatio, one batch into an empty store, at and above
+// the batch size a 2 GiB budget's own cap admits, as the largest live heap seen
+// while the call ran:
+//
+//	shape             charged/node   peak/charged   retained/charged
+//	empty record            82 B         3.20x           0.59x
+//	256 B payload          338 B         4.36x           0.90x
+//	3,200 B payload      3,282 B         4.27x           0.99x
+//
+// So a batch holds between three and four and a half times what it is charged,
+// across the whole range of record shapes this engine is aimed at, and gives
+// most of it back: what it goes on holding afterwards is the delta's own copy,
+// which is the charged figure itself to within a percent at any payload large
+// enough to matter. The gap between the two columns is the transient -- the
+// identifier slice, the record copies before they are installed, and the WAL
+// frame -- and it is the term this cap exists to bound.
+//
+// Two percent of a 2 GiB budget is 41 MiB charged, so a batch at the cap peaks
+// at about 176 MiB, which is 8.6% of the budget. That is the figure this
+// constant is actually choosing, and it is chosen to leave a batch under a tenth
+// of what the store is allowed: large enough that no ordinary caller meets the
+// refusal, and small enough that a batch is never the term that decides whether a
+// store fits. Raising it to 4 would put a batch at a sixth of the budget, which
+// is no longer a rounding error against a rebuild.
+//
+// The measurement leaves the shipped figure where it was. That is a result and
+// not an absence of one: the constant was set by argument and this says the
+// argument was sound to within the precision the decision needs, and it replaces
+// "obviously safe" with a multiplier a caller can do their own arithmetic with.
+//
+// # What it does not cover
+//
+// Index entries. A record's property entries are registered by separate calls
+// and are not in the delta's accounting at all, so neither this cap nor
+// MaxDeltaBytes sees them -- which is M2 in the plan, and the same benchmark
+// measures the same shapes with four indexed entries a record at 5.4x to 10.2x
+// held against charged. A caller whose records are heavily indexed is bounded by
+// CompactionPolicy and by MemoryBudget, not by this.
 const batchBudgetPercent = 2
 
 // minNodeBatchCost is what one record costs with no payload at all: a version

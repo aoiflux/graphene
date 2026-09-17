@@ -13,7 +13,7 @@ import (
 // neither is covered by any test that merely reads a store back.
 
 // TestArenaRecordsDoNotAliasAcrossRecords pins the three-index slicing in
-// arenaBytes and arenaLabels.
+// csrRecordSource.blobAt and labelRun, which the loader now reaches instead.
 //
 // Every record's Properties is a sub-slice of one shared arena. If the sub-slice
 // were taken with the two-index form its capacity would run to the end of the
@@ -21,7 +21,7 @@ import (
 // next record's bytes in place — silently, with no allocation and no error, and
 // visible only as another entity's properties changing.
 //
-// Mutation check: change the three-index slices in arenaBytes/arenaLabels to
+// Mutation check: change the three-index slices in blobAt/labelRun to
 // two-index and this test fails.
 func TestArenaRecordsDoNotAliasAcrossRecords(t *testing.T) {
 	nodes := []nodeRecord{

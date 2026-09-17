@@ -4479,6 +4479,43 @@ if s, ok := g.Forensics(); ok {
 | `Options.MaxReplayBytes` / `.MaxReplayRecords` | Refuse an `Open` whose WAL replay exceeds the budget, with `ErrReplayBudget`, rather than replaying into an OOM (§14) |
 | `Options.MemoryBudget` | Refuse an `Open` or a `Compact` whose modelled heap exceeds the budget, with `ErrMemoryBudget` naming the arithmetic — a pre-flight refusal, never a runtime degradation |
 | `Options.Compact.MaxWorkingBytes` | Size the four intermediates a mapped-index compaction holds, as one figure; default 4,325,376 B, floor 524,288 B, and the image is byte-identical at every setting |
+| `Options.Compact.MaxIndexTailBytes` | Bound the index mutation log a compaction records so it can adopt its own output; default 16,777,216 B, floor 65,536 B, 48 B per write landing during the build |
+
+### Bounding what a compaction records so it can give its index back
+
+```go
+s, err := disk.OpenWithOptions(dir, disk.Options{
+    Compact: disk.CompactOptions{MaxIndexTailBytes: 64 << 20},  // zero is the default
+})
+```
+
+A compaction writes every index entry into the image and then swaps the live
+index onto the base it just wrote, which is what takes the index term from
+83.8 MiB to 15.3 at the shape `docs/MEMORY_MODEL.md` measures. It can only do
+that if it knows what changed while it was building, so it records the index's
+mutations as they land — and this bounds that recording.
+
+- **The unit is one write.** `index.TailOpBytes` is 48, so the 16 MiB default
+  covers roughly 350,000 index mutations landing inside a single build. That
+  is a great many for a build measured in milliseconds and not many for a
+  whole-layer rebuild under a firehose.
+- **Exceeding it is not an error.** The capture is dropped, the compaction
+  completes, the image is correct and every query answers the same. What is
+  lost is the memory: the index stays resident until the store is reopened,
+  which is exactly the behaviour that existed before captures.
+- **The floor is 65,536**, which is 1,365 mutations, refused at `Open` with
+  `ErrCompactIndexTailBytes`. Below it the capture is too small to cover any
+  realistic commit, so the store would pay the recording cost on every build
+  and complete only for builds during which nothing was written.
+- **Raising it buys adoption with memory**, at 48 bytes per write in the
+  window. A caller ingesting under a bounded delta with `CompactAndReopen`
+  does not need it; a caller compacting a live store under sustained writes
+  is the case it is for.
+
+It is a second figure rather than a share of `MaxWorkingBytes` because the two
+scale with different things: those four intermediates are the same size at a
+thousand records and at a billion, and this one scales with the write rate
+times the build's duration.
 
 ### Snapshot roots, attestations, proofs
 

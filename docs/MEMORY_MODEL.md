@@ -2392,10 +2392,11 @@ per key rather than one index probe per record.
 
 #### What this does not establish
 
-**No arm above 400,000 records.** The session this was measured in carried a 20 GiB hard
-ceiling on test writes, and the incremental arm at 1M alone would have written on the order of
-250 GiB. So the 1M and 2M figures item 0c asks for are still outstanding, and the 530× above
-is a projection rather than a reading.
+**No arm above 400,000 records** — superseded by §9.12, which takes the bulk arm to 1M and 2M.
+The incremental arm at those sizes is still not run and is not going to be: §9.12 prices it at
+roughly 171 GiB and 617 GiB, against a 20 GiB hard ceiling on test writes. §9.12 also revises the
+530× above: it is the pure quadratic's 2× per doubling extrapolated, and the measured slope is
+1.80×, which puts the honest band at 330–530× rather than a single figure.
 
 **Windows, under a Job Object.** §9.9's caveat carries over unchanged: a Job Object charges
 committed private bytes, so the charged column here says nothing about what a linux cgroup
@@ -2506,6 +2507,286 @@ compaction-heavy phase holds a much larger live set (313.2 MiB modelled on the `
 this same run) and would have correspondingly less gap to give back. The knee will also move: it
 sits just below whatever the runtime is charging, so a setting measured here is not transferable
 to a different store, a different `GOGC`, or a different phase.
+
+### 9.12 The target shape, at the target size: item 0c closed
+
+This closes Phase 0. The plan's item 0c asks for "3.2 KB records at 1M and 2M, both arms, so
+the slope is measured", and it was written before Phase 5 existed, when both arms rewrote the
+image once per delta window. One of the two arms is now cheap enough to run and the other is
+now expensive enough to refuse on the strength of its own measured slope.
+
+#### The bulk arm, seven sizes
+
+Every row is `TestCeiling_BulkIngestFitsUnderTheLimit` with `GRAPHENE_CEILING_BULKLOAD=1`, at
+3,200 B a record with the audited consumer's thirteen indexed entries, under a real 2,048 MiB
+Job Object. The last two rows are new here; the first five are §9.11's.
+
+| records | image | written | ampl. | B/node | image write held | charged peak | headroom | wall |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 25,000 | 94.6 MiB | — | 1.00× | 3,971 | 11.301 MiB | — | — | — |
+| 50,000 | 189.3 | — | 1.00× | 3,971 | 10.305 | — | — | — |
+| 100,000 | 378.5 | 0.37 GiB | 1.00× | 3,971 | 11.637 | 76.3 MiB | 96.3% | 4.39 s |
+| 200,000 | 757.1 | — | 1.00× | 3,971 | 12.297 | — | — | — |
+| 400,000 | 1,514.2 | — | 1.00× | 3,971 | 12.680 | — | — | — |
+| **1,000,000** | **3,785.4** | **3.70 GiB** | **1.00×** | **3,969** | **13.910** | **313.8 MiB** | **84.7%** | **35.8 s** |
+| **2,000,000** | **7,570.5** | **7.39 GiB** | **1.00×** | **3,969** | **12.391** | **576.6 MiB** | **71.8%** | **71.0 s** |
+
+Three things are flat across an eightyfold range, and they are the three the phase was built to
+make flat. Amplification is 1.00× at every size, which is the definition of writing the image
+once. Bytes per node is 3,971 at 25,000 records and 3,969 at two million — a difference of two
+bytes, which is the header amortised. And **what the image write itself holds never leaves the
+10.3–13.9 MiB band**, taken through item 0a's stage boundaries: at two million records the build
+raised the process peak by 12.391 MiB over the pin, 6.5 bytes a record, and the commit added
+0.020.
+
+Wall clock is linear to within the instrument: 35.836 s and 71.038 s, a ratio of 1.982 for twice
+the data.
+
+#### What is not flat, and it is the whole of Phase 6's case
+
+The charged peak is. It is 76.3 MiB at 100,000 records, 313.8 at a million and 576.6 at two
+million — 263 MiB per million records above a 51 MiB intercept, linear to three figures.
+
+That is not the load. The load is the flat 12 MiB column beside it. It is the **reopen**, which
+the phase includes because `BulkLoad` hands back a usable handle, and which is linear in the
+store by construction: opening a store parses its record arrays, builds its adjacency and reads
+its label postings, and every one of those is per-record work producing per-record anonymous
+memory. The engine's own estimate says the same thing from the other side and agrees with itself
+exactly across the two sizes:
+
+| term | 1M | 2M | per million |
+|---|---:|---:|---:|
+| records | 53.6 MiB | 107.0 MiB | 53.5 |
+| adjacency | 15.3 | 30.6 | 15.3 |
+| labels | 7.6 | 15.3 | 7.7 |
+| payload | 1.9 | 3.8 | 1.9 |
+| **total heap** | **78.5** | **156.7** | **78.2** |
+| mapped | 3,785.4 | 7,570.5 | 3,785.3 |
+
+82.2 bytes a node, decomposing exactly as §9.7's coefficients say, and **the record arena is 68%
+of it**.
+
+Extrapolating the charged peak: it reaches 2,048 MiB at about **7.6 million records**, and the
+target is ten million. So the answer to the question Phase 6 is gated on — whether the at-rest
+term or the transient is what is left over the line after Phases 4 and 5 — is now a reading
+rather than an argument. **The transient is flat and finished. The at-rest term is linear and
+crosses the ceiling before the target does.**
+
+#### The incremental arm at 1M and 2M: priced, and not run
+
+§9.9 measured amplification at three sizes on the bounded-plus-reopen arm: 6.53× at 100,000,
+11.77× at 200,000, 21.24× at 400,000. That is 1.802× and 1.805× per doubling — the same ratio
+twice, which is what makes it a slope and not two points.
+
+Carried forward at 1.8035× per doubling:
+
+| records | amplification | bytes written | against the bulk arm |
+|---:|---:|---:|---:|
+| 1,000,000 | ~46× | **~171 GiB** | 3.70 GiB, 46× less |
+| 2,000,000 | ~84× | **~617 GiB** | 7.39 GiB, 84× less |
+
+788 GiB between them, against a 20 GiB hard ceiling on test writes in force when this was taken.
+That is not a near miss to be argued about; it is a factor of forty, and the two runs are
+therefore **stated as unreachable rather than pending**. The slope is measured over an octave and
+a bit and extrapolated over two more, which is the weakness in the figure and is why it is quoted
+to two significant digits.
+
+The same extrapolation revises §9.11's projection to ten million. That section carried ~19.2 TiB
+and a factor of ~530, which is the **pure quadratic** — `N²·b / (2·chunk)`, 2× per doubling. The
+measured slope is 1.80×, below it, so the model over-predicts. At the measured slope ten million
+records is ~330×, which is ~11.9 TiB. **The honest figure is a band: ~37 GiB written once,
+against 11.9–19.2 TiB.** Both ends of that band are the same answer to the same question, and
+neither is a number anyone would spend.
+
+#### What a write batch holds, against what it is charged
+
+The other half of item 0c: `batchBudgetPercent` shipped as a provisional 2 with its own comment
+saying it had not been tuned. `BenchmarkBatchCapRatio` is the measurement, one batch into an
+empty store, at and above the batch size a 2 GiB budget's cap admits, reporting the largest live
+heap seen while the call ran rather than the allocator's churn.
+
+| shape | charged/node | peak/charged | retained/charged | churn/charged |
+|---|---:|---:|---:|---:|
+| empty record | 82 B | 3.20× | 0.59× | 3.20× |
+| 256 B payload | 338 B | 4.36× | 0.90× | 5.12× |
+| 3,200 B payload | 3,282 B | **4.27×** | 0.99× | 6.44× |
+
+A batch holds three to four and a half times what the cap charges it, across every record shape
+the engine is aimed at, and gives nearly all of it back — what it retains is the delta's own copy,
+which is the charged figure itself to within a percent at any payload large enough to matter.
+
+So two percent of a 2 GiB budget is 41 MiB charged and about **176 MiB held, which is 8.6% of the
+budget**. That is what the constant is really choosing, and it is where a batch is comfortably
+under a tenth of what the store is allowed. **The figure is unchanged, and that is the result**:
+the constant was set by argument, and the measurement says the argument was sound to the
+precision the decision needs. What it replaces is the word "provisional" with a multiplier a
+caller can do their own arithmetic with.
+
+Reporting churn alone — which the first version of this benchmark did — reads 6.44× on the fat
+shape and is wrong by half. The WAL frame is built by appending, so its superseded buffers are
+garbage *inside* the call, and a figure that counts every copy as though all were live at once
+overstates by a factor nobody had measured. Both columns are kept because together they bracket
+the answer.
+
+#### What this does not establish
+
+**The incremental arm above 400,000 records, at any size.** Priced above, refused, and the slope
+it is priced from spans 100,000 to 400,000. If the real curve bends, this is where it would be
+invisible.
+
+**Windows, under a Job Object.** §9.9's caveat carries over: a Job Object charges committed
+private bytes, so the charged column and the anonymous column agree here and neither says what a
+linux cgroup would charge for the 7.4 GiB mapping beside them. The crossing at ~7.6M records is a
+statement about anonymous memory, which is the class that cannot be reclaimed; the mapped class
+is larger and reclaimable, and §9.9 and items 2a/2b are where that is dealt with.
+
+**Nodes only, one pass, no edges.** Unchanged from §9.11.
+
+```sh
+GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_BULKLOAD=1 GRAPHENE_CEILING_INGEST_DIR=/path/to/empty \
+  GRAPHENE_RSS_NODES=2000000 GRAPHENE_RSS_BLOB=3200 \
+  go test ./tests/ -tags=stress -count=1 -run TestCeiling_BulkIngest -v -timeout=180m
+
+go test ./tests/ -tags=stress -run='^$' -bench=BatchCapRatio -benchtime=1x -count=1 -v
+```
+
+### 9.13 The open holds what the store holds, and Phase 6 did not need a format change
+
+Phase 6 of `docs/PLAN_BOUNDED_INGEST.md` is "map the record arena, v10", and it is gated:
+*"Build it only if Phase 0 says the at-rest term, not the transient, is what is left over the
+line after Phases 4-5."* §9.12 said it was — the charged peak was linear at 263 MiB per million
+records and crossed 2,048 MiB at about 7.6 million, against a ten million record target.
+
+This section is what happened when that peak was taken apart instead of assumed, and the answer
+is that **half of it was not the at-rest term at all**. It was the loader.
+
+#### What an open was made of
+
+A read-only measurement, opening the two-million-record fixture §9.12 built, in a fresh process,
+with an `inuse_space` and an `alloc_space` profile taken with the store still reachable. 399.7 MiB
+of peak anonymous memory, 226.6 settled, so 173.1 MiB of transient; 356 MB allocated in total
+against 161 MB still held.
+
+| site | allocated | still held | what it is |
+|---|---:|---:|---|
+| `deserialiseCSRFrom` | 125.90 MB | 3.82 MB | **the record set, materialised and then thrown away** |
+| `buildSeq` | 106.97 | 106.97 | the record arena the graph keeps |
+| `buildLabelIndex` | 86.65 | 17.48 | the by-label posting lists, grown by doubling |
+| `buildAdjacency` | 30.58 | 30.58 | the four adjacency arrays |
+
+The first row is the finding. `buildSeq` has taken sequences rather than slices since Phase 4,
+and its own comment says why — *"The one caller that does not already hold a slice is
+compaction."* The loader reached it through `Build`, with a slice, **because it had one**: it
+parsed the record stream into a `[]nodeRecord` and a `[]rawEdge` and handed those over to be
+copied into the arena. So every record existed twice for the length of the load, and the first
+copy was garbage by the time any profile could see it. It was visible in the peak and nowhere
+else, which is how it survived four phases of memory work.
+
+The third row is the same kind of thing one level down: a posting list that ends at 16 MB is
+built by handing the allocator 8, then 16, and discarding the first.
+
+#### What was changed, and what was not
+
+No format change. No new section, no version bump, nothing written differently. Three changes,
+all on the load path:
+
+- **The loader walks the record stream instead of materialising it.** `csrRecordSource` fills the
+  label arenas once — and the property arenas too, when the image is not mapped — and then hands
+  `buildSeq` a sequence that re-walks the bytes. A walk is a pure function of the image and its
+  version, which is exactly the repeatability `buildSeq` already requires. It needs no span table
+  to find a record's labels: the arenas were filled in record order and every walk visits records
+  in that same order, so a running cursor lands on the same run every time.
+- **`buildSeq` is given the shape it would otherwise compute.** Its first two passes find the
+  highest identifier and mark the pages to materialise, and the loader was already walking for
+  both of those — once to fill its arenas, once to bound the identifiers against a hostile file.
+  Those are now one walk that produces a `csrBuildShape`, and `buildSeq` places and nothing else.
+  Six passes over the mapping became three.
+- **The label postings are counted before they are filled.** Two passes over the record arena,
+  which is anonymous memory the pass before has just written, in place of the allocator work.
+
+#### What it is worth
+
+Measured on the same fixture, in the same way, before and after. This is the first reading of
+the pair; the reconfirmed figures are in the slope table below and differ by 1.4% on the
+two-million row:
+
+| | before | after | |
+|---|---:|---:|---|
+| peak anonymous | 399.7 MiB | **220.6 MiB** | −45% |
+| transient above settled | 173.1 | **−1.4** | gone |
+| settled anonymous | 226.6 | 222.0 | unchanged, as intended |
+| open wall clock | 3.18 s | **2.15 s** | −32% |
+
+**The peak is now the settled figure.** An open of a two-million-record store holds what the
+store holds and nothing else, to within the measurement's own noise — which is what the
+`-1.4 MiB` is, a peak sampler and a settled reading disagreeing by less than a megabyte.
+
+The wall clock is the part that was expected to go the other way. Walking a 7.4 GiB mapping three
+times instead of once should cost, and at six walks it did: an intermediate version of this
+change read **5.38 s**, 69% slower. At three walks it is 32% *faster* than the single-walk
+version it replaces, because the walk it removed was not free either — it allocated 112 MB,
+filled it, and made the collector deal with it. Three passes over warm pages beat one pass plus a
+hundred megabytes of garbage.
+
+Both sizes, so the slope is a measurement:
+
+| records | peak anon | settled | transient | open |
+|---:|---:|---:|---:|---:|
+| 1,000,000 | 136.7 MiB | 136.5 | 0.2 | 1.09 s |
+| 2,000,000 | 223.7 | 223.1 | 0.6 | 2.12 s |
+
+**87.0 MiB per million records above a 49.7 MiB intercept**, and wall clock linear to 0.98.
+
+Both rows are a second reading. The first pair came out at 136.8 and 220.6, so the two-million
+figure moves by 1.4% between runs and the one-million figure by less than a tenth of that; the
+pair above is the one the slope is taken from, and the spread is the precision this instrument
+has. Nothing below turns on 3 MiB.
+
+#### The gate, answered
+
+At ten million records that projects to **920 MiB of peak anonymous memory, 55% headroom under a
+2 GiB ceiling.** Before this it was about 2,000 MiB — 113.3 MiB per million settled plus 86.6
+transient — which is over the line with nothing to spare.
+
+So the premise Phase 6 was gated on is no longer true. The at-rest term is not what is left over
+the line; nothing is. **v10 is not built**, and the reason is worth stating plainly because it is
+not the reason the plan expected: the record arena being anonymous was never the binding problem.
+The binding problem was a second copy of it that nothing needed, and taking that out cost a
+hundred lines of loader and no change to a single byte on disk.
+
+#### What is still available, costed and not taken
+
+The arena itself is untouched: 56 bytes a node and 80 an edge, 107.0 MiB at two million records,
+68.3% of what an open holds. `disk/arena_spike_test.go` costed the packing years of commits ago —
+the identifier is derivable from the slot, and the two slice headers are 48 of the 56 bytes for
+what is usually two bytes of labels and a blob that already aliases the mapping. Replacing them
+with offsets is 56 → 24, which at ten million records is another 306 MiB.
+
+It is not built because it is not needed, and because it is the change that would touch
+`nodeRecord` everywhere rather than the load path alone. If a larger target ever moves the line,
+this is where the next 300 MiB is, and it still needs no format change.
+
+#### What this does not establish
+
+**One store shape.** Two million nodes, no edges, 3.2 KB blobs, one label each. The edge arena is
+80 bytes a record against a node's 56 and its walk carries two more endpoints and a weight, so an
+edge-heavy store would move different amounts of the same terms — the streaming change covers
+both kinds and is tested on both, but only the node side is measured here.
+
+**Windows, and a mapped image.** The property blobs alias the mapping on this path, so the
+transient that was removed is the record *headers* rather than the payload. An unmapped store
+copies its blobs into an arena, and that arena is real anonymous memory this does not reduce.
+
+**The wall clock is one machine's.** Three passes over a mapping beat one pass plus a large
+allocation *here*, where the file is on a local volume and mostly in page cache. On a machine
+where the image does not fit in cache the three passes fault three times and the trade could
+invert. The memory result does not depend on that; the timing one does.
+
+```sh
+GRAPHENE_ARENA_DIR=/path/to/store GRAPHENE_ARENA_PROFILE=/tmp/open.pprof \
+  go test ./tests/ -tags=stress -count=1 -run TestArenaOpenProfile -v
+go tool pprof -top -alloc_space /tmp/open.pprof.Defaults
+```
 
 ## Reproducing these figures
 

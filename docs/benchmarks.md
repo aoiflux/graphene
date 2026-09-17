@@ -4197,3 +4197,85 @@ its own. Windows under a Job Object, so the charged column says nothing about wh
 a linux cgroup would charge for the mapping. And nodes only — the ingest arm
 writes no edges, so neither does this one; the edge path is held by the
 byte-identity tests, which is correctness and not cost.
+
+## What an open stopped holding (2026-09-17)
+
+This is the read-path half of the same day's work. `BulkLoad` above made writing the image once
+cost 1.00x amplification; this is what opening the result costs, and it is the measurement that
+settled whether the record arena needed a format change. It did not.
+
+### Not an A/B between arms, and why that is allowed here
+
+Every other comparison in this file interleaves, because §"Timing effects below roughly 25% are
+not resolvable in this dataset" applies to anything read off a clock. This one does not, and the
+reason is that the figure it turns on is **peak anonymous memory**, which on windows is committed
+private bytes and is a counter rather than a sample: the same store opened twice charges the same
+bytes. The wall clock beside it is reported because it moved by a third, which is well outside the
+resolvable band, and it is reported as one machine's figure rather than as a ratio to defend.
+
+The fixture is the two-million-record store the ceiling harness built for MEMORY_MODEL §9.12 --
+7,570.5 MiB on disk, 3.2 KB a record, thirteen indexed entries each -- opened in a fresh process
+with nothing else in it.
+
+### Two million records, opened cold
+
+| | before | after |
+|---|---:|---:|
+| peak anonymous | 399.7 MiB | **223.7 MiB** |
+| settled anonymous | 226.6 | 223.1 |
+| transient above settled | 173.1 | **0.6** |
+| wall clock | 3.18 s | **2.12 s** |
+| total allocated | 356 MB | 237 MB after the first change alone |
+
+The second row is the one that says what happened: the settled figure barely moved, because
+nothing about what a store holds changed. What went was the **transient** -- and it went to zero.
+
+An `alloc_space` profile named it exactly. `deserialiseCSRFrom` allocated 125.90 MB and retained
+3.82: the loader parsed the record stream into a `[]nodeRecord` and a `[]rawEdge` and handed them
+to `buildSeq`, which copied every record into the arena the graph keeps. Two copies of the whole
+record set, for the length of the load, with the first one garbage before any profile taken after
+the open could see it.
+
+### The wall clock went the wrong way first, at six passes
+
+Walking the record stream instead of materialising it means walking it again for each of
+`buildSeq`'s three passes. The first working version did exactly that and left the loader's own
+two passes in place: six passes over a 7.4 GiB mapping, and it read **5.38 s against 3.18** --
+69% slower, for the memory win.
+
+Folding the loader's passes together and handing `buildSeq` the shape its first two passes would
+have computed takes it to three, and at three it is **32% faster than the single-pass version it
+replaced**. The pass that was removed was not free: it allocated 112 MB, filled it, and left it to
+the collector. Three passes over warm pages beat one pass plus a hundred megabytes of garbage.
+
+The intermediate figure is recorded rather than deleted for the reason the discarded A/Bs above
+are: a change that is a regression at one design point and a win at another is a fact about the
+design, and only one of those numbers would have been published by a less careful pass.
+
+### What was checked before it was believed
+
+A walk is only sound if it is repeatable, because `buildSeq` places on its last pass what it sized
+the arena for on its first. `disk/csr_load_stream_test.go` holds that: three walks over one image
+compared record for record, in both the mapped and the copied mode, over a fixture whose label
+counts and blob lengths cycle -- so a cursor that slipped by one label would land on a run of a
+different width and a different value rather than on an identical one.
+
+Two mutants, both killed by the test that names them: a two-index slice in place of the
+three-index form (`TestCSRLoad_EveryRunIsCappedAtItsOwnLength`, and the pre-existing
+`TestArenaRecordsDoNotAliasAcrossRecords` beside it), and a label cursor advanced by the byte
+count instead of the label count (`TestCSRLoad_EveryPassYieldsTheSameRecords`).
+
+`BenchmarkPointLookupNode_Disk` is unchanged at 64 B and 1 allocation per operation.
+
+### What this does not establish
+
+Two million nodes and no edges, on windows, with the image mapped. The edge arena is 80 bytes a
+record against a node's 56 and the streaming change covers both kinds, but only the node side is
+measured. And the wall-clock direction depends on the file being mostly in page cache: on a
+machine where it is not, three passes fault three times and the trade could invert. The memory
+result does not depend on that.
+
+```sh
+GRAPHENE_ARENA_DIR=/path/to/store GRAPHENE_ARENA_PROFILE=/tmp/open.pprof \
+  go test ./tests/ -tags=stress -count=1 -run TestArenaOpenProfile -v
+```

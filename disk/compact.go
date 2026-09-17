@@ -223,6 +223,11 @@ type compactPlan struct {
 	// the only thing a recording would buy there is the memory it costs.
 	idxTail *index.Tail
 
+	// idxTailBytes is the limit idxTail was opened with, carried so that the
+	// refusal can name the figure that actually bound rather than a constant
+	// that may no longer be the one in force.
+	idxTailBytes int64
+
 	// indexMode is which encoding of that index the image will carry: GPIX and
 	// GPIR under IndexMapped, GIDX under IndexResident.
 	//
@@ -720,25 +725,13 @@ func (s *Store) compactPin() (*compactPlan, error) {
 	// or one that cannot map, throws pendingBase away and would throw this away
 	// with it -- so recording would be paying for a log nothing reads.
 	if plan.mapImages && plan.indexMode == IndexMapped {
-		plan.idxTail = s.propIdx.CaptureTail(maxIndexTailBytes)
+		plan.idxTailBytes = s.idxTailBytes
+		plan.idxTail = s.propIdx.CaptureTail(plan.idxTailBytes)
 	}
 
 	s.compacting = true
 	return plan, nil
 }
-
-// maxIndexTailBytes is how much of an index mutation log a compaction will hold
-// before it gives up on adopting its own output.
-//
-// The figure is a guess with a known shape rather than a measurement, and it is
-// a constant rather than an option for that reason: index.TailOpBytes per
-// mutation, so this is roughly 350,000 writes landing inside one build before the
-// capture is dropped and the compaction falls back to the behaviour it had before
-// captures existed. That is a great many for a build measured in milliseconds and
-// not many for a whole-layer rebuild under a firehose, which is precisely the
-// case docs/PLAN_BOUNDED_INGEST.md item 0c is going to measure. When it does,
-// this becomes an Options field with a floor, the way MaxWorkingBytes did.
-const maxIndexTailBytes = 16 << 20
 
 // compactRelease clears the in-progress flag however the compaction ended.
 //
@@ -1514,8 +1507,8 @@ func (p *compactPlan) tailUsable(s *Store, t *index.Tail, tail int64) error {
 		return errors.New("compact: writes landed during a build that was not recording the index")
 	}
 	if !t.Complete() {
-		return fmt.Errorf("compact: the index recorded more than %d bytes of mutations during the build",
-			maxIndexTailBytes)
+		return fmt.Errorf("compact: the index recorded more than %d bytes of mutations during the build (Options.Compact.MaxIndexTailBytes)",
+			p.idxTailBytes)
 	}
 	// Declarations are the one kind of index change the capture does not record,
 	// and deliberately: a declaration is schema, it is not journaled to the log,

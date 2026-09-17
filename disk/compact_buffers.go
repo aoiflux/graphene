@@ -127,11 +127,50 @@ type CompactOptions struct {
 	// that four megabytes is worth three tenths of a second, and for that it is
 	// exact.
 	MaxWorkingBytes int64
+
+	// MaxIndexTailBytes bounds the index mutation log a compaction records
+	// while it builds, so that it can adopt its own output afterwards. Zero
+	// takes the default, which is 16,777,216 bytes -- roughly 350,000
+	// mutations, and exactly what every version before this one held.
+	//
+	// It is a second figure rather than a share of MaxWorkingBytes because it
+	// bounds a different thing. Those four are intermediates the compaction
+	// chooses the size of, and they scale with nothing: the same four bytes at
+	// a thousand records and at a billion. This one is a log of what *other*
+	// writers do while the build runs, so it scales with the write rate times
+	// the build's duration and with neither the store nor the compaction.
+	// Dividing one figure between two terms that move independently would give
+	// a caller one knob that cannot be right for both.
+	//
+	// What it buys and what it costs, both exactly. A build during which more
+	// than this many bytes of index mutations land drops the capture and falls
+	// back to the behaviour that existed before captures: the compaction
+	// completes, the image is correct, and the index does not give its memory
+	// back until the store is reopened -- 83.8 MiB against 15.3 at the shape
+	// docs/MEMORY_MODEL.md measures. A build during which fewer land holds
+	// index.TailOpBytes -- 48 -- per mutation, transiently, and swaps the base.
+	// So raising this is buying adoption with memory at 48 bytes a write, and
+	// lowering it is the reverse.
+	//
+	// The floor is 65,536, which is 1,365 mutations. It is a weaker kind of
+	// floor than MaxWorkingBytes's: that one is where the arithmetic stops
+	// describing what is held, and this one is where the option stops being
+	// able to do its job. Below it a capture is too small to cover a single
+	// commit of any realistic size, so the store pays the recording cost on
+	// every index mutation of every build and completes only for builds during
+	// which nothing was written -- which is the gate that existed before
+	// captures, bought rather than free. A caller who wants that gate wants
+	// this option's default, not a figure near zero.
+	MaxIndexTailBytes int64
 }
 
 // ErrCompactWorkingBytes is returned by Open when CompactOptions.MaxWorkingBytes
 // is below the floor a compaction can be built within.
 var ErrCompactWorkingBytes = errors.New("disk: the configured compaction working set is below the floor")
+
+// ErrCompactIndexTailBytes is returned by Open when
+// CompactOptions.MaxIndexTailBytes is below the floor a capture is useful at.
+var ErrCompactIndexTailBytes = errors.New("disk: the configured index tail limit is below the floor")
 
 const (
 	// spillFlushBuffer is charged once per sorter. The value table's is covered
@@ -156,6 +195,16 @@ const (
 	// above it is a typo rather than a working set: it is four thousand times the
 	// default.
 	maxCompactWorkingBytes = 1 << 34
+
+	// defaultIndexTailBytes is what a compaction records before it gives up on
+	// adopting its own output: index.TailOpBytes per mutation, so about 350,000
+	// writes landing inside one build. That is a great many for a build measured
+	// in milliseconds and not many for a whole-layer rebuild under a firehose.
+	defaultIndexTailBytes = 16 << 20
+
+	// minIndexTailBytes is 1,365 mutations. See MaxIndexTailBytes for why the
+	// floor is here and why it is a softer argument than the other one.
+	minIndexTailBytes = 64 << 10
 )
 
 // compactBuffers is the four sizes, resolved.
@@ -235,6 +284,10 @@ func (b compactBuffers) resolved() compactBuffers {
 // should stop the store coming up rather than surface on the first compaction,
 // which under AutoCompact is a background tick nobody is watching.
 func (o CompactOptions) validate() error {
+	if o.MaxIndexTailBytes != 0 && o.MaxIndexTailBytes < minIndexTailBytes {
+		return fmt.Errorf("%w: MaxIndexTailBytes is %d, and the floor is %d",
+			ErrCompactIndexTailBytes, o.MaxIndexTailBytes, minIndexTailBytes)
+	}
 	if o.MaxWorkingBytes == 0 {
 		return nil
 	}
@@ -243,6 +296,15 @@ func (o CompactOptions) validate() error {
 			ErrCompactWorkingBytes, o.MaxWorkingBytes, minCompactWorkingBytes)
 	}
 	return nil
+}
+
+// indexTailBytes resolves what a compaction will record, which is the default
+// where nothing was asked for.
+func (o CompactOptions) indexTailBytes() int64 {
+	if o.MaxIndexTailBytes <= 0 {
+		return defaultIndexTailBytes
+	}
+	return o.MaxIndexTailBytes
 }
 
 // clampInt narrows to int without wrapping, which matters only on a 32-bit

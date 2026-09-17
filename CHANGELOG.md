@@ -118,6 +118,91 @@ Worse, the configuration §9.8 measured passing was undocumented, and the one
   the key. Adoption is now gated on index identity, capture completeness, and the
   declared key sets matching what went into the image.
 
+### An open holds what the store holds, and not a second copy of it
+
+- **The loader stopped materialising every record before building the graph.** It
+  parsed the image's record stream into a `[]nodeRecord` and a `[]rawEdge` and
+  handed those to `buildSeq`, which copied each one into the arena the graph
+  keeps — so every record existed twice for the length of the load. At two
+  million 3.2 KB records that was 125.90 MB allocated and immediately garbage,
+  visible in the peak and in no profile taken after the open finished, which is
+  how it survived four phases of memory work. `buildSeq` has taken sequences
+  rather than slices since the streaming compaction landed, and its own comment
+  said the loader was not the caller that needed one. It was.
+
+- **Six passes over the mapping became three.** The walk that fills the label
+  arenas now also finds the highest identifier and marks the pages the build will
+  materialise, so `buildSeq` is handed a `csrBuildShape` and places records
+  without recomputing what the loader already knew. An intermediate version that
+  left those passes in place ran the open **69% slower**; this one runs it **32%
+  faster** than the single-walk version it replaces, because the pass it removed
+  was not free either.
+
+- **Label postings are counted before they are filled.** A list that ends at 16 MB
+  was built by handing the allocator 8, then 16, and discarding the first: 86.65 MB
+  allocated against 17.48 MB held. Two passes over the record arena — anonymous
+  memory the pass before has just written — replace the allocator work.
+
+- **Measured, two million records, opened in a fresh process: peak anonymous
+  memory 399.7 → 223.7 MiB, the transient above the settled figure 173.1 MiB →
+  0.6, open wall clock 3.18 → 2.12 s.** The peak is now the settled figure: an
+  open holds what the store holds. The slope across one and two million is
+  87.0 MiB per million above a 49.7 MiB intercept, which puts ten million at
+  ~920 MiB against a 2 GiB ceiling.
+
+- **No format change, and that is the point.** `docs/PLAN_BOUNDED_INGEST.md`
+  scheduled a v10 that would map the record arena, gated on the at-rest term being
+  what was left over the line. Half of what was over the line was a copy nothing
+  needed. The arena is untouched, the packing that would shrink it is costed in
+  `disk/arena_spike_test.go` and still available, and no image written by any
+  version reads differently.
+
+### How much a compaction records is now the caller's figure
+
+- **`disk.Options.Compact.MaxIndexTailBytes` bounds the index mutation log a
+  compaction holds so that it can adopt its own output.** It was a constant, chosen
+  by argument and marked in its own comment as a guess waiting for a measurement.
+  The default is unchanged at 16,777,216 bytes, which is roughly 350,000 writes
+  landing inside one build at `index.TailOpBytes` apiece, so nothing moves for a
+  caller who sets nothing.
+
+- **Exceeding it is not an error and never was.** The capture is dropped, the
+  compaction completes, the image is correct and every query answers the same;
+  what is lost is the memory, because the index stays resident until the store is
+  reopened. So the figure is a trade a caller can now price: 48 bytes per write in
+  the window buys the drop from 83.8 MiB to 15.3 that `docs/MEMORY_MODEL.md`
+  measures.
+
+- **The floor is 65,536 and it is a softer argument than `MaxWorkingBytes`'s.**
+  That one is where the arithmetic stops describing what is held; this one is where
+  the option stops being able to do its job — below about 1,365 mutations a capture
+  cannot cover a realistic commit, so the store pays the recording cost on every
+  build and completes only for builds during which nothing was written, which is the
+  gate that existed before captures. Refused at `Open` with
+  `disk.ErrCompactIndexTailBytes`, and the refusal a full capture produces now names
+  the configured figure rather than the constant it replaced.
+
+- **A second figure rather than a share of `MaxWorkingBytes`.** Those four
+  intermediates are the same size at a thousand records and at a billion; this one
+  scales with the write rate times the build's duration. One knob divided between
+  two terms that move independently cannot be right for both.
+
+### The provisional batch fraction is now a measured one
+
+- **`batchBudgetPercent` stays at 2, and that is the result.** It shipped with a
+  comment saying it had not been tuned against a measurement.
+  `BenchmarkBatchCapRatio` is that measurement, and it reports what nothing had
+  established before: a batch **holds 3.20× to 4.36× what the cap charges it**,
+  across every record shape from an empty node to the 3.2 KB target, as peak live
+  heap rather than allocator churn. So two percent of a 2 GiB budget is 41 MiB
+  charged and about 176 MiB held — 8.6% of the budget, comfortably under a tenth.
+
+- **Charged is not held, and that distinction is now written down where the cap
+  is.** `MaxBatchBytes` is in the delta's own accounting, the same units
+  `MaxDeltaBytes` counts in. A caller setting it by hand is choosing a number four
+  times smaller than the memory it governs, and the multiplier is documented so the
+  arithmetic can be done rather than guessed.
+
 ### An import is bounded by default at the command line, and unchanged in the library
 
 - **`bulk.Options` gains `MaxBatchBytes`, a `Compact` schedule and a `Reopen`

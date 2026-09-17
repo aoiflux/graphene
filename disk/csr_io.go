@@ -12,7 +12,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"iter"
-	"math"
 	"slices"
 	"time"
 
@@ -373,20 +372,13 @@ func deserialiseCSR(data []byte) (*CSRGraph, *csrIndexSection, error) {
 // sections, the errors. A file parses to the same graph either way, which is what
 // TestImageMode_SameGraphEitherWay asserts.
 func deserialiseCSRFrom(data []byte, mapped bool, adj AdjacencyMode) (*CSRGraph, *csrIndexSection, error) {
-	if len(data) < 22 {
-		return nil, nil, fmt.Errorf("deserialiseCSR: data too short")
+	// Where the records begin, how many there are, and the bounds on both counts:
+	// see csrRecordRegion, which is also what the walks start from, so the loader
+	// and the walks cannot disagree about it.
+	_, version, nodeCount, edgeCount, err := csrRecordRegion(data)
+	if err != nil {
+		return nil, nil, err
 	}
-	if string(data[0:4]) != "GCSR" {
-		return nil, nil, fmt.Errorf("deserialiseCSR: invalid magic")
-	}
-	version := binary.LittleEndian.Uint16(data[4:6])
-	if version < csrVersionV2 || version > csrVersionMax {
-		return nil, nil, fmt.Errorf("deserialiseCSR: unsupported version %d (supported: %d-%d)",
-			version, csrVersionV2, csrVersionMax)
-	}
-	nodeCount := int(binary.LittleEndian.Uint64(data[6:14]))
-	edgeCount := int(binary.LittleEndian.Uint64(data[14:22]))
-	pos := 22
 
 	// Sequence high-water marks (version 5+).
 	var nodeSeqHW, edgeSeqHW uint64
@@ -396,7 +388,6 @@ func deserialiseCSRFrom(data []byte, mapped bool, adj AdjacencyMode) (*CSRGraph,
 		}
 		nodeSeqHW = binary.LittleEndian.Uint64(data[22:30])
 		edgeSeqHW = binary.LittleEndian.Uint64(data[30:38])
-		pos = csrV5HeaderSize
 	}
 
 	// Property-index section offset (version 6+).
@@ -406,7 +397,6 @@ func deserialiseCSRFrom(data []byte, mapped bool, adj AdjacencyMode) (*CSRGraph,
 			return nil, nil, fmt.Errorf("deserialiseCSR: truncated index-offset header")
 		}
 		indexOffset = binary.LittleEndian.Uint64(data[38:46])
-		pos = csrV6HeaderSize
 	}
 
 	// v8 header additions and the section directory.
@@ -420,7 +410,6 @@ func deserialiseCSRFrom(data []byte, mapped bool, adj AdjacencyMode) (*CSRGraph,
 		trailer.LastCompactUnixNano = int64(binary.LittleEndian.Uint64(data[54:62]))
 		sectionTableOffset := binary.LittleEndian.Uint64(data[62:70])
 		copy(trailer.Digest[:], data[csrDigestOffset:csrDigestOffset+csrDigestSize])
-		pos = csrV8HeaderSize
 
 		sections, err := readCSRSectionDirectory(data, sectionTableOffset)
 		if err != nil {
@@ -439,196 +428,18 @@ func deserialiseCSRFrom(data []byte, mapped bool, adj AdjacencyMode) (*CSRGraph,
 		}
 	}
 
-	// Both counts come straight off the header, so a corrupt or hostile file
-	// controls them completely. Allocating from them unchecked lets a 46-byte
-	// file demand terabytes: nodeCount is a uint64 narrowed to int, so a large
-	// value allocates until the process dies and a value above MaxInt64 goes
-	// negative and panics in makeslice before any record is read.
-	//
-	// The bound is the cheapest sound one: every node record occupies at least
-	// minNodeRecordBytes on disk, so a file cannot hold more than its own
-	// remaining length divided by that. This rejects the hostile case without
-	// constraining any legitimate one.
-	if nodeCount < 0 || nodeCount > (len(data)-pos)/minNodeRecordBytes {
-		return nil, nil, fmt.Errorf("deserialiseCSR: node count %d exceeds what %d remaining bytes can hold",
-			nodeCount, len(data)-pos)
-	}
-	nodes := make([]nodeRecord, nodeCount)
-
-	// Labels and property blobs are allocated once each for the whole image
-	// rather than once per record, and every record's slice is a sub-slice of
-	// the arena. The file already holds them as one packed byte stream; the old
-	// loop unpacked that stream into two heap objects per record and handed the
-	// collector 600 000 of them on a 300 000-record image, live for the life of
-	// the store.
-	//
-	// Every sub-slice is taken with the three-index form, so cap == len and an
-	// append by a caller reallocates instead of writing over the next record's
-	// bytes. That is what keeps the existing csrBytes aliasing contract true
-	// under a shared backing array; without it this would be a silent
-	// cross-record corruption rather than an optimisation.
-	//
-	// Spans are recorded during the parse and resolved to slices afterwards,
-	// because appending to the arena may move it and would leave any slice taken
-	// mid-parse pointing at a stale array.
-	nodeLabelArena := make([]store.NodeType, 0, nodeCount)
-	nodeLabelSpan := make([][2]uint32, nodeCount)
-
-	// Neither the property arena nor its span array is allocated under a
-	// mapping: the blob is addressed where it lies and the record's slice is
-	// taken in the loop below. See deserialiseCSRFrom.
-	var nodePropArena []byte
-	var nodePropSpan [][2]uint32
-	if !mapped {
-		nodePropArena = make([]byte, 0, len(data)/8)
-		nodePropSpan = make([][2]uint32, nodeCount)
-	}
-
-	for i := range nodes {
-		if pos+9 > len(data) {
-			return nil, nil, fmt.Errorf("deserialiseCSR: truncated node record %d", i)
-		}
-		nid := store.NodeID(binary.LittleEndian.Uint64(data[pos:]))
-		pos += 8
-		labelCount := int(data[pos])
-		pos++
-		labelBytes := labelCount
-		if version >= csrVersionWithU16Labels {
-			labelBytes = labelCount * currentLabelBytesPerValue
-		}
-		// Bytes still required after the labels: the property field. v2 reserved
-		// 8 bytes for it; v3+ writes a 4-byte length followed by the blob.
-		//
-		// This used to demand 8 unconditionally, which over-reads by 4 on v3+.
-		// It never fired because the file always carried trailing adjacency
-		// arrays that supplied slack — arrays the reader never actually read. The
-		// moment those stopped being written, a perfectly valid file ending at
-		// its last record started being rejected.
-		nodeTail := nodePayloadPropLenBytes
-		if version == csrVersionV2 {
-			nodeTail = 8
-		}
-		if pos+labelBytes+nodeTail > len(data) {
-			return nil, nil, fmt.Errorf("deserialiseCSR: truncated node labels %d", i)
-		}
-		labelStart := uint32(len(nodeLabelArena))
-		for j := 0; j < labelCount; j++ {
-			if version >= csrVersionWithU16Labels {
-				nodeLabelArena = append(nodeLabelArena, store.NodeType(binary.LittleEndian.Uint16(data[pos:])))
-				pos += currentLabelBytesPerValue
-			} else {
-				nodeLabelArena = append(nodeLabelArena, store.NodeType(data[pos]))
-				pos++
-			}
-		}
-		nodeLabelSpan[i] = [2]uint32{labelStart, uint32(labelCount)}
-
-		nodes[i] = nodeRecord{ID: nid}
-		if mapped {
-			props, nextPos, err := aliasCSRProperties(data, pos, version, "node", i)
-			if err != nil {
-				return nil, nil, err
-			}
-			nodes[i].Properties = props
-			pos = nextPos
-		} else {
-			arena, propStart, propLen, nextPos, err := readCSRPropertiesInto(nodePropArena, data, pos, version, "node", i)
-			if err != nil {
-				return nil, nil, err
-			}
-			nodePropArena = arena
-			nodePropSpan[i] = [2]uint32{propStart, propLen}
-			pos = nextPos
-		}
-	}
-
-	for i := range nodes {
-		nodes[i].Labels = arenaLabels(nodeLabelArena, nodeLabelSpan[i])
-		if !mapped {
-			nodes[i].Properties = arenaBytes(nodePropArena, nodePropSpan[i])
-		}
-	}
-
-	if edgeCount < 0 || edgeCount > (len(data)-pos)/minEdgeRecordBytes {
-		return nil, nil, fmt.Errorf("deserialiseCSR: edge count %d exceeds what %d remaining bytes can hold",
-			edgeCount, len(data)-pos)
-	}
-	edges := make([]rawEdge, edgeCount)
-
-	// Same arena treatment as the node records above, and for the same reason --
-	// including the mapped case, where there is no property arena at all.
-	edgeLabelArena := make([]store.EdgeType, 0, edgeCount)
-	edgeLabelSpan := make([][2]uint32, edgeCount)
-
-	var edgePropArena []byte
-	var edgePropSpan [][2]uint32
-	if !mapped {
-		edgePropArena = make([]byte, 0, len(data)/8)
-		edgePropSpan = make([][2]uint32, edgeCount)
-	}
-
-	for i := range edges {
-		if pos+25 > len(data) {
-			return nil, nil, fmt.Errorf("deserialiseCSR: truncated edge record %d", i)
-		}
-		eid := store.EdgeID(binary.LittleEndian.Uint64(data[pos:]))
-		pos += 8
-		src := store.NodeID(binary.LittleEndian.Uint64(data[pos:]))
-		pos += 8
-		dst := store.NodeID(binary.LittleEndian.Uint64(data[pos:]))
-		pos += 8
-		labelCount := int(data[pos])
-		pos++
-		labelBytes := labelCount
-		if version >= csrVersionWithU16Labels {
-			labelBytes = labelCount * currentLabelBytesPerValue
-		}
-		// weight(4) + the property field, which is 8 on v2 and 4 on v3+.
-		// Same over-strict constant as the node case above.
-		edgeTail := 4 + nodePayloadPropLenBytes
-		if version == csrVersionV2 {
-			edgeTail = 4 + 8
-		}
-		if pos+labelBytes+edgeTail > len(data) {
-			return nil, nil, fmt.Errorf("deserialiseCSR: truncated edge labels %d", i)
-		}
-		labelStart := uint32(len(edgeLabelArena))
-		for j := 0; j < labelCount; j++ {
-			if version >= csrVersionWithU16Labels {
-				edgeLabelArena = append(edgeLabelArena, store.EdgeType(binary.LittleEndian.Uint16(data[pos:])))
-				pos += currentLabelBytesPerValue
-			} else {
-				edgeLabelArena = append(edgeLabelArena, store.EdgeType(data[pos]))
-				pos++
-			}
-		}
-		edgeLabelSpan[i] = [2]uint32{labelStart, uint32(labelCount)}
-		weight := math.Float32frombits(binary.LittleEndian.Uint32(data[pos:]))
-		pos += 4
-		edges[i] = rawEdge{ID: eid, Src: src, Dst: dst, Weight: weight}
-		if mapped {
-			props, nextPos, err := aliasCSRProperties(data, pos, version, "edge", i)
-			if err != nil {
-				return nil, nil, err
-			}
-			edges[i].Properties = props
-			pos = nextPos
-		} else {
-			arena, propStart, propLen, nextPos, err := readCSRPropertiesInto(edgePropArena, data, pos, version, "edge", i)
-			if err != nil {
-				return nil, nil, err
-			}
-			edgePropArena = arena
-			edgePropSpan[i] = [2]uint32{propStart, propLen}
-			pos = nextPos
-		}
-	}
-
-	for i := range edges {
-		edges[i].Labels = arenaLabels(edgeLabelArena, edgeLabelSpan[i])
-		if !mapped {
-			edges[i].Properties = arenaBytes(edgePropArena, edgePropSpan[i])
-		}
+	// The records are walked rather than materialised. See csr_load_stream.go:
+	// the parse used to build a []nodeRecord and a []rawEdge and hand them to
+	// buildSeq, which copied every record into the arena it keeps -- two copies
+	// of the whole record set alive at once, 112 MB of them at two million
+	// records, visible only in the peak because the first is garbage by the time
+	// anything looks.
+	// One pass fills the arenas the walks read from and locates the edge region.
+	// It is also where a truncated record is found, which is why every later walk
+	// can treat a failure as unreachable rather than as the ordinary case.
+	src, err := csrRecordSourceOf(data, mapped)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Build allocates one int32 per page of the identifier space up to the
@@ -637,13 +448,21 @@ func deserialiseCSRFrom(data []byte, mapped bool, adj AdjacencyMode) (*CSRGraph,
 	// enough: two records carrying IDs of 0x3030303030303030 would make a
 	// 105-byte file demand an exabyte-scale directory, which panics in makeslice
 	// rather than returning an error. Validate the IDs before Build sees them.
-	if err := checkCSREntityIDs(nodes, edges, version, nodeSeqHW, edgeSeqHW); err != nil {
+	shape, err := csrShapeOf(src.nodeSeq(), src.edgeSeq(), src.ext,
+		nodeCount, edgeCount, version, nodeSeqHW, edgeSeqHW)
+	if err != nil {
 		return nil, nil, err
 	}
 
-	csr, err := buildSeq(slices.Values(nodes), slices.Values(edges), adj)
+	csr, err := buildSeqShaped(src.nodeSeq(), src.edgeSeq(), adj, shape)
 	if err != nil {
 		return nil, nil, err
+	}
+	// A walk cannot return an error, so it latches one. Checked here rather than
+	// inside buildSeq because a short sequence trips errUnstableBuild first and
+	// that message would name the symptom rather than the truncated record.
+	if src.err != nil {
+		return nil, nil, src.err
 	}
 	if mapped {
 		csr.imgBytes = int64(len(data))
@@ -653,8 +472,7 @@ func deserialiseCSRFrom(data []byte, mapped bool, adj AdjacencyMode) (*CSRGraph,
 	// arena is holding, and under ImageMapped it correctly omits the property
 	// half, which is in the mapping and counted as ImageMappedBytes. See
 	// CSRGraph.payloadBytes.
-	csr.payloadBytes = int64(cap(nodePropArena)+cap(edgePropArena)) +
-		int64(cap(nodeLabelArena)+cap(edgeLabelArena))*sizeofLabel
+	csr.payloadBytes = src.payloadBytes()
 	csr.nodeSeqHW = nodeSeqHW
 	csr.edgeSeqHW = edgeSeqHW
 	csr.commitSeqHW = trailer.CommitSeqHW
@@ -888,85 +706,152 @@ func (t *touchedPageSet) mark(id uint64) {
 // node the file does not contain cannot extend the identifier space the bitmap
 // covers.
 func checkCSREntityIDs(nodes []nodeRecord, edges []rawEdge, version uint16, nodeSeqHW, edgeSeqHW uint64) error {
-	var maxNID, maxEID uint64
-	for i := range nodes {
-		if uint64(nodes[i].ID) > maxNID {
-			maxNID = uint64(nodes[i].ID)
-		}
-	}
-	for i := range edges {
-		if uint64(edges[i].ID) > maxEID {
-			maxEID = uint64(edges[i].ID)
-		}
-	}
-
-	if err := checkIDSpace("node", maxNID); err != nil {
+	ns, es := slices.Values(nodes), slices.Values(edges)
+	ext, err := csrExtentOf(ns, es)
+	if err != nil {
 		return err
 	}
-	if err := checkIDSpace("edge", maxEID); err != nil {
-		return err
-	}
+	_, err = csrShapeOf(ns, es, ext, len(nodes), len(edges), version, nodeSeqHW, edgeSeqHW)
+	return err
+}
 
-	// Endpoints are a separate bound from IDs, and the one that used to crash.
-	// Build materialises the page of every endpoint whether or not a node record
-	// falls in it, so an edge naming a node the file does not contain costs a
-	// page rather than reading past the end of an array. That is bounded — the
-	// page rule below counts endpoint pages — but keeping the check confines
-	// materialisation to pages inside the identifier space the records already
-	// describe. Every live edge has both endpoints present — deletion cascades to
-	// incident edges — so this rejects nothing valid.
-	for i := range edges {
-		if uint64(edges[i].Src) > maxNID {
-			return fmt.Errorf("deserialiseCSR: edge %d has source %d, beyond the highest node ID %d",
-				edges[i].ID, edges[i].Src, maxNID)
-		}
-		if uint64(edges[i].Dst) > maxNID {
-			return fmt.Errorf("deserialiseCSR: edge %d has target %d, beyond the highest node ID %d",
-				edges[i].ID, edges[i].Dst, maxNID)
-		}
-	}
+// csrIDExtent is how far into the identifier space a record set reaches, and how
+// many of its records will be placed.
+//
+// nodeExtent is separate from highestNode because an edge endpoint materialises
+// a node page whether or not a node record falls in it, so the node directory
+// has to cover the endpoints too.
+type csrIDExtent struct {
+	yielded              int // every node offered, invalid identifiers included
+	wantNodes, wantEdges int
+	highestNode          uint64
+	highestEdge          uint64
+	nodeExtent           uint64
+}
 
-	// Count exactly what Build will materialise: the page of every record with a
-	// usable identifier, plus the pages of both endpoints of every such edge.
-	// Records carrying the invalid zero identifier are skipped there, so they are
-	// skipped here.
-	nodePages := newTouchedPageSet(maxNID)
-	edgePages := newTouchedPageSet(maxEID)
-	for i := range nodes {
-		if nodes[i].ID != store.InvalidNodeID {
-			nodePages.mark(uint64(nodes[i].ID))
-		}
-	}
-	for i := range edges {
-		if edges[i].ID == store.InvalidEdgeID {
+// csrExtentOf walks both kinds once and reports how far they reach, refusing an
+// identifier outside the addressable space as it goes.
+//
+// Refused per record rather than at the end, because the extent is what the page
+// directories are then sized from: a single record carrying 0x3030303030303030
+// would otherwise be found only after something had tried to allocate for it.
+func csrExtentOf(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge]) (csrIDExtent, error) {
+	var ext csrIDExtent
+	for n := range nodes {
+		ext.yielded++
+		if n.ID == store.InvalidNodeID {
 			continue
 		}
-		edgePages.mark(uint64(edges[i].ID))
-		nodePages.mark(uint64(edges[i].Src))
-		nodePages.mark(uint64(edges[i].Dst))
+		if err := checkIDSpace("node", uint64(n.ID)); err != nil {
+			return ext, err
+		}
+		ext.wantNodes++
+		if id := uint64(n.ID); id > ext.highestNode {
+			ext.highestNode = id
+		}
+	}
+	ext.nodeExtent = ext.highestNode
+	for e := range edges {
+		if e.ID == store.InvalidEdgeID {
+			continue
+		}
+		if err := checkIDSpace("edge", uint64(e.ID)); err != nil {
+			return ext, err
+		}
+		if err := checkIDSpace("node", max(uint64(e.Src), uint64(e.Dst))); err != nil {
+			return ext, err
+		}
+		ext.wantEdges++
+		if id := uint64(e.ID); id > ext.highestEdge {
+			ext.highestEdge = id
+		}
+		ext.nodeExtent = max(ext.nodeExtent, uint64(e.Src), uint64(e.Dst))
+	}
+	return ext, nil
+}
+
+// csrShapeOf marks the pages Build will materialise and refuses a record set
+// whose identifiers would make it allocate memory the file gives no reason to
+// believe in.
+//
+// It is both the bound and the shape, and that is deliberate: the pages have to
+// be counted to apply the ceiling and they have to be marked to build the
+// directory, and those were two walks over the same records doing the same
+// arithmetic. The loader hands the result to buildSeqShaped, which is what takes
+// an open from six passes over the mapping to three; checkCSREntityIDs throws it
+// away, which is what it has always done with this work.
+//
+// The extent must come from csrExtentOf over the same sequences. It is a
+// parameter rather than computed here because the image loader already knows it
+// -- it tracks the maxima in the pass that fills its arenas -- and recomputing it
+// would be a fourth walk over the mapping for numbers already in hand.
+func csrShapeOf(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge], ext csrIDExtent,
+	nodeCount, edgeCount int, version uint16, nodeSeqHW, edgeSeqHW uint64) (*csrBuildShape, error) {
+	shape := &csrBuildShape{
+		nodeDir: newPageDir(ext.nodeExtent), edgeDir: newPageDir(ext.highestEdge),
+		yielded: ext.yielded, wantNodes: ext.wantNodes, wantEdges: ext.wantEdges,
+		highestNode: ext.highestNode, highestEdge: ext.highestEdge,
+	}
+	nodePages, edgePages := 0, 0
+	mark := func(dir []int32, id uint64, count *int) {
+		if dir[id>>csrPageBits] == csrDeadPage {
+			*count++
+		}
+		touchPage(dir, id)
+	}
+	for n := range nodes {
+		if n.ID != store.InvalidNodeID {
+			mark(shape.nodeDir, uint64(n.ID), &nodePages)
+		}
+	}
+	// Endpoints are a separate bound from identifiers, and the one that used to
+	// crash. Build materialises the page of every endpoint whether or not a node
+	// record falls in it, so an edge naming a node the file does not contain
+	// costs a page rather than reading past the end of an array. That is bounded
+	// -- the page rule below counts endpoint pages -- but keeping the check
+	// confines materialisation to pages inside the identifier space the records
+	// already describe. Every live edge has both endpoints present, because
+	// deletion cascades to incident edges, so this rejects nothing valid.
+	for e := range edges {
+		if uint64(e.Src) > ext.highestNode {
+			return nil, fmt.Errorf("deserialiseCSR: edge %d has source %d, beyond the highest node ID %d",
+				e.ID, e.Src, ext.highestNode)
+		}
+		if uint64(e.Dst) > ext.highestNode {
+			return nil, fmt.Errorf("deserialiseCSR: edge %d has target %d, beyond the highest node ID %d",
+				e.ID, e.Dst, ext.highestNode)
+		}
+		if e.ID == store.InvalidEdgeID {
+			continue
+		}
+		mark(shape.edgeDir, uint64(e.ID), &edgePages)
+		mark(shape.nodeDir, uint64(e.Src), &nodePages)
+		mark(shape.nodeDir, uint64(e.Dst), &nodePages)
 	}
 
-	if err := checkIDCeiling("node", maxNID, len(nodes), nodePages.pages); err != nil {
-		return err
+	if err := checkIDCeiling("node", ext.highestNode, nodeCount, nodePages); err != nil {
+		return nil, err
 	}
-	if err := checkIDCeiling("edge", maxEID, len(edges), edgePages.pages); err != nil {
-		return err
+	if err := checkIDCeiling("edge", ext.highestEdge, edgeCount, edgePages); err != nil {
+		return nil, err
 	}
 
 	// A zero mark means "not stamped" rather than "the highest ID is zero".
 	// Compact always stamps the live counters, but a CSRGraph serialised straight
 	// out of Build carries zeros, and those files are legitimate. Skipping the
-	// comparison there costs nothing: maxCSREntityID above still bounds the
+	// comparison there costs nothing: checkIDSpace above still bounds the
 	// allocation, so an unstamped file cannot name an unbounded one.
 	if version >= csrVersionWithSeqHW {
-		if nodeSeqHW > 0 && maxNID > nodeSeqHW {
-			return fmt.Errorf("deserialiseCSR: node ID %d exceeds the file's own sequence high-water mark %d", maxNID, nodeSeqHW)
+		if nodeSeqHW > 0 && ext.highestNode > nodeSeqHW {
+			return nil, fmt.Errorf("deserialiseCSR: node ID %d exceeds the file's own sequence high-water mark %d",
+				ext.highestNode, nodeSeqHW)
 		}
-		if edgeSeqHW > 0 && maxEID > edgeSeqHW {
-			return fmt.Errorf("deserialiseCSR: edge ID %d exceeds the file's own sequence high-water mark %d", maxEID, edgeSeqHW)
+		if edgeSeqHW > 0 && ext.highestEdge > edgeSeqHW {
+			return nil, fmt.Errorf("deserialiseCSR: edge ID %d exceeds the file's own sequence high-water mark %d",
+				ext.highestEdge, edgeSeqHW)
 		}
 	}
-	return nil
+	return shape, nil
 }
 
 // readMappedIndexSections parses a v9 image's index into a base, reporting
@@ -1159,113 +1044,4 @@ func readCSRIndexSection(data []byte, offset int) (*csrIndexSection, error) {
 	}
 
 	return section, nil
-}
-
-// arenaLabels resolves a recorded span to a sub-slice of the label arena. The
-// three-index form is load-bearing: it makes cap == len so that a caller
-// appending to a record's Labels reallocates rather than overwriting the next
-// record's labels in the shared array.
-func arenaLabels[T store.NodeType | store.EdgeType](arena []T, span [2]uint32) []T {
-	if span[1] == 0 {
-		return nil
-	}
-	lo, hi := span[0], span[0]+span[1]
-	return arena[lo:hi:hi]
-}
-
-// arenaBytes is arenaLabels for the property arena, under the same contract and
-// for the same reason. A zero-length blob resolves to nil rather than to an
-// empty sub-slice, because both stores normalise an empty blob to nil on the way
-// in and a reader must not be able to tell the two apart.
-func arenaBytes(arena []byte, span [2]uint32) []byte {
-	if span[1] == 0 {
-		return nil
-	}
-	lo, hi := span[0], span[0]+span[1]
-	return arena[lo:hi:hi]
-}
-
-// readCSRPropertiesInto is readCSRProperties writing through an arena: it
-// appends the blob and reports where it landed, instead of allocating one slice
-// per record. It returns the (possibly reallocated) arena, which the caller must
-// store back.
-func readCSRPropertiesInto(arena []byte, data []byte, pos int, version uint16, kind string, index int) ([]byte, uint32, uint32, int, error) {
-	if version == 2 {
-		if pos+8 > len(data) {
-			return arena, 0, 0, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
-		}
-		return arena, 0, 0, pos + 8, nil
-	}
-	if pos+4 > len(data) {
-		return arena, 0, 0, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
-	}
-	propLen := int(binary.LittleEndian.Uint32(data[pos:]))
-	pos += 4
-	if pos+propLen > len(data) {
-		return arena, 0, 0, pos, fmt.Errorf("deserialiseCSR: truncated %s property blob %d", kind, index)
-	}
-	if propLen == 0 {
-		return arena, 0, 0, pos, nil
-	}
-	off := uint32(len(arena))
-	arena = append(arena, data[pos:pos+propLen]...)
-	return arena, off, uint32(propLen), pos + propLen, nil
-}
-
-// aliasCSRProperties is readCSRProperties without the copy: the returned slice
-// addresses data.
-//
-// The three-index form is as load-bearing here as it is in arenaBytes, and for a
-// larger reason. cap == len makes a caller appending to a record's Properties
-// reallocate rather than write over the next record's bytes -- and under a
-// mapping those bytes are a read-only file, so the write would not corrupt the
-// next record, it would fault. Either way the append must not be allowed to
-// reach them, and this is what stops it.
-//
-// A zero-length blob resolves to nil rather than to an empty sub-slice, so that
-// a mapped read and a copied read are indistinguishable: both stores normalise
-// an empty blob to nil on the way in.
-func aliasCSRProperties(data []byte, pos int, version uint16, kind string, index int) ([]byte, int, error) {
-	if version == csrVersionV2 {
-		if pos+8 > len(data) {
-			return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
-		}
-		return nil, pos + 8, nil
-	}
-	if pos+4 > len(data) {
-		return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
-	}
-	propLen := int(binary.LittleEndian.Uint32(data[pos:]))
-	pos += 4
-	if pos+propLen > len(data) {
-		return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s property blob %d", kind, index)
-	}
-	if propLen == 0 {
-		return nil, pos, nil
-	}
-	end := pos + propLen
-	return data[pos:end:end], end, nil
-}
-
-func readCSRProperties(data []byte, pos int, version uint16, kind string, index int) ([]byte, int, error) {
-	if version == 2 {
-		if pos+8 > len(data) {
-			return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
-		}
-		return nil, pos + 8, nil
-	}
-	if pos+4 > len(data) {
-		return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s properties %d", kind, index)
-	}
-	propLen := int(binary.LittleEndian.Uint32(data[pos:]))
-	pos += 4
-	if pos+propLen > len(data) {
-		return nil, pos, fmt.Errorf("deserialiseCSR: truncated %s property blob %d", kind, index)
-	}
-	if propLen == 0 {
-		return nil, pos, nil
-	}
-	props := make([]byte, propLen)
-	copy(props, data[pos:pos+propLen])
-	return props, pos + propLen, nil
 }

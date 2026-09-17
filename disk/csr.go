@@ -294,7 +294,38 @@ var errUnstableBuild = errors.New("csr: a build sequence yielded a different num
 // csrPageSlots records and two csrPageSlots offsets per materialised page. The
 // only transient beyond the result is the directory's own touched-page marks.
 func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge], adj AdjacencyMode) (*CSRGraph, error) {
+	return buildSeqShaped(nodes, edges, adj, nil)
+}
+
+// csrBuildShape is everything buildSeq's first two passes compute, when the
+// caller has computed it already.
+//
+// It exists for the loader. A pass over a slice is a pass over memory; a pass
+// over an image's record stream is a pass over a mapping, and at two million
+// 3.2 KB records that is a 7.4 GiB file walked at a 3.2 KB stride, which is
+// every page of it. The loader was already walking once to fill its arenas and
+// once to bound the identifiers, so the two passes here were the fifth and sixth
+// -- and the wall clock said so. Handed the shape, buildSeq places and nothing
+// else, and the whole load is three passes.
+//
+// The directories arrive already touched and are consumed: assignPages rewrites
+// them in place, so a shape is single-use. wantNodes and wantEdges are what the
+// placement passes are still held to, so a sequence that yields differently on
+// the pass that matters is still errUnstableBuild rather than a short graph --
+// the check moved, it did not go.
+type csrBuildShape struct {
+	nodeDir, edgeDir         []int32
+	yielded                  int // every node offered, invalid identifiers included
+	wantNodes, wantEdges     int
+	highestNode, highestEdge uint64
+}
+
+func buildSeqShaped(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge],
+	adj AdjacencyMode, shape *csrBuildShape) (*CSRGraph, error) {
 	g := &CSRGraph{}
+	if shape != nil {
+		return g.placeSeq(nodes, edges, adj, shape)
+	}
 
 	// The extent of each directory. The node directory covers the highest node
 	// ID and every endpoint of a live edge; the edge directory the highest edge
@@ -373,6 +404,31 @@ func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge], adj Adjacency
 	if seen != wantEdges {
 		return nil, errUnstableBuild
 	}
+	return g.placeSeq(nodes, edges, adj, &csrBuildShape{
+		nodeDir: g.nodeDir, edgeDir: g.edgeDir,
+		yielded: yielded, wantNodes: wantNodes, wantEdges: wantEdges,
+		highestNode: highestNode, highestEdge: highestEdge,
+	})
+}
+
+// placeSeq is buildSeq's third pass and everything after it: the directories are
+// settled, so what is left is to hand out arena pages and put each record in its
+// slot.
+func (g *CSRGraph) placeSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge],
+	adj AdjacencyMode, shape *csrBuildShape) (*CSRGraph, error) {
+	wantNodes, wantEdges := shape.wantNodes, shape.wantEdges
+	if shape.yielded == 0 {
+		g.nodesByLabel = make(map[store.NodeType][]store.NodeID)
+		g.edgesByLabel = make(map[store.EdgeType][]store.EdgeID)
+		// buildAdjacency over zero slots produces one sentinel each, which is the
+		// shape verifyAdjacency checks -- the offset arrays are one longer than
+		// the arena at every size, and the empty image is not an exception.
+		if adj == AdjacencyEager {
+			g.ensureAdjacency()
+		}
+		return g, nil
+	}
+	g.nodeDir, g.edgeDir = shape.nodeDir, shape.edgeDir
 	g.nodePages = assignPages(g.nodeDir)
 	g.edgePages = assignPages(g.edgeDir)
 	g.nodeRecs = make([]nodeRecord, len(g.nodePages)<<csrPageBits)
@@ -410,8 +466,8 @@ func buildSeq(nodes iter.Seq[nodeRecord], edges iter.Seq[rawEdge], adj Adjacency
 	if g.liveEdges != wantEdges {
 		return nil, errUnstableBuild
 	}
-	g.highestNodeID = store.NodeID(highestNode)
-	g.highestEdgeID = store.EdgeID(highestEdge)
+	g.highestNodeID = store.NodeID(shape.highestNode)
+	g.highestEdgeID = store.EdgeID(shape.highestEdge)
 	g.nodeLiveBefore = make([]int, len(g.nodePages))
 	for p := 1; p < len(g.nodePages); p++ {
 		g.nodeLiveBefore[p] = g.nodeLiveBefore[p-1] + g.livePageNodes(p-1)
@@ -641,9 +697,51 @@ func (g *CSRGraph) nodeSlotID(slot int) store.NodeID {
 // append the same ID twice in a row, breaking the strict-ascending invariant the
 // postings rely on. Records carrying duplicates can come from a caller or from a
 // CSR file written before that was normalised, so this cannot assume clean input.
+// # Counted before it is filled
+//
+// Each posting list used to be grown by append, which doubles: a list that ends
+// at 16 MB is built by handing the allocator 8, then 16, and throwing the first
+// away. At two million records that read as 86.1 MB allocated against 17.5 MB
+// held -- four fifths of it garbage, all of it live at once inside an open whose
+// peak is the figure a ceiling is set against.
+//
+// So the labels are counted first and every list is allocated at its final
+// length. It is a second pass over the record arena, which is anonymous memory
+// that the pass before it has just written and is therefore as warm as memory
+// gets; the allocator work it replaces was the expensive half.
+//
+// The two passes must agree about which labels count, which is why the
+// deduplication is the same expression in both rather than a flag: a count that
+// included a duplicate the fill then skipped would leave a list with spare
+// capacity, and the reverse would reallocate, which is what this exists to stop.
 func (g *CSRGraph) buildLabelIndex() {
-	g.nodesByLabel = make(map[store.NodeType][]store.NodeID)
-	g.edgesByLabel = make(map[store.EdgeType][]store.EdgeID)
+	nodeCounts := make(map[store.NodeType]int)
+	for n := range g.Nodes() {
+		for j, lbl := range n.Labels {
+			if nodeRecordHasLabel(n.Labels[:j], lbl) {
+				continue
+			}
+			nodeCounts[lbl]++
+		}
+	}
+	edgeCounts := make(map[store.EdgeType]int)
+	for e := range g.Edges() {
+		for j, lbl := range e.Labels {
+			if rawEdgeHasLabel(e.Labels[:j], lbl) {
+				continue
+			}
+			edgeCounts[lbl]++
+		}
+	}
+
+	g.nodesByLabel = make(map[store.NodeType][]store.NodeID, len(nodeCounts))
+	for lbl, n := range nodeCounts {
+		g.nodesByLabel[lbl] = make([]store.NodeID, 0, n)
+	}
+	g.edgesByLabel = make(map[store.EdgeType][]store.EdgeID, len(edgeCounts))
+	for lbl, n := range edgeCounts {
+		g.edgesByLabel[lbl] = make([]store.EdgeID, 0, n)
+	}
 
 	for n := range g.Nodes() {
 		for j, lbl := range n.Labels {

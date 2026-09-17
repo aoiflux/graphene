@@ -231,6 +231,13 @@ type Store struct {
 	// zero value means every consumer takes its own default.
 	compactBufs compactBuffers
 
+	// idxTailBytes is Options.Compact.MaxIndexTailBytes resolved, which is how
+	// much of an index mutation log a compaction records before it gives up on
+	// adopting its own output. Kept here for the same reason compactBufs is: the
+	// store compacts on a timer, and the figure has to be the one the caller
+	// chose rather than the one whichever code path happens to ask.
+	idxTailBytes int64
+
 	// deltaOverBudget is whether the delta is currently above that limit, and
 	// deltaBudgetReported whether the crossing has been announced to a metrics
 	// sink. Both are maintained by noteDeltaBytesLocked under the store lock and
@@ -1653,6 +1660,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		residentAdvice:       opts.ResidentAdvice,
 		batchCaps:            batchCapsFor(opts),
 		compactBufs:          compactBuffersFor(opts.Compact.MaxWorkingBytes),
+		idxTailBytes:         opts.Compact.indexTailBytes(),
 		imageMode:            opts.ImageMode,
 		indexMode:            opts.IndexMode,
 		strictProjectionKeys: opts.RefuseUnindexedProjectionKeys,
