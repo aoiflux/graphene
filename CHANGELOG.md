@@ -3,7 +3,7 @@
 Release notes start here. Tags v0.1 through v0.4.0 predate this file; use
 `git log` for those.
 
-## Unreleased (v0.9.0) — an ingest the engine bounds, and a ceiling it can find for itself
+## v0.9.0 "Bookshelf III" — an ingest the engine bounds, and a ceiling it can find for itself
 
 The question this release answers is "what if I bulk-ingest ten million nodes?".
 v0.8.0 made a whole-layer *rebuild* fit under 2 GiB. An ingest is the other
