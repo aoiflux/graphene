@@ -49,7 +49,17 @@ And for filling that store, the rule that matters more than every option above:
 > the square of what you are loading. At two hundred thousand 3.2 KB records
 > that is **6.85 GiB against 0.64**, and the gap widens with every doubling.
 
-Everything else in this document is the detail behind those two blocks.
+And the limit both of them run into, because it is the question this guide is
+most often read with the wrong answer to:
+
+> **The ceiling is a record count, not a data size.** Payload is mapped, so bytes
+> are nearly free against the anonymous budget; the per-record structures are not,
+> and they are the store rather than a transient. **Roughly ten million records is
+> comfortable and twenty-three million is the wall**, whatever those records
+> weigh. Batching, committing and compacting between batches does **not** move it
+> — see §4.6 before planning anything large.
+
+Everything else in this document is the detail behind those blocks.
 
 ---
 
@@ -269,6 +279,100 @@ Reopening is what gives those bytes back.
 no way to hand you a new handle. It bounds the delta and not the payload term.
 That is a real limitation and it is why the loop above is written out.
 
+### 4.6 The limit batching does not move: record count, not data size
+
+The loop in §4.5 is the right loop, and it is worth being precise about what it
+buys, because the obvious reading of this guide is more optimistic than the
+engine is.
+
+**It bounds three of the four classes in §3 and not the fourth.** The delta, the
+batch transient and the compaction working set are all bounded by figures you
+choose. What is left is the per-record structure the store holds *at rest* —
+record arrays at 56 B, label postings at 8, adjacency at 16, and the property
+index on top. That is not a transient. It is the store, it grows with every
+record you add, and no option in §8 reduces it below what the records require.
+
+So committing and compacting between batches keeps each *step* small. It does
+nothing about the total, and the total is what the ceiling is measured against.
+
+#### The arithmetic
+
+From §5's measured slope — **87.0 MiB per million records above a 49.7 MiB
+intercept**:
+
+| records | peak anonymous | headroom under 2 GiB |
+|---:|---:|---:|
+| 1,000,000 | 136.7 MiB *(measured)* | 93% |
+| 2,000,000 | 223.7 *(measured)* | 89% |
+| 5,000,000 | ~485 | 76% |
+| 10,000,000 | ~920 | 55% |
+| 15,000,000 | ~1,355 | 34% |
+| 20,000,000 | ~1,790 | 13% |
+| **22,970,000** | **~2,048** | **none — an open alone fills the ceiling** |
+
+Everything up to two million is measured; the rest is that line extended. Two
+points cannot show that a line is straight, so what the extrapolation actually
+rests on is §9's decomposition: the per-record terms are slice lengths, linear in
+the record count by construction, and they sum to the measured total. The risk in
+the table is therefore not curvature — it is your schema, because the property
+index sits on top of these figures and is the one term that depends on what you
+declare.
+
+Treat ~10M as the size to plan for and ~23M as the wall, because at the wall the
+store opens and there is nothing left to read it with.
+
+#### Which is why "terabytes" has no single answer
+
+Property blobs live in the mapped image. They are file-backed, so they cost
+almost nothing against the anonymous budget — the payload term at rest is **2 B
+per node**. It is the *count* that costs. At ten million records:
+
+| average record | total data on disk | under a 2 GiB ceiling |
+|---:|---:|---|
+| 256 B | 2.6 GB | fits |
+| 3.2 KB | 32 GB | fits — this is the shape everything here is measured at |
+| 32 KB | 328 GB | fits |
+| 100 KB | **1.0 TB** | fits |
+| 1 MB | **10.5 TB** | fits |
+
+So terabytes are reachable, and reachable comfortably, **when your records are
+large**. They are not reachable by adding hundreds of millions of small ones: one
+terabyte at 3.2 KB a record is 312 million records, which projects to **26.6 GiB
+of anonymous memory — thirteen times over the ceiling.** No amount of batching
+changes that number, because it is what the store holds after the ingest has
+finished.
+
+#### Three things that bite before memory does
+
+- **Write volume, on the incremental path.** §4.1 measured its writes growing
+  2.69× then 3.39× per doubling. Extended from 6.85 GiB at two hundred thousand
+  records, a hundred-million-record incremental ingest is in the petabytes
+  written. Memory is not what stops it. `BulkLoad` writes 1.00× — but it is
+  atomic, one-shot and needs an empty store, so it is not a "batch, then next
+  batch" loop either.
+- **Deletes do not give the arena back.** `ResidentEstimate.RecordArrays` scales
+  with *identifiers issued*, not records held, because a page is materialised
+  whole. A long-lived store that churns walks toward the wall at constant size.
+  `StorageStats.HighestNodeID` is the figure to watch, not the record count.
+- **A cgroup charges file-backed pages too.** They are reclaimable, so a
+  multi-terabyte mapping under a 2 GiB limit thrashes rather than OOM-kills you.
+  That is the better failure of the two, and it is still a failure: random access
+  over a mapping far larger than the limit degrades badly. `ResidentAdvice` (§7)
+  is the knob aimed at this.
+
+#### What would move the wall, and what to do until it does
+
+Packing the record arena from 56 to 24 bytes a record is designed and costed in
+`disk/arena_spike_test.go` and needs no format change. It would take the slope
+from 87.0 to **56.5 MiB per million**, putting ten million at ~615 MiB and the
+wall at **~35 million records**. **It is not built**, because at the shapes
+measured so far it is not needed; do not plan against it.
+
+If you are past the wall, the answer is not a setting. It is more than one store:
+partition by whatever your queries already partition by — time window, tenant,
+case — and give each its own directory and its own budget. The engine does not do
+this for you, and this guide would rather say so than imply a knob exists.
+
 ---
 
 ## 5. Reading: what an open holds
@@ -460,6 +564,10 @@ The third row is the one to be careful with. At 256 B records and 13 entries eac
 the multiplier is roughly 6.4×, and the index is the store. `EstimateResident`
 breaks the total into seven terms; read it rather than guessing.
 
+All three rows are sized by their **record count**, and none of them is near the
+wall. **§4.6 is where the wall is** — ~23 million records, whatever they weigh —
+and it is the first thing to check when planning something larger than these.
+
 ### What a rebuild costs, which is not the same question
 
 Reading a 1.4M store fits in 561 MiB. Rebuilding the whole layer **in the same
@@ -519,6 +627,8 @@ of evidence that settles the question.
 | symptom | most likely cause | what to do |
 |---|---|---|
 | memory climbs steadily through a long ingest and never falls | `Compact()` in a loop without reopening | `CompactAndReopen` |
+| memory climbs even with `CompactAndReopen` every batch | the store itself is growing; batching bounds steps, not totals | §4.6 — check the record count against ~23M |
+| a store at constant size drifts upward over months | the arena scales with identifiers issued, and deletes do not return them | watch `StorageStats.HighestNodeID`; rebuild into a fresh directory |
 | an ingest writes far more than the data | incremental path into an empty store | `BulkLoad` / `ImportDumpBulk` |
 | `MaxDeltaBytes` is set but memory still climbs | the property index is not in `DeltaBytes` (up to 5.6×) | add `MaxResidentBytes` |
 | `AutoCompact` is on and the payload term still ratchets | it cannot reopen, by construction | compact from your own loop |
