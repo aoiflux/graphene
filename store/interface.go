@@ -1423,6 +1423,32 @@ type CompactionPolicy struct {
 	// sets this to the memory they have available should expect to exceed it by
 	// that factor on a workload that mostly deletes, and should size such a
 	// workload against ResidentEstimate.Delta instead.
+	//
+	// # The larger gap: the index those writes created
+	//
+	// The paragraph above understates it, and the understatement is worse than
+	// the one it describes. This counts records. The property index the same
+	// writes built is not in it at all -- a registration costs roughly 107 bytes
+	// resident and is invisible here -- so on an indexed store the multiplier is
+	//
+	//	held / watched  =  1 + 107 * entries / recordBytes
+	//
+	// where entries is how many index entries one record creates: one per
+	// declared unique or ordered key it carries, plus one per declared
+	// composite. At 338-byte records with thirteen entries each that is
+	// **5.6x** -- 1,893 bytes held against 338 watched -- against the delete
+	// case's 1.8x. It falls towards 1 as records get fatter: about 1.45x at
+	// 3.2 KB with the same schema.
+	//
+	// Measured at the extreme: rebuilding a store without compacting, at 400,000
+	// records the resident property index was 546.4 MiB against the delta's
+	// 295.0. The term this rule cannot see was 1.85 times the term it can.
+	//
+	// The rule is not changed to count it, and that is deliberate: this figure
+	// is the delta's own bytes, a caller sizing against DeltaBytes gets what
+	// DeltaBytes says, and moving what it counts would silently retune every
+	// deployment already calibrated against it. MaxResidentBytes is the rule
+	// that sees the index, and it is additive rather than a replacement.
 	MaxDeltaBytes int64
 
 	// MaxWALBytes fires when the log grows past this size.

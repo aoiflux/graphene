@@ -105,20 +105,26 @@ func readRSS() rssSample {
 	anon := uint64(c.PrivateUsage)
 
 	// Committed-but-paged-out private memory can push PrivateUsage past the
-	// whole working set. Clamp rather than underflow, and let file go to zero:
-	// "no file-backed residency measured" is the honest reading of that state.
+	// whole working set. Clamp rather than underflow -- and say that the clamp
+	// fired, because the zero it leaves in file is not a measurement. The
+	// over-commit described above is usually enough to trigger this, so a
+	// windows run reports the split honestly only when the working set has grown
+	// past the runtime's committed-but-unused reserve.
 	var file uint64
+	clamped := false
 	if total > anon {
 		file = total - anon
 	} else {
 		anon = total
+		clamped = true
 	}
 
 	return rssSample{
-		Anon:  anon,
-		File:  file,
-		Total: total,
-		Peak:  uint64(c.PeakWorkingSetSize),
-		Split: true,
+		Anon:        anon,
+		File:        file,
+		Total:       total,
+		Peak:        uint64(c.PeakWorkingSetSize),
+		Split:       true,
+		AnonClamped: clamped,
 	}
 }

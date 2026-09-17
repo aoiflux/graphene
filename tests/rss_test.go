@@ -43,6 +43,23 @@ type rssSample struct {
 	Total uint64 // resident bytes, both classes
 	Peak  uint64 // high-water mark of resident bytes for the process lifetime
 	Split bool   // whether Anon and File are separately measured
+
+	// AnonClamped says that Anon is Total because the platform's private figure
+	// came out larger than the whole working set, so File is zero by
+	// construction rather than by measurement.
+	//
+	// It exists because those two zeros mean opposite things and print the same.
+	// "No file-backed residency" is a finding; "the estimate collapsed" is the
+	// absence of one, and a reader deciding whether to bound the file class off
+	// a table of 0.0 needs to know which they are looking at. Windows is where
+	// this happens -- see rss_windows_test.go for why its split is an estimate at
+	// all -- and the Go runtime routinely over-commits enough to trigger it, so
+	// this is the ordinary case there rather than an edge.
+	//
+	// Split stays true when it fires: the reading is still the platform's best
+	// answer and Anon is still usable, in the conservative direction. Only File
+	// is uninformative.
+	AnonClamped bool
 }
 
 // goHeap is the Go runtime's own view, read beside every RSS sample so the drift
@@ -139,6 +156,48 @@ func TestRSSInstrument_ReadsSomething(t *testing.T) {
 		t.Fatalf("reader claims an anon/file split but anon is zero: %+v", s)
 	}
 	t.Logf("anon=%d file=%d total=%d peak=%d split=%v", s.Anon, s.File, s.Total, s.Peak, s.Split)
+}
+
+// TestRSSInstrument_TheSplitAddsUpOrSaysItCannot holds the two invariants that
+// make the anon/file columns readable.
+//
+// A reading that claims a split must account for all of it -- Anon plus File is
+// the whole of Total -- or one class is silently absorbing bytes that belong to
+// the other, which is the one error that would make a mapped-image result look
+// like an anonymous one. And a reading whose split collapsed must say so, so
+// that the zero it leaves in File is not read as a measurement of zero.
+//
+// Both are properties of the ruler rather than of graphene, which is why this
+// sits beside the other calibrations and asserts nothing about a store. The
+// second invariant is the one added for Phase 2 of docs/PLAN_BOUNDED_INGEST.md:
+// that phase is gated on how large the file-backed class turns out to be during
+// an ingest, and on windows the ordinary state of a small process is a collapsed
+// split reporting 0.0 -- see rssSample.AnonClamped.
+func TestRSSInstrument_TheSplitAddsUpOrSaysItCannot(t *testing.T) {
+	if !rssSupported {
+		t.Skipf("no RSS instrument for %s", runtime.GOOS)
+	}
+	s := readRSS()
+	if !s.Split {
+		t.Skipf("platform reports no anon/file split: %+v", s)
+	}
+
+	if s.AnonClamped {
+		// The collapse is defined as anon having swallowed the whole reading. A
+		// clamped sample that still carries a file figure would mean the flag and
+		// the arithmetic disagree, and the flag is what the report trusts.
+		if s.Anon != s.Total || s.File != 0 {
+			t.Fatalf("a clamped reading must be all anon and no file: %+v", s)
+		}
+		t.Logf("split collapsed on this reading (anon=%d total=%d); File reads as unmeasured",
+			s.Anon, s.Total)
+		return
+	}
+	if s.Anon+s.File != s.Total {
+		t.Fatalf("the split does not account for the whole reading: anon=%d + file=%d != total=%d",
+			s.Anon, s.File, s.Total)
+	}
+	t.Logf("anon=%d + file=%d = total=%d", s.Anon, s.File, s.Total)
 }
 
 // TestRSSInstrument_TracksAnonymousGrowth is the calibration the rest of the

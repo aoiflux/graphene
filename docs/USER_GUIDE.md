@@ -944,16 +944,14 @@ These methods make chained query pipelines easier to write.
 
 ## 10. Persistence Lifecycle
 
-GrapheneDB disk mode uses WAL + delta + CSR compaction.
+GrapheneDB disk mode uses WAL + delta + CSR compaction. A write goes into the
+log and into an in-memory delta; a compaction folds the delta into a new image
+and truncates the log.
 
-Recommended lifecycle for large ingest:
+### The small case: ingest, compact, close
 
-1. Open disk graph.
-2. Ingest nodes and edges.
-3. Index query-critical properties.
-4. Run `Compact()`.
-5. Close.
-6. Reopen and run query/traversal workloads.
+If everything you are ingesting fits comfortably in memory, this is the whole
+lifecycle and there is nothing to tune.
 
 ```go
 g, _ := graphene.Open("./case-data")
@@ -962,7 +960,227 @@ _ = g.Compact()
 _ = g.Close()
 ```
 
-## 11. Visualization
+**"Comfortably" means the delta and the property index it creates, not the file
+on disk.** The rule of thumb is that a record costs about its own size in the
+delta *plus* roughly 107 bytes for every index entry the writes create, so a
+store with thirteen declared keys per record multiplies a 338-byte record into
+about 1.9 KiB held. §11 below has the coefficients and §9.7 of
+`docs/MEMORY_MODEL.md` has how they were taken.
+Below a few hundred thousand records at ordinary sizes, take this path.
+
+### The large case: bound the delta *and* reopen
+
+Past that, the recipe above is the wrong one, and this is worth stating plainly
+because it was the recipe this guide gave until v0.9.0. Ingesting everything and
+compacting once at the end holds **anonymous memory exactly linear in the record
+count**: measured at 3.2 KB records, 510 MiB at 100,000 and 1,010 MiB at 200,000,
+which is 10% of a 2 GiB ceiling left for a store of 757 MiB on disk. It does not
+reach 400,000. The same shape under the recipe below ingests 400,000 holding
+98 MiB.
+
+Two settings fix it and **they are one setting**. Neither works without the
+other:
+
+```go
+g, err := graphene.Open("./case-data")
+if err != nil {
+    return err
+}
+
+// Bound what the delta may hold before a compaction is due. 32 MiB is the
+// figure MEMORY_MODEL section 9.8 measured passing at 1.4M nodes; the shipped
+// default of 128 MiB is not.
+policy := store.CompactionPolicy{MaxDeltaBytes: 32 << 20}
+
+for _, chunk := range chunks {
+    if _, err := g.AddNodes(chunk); err != nil {
+        return err
+    }
+    // index the chunk...
+
+    due, _ := g.ShouldCompact(policy)
+    if !due {
+        continue
+    }
+    // Compact *and reopen*. The reopen is not optional -- see below.
+    next, err := g.CompactAndReopen()
+    if err != nil {
+        return err
+    }
+    g = next
+}
+
+if err := g.Compact(); err != nil { // the final fold
+    return err
+}
+return g.Close()
+```
+
+**Why the bound alone is not enough.** A compaction writes a new image, but the
+records this process is *holding* still carry their own payload bytes, because
+`AttachBase` — the step that makes a record address the mapped file instead of
+the heap — runs on the load path, and a compaction is not one. So the payload
+term does not fall at a compaction; it ratchets, once per record written, for
+the life of the handle. §9.8 measured it climbing **49.0 MiB per 100,000
+records and never resetting**. Reopening is what makes the records address the
+file again.
+
+**Why the reopen alone is not enough.** A reopen sheds what accumulated since
+the last one, so how often it happens is the setting that matters — and what
+makes it happen is the delta bound. The same sequence at the default 128 MiB
+reopens five times instead of fifteen and still fails.
+
+**It is also faster**, which was not the argument for it: 242 s for the whole
+sequence against 469 s for an arm that never finished. Twenty-nine compactions
+against a heap that never stops growing cost more than fifteen against one that
+does not.
+
+### What it costs on disk
+
+Bounding the delta trades memory for writes, and the trade is steep, because
+every compaction rewrites the *whole* image. Measured on a bulk ingest of
+3.2 KB records at a 32 MiB bound:
+
+| records ingested | store on disk | bytes written | amplification | anonymous, ingesting |
+|---:|---:|---:|---:|---:|
+| 100,000 | 378.7 MiB | 2.42 GiB | 6.5× | 94.6 MiB |
+| 200,000 | 757.3 MiB | 8.71 GiB | 11.8× | 76.3 MiB |
+| 400,000 | 1,514.3 MiB | 31.40 GiB | 21.2× | 98.2 MiB |
+
+**Read those two columns together, because they are the trade.** Anonymous
+memory is flat across a fourfold size range — that is the bound doing exactly
+what it is for. The amplification grows by 1.80× every time the record count
+doubles, measured twice, because the number of compactions and the mean size of
+each both grow with the data. Extrapolating the same fit, ten million records at
+this shape would write on the order of a terabyte to store thirty gigabytes.
+
+So raise the bound as far as your memory ceiling allows rather than as far as it
+will go: memory is linear in the bound and writes are linear in its reciprocal.
+And if you are ingesting at that scale, the honest answer today is that graphene
+does not yet have a one-pass bulk loader — it is planned, and this table is why.
+
+### Let the engine refuse what it cannot afford
+
+Since v0.9.0 the engine will decline an input it cannot hold, rather than
+accepting it and hoping. Set a budget — or ask it to find one:
+
+```go
+opts := disk.Options{
+    // Read the cgroup limit, Job Object or machine memory this process is
+    // already under, and derive the budget from it.
+    DiscoverMemoryBudget: true,
+}
+g, err := graphene.OpenWithOptions("./case-data", opts)
+```
+
+The batch caps come from that budget without a second decision, so a caller who
+turns the budget down gets smaller batches automatically. An oversized batch
+comes back as `disk.ErrBatchTooLarge` carrying both the offending figure and
+the cap, before any ID is taken and before the lock:
+
+```go
+if _, err := g.AddNodes(huge); errors.Is(err, disk.ErrBatchTooLarge) {
+    // split it, or use the splitting form below
+}
+```
+
+`AddNodesInBatches` and `AddEdgesInBatches` do the splitting for you. **They are
+not atomic**: `AddNodes` documents that either every node is added or none is,
+and the splitting forms deliberately give that up — an error part-way leaves the
+earlier chunks written. That is the trade, and it is the reason they are a
+separate call rather than a flag on the existing one.
+
+### For a dump rather than a program
+
+`graphene import graph` takes the configuration above by default: `-bound 32`
+with a reopen after every interim compaction. `-bound 0` restores the old
+unbounded behaviour for a dump you know fits.
+
+## 11. Memory and capacity planning
+
+What a store costs to hold, and every bound you can put on it.
+
+### The two sizing rules
+
+**At rest, the ceiling binds on node count and schema, not on bytes on disk.**
+A store that has been compacted and reopened holds about **178 bytes of heap per
+node** plus its schema's per-entry index cost, and charges roughly **300–310
+bytes per node** against an OS limit. Blob size sets the file and the page cache
+and does not set the ceiling: measured across a twentyfold difference in blob
+size — 1.4M × 512 B against 1.8M × 10 KiB — every per-node term agrees to two
+decimal places.
+
+| term | B/node | moved by |
+|---|---:|---|
+| record arrays | 56.0 | nothing yet |
+| record payloads | 2.0 | already mapped — this is a slice header, not the blob |
+| label postings | 8.0 | nothing; 4.5% of heap |
+| adjacency | 16.0 | `Options.Adjacency` (deferred to first use) |
+| composites | 96.0 | two declared composites; 54% of modelled heap |
+| **modelled heap** | **178.1** | |
+| charged, peak | 300–310 | |
+
+An 18.4 GiB store of 1.8M fat nodes opens in **527 MiB charged against a 2 GiB
+limit, 74.3% headroom**. 7,071 MiB of its 7,598 MiB resident is file-backed —
+the mapped image's pages, which the kernel can drop and re-fault, and which a Job
+Object's commit charge never sees.
+
+**While writing, the figure that grows is not the one `MaxDeltaBytes` counts.**
+`DeltaBytes` counts record payloads. The property index those same writes created
+is not in it, and at a heavily indexed shape it is the larger of the two. The
+multiplier is:
+
+> held ≈ recordBytes × (1 + 107 × entries / recordBytes)
+
+where `entries` is how many index entries one record creates — one per declared
+unique or ordered key it carries, plus one per declared composite. At 338-byte
+records with thirteen entries each, that is **1,893 bytes held against 338
+watched: 5.6×**. At 3.2 KB records with the same schema it is about 1.45×.
+
+### Three worked shapes
+
+**Small records, heavily indexed** — 338 B, 13 entries/record. The index
+dominates: at 400,000 uncompacted records the resident property index was
+546.4 MiB against the delta's 295.0. Set `MaxDeltaBytes` to roughly a fifth of
+what you can afford, because five times it is what you will hold. Or set
+`MaxResidentBytes`, which is the one rule that sees the index.
+
+**Fat records, same schema** — 3.2 KB, 13 entries/record. The multiplier is
+small, so `MaxDeltaBytes` is close to honest. The binding cost is elsewhere: at a
+32 MiB bound an ingest writes 6.5× the store at 100,000 records and 11.8× at
+200,000, and that ratio keeps doubling. Set the bound as high as your ceiling
+allows.
+
+**Read-only** — no delta, no writes. Take the defaults for the residency modes
+and you get neither the mapped image nor the mapped index and pay about 3.8× what
+you need to. A live reader should ask for both explicitly.
+
+### Every bound, and what it does not cover
+
+| bound | unit | default | does **not** cover |
+|---|---|---|---|
+| `Options.MemoryBudget` | bytes | 0 (unlimited) | anything between `Open` and `Compact`. It is a refusal at two moments, not a cap — and at a compaction it refuses the operation that would have relieved the pressure, leaving a delta that keeps growing |
+| `Options.DiscoverMemoryBudget` | bool | false | darwin, which can only read `hw.memsize`. A discovery that finds nothing leaves the budget at zero, which is unlimited — check `StorageStats.MemoryBudgetSource` |
+| `Options.MaxBatchBytes` | bytes | 2% of the budget, else uncapped | a single record. A batch of one is always admitted, because these cap how many records share a commit, not how large a record may be |
+| `Options.MaxBatchRecords` | count | `MaxBatchBytes` ÷ 80, else uncapped | the same |
+| `Options.DeltaSoftLimit` | bytes | 0 | anything. It reports — `StorageStats.DeltaOverBudget` and one metric per crossing — and never acts |
+| `Options.Compact.MaxWorkingBytes` | bytes | 4,325,376 (floor 524,288) | everything a compaction holds except the four sort intermediates. Raising it is measured to buy nothing; the floor saves 3.32 MiB for 12–42% of the compaction's wall clock |
+| `CompactionPolicy.MaxDeltaRecords` | count | 100,000 | how large those records are |
+| `CompactionPolicy.MaxDeltaBytes` | bytes | 128 MiB | the property index — see the multiplier above. **The default does not hold a large ingest**; §10 has the figure that does |
+| `CompactionPolicy.MaxWALBytes` | bytes | 256 MiB | anything resident. The log is on disk |
+| `CompactionPolicy.MaxDeltaRatio` | fraction | 0.5 | a large delta against a large image |
+| `CompactionPolicy.MaxResidentBytes` | bytes | 0 (off) | the allocator's working set, the collector's headroom, or a compaction's transients. `EstimatedResidentBytes` models *retained* heap, and a process charges roughly **2.6× it** during a rebuild. Read it as a floor, not a budget |
+| `GOMEMLIMIT` | bytes | unset | mapped file pages, which is the right exclusion. It is soft — it reclaims garbage and cannot shrink a live set. **Graphene never sets it**: it is process-global and this is a library in your process |
+
+### The one thing none of them bound
+
+A compaction's own transient. `EstimateResident` models what the store retains;
+it does not model what a rebuild peaks at, and the gap is a factor of about 2.6.
+If you are sizing against a hard ceiling, measure the rebuild rather than
+modelling it — `tests/ceiling_test.go` is the harness, and `docs/MEMORY_MODEL.md`
+§9 is what it has established so far.
+
+## 12. Visualization
 
 GrapheneDB visualization is provided by the core `viz` package.
 
@@ -1001,21 +1219,22 @@ Interactive controls include:
 
 It is a static HTML artifact with no external dependency.
 
-## 12. End-to-End Large Workflow
+## 13. End-to-End Large Workflow
 
 Typical "push limits" workflow:
 
 1. Define data model and key conventions.
-2. Ingest large graph (including bucket keys).
+2. Ingest large graph (including bucket keys), **bounding the delta and reopening
+   as §10 describes** — step 4 on its own is the recipe that does not scale.
 3. Add connection-rich edges for multi-hop analysis.
-4. Compact.
+4. Compact (the final fold).
 5. Reopen and validate counts.
 6. Run type/property lookups.
 7. Run BFS/DFS/provenance/path.
 8. Run connectivity, degree, induced subgraph, pattern matching.
 9. Export visualization and archive run metadata.
 
-## 13. Commands
+## 14. Commands
 
 ### Examples
 
@@ -1052,7 +1271,7 @@ go run ./examples
 go test ./tests/ -tags=stress -run TestStress
 ```
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 ### AddNode or AddEdge fails
 

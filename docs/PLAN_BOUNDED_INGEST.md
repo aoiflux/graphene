@@ -5,9 +5,9 @@
 > | item | what it is | status |
 > |---|---|---|
 > | 0a | per-stage attribution inside a compaction | **done** |
-> | 0b | bulk-ingest arm + bytes-written counter + anon/RSS split | todo |
-> | 0c | target-shape coefficients at 1M and 2M x 3.2 KB | todo |
-> | 0d | promote the scratch probe, delete `O:\tmp\ingestprobe` | todo |
+> | 0b | bulk-ingest arm + bytes-written counter + anon/RSS split | **done** - `TestCeiling_BulkIngestFitsUnderTheLimit`; the counter sums `MetricCompaction.Bytes` and `MetricCommit.Bytes`, which the engine already emitted. Peak anon is tracked apart from peak total, and a windows reading whose split collapsed now says so rather than printing 0.0 |
+> | 0c | target-shape coefficients at 1M and 2M x 3.2 KB | **wip** - measured at 100k, 200k and 400k x 3.2 KB, both arms, in MEMORY_MODEL §9.9. The quadratic is a measurement: amplification 6.53x -> 11.77x -> 21.24x, **1.80x per doubling, twice**, against the unbounded arm's flat 1.81x and linear memory. Phase 5 is needed. 1M and 2M outstanding - ~805 GiB of writes between them |
+> | 0d | promote the scratch probe, delete `O:\tmp\ingestprobe` | **done** - the arm carries the probe's modes (`GRAPHENE_CEILING_DELTA_MIB`/`_REOPEN`), its budget knob (`_BUDGET_MIB`) and a discovery knob it did not have; the module is deleted |
 > | 1a | batch caps on count and bytes, `ErrBatchTooLarge` | **done** |
 > | 1b | caps derived from the budget | **done** - fraction provisional, 0c tunes it |
 > | 1c | auto-splitting writer, separate API, non-atomic | **done** - `AddNodesInBatches`/`AddEdgesInBatches` on the store and on `Graph` |
@@ -15,8 +15,8 @@
 > | 1e | `CompactionPolicy.MaxResidentBytes` | **done** - fifth rule, between the delta rules and the WAL proxy |
 > | 1f | index adoption gate under concurrent writes | **done** - not the shard split the plan named: `index.Tail` records the mutations and `SwapBase` replays them, because a shard split cannot carry a retraction. 0c to turn `maxIndexTailBytes` into an option |
 > | 1g | `bulk` gets byte-sized batches and a compaction schedule | **done** - `Options.MaxBatchBytes`/`Compact`/`Reopen`; `import graph` bounded by default at `-bound 32` with a reopen through `Context.ReopenGraph` |
-> | 2a-2d | bound the resident class (gated on 0b) | todo |
-> | 3a-3e | the documentation | todo |
+> | 2a-2d | bound the resident class (gated on 0b) | **gate met, todo** - file-backed residency during an ingest is 1,182 MiB at 400k x 3.2 KB, **12x the anonymous class** and linear in the store. Free against a windows Job Object, charged against a linux cgroup |
+> | 3a-3e | the documentation | **wip** - 3a done (`USER_GUIDE.md` §10 rewritten: the failing recipe replaced, with both arms' figures), 3b done (new §11 "Memory and capacity planning"; §11-14 renumbered to 12-15). 3c/3d/3e todo |
 > | 4 | write-only streaming compaction | todo |
 > | 5 | one-pass `BulkLoad` | todo |
 > | 6 | map the record arena, v10 (gated on 0) | todo |

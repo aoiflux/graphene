@@ -880,6 +880,21 @@ type Options struct {
 	// once, with no error and no warning until someone measures it.
 	//
 	// store.DefaultCompactionPolicy() is a starting point, not a tuned setting.
+	//
+	// # It cannot reopen, so it does not bound the payload term
+	//
+	// A background compaction writes a new image and truncates the log, and the
+	// records this process holds go on carrying their own payload bytes --
+	// because AttachBase, which makes a record address the mapped file instead
+	// of the heap, runs on the load path, and a compaction is not one. Only a
+	// reopen sheds that, and a background goroutine cannot reopen the store it
+	// is running inside: the handle belongs to the caller.
+	//
+	// So this bounds the delta and the log and does not bound what a long-lived
+	// writing process accumulates. Measured, that term climbs about 49 MiB per
+	// 100,000 records written and never resets. A process that ingests for hours
+	// needs Graph.CompactAndReopen on its own schedule; this is for a store whose
+	// writes are occasional and whose handle outlives them.
 	AutoCompact *store.CompactionPolicy
 
 	// AutoCompactInterval is how often the policy is evaluated. Zero means 30s.

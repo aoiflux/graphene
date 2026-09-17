@@ -711,28 +711,60 @@ func samplePeakDuring(fn func()) (peak rssSample, samples int) {
 // this returns, so a caller that widens it is trading resolution for overhead
 // deliberately rather than inheriting a constant chosen for another operation.
 func samplePeakEvery(interval time.Duration, fn func()) (peak rssSample, samples int) {
-	type reading struct {
-		s rssSample
-		n int
-	}
+	p := samplePeaksEvery(interval, fn)
+	return p.Total, p.Samples
+}
+
+// rssPeaks is what a sampling run saw, with the two classes tracked apart.
+//
+// Total is the reading whose resident total was highest and Anon the reading
+// whose anonymous bytes were highest, and they are two readings rather than one
+// because they need not be the same moment. That is not a hypothetical: a
+// compaction's peak total includes the pages the kernel faulted in while
+// reading the old image, and the anonymous high-water mark of the build can
+// land either side of it depending on how much of the file was already warm.
+//
+// Keeping them apart matters because the two classes are not the same kind of
+// memory. The directive this program is measured against bounds the anonymous
+// class, which cannot be reclaimed under pressure; the file-backed class can be,
+// so a figure that adds them reports a ceiling breach that eviction would have
+// absorbed. Reading Total-minus-Anon as "the file-backed part" is therefore
+// wrong twice over -- the readings are from different instants, and Total's own
+// sample carries its File field for exactly that question. Phase 2 of
+// docs/PLAN_BOUNDED_INGEST.md is the work these two figures are collected to
+// size, and it has nothing to aim at from a single charged total.
+type rssPeaks struct {
+	Total   rssSample // the reading whose Total was highest
+	Anon    rssSample // the reading whose Anon was highest
+	Samples int       // how many readings went into both
+}
+
+// samplePeaksEvery is samplePeakEvery keeping both peaks rather than one.
+//
+// Split reports whether the anonymous figure means anything; on a platform that
+// cannot separate the classes Anon stays zero and every reading ties, so the
+// field reads as unmeasured rather than as nothing held.
+func samplePeaksEvery(interval time.Duration, fn func()) rssPeaks {
 	done := make(chan struct{})
-	result := make(chan reading, 1)
+	result := make(chan rssPeaks, 1)
 
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		var best rssSample
-		n := 0
+		var p rssPeaks
 		for {
 			select {
 			case <-done:
-				result <- reading{best, n}
+				result <- p
 				return
 			case <-ticker.C:
 				s := readRSS()
-				n++
-				if s.Total > best.Total {
-					best = s
+				p.Samples++
+				if s.Total > p.Total.Total {
+					p.Total = s
+				}
+				if s.Split && s.Anon > p.Anon.Anon {
+					p.Anon = s
 				}
 			}
 		}
@@ -740,8 +772,7 @@ func samplePeakEvery(interval time.Duration, fn func()) (peak rssSample, samples
 
 	fn()
 	close(done)
-	r := <-result
-	return r.s, r.n
+	return <-result
 }
 
 // BenchmarkRSS_Compact measures the transient cost of compaction, which the

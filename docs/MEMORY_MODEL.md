@@ -2112,6 +2112,129 @@ rest the model is within a few percent. `EstimateResident` models retained heap;
 model the allocator's working set, the collector's headroom, or a compaction's transients,
 and a caller sizing a rebuild against it is reading a floor rather than a budget.
 
+### 9.9 A bulk ingest holds its memory, and pays for it in writes
+
+§9.8 measured a *rebuild*: a store that already exists, whose derived layer is deleted and
+written back. That is the consumer's sequence, and it is not the question this programme
+opened with, which was "what if I bulk-ingest ten million nodes?". A rebuild starts from an
+image, so the delta it accumulates is measured against something already on disk. An ingest
+starts from nothing, and every structure it holds is one it created.
+
+`TestCeiling_BulkIngestFitsUnderTheLimit` is that arm. It builds an empty store, declares the
+same 8 unique + 5 ordered + 2 composite schema, and fills it under a real ceiling with the
+configuration §9.8 established: `MaxDeltaBytes` at 32 MiB with a reopen after every interim
+compaction. It also counts what the engine wrote, by summing `MetricCompaction.Bytes` and
+`MetricCommit.Bytes` — which turns the rewrite cost from arithmetic in a plan into a
+measurement.
+
+Both arms were run: bounded with a reopen, and the unbounded arm that `USER_GUIDE.md` §10
+recommended until this release — ingest everything, compact once at the end.
+
+#### The unbounded arm dies of the data, and the crossing is visible
+
+| records | anon, ingesting | peak RSS | charged | headroom | bytes written | amplification | wall |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100,000 | 510.3 MiB | 956.7 | 996.6 | 51.3% | 0.67 GiB | 1.81× | 14.0 s |
+| 200,000 | **1,010.0 MiB** | 1,801.6 | 1,843.0 | **10.0%** | 1.34 GiB | 1.81× | 23.5 s |
+
+Anonymous memory is **exactly linear in the record count** — 510.3 doubles to 1,010.0 for
+twice the data — and the charged figure with it. At 200,000 records of 3.2 KB, a store of
+757 MiB on disk, the process has 10% of a 2 GiB ceiling left. It does not reach 400,000.
+
+The figure it stops at, 1,843.0 MiB, is the same one §9.8 recorded for the 128 MiB rebuild arm
+at 1,200,000 records. That is not a coincidence about the workload; it is where a 2 GiB
+machine gives out, reached from two different directions.
+
+Note what the amplification column does: **1.81× at both sizes, flat**. The unbounded arm
+writes the image exactly once (1.00×) plus the log (0.81×). It is the cheapest possible ingest
+in write volume and the most expensive in memory, and the bounded arm below is the exact
+converse. There is no configuration on this axis that is good at both.
+
+#### The bounded arm holds flat
+
+Three sizes, at the 3.2 KB records this programme targets, each a fresh process under a
+2,048 MiB Job Object, `MaxDeltaBytes` at 32 MiB with a reopen after every interim compaction:
+
+| records | store on disk | anon, ingesting | file-backed, ingesting | peak anon | peak RSS | charged | headroom | wall |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100,000 | 378.7 MiB | **94.6** | 251.6 | 242.7 | 477.8 | 244.0 | 88.1% | 24.7 s |
+| 200,000 | 757.3 MiB | **76.3** | 572.9 | 270.6 | 825.8 | 271.1 | 86.8% | 71.0 s |
+| 400,000 | 1,514.3 MiB | **98.2** | 1,182.0 | 336.1 | 1,615.6 | 336.1 | 83.6% | 214.4 s |
+
+**The anonymous column is the result.** It is flat across a fourfold size range while the
+store on disk quadruples — against the unbounded arm's exact linearity in the same units, at
+the same shape, on the same machine. The bound plus the reopen do exactly what §9.8 said they would, and
+they do it on the ingest path too — which was not established, because §9.8's arms all had an
+image to start from. The charged figure grows, but slowly and sublinearly: 244 → 271 → 336 MiB
+for 4× the data, and the headroom is still 83.6% at the largest arm.
+
+**The file-backed column is the one Phase 2 is about.** It tracks the store at about 0.78×
+and is **12× the anonymous class** by the third arm. On windows that costs nothing against the
+ceiling — a Job Object charges committed private bytes, so the charged column and the anon
+column agree to a tenth of a megabyte at every size. Under a linux cgroup, `memory.max`
+charges page cache. **So the same ingest that has 83.6% headroom here would be charged
+1,518 MiB rather than 336 under a v2 cgroup**, and the gate on Phase 2 is met: the resident
+class during an ingest is large, it grows with the data, and only one of the two platforms
+gets it for free.
+
+#### The quadratic, measured
+
+| records | bytes written | amplification | B/node | compactions | mean image per compaction |
+|---:|---:|---:|---:|---:|---:|
+| 100,000 | 2.42 GiB | 6.53× | 25,942 | 10 | 216.7 MiB |
+| 200,000 | 8.71 GiB | 11.77× | 46,747 | 20 | 415.1 MiB |
+| 400,000 | 31.40 GiB | 21.24× | 84,301 | 39 | 793.0 MiB |
+
+Amplification grows by **1.80× per doubling of the record count, twice**, and bytes per node by
+the same factor. Exact quadratic growth would be 2.00×; the shortfall is the early compactions
+writing a small image, which the closed form `(N·b)² / (2·chunk)` treats as asymptotic. The log
+term is a constant 0.81× of the store at all three sizes and is not the problem — the image
+is, at 5.72×, 10.96× and 20.42×.
+
+Extrapolating the measured fit rather than the plan's arithmetic: ten million records at this
+shape write on the order of a **terabyte** to store thirty gigabytes.
+
+#### What the bound costs in wall clock
+
+| records | unbounded | bounded + reopen | ratio |
+|---:|---:|---:|---:|
+| 100,000 | 14.0 s | 24.7 s | 1.8× |
+| 200,000 | 23.5 s | 71.0 s | 3.0× |
+
+Worth stating plainly rather than leaving in the phase tables: bounding the delta is **slower**
+on an ingest, and increasingly so, because the wall clock follows the bytes written. §9.8 found
+the opposite on a *rebuild* — the bounded arm finished in 242 s where an unbounded one never
+finished at all — and both are true. A rebuild that does not bound dies; an ingest that does
+not bound is faster right up until it dies.
+
+**This settles the Phase 5 decision.** The memory question is answered — an ingest of any size
+holds flat anonymous memory under a bound and a reopen. The write question is not, and no
+value of `MaxDeltaBytes` answers it, because the two arms above bracket the whole axis:
+unbounded is 1.81× writes and linear memory, bounded is flat memory and 1.80× writes per
+doubling, and tightening the bound moves along that line rather than off it. A one-pass bulk
+load writes the data once at flat memory; that is the only thing that changes the shape of the
+curve rather than the position on it.
+
+#### What this does not establish
+
+The three arms are windows under a Job Object. **The anon/file split was not measurable at
+all below this record size**: windows estimates the split as `min(PrivateUsage, WorkingSet)`
+and the Go runtime's over-commit is large enough that a small process reports the whole
+working set as anonymous and zero file-backed. `rssSample.AnonClamped` now reports that state
+as unmeasured rather than as zero — the 256-byte arms print `n/a` in the file column, and the
+3.2 KB arms are the first where the working set outgrows the runtime's reserve. A linux arm
+would measure the split exactly, and has not been run at this shape.
+
+The largest arm is 400,000 records. 1M and 2M are what the plan asks for, and the cost of
+taking them is the table above: about 805 GiB written between the two.
+
+```sh
+GRAPHENE_CEILING_MIB=2048 GRAPHENE_CEILING_INGEST_DIR=/path/to/empty \
+  GRAPHENE_RSS_NODES=400000 GRAPHENE_RSS_BLOB=3200 \
+  GRAPHENE_CEILING_DELTA_MIB=32 GRAPHENE_CEILING_REOPEN=1 \
+  go test ./tests/ -tags=stress -count=1 -run TestCeiling_BulkIngest -v -timeout=180m
+```
+
 ## Reproducing these figures
 
 Every number above comes from `tests/rss_bench_test.go` behind the `stress` tag. The
@@ -2132,6 +2255,9 @@ fixture knobs:
 | `GRAPHENE_CEILING_READONLY` | stop the sequence after the scan: the consumer's aggregate process, and the arm that fits at the full shape |
 | `GRAPHENE_CEILING_DELTA_MIB` | bound the delta during the rebuild via `CompactionPolicy.MaxDeltaBytes`; unset rebuilds into one delta |
 | `GRAPHENE_CEILING_REOPEN` | reopen the store after every interim compaction — route (b) of §9.8, and meaningless without a delta bound to produce interim compactions |
+| `GRAPHENE_CEILING_INGEST_DIR` | where `TestCeiling_BulkIngest*` builds its store (§9.9). Required above 200,000 nodes, must be empty, and deliberately **not** `GRAPHENE_RSS_DIR`: that names a reused fixture guarded by a shape marker, and an ingest arm writing into it would leave the next run a store the marker still called pristine |
+| `GRAPHENE_CEILING_BUDGET_MIB` | `Options.MemoryBudget` for the ingest arm. With a delta bound set too, this is the configuration where the two can contradict each other — the policy says compact, the budget refuses |
+| `GRAPHENE_CEILING_DISCOVER` | `Options.DiscoverMemoryBudget`: the engine reads the ceiling the harness just applied and derives its own budget from it. The run fails if a budget was asked for and none is in force |
 
 **Use `GRAPHENE_RSS_DIR` for anything that reports a peak.** Building a 1.4M-node
 fixture peaks near 9.4 GiB and `peakMiB` is a process-lifetime high-water mark, so a

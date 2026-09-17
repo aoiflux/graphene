@@ -223,13 +223,18 @@ func ceilingProgress(format string, args ...any) {
 const ceilingSelfBuildMax = 200_000
 
 // ceilingPhase is one step of the sequence and what it cost.
+//
+// Peak and PeakAnon are two readings rather than one -- see rssPeaks for why
+// they need not be the same moment, and why the difference between them is not
+// the file-backed part.
 type ceilingPhase struct {
-	Name    string
-	Note    string
-	Wall    time.Duration
-	Settled rssSample
-	Peak    rssSample
-	Samples int
+	Name     string
+	Note     string
+	Wall     time.Duration
+	Settled  rssSample
+	Peak     rssSample
+	PeakAnon rssSample
+	Samples  int
 }
 
 // TestCeilingFixture_Build builds the shared fixture and nothing else.
@@ -451,17 +456,17 @@ func TestCeiling_ConsumerSequenceFitsUnderTheLimit(t *testing.T) {
 	run := func(name string, fn func() string) {
 		var note string
 		start := time.Now()
-		peak, samples := samplePeakEvery(sampleEvery, func() { note = fn() })
+		peaks := samplePeaksEvery(sampleEvery, func() { note = fn() })
 		wall := time.Since(start)
 		settled, _ := settledRSS(g)
 		phases = append(phases, ceilingPhase{
 			Name: name, Note: note, Wall: wall,
-			Settled: settled, Peak: peak, Samples: samples,
+			Settled: settled, Peak: peaks.Total, PeakAnon: peaks.Anon, Samples: peaks.Samples,
 		})
 		ceilingProgress("phase %s done in %s: settled %.1f MiB anon / %.1f MiB total, "+
-			"peak %.1f MiB total (%s)", name, wall.Round(time.Millisecond),
+			"peak %.1f MiB total / %.1f MiB anon (%s)", name, wall.Round(time.Millisecond),
 			float64(settled.Anon)/bytesPerMiB, float64(settled.Total)/bytesPerMiB,
-			float64(peak.Total)/bytesPerMiB, note)
+			float64(peaks.Total.Total)/bytesPerMiB, float64(peaks.Anon.Anon)/bytesPerMiB, note)
 		ceilingProgress("phase %s terms: %s", name, ceilingTerms(g))
 	}
 	ceilingProgress("fixture %s: %d nodes, %.1f MiB on disk, delta bound %d MiB",
@@ -672,26 +677,40 @@ func ceilingReport(t *testing.T, dir string, diskMiB float64, phases []ceilingPh
 	// Deliberately not a t.Helper: this prints a table over many lines, and a
 	// helper would stamp every one of them with the single line that called it.
 	t.Logf("fixture %s: %d nodes, %.1f MiB on disk", dir, rssNodes, diskMiB)
-	t.Logf("%-10s %9s %9s %9s %9s %7s %9s  %s",
-		"phase", "anonMiB", "fileMiB", "rssMiB", "peakMiB", "samples", "wall", "note")
+	// Five residency columns rather than three. The settled pair is the store at
+	// rest after the phase; the peak triple is the high-water mark during it,
+	// split because the ceiling is charged against the total while the directive
+	// is written against the anonymous class alone. pkAnonMiB is the highest
+	// anonymous reading and pkFileMiB is the file-backed part of the reading
+	// where the *total* peaked -- not of the same reading, which is why they are
+	// labelled apart and why neither is a subtraction of the other.
+	t.Logf("%-10s %9s %9s %9s %9s %9s %9s %7s %9s  %s",
+		"phase", "anonMiB", "fileMiB", "rssMiB", "peakMiB", "pkAnonMiB", "pkFileMiB",
+		"samples", "wall", "note")
 	for _, p := range phases {
 		anon, file := "-", "-"
 		if p.Settled.Split {
 			anon = fmt.Sprintf("%.1f", float64(p.Settled.Anon)/bytesPerMiB)
-			file = fmt.Sprintf("%.1f", float64(p.Settled.File)/bytesPerMiB)
+			file = rssFileMiB(p.Settled)
 		}
 		// A phase shorter than the sample interval gets no reading at all, and
 		// printing that as 0.0 would say the peak was nothing rather than that
 		// nobody looked. The sample count is beside it for the same reason: the
 		// sampler returns a floor on the peak, and how many readings went into
 		// that floor is what says how good a floor it is.
-		peak := "-"
+		peak, peakAnon, peakFile := "-", "-", "-"
 		if p.Samples > 0 {
 			peak = fmt.Sprintf("%.1f", float64(p.Peak.Total)/bytesPerMiB)
+			if p.Peak.Split {
+				peakFile = rssFileMiB(p.Peak)
+			}
+			if p.PeakAnon.Split {
+				peakAnon = fmt.Sprintf("%.1f", float64(p.PeakAnon.Anon)/bytesPerMiB)
+			}
 		}
-		t.Logf("%-10s %9s %9s %9.1f %9s %7d %9s  %s",
+		t.Logf("%-10s %9s %9s %9.1f %9s %9s %9s %7d %9s  %s",
 			p.Name, anon, file,
-			float64(p.Settled.Total)/bytesPerMiB, peak, p.Samples,
+			float64(p.Settled.Total)/bytesPerMiB, peak, peakAnon, peakFile, p.Samples,
 			p.Wall.Round(time.Millisecond), p.Note)
 	}
 
@@ -758,6 +777,20 @@ func holdingNote(g *graphene.Graph) string {
 		"index " + orUnknown(st.IndexMode),
 		"adjacency " + orUnknown(st.Adjacency),
 	}, ", ")
+}
+
+// rssFileMiB renders a reading's file-backed class, or says it was not measured.
+//
+// A clamped sample carries zero in File by construction, and printing that as
+// "0.0" beside genuine zeros is the one confusion this column has to avoid:
+// Phase 2 of docs/PLAN_BOUNDED_INGEST.md is gated on how large the file class
+// turns out to be during an ingest, and a gate read off a structural zero would
+// close the phase on no evidence. See rssSample.AnonClamped.
+func rssFileMiB(s rssSample) string {
+	if s.AnonClamped {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f", float64(s.File)/bytesPerMiB)
 }
 
 func orUnknown(s string) string {
